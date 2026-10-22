@@ -360,7 +360,7 @@ void Engine::plan_slots(int main_cap) {
 }
 
 int Engine::round_cap(int need) const {  // headroom so that a growing conversation moves rarely
-    static const size_t head = getenv("QE_POOL_HEADROOM") ? atoll(getenv("QE_POOL_HEADROOM")) : 16384;
+    static const size_t head = getenv("QE_POOL_HEADROOM") ? atoll(getenv("QE_POOL_HEADROOM")) : 4096;  // 16384 left 32 regions larger than a 2-GPU pool
     static const double frac = getenv("QE_POOL_GROW_FRAC") ? atof(getenv("QE_POOL_GROW_FRAC")) : 0.25;
     const size_t want = ((size_t)need + head + (size_t)(need * frac) + 255) / 256 * 256;
     return (int)std::max<size_t>(need, std::min<size_t>(want, max_ctx_));
@@ -722,16 +722,18 @@ void Engine::archive_info(double* out) const {
 }
 
 bool Engine::can_admit(int n) const {
+    // headroom counted per sequence (its growth before it has to move); QE_ADMIT_HEADROOM overrides
+    static const size_t ah = getenv("QE_ADMIT_HEADROOM") ? atoll(getenv("QE_ADMIT_HEADROOM")) : 8192;  // 16384 admitted only 22 of 32 sequences on 2 GPUs
     bool slot = false;
     size_t used = 0;
     for (size_t i = 0; i < seqs_.size(); i++) {
         const Seq& q = seqs_[i];
         if (!q.active) slot = true;
         else if (pf_of(i)) used += units_of(q);  // its region already holds the whole prompt
-        else used += units(std::min<size_t>((size_t)q.pos - q.split + 16384, max_ctx_));
+        else used += units(std::min<size_t>((size_t)q.pos - q.split + ah, max_ctx_));
     }
     for (auto& p : pres_) used += units(p.n);
-    return slot && n <= max_ctx_ && used + units(std::min<size_t>((size_t)n + 16384, max_ctx_)) <= pool_tokens_;
+    return slot && n <= max_ctx_ && used + units(std::min<size_t>((size_t)n + ah, max_ctx_)) <= pool_tokens_;
 }
 
 unsigned* Engine::mask_buffer(int slot) {

@@ -444,8 +444,21 @@ private:
     // INT4 matmul of a decode input: the fp16-accumulate kernel on the XH copy (packed here when xh is
     // null) when enabled and m fits, else the bf16/fp32 path
     bf16* xn_bf16(bf16* xn, int m, const W4* next);
+    static int dec_gemm_min() {
+        static const int v = getenv("QE_DEC_GEMM") ? atoi(getenv("QE_DEC_GEMM")) : 33;
+        return v;
+    }
+    bool dec_gemm_rows(int m) const { return dec_gemm_min() > 0 && m >= dec_gemm_min() && rows_cap_ > kMaxGemvW4Tokens; }
+    bool dec_gemm_warm_ = false;
+    void dec_gemm_warm(int M);
     void mm4(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st,
              const __half* xh = nullptr, int ldxh = 0, __half* yh = nullptr, int ldyh = 0) {
+        // QE_DEC_GEMM = R (default 33, 0: off): batched decode passes of >= R rows run the prefill GEMM (W4A8
+        // when QE_PREFILL_INT8 covers the class) instead of the H16 GEMV
+        if (dec_gemm_rows(m)) {
+            gemm_w4(w, x, ldx, y, ldy, m, st);
+            return;
+        }
         if (h16_ && m <= rows_cap_) {
             if (!xh) {
                 xh_pack(x, ldx, w.k, m, xh_tmp_, w.k, st);

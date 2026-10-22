@@ -1,0 +1,31 @@
+# QEngine on 3x RTX 3090. Model directory on the host: QE_MODELS_DIR (must contain Qwen3.8-27B-INT4/).
+#   QE_MODELS_DIR=/path/to/models docker compose up -d
+# P2P between the GPUs depends on the host driver (it works in the container when it works on the host).
+services:
+  qengine:
+    build:
+      context: .
+      args:
+        VISION: "${QE_VISION_BUILD:-1}"
+    image: qengine:latest
+    container_name: qengine
+    restart: unless-stopped
+    gpus: all
+    ipc: host            # pinned host buffers / shared memory for the KV archive
+    ulimits:
+      memlock: -1
+    security_opt:
+      - label=disable    # SELinux hosts (Fedora/RHEL): read the bind-mounted model without relabelling it
+    environment:
+      QE_GPUS: "${QE_GPUS:-0,1,2}"   # GPU ids to use, e.g. "0,2" for two GPUs (3 GPUs = tested default)
+      QE_PORT: "8080"
+      QE_EXTRA_ARGS: "${QE_EXTRA_ARGS:-}"
+    ports:
+      - "${QE_HOST_PORT:-8080}:8080"
+      - "127.0.0.1:${QE_METRICS_HOST_PORT:-9393}:9393"   # dashboard / Prometheus metrics
+    volumes:
+      - "${QE_MODELS_DIR:-./models}:/app/models:ro"
+      - qengine-cache:/root/.cache/qengine
+
+volumes:
+  qengine-cache:

@@ -1,6 +1,8 @@
 """Batched speculative steps for concurrent sequences must reproduce each sequence decoded alone
 (greedy). Usage: python3 test_batch.py [tokens] [nseq]"""
 import os, sys, time
+# bit-exact batch == alone: batched passes of >= 33 rows would take the W4A8 GEMM (QE_DEC_GEMM, alone stays H16)
+os.environ.setdefault("QE_DEC_GEMM", "0")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 from engine import Engine
 from transformers import AutoTokenizer

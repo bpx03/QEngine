@@ -3215,6 +3215,15 @@ __global__ void splitk_reduce_kernel(const float* __restrict__ part, int ks, int
 }
 
 // per-thread device scratch, freed when the (GPU pool) thread exits
+// Grown thread-local GEMM buffers are retired, not freed: batched decode graphs (QE_DEC_GEMM) captured
+// earlier keep their pointers, and a later, larger prefill must not free memory they still use
+// (growth is rare: the buffers reach their prefill-chunk size after the first chunks).
+static void tl_retire(void* p) {
+    static std::mutex mu;
+    static std::vector<void*> keep;
+    std::lock_guard<std::mutex> g(mu);
+    keep.push_back(p);
+}
 template <typename T>
 struct TlBuf {
     T* p = nullptr;
@@ -3415,13 +3424,13 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
     const SkPlan pl = sk_plan(rb * tb, nkt, MINB, (VF >= 2 && VF <= 4 && (MBV & 8)) ? 3 : 1);
     const size_t need = (size_t)t * w.k;
     if (need > tl_xq_buf.n) {
-        if (tl_xq_buf.p) CUDA_CHECK(cudaFree(tl_xq_buf.p));
+        if (tl_xq_buf.p) tl_retire(tl_xq_buf.p);
         CUDA_CHECK(cudaMalloc(&tl_xq_buf.p, need));
         tl_xq_buf.n = need;
     }
     const size_t needs = VF ? (size_t)((t + 15) / 16 * 16) * i8v_rec_floats(w.k, G, VF == 3) : (size_t)t * i8_rec_floats(w.k, G);
     if (needs > tl_xqs_buf.n) {
-        if (tl_xqs_buf.p) CUDA_CHECK(cudaFree(tl_xqs_buf.p));
+        if (tl_xqs_buf.p) tl_retire(tl_xqs_buf.p);
         CUDA_CHECK(cudaMalloc(&tl_xqs_buf.p, needs * 4));
         tl_xqs_buf.n = needs;
     }
@@ -3443,7 +3452,7 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
     tl_prequant.x = nullptr;  // consumed (or stale)
     const size_t needw = (size_t)pl.rem * pl.parts * block_rows<WT>() * TB;
     if (needw > tl_sk_ws_buf.n) {
-        if (tl_sk_ws_buf.p) CUDA_CHECK(cudaFree(tl_sk_ws_buf.p));
+        if (tl_sk_ws_buf.p) tl_retire(tl_sk_ws_buf.p);
         CUDA_CHECK(cudaMalloc(&tl_sk_ws_buf.p, needw * sizeof(float)));
         tl_sk_ws_buf.n = needw;
     }
@@ -3457,12 +3466,12 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
             const int K2 = w.n / 2;
             const size_t nq = (size_t)t * K2, ns = (size_t)((t + 15) / 16 * 16) * i8v_rec_floats(K2, 64, false);
             if (nq > tl_gq_xq_buf.n) {
-                if (tl_gq_xq_buf.p) CUDA_CHECK(cudaFree(tl_gq_xq_buf.p));
+                if (tl_gq_xq_buf.p) tl_retire(tl_gq_xq_buf.p);
                 CUDA_CHECK(cudaMalloc(&tl_gq_xq_buf.p, nq));
                 tl_gq_xq_buf.n = nq;
             }
             if (ns > tl_gq_xs_buf.n) {
-                if (tl_gq_xs_buf.p) CUDA_CHECK(cudaFree(tl_gq_xs_buf.p));
+                if (tl_gq_xs_buf.p) tl_retire(tl_gq_xs_buf.p);
                 CUDA_CHECK(cudaMalloc(&tl_gq_xs_buf.p, ns * 4));
                 tl_gq_xs_buf.n = ns;
             }
@@ -3835,12 +3844,12 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
         // smaller k must still grow the scales)
         const size_t need = (size_t)t * w.k;
         if (need > tl_xh_n) {
-            if (tl_xh) CUDA_CHECK(cudaFree(tl_xh));
+            if (tl_xh) tl_retire(tl_xh);
             CUDA_CHECK(cudaMalloc(&tl_xh, need * 2));
             tl_xh_n = need;
         }
         if ((size_t)t > tl_xs_buf.n) {
-            if (tl_xs) CUDA_CHECK(cudaFree(tl_xs));
+            if (tl_xs) tl_retire(tl_xs);
             CUDA_CHECK(cudaMalloc(&tl_xs, (size_t)t * 4));
             tl_xs_buf.n = t;
         }
@@ -3852,7 +3861,7 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
         }
         const size_t zs = (size_t)t * w.n, needp = zs * ks;
         if (needp > tl_splitk_n) {
-            if (tl_splitk) CUDA_CHECK(cudaFree(tl_splitk));
+            if (tl_splitk) tl_retire(tl_splitk);
             CUDA_CHECK(cudaMalloc(&tl_splitk, needp * sizeof(float)));
             tl_splitk_n = needp;
         }
@@ -3869,7 +3878,7 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
     }
     const size_t zs = (size_t)t * w.n, need = zs * ks;
     if (need > tl_splitk_n) {
-        if (tl_splitk) CUDA_CHECK(cudaFree(tl_splitk));
+        if (tl_splitk) tl_retire(tl_splitk);
         CUDA_CHECK(cudaMalloc(&tl_splitk, need * sizeof(float)));
         tl_splitk_n = need;
     }
@@ -4143,7 +4152,7 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
     if (tl_out16 && !w.glu && !(i8_use(w) && g_i8_kernel >= 2)) {  // path without a bf16 epilogue
         const size_t need = (size_t)t * w.n;
         if (need > tl_o16_buf.n) {
-            if (tl_o16_buf.p) CUDA_CHECK(cudaFree(tl_o16_buf.p));
+            if (tl_o16_buf.p) tl_retire(tl_o16_buf.p);
             CUDA_CHECK(cudaMalloc(&tl_o16_buf.p, need * sizeof(float)));
             tl_o16_buf.n = need;
         }
@@ -4352,12 +4361,12 @@ bool gemm_i8_prequant(const bf16* x, int t, int k, int row0, bool glu_next, int8
     const size_t need = (size_t)kChunk * k,
                  needs = vf ? (size_t)(kChunk + 32) * i8v_rec_floats(k, g, false) : (size_t)kChunk * i8_rec_floats(k, g);
     if (need > tl_pq_xq_buf.n) {
-        if (tl_pq_xq_buf.p) CUDA_CHECK(cudaFree(tl_pq_xq_buf.p));
+        if (tl_pq_xq_buf.p) tl_retire(tl_pq_xq_buf.p);
         CUDA_CHECK(cudaMalloc(&tl_pq_xq_buf.p, need));
         tl_pq_xq_buf.n = need;
     }
     if (needs > tl_pq_xs_buf.n) {
-        if (tl_pq_xs_buf.p) CUDA_CHECK(cudaFree(tl_pq_xs_buf.p));
+        if (tl_pq_xs_buf.p) tl_retire(tl_pq_xs_buf.p);
         CUDA_CHECK(cudaMalloc(&tl_pq_xs_buf.p, needs * 4));
         tl_pq_xs_buf.n = needs;
     }

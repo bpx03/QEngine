@@ -11,19 +11,26 @@ with tensor parallelism 3 over PCIe.
 
 ## Hardware requirements and limitations
 
-**Read this first.** The engine is currently configured for, and hardcoded to, exactly this setup:
+**Read this first.**
 
-- **Exactly 3 GPUs**: tensor parallel 3, devices `0,1,2` (`server/run.sh` sets
-  `CUDA_VISIBLE_DEVICES=0,1,2` unless it is already set; the server default is `--devices 0,1,2`).
-  The weight and KV-head split is designed for three cards.
-- **sm_86 only**: `CMakeLists.txt` builds for `CMAKE_CUDA_ARCHITECTURES 86`.
-- **Kernels and tuning are tailored to the RTX 3090** (82 SMs, 24 GB GDDR6X, PCIe 4.0, no NVLink):
-  tile shapes, split counts, wave sizing and memory budgets assume this GPU.
-- **Tested only on 3× RTX 3090** (24 GB, sm_86, PCIe 4.0 x16, no NVLink). It is unknown whether it even
-  starts on 2 GPUs or on other GPU models.
+- **Designed and tuned for 3× RTX 3090** (24 GB, sm_86, PCIe 4.0 x16, no NVLink): tensor parallel 3,
+  GPUs `0,1,2` by default. The weight and KV-head split, kernels and tuning (82 SMs, tile shapes, split
+  counts, wave sizing, memory budgets) target this setup; it is the configuration behind the main
+  benchmark.
+- **2× RTX 3090 also measured**: the full benchmark suite on two cards is in
+  [`bench/results/compare_2026-10_2gpu/`](bench/results/compare_2026-10_2gpu/README.md), e.g. 1.2–2.0×
+  vLLM's output throughput on the same two GPUs up to 16 concurrent requests (short, agent and ShareGPT), at 72–85% of the 3-GPU
+  throughput.
+- **1× RTX 3090 is experimental**: it starts only with `QE_MAX_SEQS` ≤ 4 (about 85K–112K tokens of context,
+  around 100 tok/s for a single user).
+- **Device selection**: `QE_DEVICES=0,2 server/run.sh 8080` (physical GPU ids), `--devices` (indices within
+  `CUDA_VISIBLE_DEVICES`), or `QE_GPUS` in Docker. Counts other than 3 start with a warning.
+- **sm_86 only**: `CMakeLists.txt` builds for `CMAKE_CUDA_ARCHITECTURES 86`. Other GPU models are untested.
 - One model only: Qwen3.8-27B INT4 (RedHatAI compressed-tensors W4A16 layout). Other checkpoints or
   quantizations are not supported.
-- Linux only (developed on Fedora 44, kernel 7.2).
+- Linux only (developed on Fedora 44, kernel 7.2). **Windows is untested**, including Docker Desktop / WSL2:
+  there is no GPU P2P under WSL2 (the engine would fall back to the slower host-memory path) and pinned host
+  memory, which the KV archive relies on, is limited there.
 
 **Peer-to-peer (P2P).** All published numbers were measured with GPU-to-GPU P2P enabled through a
 patched open NVIDIA kernel driver (the community P2P patch for GeForce cards:
@@ -36,15 +43,16 @@ layout is disabled (smaller KV pool) and decode and prefill are slower than the 
 
 - **INT4 weights, repacked at load time** (a few seconds, no file conversion) into tensor-core fragment
   layouts; INT4 GEMV for decode and INT4 GEMM for prefill; `lm_head` in INT8.
-- **Tensor parallel 3 over PCIe**: every layer is split across the three cards (DeltaNet heads, MLP
+- **Tensor parallel over PCIe** (3 GPUs by default): every layer is split across the cards (DeltaNet heads, MLP
   groups, vocabulary). The four full-attention KV heads are split by position for heads 1 and 2, so no
   KV head is duplicated. All-reduces run inside the kernels (they work inside CUDA Graphs): a low-latency
   protocol for decode and reduce-scatter overlapped with GEMM for prefill.
 - **MTP speculative decoding** with the model's MTP head: 1–7 drafts per step, chosen adaptively from
   the measured acceptance and step cost; drafts over the 64K most frequent tokens, verification over the
   full vocabulary, so greedy and sampled outputs are unchanged.
-- **Continuous batching** of up to 32 sequences; batched steps give the same result as decoding each
-  sequence alone.
+- **Continuous batching** of up to 32 sequences; batched passes of up to 32 rows give the same result as
+  decoding each sequence alone (larger passes use the W4A8 GEMM, `QE_DEC_GEMM`, which is numerically close
+  but not bit-identical).
 - **KV cache in FP8** (e4m3) in one shared pool per GPU (about 1M tokens with P2P), up to 262,144 tokens
   of context per conversation.
 - **Prefix / KV reuse**: live slot continuation, DeltaNet state snapshots, prefix copies across slots,
@@ -66,7 +74,7 @@ layout is disabled (smaller KV pool) and decode and prefill are slower than the 
 
 Requirements:
 
-- Linux, 3× RTX 3090 (see above), NVIDIA driver with CUDA 13.1 support.
+- Linux, RTX 3090 GPUs (3 recommended, see above), NVIDIA driver with CUDA 13.1 support.
 - CUDA Toolkit **13.1** (`nvcc`).
 - CMake **≥ 3.24** (tested with 4.3) and Ninja (or Make).
 - A host C++ compiler supported by nvcc 13.1. nvcc 13.1 rejects GCC 16; `CMakeLists.txt` picks
@@ -108,10 +116,34 @@ than the published numbers (fewer accepted drafts per step, more expensive draft
 
 ```bash
 server/run.sh 8080                    # OpenAI + Anthropic API on 127.0.0.1:8080, GPUs 0,1,2
+QE_DEVICES=0,2 server/run.sh 8080     # tensor parallel 2 on GPUs 0 and 2
 server/run.sh 8080 --vision 1         # with image input (encoder on the last GPU, less KV room)
 server/run.sh 8080 --think 0          # thinking off by default
 python3 server/app.py --help          # all options
 ```
+
+### Running on one or two GPUs
+
+Three RTX 3090s are the tuned configuration; two and one card work with these settings:
+
+| setup | command | what to expect (measured) |
+|---|---|---|
+| 2× RTX 3090 | `QE_DEVICES=0,1 QE_MAX_SEQS=32 server/run.sh 8080` | ~387K-token KV pool, 32 slots, full 262K context; ~162 tok/s single user, 1.2–2.0× vLLM throughput on the same cards up to 16 concurrent requests |
+| 1× RTX 3090 | `QE_DEVICES=0 QE_MAX_SEQS=1 server/run.sh 8080` | one conversation, ~112K tokens of context; ~104 tok/s single user |
+| 1× RTX 3090, a few chats | `QE_DEVICES=0 QE_MAX_SEQS=4 server/run.sh 8080` | 4 slots, ~85K tokens of context; ~96 tok/s single user |
+
+- Pick the GPUs that are not driving a desktop: a display takes 1–2 GB of VRAM and the KV pool shrinks
+  accordingly.
+- On one card the default `QE_MAX_SEQS=16` does not start ("not enough GPU memory for a KV cache"):
+  every slot holds its DeltaNet state (~0.3 GB, about 9K tokens of KV pool each). Use `QE_MAX_SEQS`
+  between 1 and 4, leave `--vision` off, and lower `QE_RESERVE_GB` (e.g. `1.0`) only if you need a bit
+  more context.
+- The first start on a new GPU count tunes the GEMMs for the new matrix shapes and stores the table in
+  `~/.cache/qengine`; later starts reuse it.
+- The three-card-only optimizations (KV position split, copy-engine all-reduce) switch off by
+  themselves on other counts. P2P between two cards works the same way as on three.
+- Docker: the same settings as environment variables, e.g. `-e QE_GPUS=0 -e QE_MAX_SEQS=1` or
+  `-e QE_GPUS=0,1 -e QE_MAX_SEQS=32`.
 
 Startup loads the weights, pins the host-RAM archive and captures CUDA graphs. The served model name is
 `qwen3.8-27b-qengine` (`--served-name`).
@@ -144,6 +176,63 @@ Useful environment variables:
 | `QE_P2P` | auto | 0 forces the host-memory communication path |
 | `QE_MTP_FILE` | auto | MTP head file (default: `model_mtp_ft.safetensors` if present) |
 | `QE_DRAFT_VOCAB` | 65536 | MTP draft vocabulary size (0 = full vocabulary) |
+| `QE_DEC_GEMM` | 33 | batched decode passes of at least this many rows use the W4A8 GEMM instead of the GEMV (0 = off) |
+| `QE_ADMIT_HEADROOM` | 8192 | KV tokens reserved per running sequence when admitting a new one |
+
+## Run with Docker
+
+The image contains the server and `libqengine.so` built for sm_86 (CUDA 13.1.1, Ubuntu 24.04).
+The model is **not** in the image: mount the directory that contains `Qwen3.8-27B-INT4/`.
+
+Requirements on the host: NVIDIA driver with CUDA 13.1 support, Docker with the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
+GPU-to-GPU P2P inside the container works exactly when it works on the host (it depends on the
+host driver, not on the image): check for the `P2P:` line in the startup log.
+
+### Build
+
+```bash
+docker build -t qengine .                       # with vision (--vision 1): includes PyTorch, ~3 GB compressed
+docker build -t qengine --build-arg VISION=0 .  # text only, no PyTorch: ~0.27 GB compressed
+```
+
+### Run
+
+```bash
+docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
+  -p 8080:8080 -p 127.0.0.1:9393:9393 \
+  -v /path/to/models:/app/models:ro \
+  -v qengine-cache:/root/.cache/qengine \
+  qengine --think 0
+```
+
+or with Compose (edit `QE_MODELS_DIR`):
+
+```bash
+QE_MODELS_DIR=/path/to/models docker compose up -d
+docker compose logs -f
+```
+
+- Anything after the image name (or `QE_EXTRA_ARGS`) is passed to `server/app.py`, e.g. `--think 0`, `--vision 1`, `--max-ctx 131072`.
+- `QE_GPUS` selects the GPUs (ids as the host numbers them with `--gpus all`), default `0,1,2`.
+  `-e QE_GPUS=0,2` runs tensor parallel 2 on GPUs 0 and 2. Three GPUs is the tuned and tested
+  configuration; other counts start with a warning.
+- The `qengine-cache` volume keeps the GEMM tune table, the KV split and the stats between
+  restarts. Without it every start tunes the GEMMs again.
+- `--ipc=host` and `--ulimit memlock=-1`: the engine pins a large host-memory KV archive.
+- SELinux hosts (Fedora, RHEL): add `--security-opt label=disable` (Compose does) so the container
+  can read the bind-mounted model without relabelling it.
+- Port 8080: OpenAI + Anthropic API. Port 9393: monitoring dashboard, `/api/stats`, `/metrics`.
+
+Check that it is up:
+
+```bash
+docker logs qengine | grep -E "P2P|KV pool"
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b-qengine","messages":[{"role":"user","content":"Hi"}]}'
+```
+
+Performance in the container matches bare metal (single-user decode, same GPUs).
 
 ## Benchmark summary
 
@@ -158,6 +247,10 @@ divide by 3). Output tokens/s, higher is better:
 | agent (500 / 2000): QEngine / vLLM best | 287 / 128 | 1,080 / 635 | 1,302 / 857 | 1,423 / 1,219 |
 | ShareGPT: QEngine / vLLM best | 243 / 87 | 819 / 414 | 935 / 523 | 1,110 / 801 |
 
+After the comparison run, batched decode passes of ≥ 33 rows got faster (W4A8 GEMM, `QE_DEC_GEMM`) and
+admission reserves less headroom per sequence: in a same-day A/B on 3 GPUs, agent c=32 went from 1,422 to
+1,703 tok/s and short c=32 from 982 to 1,039 tok/s (the table above is the original run).
+
 Prefill of a single new prompt (median time to first token): 32K tokens 5.35 s vs 9.86 s, 200K tokens
 50.7 s vs 130.5 s. vLLM is ahead on a few latency points (e.g. RAG 15K-token prompts at c=8: lower
 median TTFT, at the cost of 115–165 ms per output token vs 9.6 ms).
@@ -165,7 +258,8 @@ median TTFT, at the cost of 115–165 ms per output token vs 9.6 ms).
 ![QEngine vs vLLM summary](bench/results/compare_2026-10/charts/hero.png)
 
 Full results, methodology, raw `vllm bench serve` JSON and logs:
-[`bench/results/compare_2026-10/`](bench/results/compare_2026-10/README.md); charts:
+[`bench/results/compare_2026-10/`](bench/results/compare_2026-10/README.md); the same suite with QEngine on
+2 GPUs: [`bench/results/compare_2026-10_2gpu/`](bench/results/compare_2026-10_2gpu/README.md); charts:
 [`bench/results/compare_2026-10/charts/`](bench/results/compare_2026-10/charts/) (`index.html`). The
 benchmark is scripted in `bench/serving_suite.py`, `bench/vllm_cfg_best.sh` and `bench/compare/`.
 The ShareGPT scenario needs `ShareGPT_V3_unfiltered_cleaned_split.json` from
@@ -181,7 +275,7 @@ server/           app.py (OpenAI + Anthropic API, tool calls, grammars), engine.
 tests/            regression tests: caches, slots, pool, batching, MTP, sampling, grammars, kernels
 tools/            reference.py / reference_vision.py (HF golden dumps), draft_vocab.py, mtp_data.py,
                   mtp_train.py, mtp_eval.py (draft vocabulary and MTP head fine-tuning)
-bench/            serving_suite.py, vllm_cfg_best.sh, compare/ (harness), results/compare_2026-10/
+bench/            serving_suite.py, vllm_cfg_best.sh, compare/ (harness), results/compare_2026-10{,_2gpu}/
 ```
 
 ## Tests

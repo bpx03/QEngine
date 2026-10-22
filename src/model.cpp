@@ -1463,7 +1463,7 @@ void Worker::forward(int m, bool logits, bool spec) {
 // `next` is the W4 matrix fed by this norm (the DeltaNet `ab` projection reads XH too); the final norm
 // (next == null) feeds lm_head in bf16
 bf16* Worker::xn_bf16(bf16* xn, int m, const W4* next) {
-    if (!h16_ || m > rows_cap_ || xn != xn_ || !next) return xn;
+    if (!h16_ || m > rows_cap_ || xn != xn_ || !next || dec_gemm_rows(m)) return xn;
     return nullptr;
 }
 
@@ -1683,7 +1683,7 @@ void Worker::mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0
     mm4(mtp_.fc, mtp_in_ + p_.fc_k.b, 2 * H, partial_, H, M, st);
     CUDA_CHECK(cudaMemsetAsync(mtp_resid_, 0, (size_t)M * H * 4, st));
     allreduce_add(mtp_resid_, partial_, M, H, comm_, rank, ctr_, st, mtp_.in_norm, eps,
-                  h16_ ? nullptr : xn_, next_ll(M), false, xh_xn_);
+                  h16_ && !dec_gemm_rows(M) ? nullptr : xn_, next_ll(M), false, xh_xn_);
     mm4(mtp_.qkv, xn_, H, proj_, proj_ld_, M, st, xh_xn_, H);
     const int qw = ow_, qbw = ash_.nq * 256;
     AttnSegs g{};
@@ -1702,7 +1702,7 @@ void Worker::mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0
     attention_seg(g, a, proj_ld_, mtp_.q_norm, mtp_.k_norm, eps, inv_freq_, st);
     mm4(mtp_.o, act_, qw, partial_, H, M, st, xh_act_, qw);
     allreduce_add(mtp_resid_, partial_, M, H, comm_, rank, ctr_, st, mtp_.post_norm, eps,
-                  h16_ ? nullptr : xn_, next_ll(M), false, xh_xn_);
+                  h16_ && !dec_gemm_rows(M) ? nullptr : xn_, next_ll(M), false, xh_xn_);
     mm4(mtp_.gate_up, xn_, H, proj_, proj_ld_, M, st, xh_xn_, H);
     silu_mul(proj_, proj_ld_, I, M, act_, st, xh_act_);
     mm4(mtp_.down, act_, I, partial_, H, M, st, xh_act_, I);
@@ -1710,6 +1710,43 @@ void Worker::mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0
                   next_ll(M));
     CUDA_CHECK(cudaMemcpyAsync(mtp_h_, xn_, (size_t)M * H * 2, cudaMemcpyDeviceToDevice, st));
     head(draft_head_, xn_, M, bmout_, true);
+}
+
+// QE_DEC_GEMM: the prefill GEMM sizes its thread-local buffers and tunes a new (shape, token bucket) on first
+// use, neither of which may happen inside a graph capture: one eager call of every decode weight at the
+// largest batch (garbage in scratch buffers, before the first capture of a batched step with such rows)
+void Worker::dec_gemm_warm(int) {
+    const int H = c_.hidden, I = p_.inter.size();
+    int t = kMaxBatchRows;
+    cudaStream_t st = stream;
+    auto run = [&](const W4& w, const bf16* x) {
+        if (w.glu) gemm_w4(w, x, w.k, reinterpret_cast<float*>(act_), w.n / 2, t, st);
+        else gemm_w4(w, x, w.k, w.k == H ? proj_ : partial_, w.k == H ? proj_ld_ : H, t, st);
+    };
+    // buffer sizes of a whole prefill chunk (no growth later), then the decode row counts (tuner buckets,
+    // stream-K plans of 33..64 rows)
+    for (int tt : {kChunk, kMaxBatchRows, kMaxGemvW4Tokens + 1}) {
+    t = tt;
+    for (auto& L : layers_) {
+        if (L.full) { run(L.fa.qkv, xn_); run(L.fa.o, act_); }
+        else { run(L.dn.in, xn_); run(L.dn.out, act_); }
+        run(L.gate_up, xn_);
+        run(L.down, act_);
+        break;  // shapes repeat: one layer of each kind is enough
+    }
+    for (auto& L : layers_)
+        if (L.full) { run(L.fa.qkv, xn_); run(L.fa.o, act_); break; }
+    if (mtp_.fc.is4) {
+        run(mtp_.fc.q, mtp_in_);
+        run(mtp_.qkv.q, xn_);
+        run(mtp_.o.q, act_);
+        run(mtp_.gate_up.q, xn_);
+        run(mtp_.down.q, act_);
+    }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    dec_gemm_warm_ = true;
+    (void)I;
 }
 
 void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd) {
@@ -1733,6 +1770,10 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         CHECK(M <= kMaxBatchRows && kd <= kMaxSpecK, "batch rows %d", M);
         cudaStream_t st = stream;
         cudaGraph_t g;
+        {
+            RowsCap cg(rows_cap_, kMaxBatchRows);
+            if (dec_gemm_rows(M) && !dec_gemm_warm_) dec_gemm_warm(M);
+        }
         CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
         const bool defer = dn_defer_on();
         if (!defer)
