@@ -69,3 +69,12 @@ ENV HOME=/root
 VOLUME ["/root/.cache/qengine"]
 EXPOSE 8080 9393
 ENTRYPOINT ["/usr/local/bin/qengine-entrypoint"]
+
+# OCI metadata: docker build --build-arg REVISION=$(git rev-parse HEAD) --build-arg VERSION=1.1 .
+ARG REVISION=unknown
+ARG VERSION=dev
+LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
+      org.opencontainers.image.description="QEngine: Qwen3.8-27B INT4 inference server for RTX 3090 (sm_86), OpenAI/Anthropic-compatible API; model not included" \
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}"

@@ -189,6 +189,16 @@ Requirements on the host: NVIDIA driver with CUDA 13.1 support, Docker with the
 GPU-to-GPU P2P inside the container works exactly when it works on the host (it depends on the
 host driver, not on the image): check for the `P2P:` line in the startup log.
 
+### Prebuilt image
+
+```bash
+docker pull ghcr.io/bpx03/qengine:latest          # ~0.27 GB, no image input
+docker pull ghcr.io/bpx03/qengine:vision          # ~3 GB, with the vision encoder (torch)
+```
+
+Tags: `latest` / `1.1` / `sha-<commit>` and `vision` / `1.1-vision` / `sha-<commit>-vision`. Use
+`ghcr.io/bpx03/qengine:latest` in place of `qengine` in the commands below, or build the image yourself.
+
 ### Build
 
 ```bash
