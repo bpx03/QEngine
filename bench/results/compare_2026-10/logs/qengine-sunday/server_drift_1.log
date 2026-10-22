@@ -1,0 +1,164 @@
+sampling defaults (when the request has none): temperature 0.60, top_p 0.95, top_k 20, min_p 0.00
+monitoring: http://127.0.0.1:19394/  (qetop, /api/stats, /metrics)
+graph warm-up: 1.0s
+GPU0: attn q[0,12) o[0,12) kv[0,2) | deltanet v[0,16) k[0,6) | mlp [0,5888) | vocab [0,82816)
+      kv0: all positions
+      kv1: 416 of every 1024 positions (offset 416), softmax stats exchanged with GPU1
+GPU1: attn q[6,18) o[6,18) kv[1,3) | deltanet v[16,32) k[5,11) | mlp [5888,11648) | vocab [82816,165632)
+      kv1: 608 of every 1024 positions (offset 0), softmax stats exchanged with GPU0
+      kv2: 608 of every 1024 positions (offset 0), softmax stats exchanged with GPU2
+GPU2: attn q[12,24) o[12,24) kv[2,4) | deltanet v[32,48) k[10,16) | mlp [11648,17408) | vocab [165632,248320)
+      kv2: 416 of every 1024 positions (offset 416), softmax stats exchanged with GPU1
+      kv3: all positions
+P2P: decode all-reduce GPU to GPU (peer access between all 3 GPUs)
+MTP draft vocabulary: 65520 most frequent tokens
+KV split: GPU0 holds 0.38 of kv1, GPU2 0.41 of kv2 (free 13.1 / 10.9 / 13.1 GB) [shares kept from the previous run]
+KV pool: 1016832 tokens shared by 32 sequence slots (max context 262144) (kv heads split by position)
+GPU0: 12032 B per pool token, regions take +175 tokens
+GPU1: 10752 B per pool token, regions take +396 tokens
+GPU2: 12288 B per pool token, regions take +176 tokens
+GPU0: weights 5.00 GB, cache+act 16.42 GB
+GPU1: weights 4.93 GB, cache+act 15.11 GB
+GPU2: weights 4.93 GB, cache+act 16.67 GB
+loaded in 4.3s
+archive pool: 42.9 GB pinned in 16.7 s
+[chat] slot 1 prompt 1036 (cached 0, prefill 5292 tok/s) | gen 512 @ 254.5 tok/s | length
+[chat] slot 0 prompt 1036 (cached 0, prefill 5119 tok/s) | gen 512 @ 139.0 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5291 tok/s) | gen 512 @ 204.8 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5355 tok/s) | gen 512 @ 221.1 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5345 tok/s) | gen 512 @ 288.9 tok/s | length
+[chat] slot 1 prompt 1037 (cached 0, prefill 5304 tok/s) | gen 512 @ 296.7 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5260 tok/s) | gen 512 @ 255.8 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5315 tok/s) | gen 512 @ 252.3 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5323 tok/s) | gen 512 @ 183.7 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5266 tok/s) | gen 512 @ 271.2 tok/s | length
+[chat] slot 0 prompt 1036 (cached 0, prefill 5439 tok/s) | gen 512 @ 241.8 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 4080 tok/s) | gen 512 @ 168.4 tok/s | length
+[chat] slot 2 prompt 1037 (cached 0, prefill 2808 tok/s) | gen 512 @ 39.7 tok/s | length
+[chat] slot 0 prompt 1036 (cached 0, prefill 5348 tok/s) | gen 512 @ 36.8 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 5420 tok/s) | gen 512 @ 34.7 tok/s | length
+[chat] slot 4 prompt 1037 (cached 0, prefill 2937 tok/s) | gen 512 @ 37.6 tok/s | length
+[chat] slot 5 prompt 1036 (cached 0, prefill 2859 tok/s) | gen 512 @ 36.0 tok/s | length
+[chat] slot 3 prompt 1036 (cached 0, prefill 2942 tok/s) | gen 512 @ 32.0 tok/s | length
+[chat] slot 7 prompt 1037 (cached 0, prefill 2865 tok/s) | gen 512 @ 32.7 tok/s | length
+[chat] slot 8 prompt 1036 (cached 0, prefill 2926 tok/s) | gen 512 @ 32.1 tok/s | length
+[chat] slot 6 prompt 1036 (cached 0, prefill 2966 tok/s) | gen 512 @ 30.0 tok/s | length
+[chat] slot 9 prompt 1036 (cached 0, prefill 3038 tok/s) | gen 512 @ 32.1 tok/s | length
+[chat] slot 10 prompt 1036 (cached 0, prefill 2952 tok/s) | gen 512 @ 30.0 tok/s | length
+[chat] slot 11 prompt 1036 (cached 0, prefill 2962 tok/s) | gen 512 @ 30.2 tok/s | length
+[chat] slot 12 prompt 1038 (cached 0, prefill 2908 tok/s) | gen 512 @ 29.5 tok/s | length
+[chat] slot 13 prompt 1036 (cached 0, prefill 2983 tok/s) | gen 512 @ 28.5 tok/s | length
+[chat] slot 14 prompt 1036 (cached 0, prefill 2954 tok/s) | gen 512 @ 28.4 tok/s | length
+[chat] slot 15 prompt 1036 (cached 0, prefill 2926 tok/s) | gen 512 @ 28.3 tok/s | length
+[chat] slot 16 prompt 1037 (cached 0, prefill 2860 tok/s) | gen 512 @ 28.0 tok/s | length
+[chat] slot 17 prompt 1037 (cached 0, prefill 2800 tok/s) | gen 512 @ 27.9 tok/s | length
+[chat] slot 18 prompt 1037 (cached 0, prefill 2895 tok/s) | gen 512 @ 27.7 tok/s | length
+[chat] slot 19 prompt 1036 (cached 0, prefill 2849 tok/s) | gen 512 @ 27.6 tok/s | length
+[chat] slot 20 prompt 1036 (cached 0, prefill 2815 tok/s) | gen 512 @ 27.5 tok/s | length
+[chat] slot 21 prompt 1037 (cached 0, prefill 2931 tok/s) | gen 512 @ 27.3 tok/s | length
+[chat] slot 22 prompt 1038 (cached 0, prefill 2885 tok/s) | gen 512 @ 27.2 tok/s | length
+[chat] slot 23 prompt 1036 (cached 0, prefill 2862 tok/s) | gen 512 @ 27.1 tok/s | length
+[chat] slot 24 prompt 1038 (cached 0, prefill 2838 tok/s) | gen 512 @ 27.1 tok/s | length
+[chat] slot 25 prompt 1036 (cached 0, prefill 2862 tok/s) | gen 512 @ 27.0 tok/s | length
+[chat] slot 26 prompt 1037 (cached 0, prefill 3009 tok/s) | gen 512 @ 27.0 tok/s | length
+[chat] slot 27 prompt 1036 (cached 0, prefill 2976 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 28 prompt 1039 (cached 0, prefill 2939 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 29 prompt 1038 (cached 0, prefill 2920 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 30 prompt 1040 (cached 0, prefill 2894 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 31 prompt 1037 (cached 0, prefill 2851 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 2 prompt 1036 (cached 0, prefill 4771 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 0 prompt 1036 (cached 0, prefill 4827 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 4 prompt 1036 (cached 0, prefill 4836 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 1 prompt 1037 (cached 0, prefill 2603 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 5 prompt 1037 (cached 0, prefill 4814 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 3 prompt 1036 (cached 0, prefill 4788 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 7 prompt 1036 (cached 0, prefill 4788 tok/s) | gen 512 @ 26.9 tok/s | length
+[chat] slot 8 prompt 1036 (cached 0, prefill 4818 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 9 prompt 1036 (cached 0, prefill 5379 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 6 prompt 1036 (cached 0, prefill 2622 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 10 prompt 1037 (cached 0, prefill 4817 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 11 prompt 1036 (cached 0, prefill 3071 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 12 prompt 1036 (cached 0, prefill 4798 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 13 prompt 1036 (cached 0, prefill 4766 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 14 prompt 1037 (cached 0, prefill 4828 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 15 prompt 1037 (cached 0, prefill 4823 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 16 prompt 1037 (cached 0, prefill 4801 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 17 prompt 1036 (cached 0, prefill 4814 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 18 prompt 1036 (cached 0, prefill 4806 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 19 prompt 1037 (cached 0, prefill 4814 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 20 prompt 1036 (cached 0, prefill 4783 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 21 prompt 1036 (cached 0, prefill 4826 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 22 prompt 1036 (cached 0, prefill 4802 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 23 prompt 1038 (cached 0, prefill 4807 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 24 prompt 1037 (cached 0, prefill 4811 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 25 prompt 1037 (cached 0, prefill 4815 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 26 prompt 1036 (cached 0, prefill 4802 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 27 prompt 1036 (cached 0, prefill 4812 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 28 prompt 1036 (cached 0, prefill 4825 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 29 prompt 1036 (cached 0, prefill 4822 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 30 prompt 1036 (cached 0, prefill 4823 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 31 prompt 1037 (cached 0, prefill 4826 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 2 prompt 1037 (cached 0, prefill 4779 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 0 prompt 1037 (cached 0, prefill 4813 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 4 prompt 1037 (cached 0, prefill 4772 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 4815 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 5 prompt 1036 (cached 0, prefill 4788 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 3 prompt 1037 (cached 0, prefill 4761 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 7 prompt 1036 (cached 0, prefill 4801 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 8 prompt 1037 (cached 0, prefill 4821 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 9 prompt 1036 (cached 0, prefill 4788 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 6 prompt 1037 (cached 0, prefill 4828 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 10 prompt 1036 (cached 0, prefill 4790 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 11 prompt 1038 (cached 0, prefill 4799 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 12 prompt 1036 (cached 0, prefill 4795 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 13 prompt 1036 (cached 0, prefill 4776 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 14 prompt 1036 (cached 0, prefill 4809 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 15 prompt 1036 (cached 0, prefill 4821 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 16 prompt 1036 (cached 0, prefill 4793 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 17 prompt 1036 (cached 0, prefill 4816 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 18 prompt 1036 (cached 0, prefill 4812 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 19 prompt 1036 (cached 0, prefill 4801 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 20 prompt 1036 (cached 0, prefill 4829 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 21 prompt 1036 (cached 0, prefill 4810 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 22 prompt 1036 (cached 0, prefill 4798 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 23 prompt 1036 (cached 0, prefill 4810 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 24 prompt 1036 (cached 0, prefill 4810 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 25 prompt 1037 (cached 0, prefill 4812 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 26 prompt 1037 (cached 0, prefill 4806 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 27 prompt 1036 (cached 0, prefill 4819 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 28 prompt 1036 (cached 0, prefill 4802 tok/s) | gen 512 @ 26.8 tok/s | length
+[chat] slot 29 prompt 1036 (cached 0, prefill 4804 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 30 prompt 1036 (cached 0, prefill 4791 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 31 prompt 1036 (cached 0, prefill 4804 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 2 prompt 1037 (cached 0, prefill 4805 tok/s) | gen 512 @ 26.7 tok/s | length
+[chat] slot 0 prompt 1036 (cached 0, prefill 4789 tok/s) | gen 512 @ 27.0 tok/s | length
+[chat] slot 4 prompt 1036 (cached 0, prefill 4822 tok/s) | gen 512 @ 27.4 tok/s | length
+[chat] slot 1 prompt 1036 (cached 0, prefill 4813 tok/s) | gen 512 @ 27.7 tok/s | length
+[chat] slot 5 prompt 1036 (cached 0, prefill 4767 tok/s) | gen 512 @ 28.0 tok/s | length
+[chat] slot 3 prompt 1036 (cached 0, prefill 4789 tok/s) | gen 512 @ 28.5 tok/s | length
+[chat] slot 7 prompt 1037 (cached 0, prefill 4808 tok/s) | gen 512 @ 29.0 tok/s | length
+[chat] slot 8 prompt 1036 (cached 0, prefill 4802 tok/s) | gen 512 @ 29.4 tok/s | length
+[chat] slot 9 prompt 1036 (cached 0, prefill 4812 tok/s) | gen 512 @ 29.8 tok/s | length
+[chat] slot 6 prompt 1037 (cached 0, prefill 4783 tok/s) | gen 512 @ 30.3 tok/s | length
+[chat] slot 10 prompt 1036 (cached 0, prefill 4777 tok/s) | gen 512 @ 31.0 tok/s | length
+[chat] slot 11 prompt 1036 (cached 0, prefill 4801 tok/s) | gen 512 @ 31.5 tok/s | length
+[chat] slot 12 prompt 1037 (cached 0, prefill 4786 tok/s) | gen 512 @ 32.2 tok/s | length
+[chat] slot 13 prompt 1036 (cached 0, prefill 4801 tok/s) | gen 512 @ 33.1 tok/s | length
+[chat] slot 14 prompt 1037 (cached 0, prefill 4829 tok/s) | gen 512 @ 33.8 tok/s | length
+[chat] slot 15 prompt 1037 (cached 0, prefill 4792 tok/s) | gen 512 @ 34.4 tok/s | length
+[chat] slot 16 prompt 1036 (cached 0, prefill 4769 tok/s) | gen 512 @ 35.1 tok/s | length
+[chat] slot 17 prompt 1036 (cached 0, prefill 4795 tok/s) | gen 512 @ 36.1 tok/s | length
+[chat] slot 18 prompt 1036 (cached 0, prefill 4780 tok/s) | gen 512 @ 37.2 tok/s | length
+[chat] slot 19 prompt 1037 (cached 0, prefill 4784 tok/s) | gen 512 @ 37.8 tok/s | length
+[chat] slot 21 prompt 1036 (cached 0, prefill 4817 tok/s) | gen 512 @ 40.3 tok/s | length
+[chat] slot 20 prompt 1036 (cached 0, prefill 4799 tok/s) | gen 512 @ 38.9 tok/s | length
+[chat] slot 22 prompt 1038 (cached 0, prefill 4781 tok/s) | gen 512 @ 41.4 tok/s | length
+[chat] slot 24 prompt 1036 (cached 0, prefill 4779 tok/s) | gen 512 @ 44.3 tok/s | length
+[chat] slot 25 prompt 1036 (cached 0, prefill 4818 tok/s) | gen 512 @ 45.5 tok/s | length
+[chat] slot 23 prompt 1036 (cached 0, prefill 4828 tok/s) | gen 512 @ 42.1 tok/s | length
+[chat] slot 26 prompt 1036 (cached 0, prefill 4784 tok/s) | gen 512 @ 47.0 tok/s | length
+[chat] slot 28 prompt 1038 (cached 0, prefill 4770 tok/s) | gen 512 @ 50.4 tok/s | length
+[chat] slot 27 prompt 1036 (cached 0, prefill 4308 tok/s) | gen 512 @ 48.4 tok/s | length
+[chat] slot 29 prompt 1037 (cached 0, prefill 4793 tok/s) | gen 512 @ 52.2 tok/s | length
+[chat] slot 30 prompt 1036 (cached 0, prefill 4787 tok/s) | gen 512 @ 54.2 tok/s | length
+[chat] slot 31 prompt 1036 (cached 0, prefill 4764 tok/s) | gen 512 @ 56.8 tok/s | length

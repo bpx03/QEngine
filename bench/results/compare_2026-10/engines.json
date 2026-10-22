@@ -1,0 +1,71 @@
+{
+ "model": "Qwen3.8-27B, INT4 (RedHatAI W4A16 compressed-tensors checkpoint + MTP head)",
+ "engines": {
+  "vllm-mtp": {
+   "version": "vLLM 0.28.0 + the two club-3090 runtime patches (FlashInfer decode pin_memory=False, vllm#40756; gpu_model_runner waits num_accepted_tokens_event, vllm#50021 / #52873)",
+   "python_env": "torch 2.13.0+cu130, flashinfer 0.6.16.post3, transformers 5.5.3",
+   "recipe": "club-3090 'qwen3.8-27b dual-fast' (https://github.com/noonghunna/club-3090), ported flag-for-flag; launcher bench/vllm_cfg_best.sh",
+   "gpus": "2x RTX 3090 (GPU0 + GPU2), tensor parallel 2",
+   "quantization": "W4A8 (INT4 weights, INT8 activations via Marlin), fp8_e4m3 KV cache",
+   "env": {
+    "CUDA_VISIBLE_DEVICES": "0,2",
+    "VLLM_MARLIN_INPUT_DTYPE": "int8",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "NCCL_CUMEM_ENABLE": "0",
+    "VLLM_NO_USAGE_STATS": "1",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_USE_FLASHINFER_SAMPLER": "0",
+    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+   },
+   "launcher": "bench/vllm_cfg_best.sh 8182 (SPEC_N=4)",
+   "speculative_decoding": "MTP, 4 draft tokens",
+   "server_command": "vllm serve models/Qwen3.8-27B-INT4 --served-model-name vllm-int4 --host 127.0.0.1 --port 8182 --dtype bfloat16 --tensor-parallel-size 2 --disable-custom-all-reduce --max-model-len 262144 --gpu-memory-utilization 0.90 --max-num-seqs 32 --max-num-batched-tokens 8192 --long-prefill-token-threshold 4096 --kv-cache-dtype fp8_e4m3 --enable-prefix-caching --enable-chunked-prefill --mamba-cache-mode align --prefix-match-unit 16 --mamba-ssm-cache-dtype bfloat16 --trust-remote-code --enable-prompt-tokens-details --default-chat-template-kwargs '{\"enable_thinking\": true}' --override-generation-config '{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}' --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":4,\"draft_sample_method\":\"probabilistic\"}'"
+  },
+  "vllm-nospec": {
+   "version": "vLLM 0.28.0 + the two club-3090 runtime patches (FlashInfer decode pin_memory=False, vllm#40756; gpu_model_runner waits num_accepted_tokens_event, vllm#50021 / #52873)",
+   "python_env": "torch 2.13.0+cu130, flashinfer 0.6.16.post3, transformers 5.5.3",
+   "recipe": "club-3090 'qwen3.8-27b dual-fast' (https://github.com/noonghunna/club-3090), ported flag-for-flag; launcher bench/vllm_cfg_best.sh",
+   "gpus": "2x RTX 3090 (GPU0 + GPU2), tensor parallel 2",
+   "quantization": "W4A8 (INT4 weights, INT8 activations via Marlin), fp8_e4m3 KV cache",
+   "env": {
+    "CUDA_VISIBLE_DEVICES": "0,2",
+    "VLLM_MARLIN_INPUT_DTYPE": "int8",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "NCCL_CUMEM_ENABLE": "0",
+    "VLLM_NO_USAGE_STATS": "1",
+    "OMP_NUM_THREADS": "1",
+    "VLLM_USE_FLASHINFER_SAMPLER": "0",
+    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+   },
+   "launcher": "SPEC_N=0 bench/vllm_cfg_best.sh 8182",
+   "speculative_decoding": "none",
+   "server_command": "vllm serve models/Qwen3.8-27B-INT4 --served-model-name vllm-int4 --host 127.0.0.1 --port 8182 --dtype bfloat16 --tensor-parallel-size 2 --disable-custom-all-reduce --max-model-len 262144 --gpu-memory-utilization 0.90 --max-num-seqs 32 --max-num-batched-tokens 8192 --long-prefill-token-threshold 4096 --kv-cache-dtype fp8_e4m3 --enable-prefix-caching --enable-chunked-prefill --mamba-cache-mode align --prefix-match-unit 16 --mamba-ssm-cache-dtype bfloat16 --trust-remote-code --enable-prompt-tokens-details --default-chat-template-kwargs '{\"enable_thinking\": true}' --override-generation-config '{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}'"
+  },
+  "qengine-sunday": {
+   "version": "qengine master 1c3f603 (1c3f6039b531b61ab2e79f263f8f720ec5c56ccb, 2026-10-18)",
+   "build": "CMake Release, sm_86, CUDA 13.1",
+   "server_command": "QE_MAX_SEQS=32 server/run.sh 8181 --think 0 --metrics-port 19394 --stats-file <scratch>/qe_stats.json",
+   "env": {
+    "QE_MAX_SEQS": "32",
+    "CUDA_VISIBLE_DEVICES": "0,1,2 (set by server/run.sh)"
+   },
+   "gpus": "3x RTX 3090 (GPU0, GPU1, GPU2), tensor parallel 3",
+   "speculative_decoding": "built-in MTP head, adaptive up to 7 drafts (default --mtp-k 7)",
+   "checkpoint": "models/Qwen3.8-27B-INT4 (same checkpoint directory as vLLM)"
+  },
+  "qengine-now": {
+   "version": "qengine master 1be10df (1be10df5a9b25fb2396528ee9e3ca1c68113ac31, 2026-10-21; engine sources identical to 4e31e5f)",
+   "build": "CMake/Ninja, sm_86, CUDA 13.1",
+   "server_command": "QE_MAX_SEQS=32 server/run.sh 8181 --think 0 --metrics-port 19394 --stats-file <scratch>/qe_stats.json",
+   "env": {
+    "QE_MAX_SEQS": "32",
+    "CUDA_VISIBLE_DEVICES": "0,1,2 (set by server/run.sh)"
+   },
+   "gpus": "3x RTX 3090 (GPU0, GPU1, GPU2), tensor parallel 3",
+   "speculative_decoding": "built-in MTP head, adaptive up to 7 drafts (default --mtp-k 7)",
+   "checkpoint": "models/Qwen3.8-27B-INT4 (same checkpoint directory as vLLM)"
+  }
+ }
+}

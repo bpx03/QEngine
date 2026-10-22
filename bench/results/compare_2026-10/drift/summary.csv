@@ -1,0 +1,9 @@
+engine,scenario,concurrency,classic_output_tok_s,drift_output_tok_s,output_delta_pct,classic_ttft_p50_ms,drift_ttft_p50_ms,classic_tpot_p50_ms,drift_tpot_p50_ms,tpot_delta_pct,drift_raw_file
+vllm-mtp,short,1,92.84,97.41,4.92,325.53,336.13,10.2,9.43,-7.55,drift/short/vllm-mtp/c1.json
+vllm-mtp,short,32,720.07,715.47,-0.64,1083.36,1095.11,39.7,39.85,0.38,drift/short/vllm-mtp/c32.json
+vllm-nospec,short,1,66.86,66.9,0.06,306.86,306.32,14.38,14.38,0.0,drift/short/vllm-nospec/c1.json
+vllm-nospec,short,32,797.36,795.51,-0.23,7169.71,7147.51,26.1,26.33,0.88,drift/short/vllm-nospec/c32.json
+qengine-sunday,short,1,218.27,219.87,0.73,205.09,200.79,3.81,3.94,3.41,drift/short/qengine-sunday/c1.json
+qengine-sunday,short,32,811.75,829.28,2.16,235.18,226.5,38.11,37.31,-2.1,drift/short/qengine-sunday/c32.json
+qengine-now,short,1,207.86,202.39,-2.63,176.07,175.55,3.92,4.35,10.97,drift/short/qengine-now/c1.json
+qengine-now,short,32,1001.14,1004.05,0.29,298.85,287.08,28.47,28.11,-1.26,drift/short/qengine-now/c32.json

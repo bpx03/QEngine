@@ -1,0 +1,12 @@
+# Tests (tests/), reference dumps and MTP tooling (tools/), benchmark scripts (bench/).
+-r requirements.txt
+torchvision==0.27.0
+transformers==4.57.6       # tests: tokenizer + its source files used as fixed prompt text (keep the version)
+jsonschema==4.26.0         # tests/test_grammar.py
+requests==2.34.2           # HTTP tests
+psutil==7.2.2              # bench/serving_suite.py (server CPU use)
+matplotlib==3.10.9         # bench/results/compare_2026-10/charts/make_charts.py
+# bench/serving_suite.py drives `vllm bench serve` (vLLM 0.28.0 was used); install vLLM in a separate venv
+# and point VLLM=<venv>/bin/vllm at it.
+# The HF reference dumps (tools/reference.py, tools/reference_vision.py, tests/test_vision_ref.py) need a newer
+# transformers than the server env: use a separate venv with requirements-ref.txt (.venv-ref/ in the docs).

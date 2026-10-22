@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.24)
+# nvcc 13.1 rejects the system GCC 16; GCC 15 works
+if(NOT CMAKE_CXX_COMPILER AND EXISTS /usr/bin/g++-15)
+  set(CMAKE_CXX_COMPILER /usr/bin/g++-15)
+  set(CMAKE_CUDA_HOST_COMPILER /usr/bin/g++-15)
+endif()
+project(qengine LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_ARCHITECTURES 86)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math -lineinfo --expt-relaxed-constexpr")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+find_package(CUDAToolkit REQUIRED)
+
+file(GLOB KERNELS CONFIGURE_DEPENDS src/kernels/*.cu)
+add_library(qengine SHARED ${KERNELS} src/capi.cpp src/config.cpp src/safetensors.cpp src/model.cpp src/engine.cpp)
+target_include_directories(qengine PUBLIC src)
+target_link_libraries(qengine PUBLIC CUDA::cudart CUDA::cuda_driver)

@@ -1,0 +1,25 @@
+# build output
+build/
+*.so
+*.o
+*.a
+
+# model weights, references and local data (not distributed in git)
+models/
+refs/
+bench/data/
+bench/compare/stage/
+third_party_ref/
+
+# tests that need local-only data
+tests/private/
+
+# Python
+__pycache__/
+*.pyc
+.venv*/
+
+# profiler output
+*.nsys-rep
+*.sqlite
+*.ncu-rep

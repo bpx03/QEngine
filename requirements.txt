@@ -1,0 +1,17 @@
+# QEngine server (server/app.py) - versions as tested (Python 3.12).
+# The engine itself is the C++/CUDA library built with CMake (see README); Python only loads it via ctypes.
+fastapi==0.136.3
+uvicorn==0.49.0
+Jinja2==3.1.6
+tokenizers==0.22.2
+numpy==2.3.5
+llguidance==1.9.1          # structured output (response_format / json_schema)
+nvidia-ml-py==13.610.43    # GPU stats in the monitoring dashboard (module "pynvml")
+rich==15.0.0               # server/qetop.py terminal monitor
+
+# Vision (--vision 1 only): the ViT encoder runs in PyTorch.
+# Tested with torch 2.12.0+cu130 (CUDA 13.0 wheels); install the CUDA build matching your driver, e.g.
+#   pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
+torch==2.12.0
+pillow==10.4.0
+safetensors==0.7.0
