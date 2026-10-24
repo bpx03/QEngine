@@ -138,7 +138,9 @@ Three RTX 3090s are the tuned configuration; two and one card work with these se
 | 1× RTX 3090, a few chats | `QE_DEVICES=0 QE_MAX_SEQS=4 server/run.sh 8080` | 4 slots, ~85K tokens of context; ~96 tok/s single user |
 
 - Pick the GPUs that are not driving a desktop: a display takes 1–2 GB of VRAM and the KV pool shrinks
-  accordingly.
+  accordingly. If one of the cards also drives a desktop, give it more headroom so the browser and
+  compositor keep enough VRAM, e.g. `QE_RESERVE_GB=1.5,3,1.5` when GPU1 runs the display; the KV pool still
+  fills the other cards.
 - On one card the default `QE_MAX_SEQS=16` does not start ("not enough GPU memory for a KV cache"):
   every slot holds its DeltaNet state (~0.3 GB, about 9K tokens of KV pool each). Use `QE_MAX_SEQS`
   between 1 and 4, leave `--vision` off, and lower `QE_RESERVE_GB` (e.g. `1.0`) only if you need a bit
