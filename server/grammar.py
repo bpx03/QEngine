@@ -10,6 +10,52 @@ import json
 import os
 import threading
 
+import numpy as np
+
+# lookup drafts for constrained sequences (the engine's own lookup skips them): the longest earlier match (<= 32
+# tokens) of the token history's suffix, if >= LK_MIN tokens, proposes the tokens that followed it (QE_LK_GRAMMAR=0 off)
+LK_GRAMMAR = os.environ.get("QE_LK_GRAMMAR", "0") != "0"  # JSON copy bench: no gain (strings escape newlines), off
+LK_MIN = int(os.environ.get("QE_LK_MIN", "24"))
+
+
+class TokenLookup:
+    """Prompt + emitted tokens of one request, append-only, with the engine's lookup policy (vectorized)."""
+
+    def __init__(self, ids):
+        self.h = np.zeros(max(1024, 2 * len(ids)), np.int32)
+        self.n = 0
+        self.append(ids)
+        self.n_drafts = 0
+
+    def append(self, toks):
+        k = len(toks)
+        if self.n + k > len(self.h):
+            self.h = np.concatenate([self.h, np.zeros(max(len(self.h), k), np.int32)])
+        self.h[self.n:self.n + k] = toks
+        self.n += k
+
+    def find(self, lmax, mmin=LK_MIN):
+        n, h = self.n, self.h
+        if n < mmin + 1:
+            return []
+        j = np.nonzero(h[:n - 1] == h[n - 1])[0]
+        if not len(j):
+            return []
+        s = np.ones(len(j), np.int32)
+        alive = np.ones(len(j), bool)
+        for d in range(1, 32):  # match length: consecutive equal tokens backwards
+            ok = alive & (j - d >= 0)
+            ok[ok] = h[j[ok] - d] == h[n - 1 - d]
+            alive = ok
+            s += alive
+            if not alive.any():
+                break
+        best = np.lexsort((j, s))[-1]  # longest, then latest
+        if s[best] < mmin:
+            return []
+        jb = int(j[best])
+        return [int(x) for x in h[jb + 1:jb + 1 + min(lmax, n - 1 - jb)]]
+
 # JSON layout the grammar allows. Schemas that name their properties: json.dumps style (", " /
 # ": "), no free whitespace: ~30 % fewer tokens than the model's pretty-printed layout (10-chunk
 # RAG batch: 915 vs 1330 tokens) and no whitespace runs under greedy decoding. Free-form objects
@@ -135,7 +181,7 @@ class Constraint:
         self.error = None
         self.n_forced = 0  # drafts proposed from grammar-forced tokens (statistics)
 
-    def plan(self, io, masks, kmax):
+    def plan(self, io, masks, kmax, lookup=None):
         """Next speculative step of a constrained sequence (engine spec_io / mask_buffer layout):
         candidates are the tokens the grammar forces from here (always accepted: their row mask
         holds only them), followed by the model's drafts io[1 : 1 + io[0]] when those agree with
@@ -151,7 +197,10 @@ class Constraint:
                 cand = list(ff) + drafts[len(ff):] if drafts[:len(ff)] == list(ff) else list(ff)
                 self.n_forced += min(len(ff), kmax)
             else:
-                cand = drafts
+                lk = lookup.find(kmax) if lookup is not None and LK_GRAMMAR else []
+                cand = lk if len(lk) > len(drafts) or (lk and lk[:1] != drafts[:1]) else drafts
+                if cand is lk and lk:
+                    lookup.n_drafts += 1
             for t in cand[:kmax]:
                 # the row mask is exact: a token outside it would put the matcher in its error state
                 if t in self.eos or not allowed(masks[n], t) or not m.consume_token(t):

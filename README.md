@@ -52,6 +52,9 @@ layout is disabled (smaller KV pool) and decode and prefill are slower than the 
 - **MTP speculative decoding** with the model's MTP head: 1–7 drafts per step, chosen adaptively from
   the measured acceptance and step cost; drafts over the 64K most frequent tokens, verification over the
   full vocabulary, so greedy and sampled outputs are unchanged.
+- **Lookup drafts** on the GPU: when the recent tokens repeat an earlier part of the prompt or reply (file
+  edits, quoted code), up to 12 drafts are copied from there instead of the MTP drafts, in single and batched
+  decoding (`QE_LOOKUP=0` switches them off).
 - **Continuous batching** of up to 32 sequences; batched passes of up to 32 rows give the same result as
   decoding each sequence alone (larger passes use the W4A8 GEMM, `QE_DEC_GEMM`, which is numerically close
   but not bit-identical).
@@ -172,7 +175,7 @@ Useful environment variables:
 |---|---|---|
 | `QE_MAX_SEQS` | 16 | sequence slots (conversations kept in the KV pool), up to 32 |
 | `QE_POOL_TOKENS` | auto | KV pool size in tokens (default: all free memory) |
-| `QE_RESERVE_GB` | 1.5 | VRAM left outside the KV pool |
+| `QE_RESERVE_GB` | 1.5 | VRAM left outside the KV pool; a list sets it per card, e.g. `1.5,3,1.5` (a short list repeats its last value) |
 | `QE_KV_ARCHIVE_GB` | 32 | host-RAM archive of evicted conversations (0 = off) |
 | `QE_PREFIX_GB` | 8 | host RAM for pinned system-prompt prefixes |
 | `QE_P2P` | auto | 0 forces the host-memory communication path |
@@ -180,6 +183,7 @@ Useful environment variables:
 | `QE_DRAFT_VOCAB` | 65536 | MTP draft vocabulary size (0 = full vocabulary) |
 | `QE_DEC_GEMM` | 33 | batched decode passes of at least this many rows use the W4A8 GEMM instead of the GEMV (0 = off) |
 | `QE_ADMIT_HEADROOM` | 8192 | KV tokens reserved per running sequence when admitting a new one |
+| `QE_LOOKUP` | 1 | lookup drafts from the token history (0 = off) |
 
 ## Run with Docker
 
@@ -248,7 +252,7 @@ Performance in the container matches bare metal (single-user decode, same GPUs).
 
 ## Benchmark summary
 
-Serving benchmark against vLLM 0.28.0 (club-3090 "dual-fast" recipe, best of MTP / no-spec per point)
+Serving benchmark (October 2026) against vLLM 0.28.0 (club-3090 "dual-fast" recipe, best of MTP / no-spec per point)
 with the same checkpoint, client (`vllm bench serve`), prompts and seeds. QEngine on 3× RTX 3090
 (TP=3); vLLM on 2× RTX 3090 (TP=2, because this model's 4 KV heads and 16 DeltaNet key heads do not
 divide by 3). Output tokens/s, higher is better:

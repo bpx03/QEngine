@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from tokenizers import Tokenizer
 
 from engine import Engine
-from grammar import GrammarError, Grammars, schema_of
+from grammar import GrammarError, Grammars, TokenLookup, schema_of
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -717,6 +717,7 @@ class Job:
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
         self.affinity = affinity
         self.grammar, self.grammar_s, self.gsteps = None, 0.0, 0  # structured output (begin_start)
+        self.glk = None  # TokenLookup of a constrained reply (grammar.py)
         self.done = threading.Event()
         self.error, self.stats, self.slot = None, None, -1
         self.finished = False
@@ -810,10 +811,13 @@ class Job:
                     break
             pending = ok
             self.gsteps += 1
+            if self.glk is None:  # token history for lookup drafts (prompt + emitted so far)
+                self.glk = TokenLookup(list(self.ids) + list(self.det.ids))
+            self.glk.append(ok)
             if not gdone:
-                # drafts for the next step: forced tokens / the grammar-valid model drafts
+                # drafts for the next step: forced tokens / lookup / the grammar-valid model drafts
                 e = g.engine
-                c.plan(e.spec_io(self.slot), e.mask_buffer(self.slot), g.args.mtp_k)
+                c.plan(e.spec_io(self.slot), e.mask_buffer(self.slot), g.args.mtp_k, self.glk)
             self.grammar_s += time.perf_counter() - tg
         for i, t in enumerate(pending):
             if t in g.eos and not self.p.get("ignore_eos"):
@@ -1451,7 +1455,7 @@ def main():
     if not args.template:
         args.template = os.path.join(args.model, "chat_template.jinja")
     args.think = bool(args.think)
-    # the MTP head fine-tuned on the engine's own answers (tools/mtp_train.py): +8% accepted drafts
+    # the MTP head fine-tuned on the engine's own answers: +8% accepted drafts
     ft = os.path.join(args.model, "model_mtp_ft.safetensors")
     if "QE_MTP_FILE" not in os.environ and os.path.exists(ft):
         os.environ["QE_MTP_FILE"] = ft

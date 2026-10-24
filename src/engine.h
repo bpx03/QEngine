@@ -276,6 +276,24 @@ private:
     int bkvs_[2][kMaxSegs] = {};
     std::vector<int> bstep_[2];          // slots of the batched step in each buffer (bkvs_ order)
     bool bclamp_[2][kMaxSegs] = {};
+    // lookup drafts in batched steps (QE_LKB): per slot the history length the cards hold for sure (-1: unknown,
+    // full upload), dirty (an undone step may have appended past it), sticky lookup mode, misses since the last find
+    int blkr_[2][kMaxSegs] = {};         // lookup rows of each sequence of the step in each buffer (0: MTP)
+    std::vector<int> lkb_len_, lkb_miss_;
+    std::vector<char> lkb_dirty_, lkb_mode_;
+    std::vector<float> lkb_ema_;           // accepted lookup drafts per lookup step (EMA): sizes the slot's rows
+    std::vector<int> lkb_cool_;
+    std::vector<int*> lkb_pin_;            // pinned upload buffer per slot (lazily allocated)            // steps left before a slot that left lookup mode (low acceptance) may return
+    bool lkb_on_ = false;
+    int lkb_rows_ = 32, lkb_hold_ = 2, lkb_min_ = 4;
+  public:
+    long long lkb_steps_ = 0, lkb_rows_sum_ = 0, lkb_tok_ = 0, lkb_bsteps_ = 0, lkb_slotsteps_ = 0;
+  private:
+    void lkb_inval(int slot) {
+        if (slot < 0 || slot >= (int)lkb_len_.size()) return;
+        lkb_len_[slot] = -1;
+        lkb_mode_[slot] = 0, lkb_miss_[slot] = 0, lkb_cool_[slot] = 0, lkb_ema_[slot] = 6.f;
+    }
     int bcap_ = 0, bbuf_ = 0;
     bool binflight_ = false;
     cudaEvent_t bev_[2] = {nullptr, nullptr};
@@ -465,6 +483,13 @@ private:
     void observe_time(int buf);
     int buf_kv_[2] = {0, 0};               // drafts verified by the step in each buffer
     bool buf_clamped_[2] = {false, false};
+    bool buf_lk_[2] = {false, false};      // the step in each buffer was a lookup step
+    bool lk_on_ = false;                   // QE_LOOKUP: lookup drafts on the GPU (single-sequence steps)
+    int lk_slot_ = -1;                     // slot whose history the cards hold (-1: none / stale)
+    int lk_next_ = 0;                      // lookup drafts found by the last finished step
+  public:
+    long long lk_steps_ = 0, lk_rows_ = 0, lk_tok_ = 0, steps_all_ = 0;  // statistics (lookup steps, their rows / tokens)
+  private:
     int buf_kd_[2] = {0, 0}, bkd_[2] = {0, 0};  // drafts made by the step in each buffer
     long long epoch_ = 0;                  // launches (steps, prefill chunks): trim's validity  // fewer drafts than available (set_limit): no statistics
     // drafts a step of slot q starting at position `base` may verify under its limit (set_limit)
@@ -473,7 +498,7 @@ private:
     }
     // Steps are queued one ahead (graph launches cost ~0.8 ms of host time each), so the GPU
     // never waits for the host; emit buffers / events alternate between the two steps.
-    void launch_step(int buf, int base);  // base: the slot's position when the step runs
+    void launch_step(int buf, int base, int lk = 0);  // base: the slot's position when the step runs; lk: lookup drafts
     int* emit_host_ = nullptr;   // [2][64] pinned
     std::vector<unsigned*> mask_host_;  // per slot, pinned (mask_buffer)
     std::vector<int*> spec_io_;          // per slot, pinned (spec_io)

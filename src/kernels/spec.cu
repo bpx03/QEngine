@@ -1,4 +1,12 @@
+#include <cstdio>
 #include "spec.cuh"
+#include "ops.cuh"
+// bounds checks of the lookup kernels (build with -DQE_LKB_ASSERT: printf + trap; off by default)
+#ifdef QE_LKB_ASSERT
+#define LKB_ASSERT(c) do { if (!(c)) { printf("LKB_ASSERT %s:%d %s\n", __FILE__, __LINE__, #c); __trap(); } } while (0)
+#else
+#define LKB_ASSERT(c) do { } while (0)
+#endif
 
 namespace {
 
@@ -179,4 +187,129 @@ void spec_copy_last(const SpecState& s, int m, cudaStream_t st) {
 }
 void spec_finish_prefill(const SpecState& s, int k, cudaStream_t st) {
     finish_prefill_kernel<<<1, 1, 0, st>>>(s, k);
+}
+
+// ---- lookup drafts on the GPU
+namespace {
+__global__ void lk_append_kernel(LookupDev d, const int* __restrict__ emit) {
+    if (threadIdx.x != 0) return;
+    const int n = *d.hn, c = emit[0];
+    for (int i = 0; i < c && n + i < d.cap; i++) d.hd[n + i] = emit[1 + i];
+    *d.hn = min(n + c, d.cap);
+}
+__device__ void lk_scan_dev(const LookupDev& d, int b0, int nb) {  // grid-stride over the history (a few waves at 256K)
+    const int n = *d.hn;
+    unsigned long long key = 0ull;
+    const int last = n > 0 ? d.hd[n - 1] : -1;
+    for (int j = b0 * blockDim.x + threadIdx.x; j < n - 1; j += nb * blockDim.x)
+        if (d.hd[j] == last) {
+            int s = 1;
+            while (s < 32 && j - s >= 0 && d.hd[j - s] == d.hd[n - 1 - s]) s++;
+            const unsigned long long k = ((unsigned long long)s << 32) | (unsigned)j;
+            key = k > key ? k : key;
+        }
+    for (int o = 16; o > 0; o >>= 1) {
+        const unsigned long long t = __shfl_xor_sync(0xffffffffu, key, o);
+        key = t > key ? t : key;
+    }
+    __shared__ unsigned long long wmax[8];
+    if ((threadIdx.x & 31) == 0) wmax[threadIdx.x >> 5] = key;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long b = 0ull;
+        for (int w = 0; w < (int)(blockDim.x >> 5); w++) b = wmax[w] > b ? wmax[w] : b;
+        if (b) atomicMax(d.best, b);
+    }
+}
+__global__ void lk_scan_kernel(LookupDev d) { lk_scan_dev(d, blockIdx.x, gridDim.x); }
+__device__ void lk_emit_dev(const LookupDev& d, int* __restrict__ out) {
+    const unsigned long long b = *d.best;
+    *d.best = 0ull;
+    const int s = (int)(b >> 32), j = (int)(b & 0xffffffffu), n = *d.hn;
+    LKB_ASSERT(n >= 0 && n <= d.cap && (b == 0ull || (j >= 0 && j < n - 1 && s >= 1 && s <= 32)));
+    int L = 0;
+    if (s >= d.mmin) L = min(d.lmax, n - 1 - j);
+    d.lk[0] = L;
+    d.lk[31] = s;
+    if (out) *out = L;  // beside the step's emitted tokens (one read-back)
+    for (int i = 0; i < L; i++) d.lk[1 + i] = d.hd[j + 1 + i];
+}
+__global__ void lk_emit_kernel(LookupDev d, int* __restrict__ out) {
+    if (threadIdx.x == 0) lk_emit_dev(d, out);
+}
+__global__ void lk_tokens_kernel(LookupDev d, int* __restrict__ tokens, int L) {
+    const int i = threadIdx.x;
+    if (i < L) tokens[1 + i] = d.lk[1 + i];
+}
+__global__ void lk_cond_kernel(LookupDev d, cudaGraphConditionalHandle h) {
+    if (threadIdx.x == 0) cudaGraphSetConditional(h, d.lk[0] == 0 ? 1u : 0u);
+}
+}  // namespace
+void lookup_append(const LookupDev& d, const int* emit, cudaStream_t st) { lk_append_kernel<<<1, 32, 0, st>>>(d, emit); }
+void lookup_scan_emit(const LookupDev& d, cudaStream_t st, int* out) {
+    lk_scan_kernel<<<82, 256, 0, st>>>(d);
+    lk_emit_kernel<<<1, 32, 0, st>>>(d, out);
+}
+void lookup_to_tokens(const LookupDev& d, int* tokens, int L, cudaStream_t st) { lk_tokens_kernel<<<1, 32, 0, st>>>(d, tokens, L); }
+void lookup_cond(const LookupDev& d, cudaGraphConditionalHandle h, cudaStream_t st) { lk_cond_kernel<<<1, 32, 0, st>>>(d, h); }
+namespace {
+__global__ void add_pos_kernel(int* dst, const int* src, int d) { *dst = *src + d; }
+}
+void spec_add_pos(int* dst, const int* src, int d, cudaStream_t st) { add_pos_kernel<<<1, 1, 0, st>>>(dst, src, d); }
+
+// ---- lookup drafts in batched steps (one history per slot)
+namespace {
+__global__ void lkb_fill_kernel(LkBatch b) {
+    const int z = blockIdx.x;
+    if (threadIdx.x != 0 || b.rows[z] <= 0) return;
+    const LookupDev& d = b.d[z];
+    int* t = b.tokens[z];
+    const int R = b.rows[z], L = d.lk[0];
+    LKB_ASSERT(R <= kMaxLookupK && L >= 0 && L <= kMaxLookupK && b.kav[z] >= 0 && b.kav[z] <= kMaxSpecK);  // debug builds
+    if (L > 0) {
+        for (int i = 0; i < R; i++) t[1 + i] = d.lk[1 + min(i, L - 1)];
+        if (b.used) b.used[z] = 1;
+    } else {  // no lookup drafts: the slot's MTP drafts, padded (rows past them are rejected or happen to match)
+        const int ka = min(b.kav[z], R);
+        for (int i = ka; i < R; i++) t[1 + i] = t[ka];
+        if (b.used) b.used[z] = 0;
+    }
+    if (b.pos8[z]) *b.pos8[z] = *b.pos[z] + 8;
+}
+__global__ void lkb_append_kernel(LkBatch b) {
+    const int z = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    const LookupDev& d = b.d[z];
+    const int* emit = b.emit[z];
+    const int n = *d.hn, c = emit[0];
+    LKB_ASSERT(n >= 0 && n <= d.cap && c >= 0 && c <= kMaxLookupK + 1);
+    for (int i = 0; i < c && n + i < d.cap; i++) d.hd[n + i] = emit[1 + i];
+    *d.hn = min(n + c, d.cap);
+}
+__global__ void lkb_scan_kernel(LkBatch b) { lk_scan_dev(b.d[blockIdx.y], blockIdx.x, gridDim.x); }
+__global__ void lkb_emit_kernel(LkBatch b) {
+    if (threadIdx.x == 0) lk_emit_dev(b.d[blockIdx.x], b.emit[blockIdx.x] ? b.emit[blockIdx.x] + 31 : nullptr);
+}
+__global__ void lkb_pos8_kernel(LkBatch b) {
+    const int z = blockIdx.x;
+    LKB_ASSERT(b.n <= 32);
+    if (threadIdx.x == 0 && b.pos8[z]) *b.pos8[z] = *b.pos[z] + 8;
+}
+__global__ void lk_setlen_kernel(LookupDev d, int n) {
+    *d.hn = n;
+    *d.best = 0ull;
+}
+}  // namespace
+void lookup_fill_batch(const LkBatch& b, cudaStream_t st) { if (b.n) lkb_fill_kernel<<<b.n, 32, 0, st>>>(b); }
+void lookup_pos8_batch(const LkBatch& b, cudaStream_t st) { if (b.n) lkb_pos8_kernel<<<b.n, 32, 0, st>>>(b); }
+void lookup_step_batch(const LkBatch& b, cudaStream_t st) {
+    if (!b.n) return;
+    lkb_append_kernel<<<b.n, 32, 0, st>>>(b);
+    lkb_scan_kernel<<<dim3(16, b.n), 256, 0, st>>>(b);
+    lkb_emit_kernel<<<b.n, 32, 0, st>>>(b);
+}
+void lookup_set_len_scan(const LookupDev& d, int n, cudaStream_t st) {
+    lk_setlen_kernel<<<1, 1, 0, st>>>(d, n);
+    lk_scan_kernel<<<16, 256, 0, st>>>(d);
+    lk_emit_kernel<<<1, 32, 0, st>>>(d, nullptr);
 }

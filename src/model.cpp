@@ -104,19 +104,21 @@ void Worker::add_slot() {
         CUDA_CHECK(cudaMemset(sl.dn_pend, 0, pb));
     }
     {  // speculative-decoding state of this sequence
-        int* sp = (int*)dalloc(64 * 4, false);
-        CUDA_CHECK(cudaMemset(sp, 0, 64 * 4));
+        int* sp = (int*)dalloc(128 * 4, false);
+        CUDA_CHECK(cudaMemset(sp, 0, 128 * 4));
         SpecState& ss = sl.spec;
         ss.tokens = (int*)dalloc(kChunk * 4, false);
         ss.out = (int*)dalloc(kChunk * 4, false);
         ss.mtp_tok = (int*)dalloc(kChunk * 4, false);
         ss.mtp_out = (int*)dalloc(kChunk * 4, false);
         ss.pos = sp;
-        ss.emit = sp + 16;         // [16]
+        ss.emit = sp + 64;         // [32]: count + up to 1 + kMaxLookupK tokens
         ss.acc = sp + 32;
         ss.mtp_pos = sp + 33;
         ss.hrow = sp + 34;
         ss.drafts = sp + 40;       // [8]
+        sl.pos8 = sp + 36;
+        sl.mpos8 = sp + 37;
         ss.eos0 = c_.eos;
         ss.eos1 = c_.eos2;
         sl.sp = (SampleParams*)dalloc(sizeof(SampleParams), false);
@@ -126,6 +128,7 @@ void Worker::add_slot() {
         sl.mask = (unsigned*)dalloc(mw * 4, false);
         CUDA_CHECK(cudaMemset(sl.mask, 0xff, mw * 4));
     }
+    if (lkb_cap_ > 0) lkb_alloc(sl);
     slots_.push_back(sl);
     const int prev = cur_slot_;
     select_slot(slots_.size() - 1);
@@ -1174,6 +1177,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     alloc_xchg();
     logits_ = (float*)dalloc((size_t)kMaxBatchRows * p_.vocab.size() * 4, false);
     pairs_ = (float*)dalloc(kMaxBatchRows * 2 * 4, false);
+    pos8_ = (int*)dalloc(4, false);
     pairs_all_ = (float*)dalloc(ngpu_ * kMaxBatchRows * 2 * 4, false);
     topk_ = (float*)dalloc(kMaxBatchRows * kTopK * 2 * 4, false);
     topk_all_ = (float*)dalloc(ngpu_ * kMaxBatchRows * kTopK * 2 * 4, false);
@@ -1376,9 +1380,11 @@ void Worker::forward(int m, bool logits, bool spec) {
             xchg_fill(a);
             attn_prep(proj_, proj_ld_, a, L.fa.q_norm, L.fa.k_norm, eps, inv_freq_, pos_, m,
                       qbuf_, L.fa.kc, L.fa.vc, st);
+            verify_ = spec;
             attend(a, qbuf_, L.fa.kc, L.fa.vc, pos_, m, nullptr, nullptr, xha);
+            verify_ = false;
             // prefill attention (m > 8) does not write XH: fallback packing
-            mm4(L.fa.o, act_, qw, partial_, H, m, st, m <= kMaxGemvTokens ? xha : nullptr, qw);
+            mm4(L.fa.o, act_, qw, partial_, H, m, st, (m <= kMaxGemvTokens || (spec && m <= kPendRows)) ? xha : nullptr, qw);
         } else {
             const size_t abs = (size_t)kChunk * 2 * dsh_.ab_pad;
             static const bool ab_par = !getenv("QE_AB_PAR") || atoi(getenv("QE_AB_PAR"));
@@ -1446,9 +1452,11 @@ void Worker::forward(int m, bool logits, bool spec) {
     if (!spec) dn_commit(dn_cur_, nullptr, m, st);
     if (logits) {
         // prompt chunks only need the last row; spec verification samples in run_spec
-        const bf16* x = m <= kMaxGemvTokens ? xn_ : xn_ + (size_t)(m - 1) * H;
-        const int rows = m <= kMaxGemvTokens ? m : 1;
-        int* out = m <= kMaxGemvTokens ? out_tok_ : out_tok_ + m - 1;
+        // (a lookup verification of up to 16 rows: every row)
+        const bool all = m <= kMaxGemvTokens || (spec && m <= kPendRows);
+        const bf16* x = all ? xn_ : xn_ + (size_t)(m - 1) * H;
+        const int rows = all ? m : 1;
+        int* out = all ? out_tok_ : out_tok_ + m - 1;
         mask_current(rows, spec);
         if (!sampling) {
             head(lm_head_, x, rows, out);
@@ -1584,15 +1592,20 @@ void Worker::forward_batch(const std::vector<int>& slots, const std::vector<int>
         if (L.full) {
             mm4(L.fa.qkv, xn_, H, proj_, ld, M, st, xh_xn_, H);
             AttnSegs g{};  // all sequences in one launch per kernel
-            g.n = slots.size();
+            // (a lookup verification of > 8 rows: two segments, the second at position + 8 - every row's result
+            // as in any decode step)
             for (size_t i = 0; i < slots.size(); i++) {
                 SeqSlot& sl = slots_[slots[i]];
-                g.c[i] = AttnSeg{proj_ + (size_t)r0[i] * ld, qbuf_ + (size_t)r0[i] * qbw, sl.kc[f],
-                                 sl.vc[f], sl.spec.pos, sl.rdelta, ms[i], sl.max_t,
-                                 attn_work_ + attn_work_floats(ash_) * i, act_ + (size_t)r0[i] * qw,
-                                 xh_act_ ? xh_act_ + (size_t)r0[i] * qw : nullptr,
-                                 sl.split ? sl.kc2[f] : nullptr, sl.split ? sl.vc2[f] : nullptr, sl.split};
-                g.max_m = std::max(g.max_m, ms[i]);
+                for (int h0 = 0; h0 < ms[i]; h0 += kMaxGemvTokens) {
+                    const int z = g.n++, rr = r0[i] + h0, mm = std::min(kMaxGemvTokens, ms[i] - h0);
+                    CHECK(z < kMaxSegs, "attention segments");
+                    g.c[z] = AttnSeg{proj_ + (size_t)rr * ld, qbuf_ + (size_t)rr * qbw, sl.kc[f],
+                                     sl.vc[f], h0 ? sl.pos8 : sl.spec.pos, sl.rdelta, mm, sl.max_t,
+                                     attn_work_ + attn_work_floats(ash_) * z, act_ + (size_t)rr * qw,
+                                     xh_act_ ? xh_act_ + (size_t)rr * qw : nullptr,
+                                     sl.split ? sl.kc2[f] : nullptr, sl.split ? sl.vc2[f] : nullptr, sl.split};
+                    g.max_m = std::max(g.max_m, mm);
+                }
             }
             AttnShape a = layer_shape(&L);
             xchg_fill(a);
@@ -1687,14 +1700,17 @@ void Worker::mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0
     mm4(mtp_.qkv, xn_, H, proj_, proj_ld_, M, st, xh_xn_, H);
     const int qw = ow_, qbw = ash_.nq * 256;
     AttnSegs g{};
-    g.n = slots.size();
     for (size_t i = 0; i < slots.size(); i++) {
         SeqSlot& sl = slots_[slots[i]];
-        g.c[i] = AttnSeg{proj_ + (size_t)r0[i] * proj_ld_, qbuf_ + (size_t)r0[i] * qbw, sl.mkc, sl.mvc,
-                         sl.spec.mtp_pos, sl.rdelta, ms[i], sl.max_t, attn_work_ + attn_work_floats(ash_) * i,
-                         act_ + (size_t)r0[i] * qw, xh_act_ ? xh_act_ + (size_t)r0[i] * qw : nullptr,
-                         sl.mkc2, sl.mvc2, sl.split};
-        g.max_m = std::max(g.max_m, ms[i]);
+        for (int h0 = 0; h0 < ms[i]; h0 += kMaxGemvTokens) {  // > 8 rows: two segments (see forward_batch)
+            const int z = g.n++, rr = r0[i] + h0, mm = std::min(kMaxGemvTokens, ms[i] - h0);
+            CHECK(z < kMaxSegs, "attention segments");
+            g.c[z] = AttnSeg{proj_ + (size_t)rr * proj_ld_, qbuf_ + (size_t)rr * qbw, sl.mkc, sl.mvc,
+                             h0 ? sl.mpos8 : sl.spec.mtp_pos, sl.rdelta, mm, sl.max_t,
+                             attn_work_ + attn_work_floats(ash_) * z, act_ + (size_t)rr * qw,
+                             xh_act_ ? xh_act_ + (size_t)rr * qw : nullptr, sl.mkc2, sl.mvc2, sl.split};
+            g.max_m = std::max(g.max_m, mm);
+        }
     }
     AttnShape a = layer_shape(nullptr);
     if (p_.pos_split) rope_table_seg(g, a, inv_freq_, rtab_, st);
@@ -1749,12 +1765,16 @@ void Worker::dec_gemm_warm(int) {
     (void)I;
 }
 
-void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd) {
+void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd,
+                            const std::vector<int>* lkr, const std::vector<int>* kav) {
     attn_rs_ = false;  // row split only for the single-sequence step (launch_step)
     std::string key = std::to_string(kd);
-    for (size_t i = 0; i < slots.size(); i++)
+    for (size_t i = 0; i < slots.size(); i++) {
+        const int lr = lkr ? (*lkr)[i] : 0;
         key += "|" + std::to_string(slots[i]) + ":" + std::to_string(kvs[i]) + ":" +
-               std::to_string((int)slots_[slots[i]].sampling + 2 * (int)slots_[slots[i]].constrained);
+               std::to_string((int)slots_[slots[i]].sampling + 2 * (int)slots_[slots[i]].constrained) +
+               (lr > 0 ? "L" + std::to_string(kav ? std::min((*kav)[i], lr) : 0) : "");
+    }
     cudaGraphExec_t bge = batch_graphs_.get(key);
     if (!bge) {
         const auto tcap0 = std::chrono::steady_clock::now();
@@ -1768,6 +1788,7 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
             r1[i] = i;
         }
         CHECK(M <= kMaxBatchRows && kd <= kMaxSpecK, "batch rows %d", M);
+        for (int i = 0; i < n; i++) CHECK(ms[i] <= kPendRows, "rows %d of sequence %d", ms[i], i);
         cudaStream_t st = stream;
         cudaGraph_t g;
         {
@@ -1778,6 +1799,25 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         const bool defer = dn_defer_on();
         if (!defer)
             for (int sidx : slots) copy_int(slots_[sidx].dn_save, slots_[sidx].dn_cur, st);
+        LkBatch lb;  // lookup drafts (lkb_on): fill at the start, history + scan at the end
+        bool any_lk = false, any8 = false;
+        if (lkb_on()) {
+            lb.n = n;
+            for (int i = 0; i < n; i++) {
+                SeqSlot& sl = slots_[slots[i]];
+                lb.d[i] = sl.lk;
+                lb.tokens[i] = sl.spec.tokens;
+                lb.emit[i] = sl.spec.emit;
+                lb.rows[i] = lkr ? (*lkr)[i] : 0;
+                lb.kav[i] = kav ? (*kav)[i] : 0;
+                lb.pos[i] = sl.spec.pos;
+                lb.pos8[i] = ms[i] > kMaxGemvTokens ? sl.pos8 : nullptr;
+                any_lk |= lb.rows[i] > 0;
+                any8 |= ms[i] > kMaxGemvTokens;
+            }
+            lookup_fill_batch(lb, st);  // (always: the same topology with or without lookup rows - graph updates)
+        }
+        CHECK(!any8 || lkb_on(), "batch rows > 8 per sequence need QE_LKB");
         forward_batch(slots, r0, ms);
         std::vector<SpecState> v(n);
         // acceptance of all sequences in one launch (QE_SPEC_BATCH=0: one launch per sequence; same
@@ -1846,6 +1886,14 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         }
         std::vector<const bf16*> hs(n);
         for (int i = 0; i < n; i++) hs[i] = xn_ + (size_t)r0[i] * H;
+        if (lkb_on()) {  // the MTP pass's second segments: mtp_pos (set by accept) + 8 (always: same topology)
+            LkBatch pb = lb;
+            for (int i = 0; i < n; i++) {
+                pb.pos[i] = slots_[slots[i]].spec.mtp_pos;
+                pb.pos8[i] = ms[i] > kMaxGemvTokens ? slots_[slots[i]].mpos8 : nullptr;
+            }
+            lookup_pos8_batch(pb, st);
+        }
         mtp_batch(slots, r0, ms, hs);
         SpecBatch sbt;
         for (int i = 0; i < n; i++) {
@@ -1870,8 +1918,12 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         } else {
             for (int i = 0; i < n; i++) spec_finish(v[i], kd, st);
         }
+        if (lkb_on()) lookup_step_batch(lb, st);  // drafts for the next step (count at emit[31])
         CUDA_CHECK(cudaStreamEndCapture(st, &g));
-        instantiate(&bge, g);
+        const auto tcap1 = std::chrono::steady_clock::now();
+        if (!batch_update(key, g, &bge)) instantiate(&bge, g);
+        static double tcap_tot = 0;
+        tcap_tot += std::chrono::duration<double, std::milli>(tcap1 - tcap0).count();
         CUDA_CHECK(cudaGraphDestroy(g));
         batch_graphs_.put(key, bge);
         static const bool stats = getenv("QE_GRAPH_STATS") && atoi(getenv("QE_GRAPH_STATS"));
@@ -1880,10 +1932,56 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
             static double tot = 0;
             tot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tcap0).count();
             if (rank == 0 && ++cnt % 20 == 0)
-                fprintf(stderr, "[graphs] %d batch captures, %.1f ms each (n=%d)\n", cnt, tot / cnt, n);
+                fprintf(stderr, "[graphs] %d batch captures, %.1f ms each, capture %.1f (n=%d), updates %lld ok %lld failed\n", cnt,
+                        tot / cnt, tcap_tot / cnt, n, bupd_ok_, bupd_fail_);
         }
     }
     CUDA_CHECK(cudaGraphLaunch(bge, stream));
+    blaunch_[1] = blaunch_[0];
+    blaunch_[0] = bge;
+}
+
+// structure of a batched-step key: the sequences and their modes without the row counts
+static std::string batch_skey(const std::string& key) {
+    std::string r;
+    size_t i = key.find('|');
+    if (i == std::string::npos) return key;
+    r = key.substr(0, i);  // kd
+    while (i != std::string::npos) {
+        const size_t j = key.find('|', i + 1);
+        const std::string t = key.substr(i + 1, j == std::string::npos ? std::string::npos : j - i - 1);
+        const size_t a = t.find(':'), b = t.find(':', a + 1);
+        std::string mode = t.substr(b + 1);
+        const size_t l = mode.find('L');
+        if (l != std::string::npos) mode = mode.substr(0, l);
+        r += "|" + t.substr(0, a) + ":" + mode;
+        i = j;
+    }
+    return r;
+}
+
+bool Worker::batch_update(const std::string& key, cudaGraph_t g, cudaGraphExec_t* out) {
+    static const bool on = !getenv("QE_GRAPH_UPDATE") || atoi(getenv("QE_GRAPH_UPDATE"));
+    if (!on) return false;
+    const std::string sk = batch_skey(key);
+    // the least recently used cached graph of the same structure that is not (maybe) in flight
+    auto best = batch_graphs_.m.end();
+    for (auto it = batch_graphs_.m.begin(); it != batch_graphs_.m.end(); ++it) {
+        if (it->second.g == blaunch_[0] || it->second.g == blaunch_[1]) continue;
+        if (batch_skey(it->first) != sk) continue;
+        if (best == batch_graphs_.m.end() || it->second.used < best->second.used) best = it;
+    }
+    if (best == batch_graphs_.m.end()) return false;
+    cudaGraphExecUpdateResultInfo info;
+    if (cudaGraphExecUpdate(best->second.g, g, &info) != cudaSuccess) {
+        cudaGetLastError();
+        bupd_fail_++;
+        return false;
+    }
+    *out = best->second.g;
+    batch_graphs_.m.erase(best);  // now the new key's graph (put by the caller)
+    bupd_ok_++;
+    return true;
 }
 
 void Worker::head_topk(const Lin& w, const bf16* x, int m) {
@@ -1924,9 +2022,20 @@ void Worker::attend(const AttnShape& a, const bf16* q, const void* kc, const voi
                     const int* pos, int m, const float* proj, bf16* out, __half* xh) {
     if (!proj) proj = proj_;
     if (!out) out = act_;
-    if (m <= kMaxGemvTokens)
+    if (m <= kMaxGemvTokens) {
         attention(q, kc, vc, a, proj, proj_ld_, pos, m, attn_work_, out, stream, xh);
-    else
+    } else if (verify_ && m <= kPendRows) {
+        // a lookup verification of up to 16 rows: the decode attention in two halves of <= 8 rows (each row's
+        // result as in any decode step; the second half's exchange in its own slot)
+        const int qbw = ash_.nq * 256;
+        attention(q, kc, vc, a, proj, proj_ld_, pos, kMaxGemvTokens, attn_work_, out, stream, xh);
+        AttnShape a2 = a;
+        xchg_fill(a2);
+        spec_add_pos(pos8_, pos, kMaxGemvTokens, stream);
+        const size_t r0 = kMaxGemvTokens;
+        attention(q + r0 * qbw, kc, vc, a2, proj + r0 * proj_ld_, proj_ld_, pos8_, m - kMaxGemvTokens,
+                  attn_work_ + attn_work_floats(ash_), out + r0 * ow_, stream, xh ? xh + r0 * ow_ : nullptr);
+    } else
         attention_prefill(q, kc, vc, a, proj, proj_ld_, pos, m, out, stream, pattn_work_,
                           pattn_work_floats_);
 }
@@ -2253,8 +2362,10 @@ void Worker::mtp_forward(int m, const int* pos, const int* tok, const bf16* hsrc
     xchg_fill(a);
     attn_prep(proj_, proj_ld_, a, mtp_.q_norm, mtp_.k_norm, eps, inv_freq_, pos, m, qbuf_,
               mtp_.kc, mtp_.vc, st);
+    verify_ = m <= kPendRows;
     attend(a, qbuf_, mtp_.kc, mtp_.vc, pos, m, nullptr, nullptr, xha);
-    mm4(mtp_.o, act_, ow_, partial_, H, m, st, m <= kMaxGemvTokens ? xha : nullptr, ow_);
+    verify_ = false;
+    mm4(mtp_.o, act_, ow_, partial_, H, m, st, m <= kPendRows ? xha : nullptr, ow_);
     allreduce_add(mtp_resid_, partial_, m, H, comm_, rank, ctr_, st, mtp_.post_norm, eps,
                   xhx ? nullptr : xn_, next_ll(m), false, xhx);
     mm4(mtp_.gate_up, xn_, H, proj_, proj_ld_, m, st, xhx, H);
@@ -2264,7 +2375,7 @@ void Worker::mtp_forward(int m, const int* pos, const int* tok, const bf16* hsrc
                   next_ll(m));
     CUDA_CHECK(cudaMemcpyAsync(mtp_h_, xn_, (size_t)m * H * 2, cudaMemcpyDeviceToDevice, st));
     if (logits) {
-        if (m <= kMaxGemvTokens) head(draft_head_, xn_, m, spec_.mtp_out, true);
+        if (m <= kPendRows) head(draft_head_, xn_, m, spec_.mtp_out, true);  // (16: lookup verification rows)
         else head(draft_head_, xn_ + (size_t)(m - 1) * H, 1, spec_.mtp_out + m - 1, true);
     }
 }
@@ -2450,8 +2561,62 @@ void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const in
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void Worker::run_spec(int kv, int kd, bool launch) {
-    auto key = std::make_tuple(kv, kd, mode(), cur_slot_);
+void Worker::lk_init(int cap, int mmin, int lmax) {
+    CUDA_CHECK(cudaSetDevice(device));
+    lk_dev_.cap = cap;
+    lk_dev_.mmin = mmin;
+    lk_dev_.lmax = lmax;
+    lk_dev_.hd = (int*)dalloc((size_t)cap * 4, false);
+    lk_dev_.hn = (int*)dalloc(4, false);
+    lk_dev_.best = (unsigned long long*)dalloc(8, false);
+    lk_dev_.lk = (int*)dalloc(32 * 4, false);
+    CUDA_CHECK(cudaMemset(lk_dev_.hn, 0, 4));
+    CUDA_CHECK(cudaMemset(lk_dev_.best, 0, 8));
+    CUDA_CHECK(cudaMemset(lk_dev_.lk, 0, 32 * 4));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&lk_cst_, cudaStreamNonBlocking));
+    // batched steps: a history per slot (QE_LKB=0: off)
+    if (!getenv("QE_LKB") || atoi(getenv("QE_LKB"))) {
+        lkb_cap_ = cap;
+        for (auto& sl : slots_) lkb_alloc(sl);
+    }
+}
+
+void Worker::lkb_alloc(SeqSlot& sl) {
+    LookupDev& d = sl.lk;
+    d.cap = lkb_cap_;
+    d.mmin = lk_dev_.mmin;
+    d.lmax = lk_dev_.lmax;
+    d.hd = (int*)dalloc((size_t)d.cap * 4, false);
+    d.hn = (int*)dalloc(4, false);
+    d.best = (unsigned long long*)dalloc(8, false);
+    d.lk = (int*)dalloc(32 * 4, false);
+    CUDA_CHECK(cudaMemset(d.hn, 0, 4));
+    CUDA_CHECK(cudaMemset(d.best, 0, 8));
+    CUDA_CHECK(cudaMemset(d.lk, 0, 32 * 4));
+}
+
+void Worker::lkb_sync(int i, const int* tail, int from, int n) {
+    CUDA_CHECK(cudaSetDevice(device));
+    const LookupDev& d = slots_[i].lk;
+    n = std::min(n, d.cap);
+    if (n > from)  // pinned source (Engine::lkb_pin_): an asynchronous copy, the host never waits
+        CUDA_CHECK(cudaMemcpyAsync(d.hd + from, tail, (size_t)(n - from) * 4, cudaMemcpyHostToDevice, stream));
+    lookup_set_len_scan(d, n, stream);
+}
+
+void Worker::lk_set_history(const int* ids, int n) {
+    if (!lk_on()) return;
+    CUDA_CHECK(cudaSetDevice(device));
+    n = std::min(n, lk_dev_.cap);
+    CUDA_CHECK(cudaMemcpyAsync(lk_dev_.hd, ids, (size_t)n * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(lk_dev_.hn, &n, 4, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemsetAsync(lk_dev_.best, 0, 8, stream));
+    lookup_scan_emit(lk_dev_, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void Worker::run_spec(int kv, int kd, bool launch, bool lookup) {
+    auto key = std::make_tuple(kv, kd | (lookup ? 256 : 0), mode(), cur_slot_);
     cudaGraphExec_t sge = spec_graphs_.get(key);
     if (!sge) {
         cudaGraph_t g;
@@ -2463,6 +2628,7 @@ void Worker::run_spec(int kv, int kd, bool launch) {
         } else if (!defer) {
             copy_int(dn_save_, dn_cur_, stream);
         }
+        if (lookup) lookup_to_tokens(lk_dev_, spec_.tokens, kv, stream);  // the previous step's lookup drafts
         forward(kv + 1, true, true);
         if (sampling) spec_accept_sampled(topk_all_, ngpu_, kv, sp_, spec_, stream);
         else spec_accept(spec_, kv, stream);
@@ -2503,11 +2669,50 @@ void Worker::run_spec(int kv, int kd, bool launch) {
         // kd == 0: the MTP pass only fills its KV cache, no draft head
         mtp_forward(kv + 1, spec_.mtp_pos, spec_.mtp_tok, xn_, spec_.hrow, kd > 0);
         spec_select(spec_, stream);
-        for (int r = 1; r < kd; r++) {
-            mtp_forward(1, spec_.mtp_pos, spec_.mtp_tok, mtp_h_, spec_.hrow, true, mtp_draft_win());
-            spec_append(spec_, r, stream);
+        auto chain = [&]() {
+            for (int r = 1; r < kd; r++) {
+                mtp_forward(1, spec_.mtp_pos, spec_.mtp_tok, mtp_h_, spec_.hrow, true, mtp_draft_win());
+                spec_append(spec_, r, stream);
+            }
+        };
+        if (lookup && lk_on() && kd > 1) {
+            // lookup of this step first; the chain (drafts 2..kd) in an IF node: only when no lookup drafts follow
+            // (the emitted tokens are appended to the history before the scan, so the scan runs after accept)
+            lookup_append(lk_dev_, spec_.emit, stream);
+            lookup_scan_emit(lk_dev_, stream, spec_.emit + 31);
+            cudaStreamCaptureStatus cs;
+            cudaGraph_t cg;
+            const cudaGraphNode_t* deps;
+            size_t nd;
+            CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &cs, nullptr, &cg, nullptr, nullptr, nullptr));
+            cudaGraphConditionalHandle h;
+            CUDA_CHECK(cudaGraphConditionalHandleCreate(&h, cg, 0, 0));
+            lookup_cond(lk_dev_, h, stream);
+            CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &cs, nullptr, &cg, &deps, nullptr, &nd));
+            cudaGraphNodeParams cp = {};
+            cp.type = cudaGraphNodeTypeConditional;
+            cp.conditional.handle = h;
+            cp.conditional.type = cudaGraphCondTypeIf;
+            cp.conditional.size = 1;
+            cudaGraphNode_t node;
+            CUDA_CHECK(cudaGraphAddNode(&node, cg, deps, nullptr, nd, &cp));
+            CUDA_CHECK(cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
+            cudaGraph_t body = cp.conditional.phGraph_out[0];
+            cudaStream_t s0 = stream;
+            stream = lk_cst_;
+            CUDA_CHECK(cudaStreamBeginCaptureToGraph(stream, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
+            chain();
+            CUDA_CHECK(cudaStreamEndCapture(stream, &body));
+            stream = s0;
+            spec_finish(spec_, kd, stream);
+        } else {
+            chain();
+            spec_finish(spec_, kd, stream);
+            if (lk_on()) {  // drafts for the next step (their count at emit[31])
+                lookup_append(lk_dev_, spec_.emit, stream);
+                lookup_scan_emit(lk_dev_, stream, spec_.emit + 31);
+            }
         }
-        spec_finish(spec_, kd, stream);
         CUDA_CHECK(cudaStreamEndCapture(stream, &g));
         instantiate(&sge, g);
         CUDA_CHECK(cudaGraphDestroy(g));

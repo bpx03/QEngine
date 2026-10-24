@@ -84,6 +84,9 @@ struct SeqSlot {
     // the graphs of a constrained slot (row j: the grammar state after drafts 1..j)
     unsigned* mask = nullptr;
     bool constrained = false;
+    LookupDev lk;                 // lookup drafts of batched steps: this sequence's history (QE_LKB, lk_init)
+    int* pos8 = nullptr;          // device: spec.pos + 8 / mtp_pos + 8 (second attention segment of > 8 rows)
+    int* mpos8 = nullptr;
 };
 
 // Owns one GPU's slice of the model and runs its part of every forward pass.
@@ -195,16 +198,37 @@ public:
     void set_rope_delta(int delta);
     // One speculative step with k drafts (CUDA graph). Emitted tokens -> spec_.emit.
     // kv: drafts verified this step (made by the previous step); kd: drafts made for the next.
-    void run_spec(int kv, int kd, bool launch = true);  // launch = false: only build the graph
-    bool has_spec_graph(int kv, int kd) {
-        return spec_graphs_.m.count(std::make_tuple(kv, kd, mode(), cur_slot_)) != 0;
+    // lookup = true: the kv drafts are the device lookup drafts (lk_dev_), the MTP draft chain (drafts 2..kd) runs
+    // only when the step's own lookup finds none (conditional graph node)
+    void run_spec(int kv, int kd, bool launch = true, bool lookup = false);  // launch = false: only build the graph
+    bool has_spec_graph(int kv, int kd, bool lookup = false) {
+        return spec_graphs_.m.count(std::make_tuple(kv, kd | (lookup ? 256 : 0), mode(), cur_slot_)) != 0;
     }
+    // Lookup drafts on the GPU (QE_LOOKUP): the current sequence's token history on the device, appended and scanned
+    // at the end of every single-sequence step graph; lk_dev_.lk = drafts for the next step.
+    void lk_init(int cap, int mmin, int lmax);
+    void lk_set_history(const int* ids, int n);  // + scan (synchronous)
+    bool lk_on() const { return lk_dev_.hd != nullptr; }
+    const int* lk_dev_ptr() const { return lk_dev_.lk; }
+    LookupDev lk_dev_;
+    cudaStream_t lk_cst_ = nullptr;  // capture stream of the conditional draft chain
+    int* pos8_ = nullptr;   // device: position + 8 (second half of a long verification's attention)
+    bool verify_ = false;   // attend() of a verification / MTP pass (decode attention up to kPendRows rows)
     // Undo the last speculative step's recurrent-state commit (KV past the position is unused).
     void undo_spec();
     // One speculative step for several sequences at once (CUDA graph): sequence i lives in
     // slot slots[i] and verifies kvs[i] drafts; all make kd drafts for their next step. The
     // weight-streaming matmuls, all-reduces and norms run once over all rows.
-    void run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd);
+    // lkr[i] > 0: sequence i verifies lkr[i] = kvs[i] lookup drafts (its own history, see LkBatch); kav[i]: its MTP
+    // drafts made by the last step (the fallback when the history has no match)
+    void run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd,
+                        const std::vector<int>* lkr = nullptr, const std::vector<int>* kav = nullptr);
+    // batched lookup history of slot i: tokens [from, n) uploaded (tail), length := n, scan
+    void lkb_sync(int i, const int* tail, int from, int n);
+    bool lkb_on() const { return lkb_cap_ > 0; }
+    const LookupDev& slot_lk(int i) const { return slots_[i].lk; }
+    int lkb_cap_ = 0;
+    void lkb_alloc(SeqSlot& sl);
     const SpecState& slot_spec(int i) const { return slots_.at(i).spec; }
     // Point slot i's next speculative step at (token, position) with no drafts to verify
     // (after a queued-ahead step was undone, its device-side token/position are stale).
@@ -492,6 +516,11 @@ private:
     std::set<std::tuple<int, bool, int, int>> eager_seen_;    // short prefill passes run without a graph once
     GraphCache<std::tuple<int, int, int, int>> spec_graphs_;  // (kv, kd, mode, slot)
     GraphCache<std::string> batch_graphs_;
+    // a new batched-step graph of the same sequences / modes as a cached one (other draft or lookup rows) updates that
+    // graph in place (cudaGraphExecUpdate) instead of a new instantiation when the topology matches (QE_GRAPH_UPDATE)
+    cudaGraphExec_t blaunch_[2] = {nullptr, nullptr};  // the last two launched (maybe in flight): never updated
+    bool batch_update(const std::string& key, cudaGraph_t g, cudaGraphExec_t* out);
+    long long bupd_ok_ = 0, bupd_fail_ = 0;
     void instantiate(cudaGraphExec_t* ge, cudaGraph_t g);
     std::vector<void*> allocs_;  // everything from dalloc, freed by the destructor
     int *bout_ = nullptr, *bmout_ = nullptr;  // per-row argmax of a batched step / its MTP pass

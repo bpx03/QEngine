@@ -282,24 +282,64 @@ void Engine::plan_slots(int main_cap) {
         pool_->run([&](int r) { workers_[r]->add_slot(); });
         seqs_.push_back(Seq{});
     }
-    const double reserve_gb = getenv("QE_RESERVE_GB") ? atof(getenv("QE_RESERVE_GB")) : 1.5;
+    // VRAM left outside the KV pool, per card in worker order: "1.5" for every card or a list
+    // "1.5,3,1.5" (more room on the card driving the desktop); a short list repeats its last value
+    std::vector<size_t> reserve(workers_.size(), (size_t)1.5e9);
+    if (const char* e = getenv("QE_RESERVE_GB")) {
+        std::stringstream ss(e);
+        size_t r = 0;
+        double last = 1.5;
+        for (std::string x; std::getline(ss, x, ',') && r < reserve.size();) reserve[r++] = (size_t)((last = atof(x.c_str())) * 1e9);
+        for (; r < reserve.size(); r++) reserve[r] = (size_t)(last * 1e9);
+    }
+    // pool tokens every card fits with its free memory past the reserve: the cards hold the same
+    // token offsets, so the smallest (free_r - reserve_r) / bytes per token_r
+    auto pool_fit = [&]() {
+        size_t fit = SIZE_MAX;
+        for (size_t r = 0; r < workers_.size(); r++) {
+            const size_t fr = workers_[r]->free_bytes(), res = reserve[r];
+            fit = std::min(fit, (fr > res ? fr - res : 0) / workers_[r]->slot_token_bytes());
+        }
+        return fit;
+    };
+    size_t fit_fresh = 0, fit_used = 0;
     if (kvs_auto_) {
         // shares from the free memory after the weights: with x = GPU0's share of kv1 and y =
         // GPU2's of kv2 the cards hold 1 + x, 2 - x - y, 1 + y heads per token; every card's pool
         // fills when f_r / (heads_r) are equal: per = (f0 + f1 + f2) / 4 head-tokens; x = f0 / per - 1
         std::vector<double> f(workers_.size());
         for (size_t r = 0; r < workers_.size(); r++) {
-            const size_t fr = workers_[r]->free_bytes(), res = (size_t)(reserve_gb * 1e9);
+            const size_t fr = workers_[r]->free_bytes(), res = reserve[r];
             f[r] = fr > res ? (double)(fr - res) : 0.0;
         }
         const double per = (f[0] + f[1] + f[2]) / 4;
         const double x = std::min(0.55, std::max(0.25, f[0] / per - 1)), y = std::min(0.55, std::max(0.25, f[2] / per - 1));
-        kvs_.a01 = kvs_.to_a(x);
-        kvs_.a12 = kvs_.to_a(y);
+        // the shares move in steps of 32 / period: of the neighbours of the exact shares (within the
+        // same [0.25, 0.55] bounds) take the pair whose pool is the largest (the cards' bytes per token)
+        const int alo = kvs_.to_a(0.55), ahi = kvs_.to_a(0.25);
+        auto try_split = [&](int a, int b) {
+            kvs_.a01 = a;
+            kvs_.a12 = b;
+            kv_split_maps(plan_, kvs_);
+            pool_->run([&](int r) { workers_[r]->set_plan(plan_[r]); });
+            return pool_fit();
+        };
+        int best_a = kvs_.to_a(x), best_b = kvs_.to_a(y);
+        const int a0 = best_a, b0 = best_b;
+        for (int da = -64; da <= 64; da += 32)
+            for (int db = -64; db <= 64; db += 32) {
+                const int a = a0 + da, b = b0 + db;
+                if (a < alo || a > ahi || b < alo || b > ahi) continue;
+                const size_t t = try_split(a, b);
+                if (t > fit_fresh) fit_fresh = t, best_a = a, best_b = b;
+            }
+        kvs_.a01 = best_a;
+        kvs_.a12 = best_b;
+        fit_used = fit_fresh;
         // reproducible across restarts: the free memory moves with the desktop on GPU1, so the
         // shares chosen once are kept (QE_KV_SPLIT_FILE, default $QE_DISK_CACHE or
-        // ~/.cache/qengine: kv_split_<model>_<gpus>.txt) while they stay within 64 positions of
-        // the fresh choice; a larger drift (other weights, other cards) picks and stores anew
+        // ~/.cache/qengine: kv_split_<model>_<gpus>.txt) while their pool stays within 1 % of the
+        // fresh choice's; a larger loss (other reserves, other weights, other cards) picks and stores anew
         const char* home = getenv("HOME");
         std::string dir = getenv("QE_DISK_CACHE") && *getenv("QE_DISK_CACHE") ? getenv("QE_DISK_CACHE")
                           : home ? std::string(home) + "/.cache/qengine" : std::string();
@@ -314,14 +354,15 @@ void Engine::plan_slots(int main_cap) {
         if (!file.empty()) {
             int p = 0, a = 0, b = 0;
             if (FILE* fh = fopen(file.c_str(), "r")) {
-                if (fscanf(fh, "%d %d %d", &p, &a, &b) == 3 && p == kvs_.period && std::abs(a - kvs_.a01) <= 64 &&
-                    std::abs(b - kvs_.a12) <= 64 && a >= 32 && b >= 32 && a <= p - 32 && b <= p - 32) {
-                    kvs_.a01 = a;
-                    kvs_.a12 = b;
-                    stored = true;
+                if (fscanf(fh, "%d %d %d", &p, &a, &b) == 3 && p == kvs_.period && a % 32 == 0 && b % 32 == 0 &&
+                    a >= alo && b >= alo && a <= ahi && b <= ahi) {
+                    const size_t t = try_split(a, b);
+                    if ((double)t >= 0.99 * (double)fit_fresh) stored = true, best_a = a, best_b = b, fit_used = t;
                 }
                 fclose(fh);
             }
+            kvs_.a01 = best_a;
+            kvs_.a12 = best_b;
             if (!stored) {
                 if (!dir.empty()) mkdir(dir.c_str(), 0755);
                 if (FILE* fh = fopen(file.c_str(), "w")) {
@@ -332,18 +373,32 @@ void Engine::plan_slots(int main_cap) {
         }
         kv_split_maps(plan_, kvs_);
         pool_->run([&](int r) { workers_[r]->set_plan(plan_[r]); });
-        printf("KV split: GPU0 holds %.2f of kv1, GPU2 %.2f of kv2 (free %.1f / %.1f / %.1f GB)%s\n",
+        printf("KV split: GPU0 holds %.3f of kv1, GPU2 %.3f of kv2 (free past the reserve %.2f / %.2f / %.2f GB, "
+               "pool %zu tokens, fresh choice %zu)%s\n",
                1.0 - (double)kvs_.a01 / kvs_.period, 1.0 - (double)kvs_.a12 / kvs_.period, f[0] / 1e9, f[1] / 1e9, f[2] / 1e9,
-               stored ? " [shares kept from the previous run]" : "");
+               fit_used, fit_fresh, stored ? " [shares kept from the previous run]" : "");
     }
     // every card holds the same token offsets; its bytes per token follow its share of the kv
     // heads (kv-pos-split), so the pool is the smallest (free / bytes per token)
-    size_t fit = SIZE_MAX;
-    for (auto& w : workers_) {
-        const size_t fr = w->free_bytes(), res = (size_t)(reserve_gb * 1e9);
-        fit = std::min(fit, (fr > res ? fr - res : 0) / w->slot_token_bytes());
-        slack_ = std::max(slack_, w->region_slack());
+    // lookup drafts on the GPU (QE_LOOKUP=1): the current sequence's history on every card (1 MB), before the pool
+    lk_on_ = has_mtp() && (!getenv("QE_LOOKUP") || atoi(getenv("QE_LOOKUP")));  // QE_LOOKUP=0: off
+    if (lk_on_) {
+        const int mmin = getenv("QE_LK_MIN") ? atoi(getenv("QE_LK_MIN")) : 24;  // shorter matches: MTP drafts as well (k up to 7)
+        const int lmax = getenv("QE_LK_LMAX") ? std::max(1, std::min(kMaxLookupK, atoi(getenv("QE_LK_LMAX")))) : kMaxLookupK;
+        pool_->run([&](int r) { workers_[r]->lk_init(kMaxPos + 64, mmin, lmax); });
+        lkb_on_ = workers_[0]->lkb_on();
+        if (getenv("QE_LKB_ROWS")) lkb_rows_ = atoi(getenv("QE_LKB_ROWS"));  // rows a batched step may grow to
+        if (getenv("QE_LKB_HOLD")) lkb_hold_ = atoi(getenv("QE_LKB_HOLD"));  // steps without a find before MTP again
+        if (getenv("QE_LKB_MIN")) lkb_min_ = atoi(getenv("QE_LKB_MIN"));     // fewest lookup drafts worth a step
+        lkb_len_.assign(nslots, -1);
+        lkb_miss_.assign(nslots, 0);
+        lkb_dirty_.assign(nslots, 0);
+        lkb_mode_.assign(nslots, 0);
+        lkb_ema_.assign(nslots, 6.f);
+        lkb_cool_.assign(nslots, 0);
     }
+    const size_t fit = pool_fit();
+    for (auto& w : workers_) slack_ = std::max(slack_, w->region_slack());
     pool_tokens_ = std::min(fit, cap_tokens) / 1024 * 1024;
     CHECK(pool_tokens_ >= 8192 + slack_, "not enough GPU memory for a KV cache");
     max_ctx_ = (int)std::min<size_t>(std::min<size_t>(main_cap, kMaxPos), pool_tokens_ - slack_);
@@ -782,6 +837,7 @@ void Engine::constrain(int slot, bool on) {
 }
 
 void Engine::use_slot(int i) {
+    lk_slot_ = -1;  // the device lookup history is the current sequence's
     cur_ = i;
     pool_->run([&](int r) { workers_[r]->select_slot(i); });
 }
@@ -2233,6 +2289,8 @@ int Engine::start_finish_slot(int slot) {
     CUDA_CHECK(cudaMemcpy(&tok, workers_[0]->out_tok_ + last_m - 1, 4, cudaMemcpyDeviceToHost));
     q.last_tok = q.pending = tok;
     q.k_avail = pf.kstart;
+    lk_slot_ = -1;
+    lkb_inval(pf.slot);
     if (q.constrained) {  // the drafts made at the prompt end, for the caller to check
         int* io = spec_io(pf.slot);
         io[16] = 0;
@@ -2247,12 +2305,15 @@ int Engine::start_finish_slot(int slot) {
     return tok;
 }
 
-void Engine::launch_step(int buf, int base) {
+void Engine::launch_step(int buf, int base, int lk) {
     // a grammar-constrained sequence verifies the caller's drafts (spec_io) with per-row masks;
-    // the drafts the step makes go back to the caller
+    // the drafts the step makes go back to the caller. lk > 0: a lookup step verifying lk device lookup drafts.
     const bool con = seqs_[cur_].constrained;
-    const int kv0 = con ? con_kv(cur_, k_) : seqs_[cur_].k_avail, kd = next_k();
-    const int kv = clamp_kv(seqs_[cur_], kv0, base);
+    const int kv0 = con ? con_kv(cur_, k_) : lk > 0 ? lk : seqs_[cur_].k_avail, kd = next_k();
+    int kv = clamp_kv(seqs_[cur_], kv0, base);
+    const bool look = lk > 0 && kv > 0;
+    if (lk > 0 && !look) kv = 0;
+    buf_lk_[buf] = look;
     buf_kv_[buf] = kv;
     buf_clamped_[buf] = kv < kv0;
     buf_kd_[buf] = kd;
@@ -2260,7 +2321,7 @@ void Engine::launch_step(int buf, int base) {
     seqs_[cur_].launches++;
     const bool wd = seqs_[cur_].want_drafts && kd > 0;
     seqs_[cur_].k_avail = kd;
-    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd);
+    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look);
     const unsigned* mh = con ? mask_buffer(cur_) : nullptr;
     int* io = con ? spec_io(cur_) : nullptr;
     if (io) io[0] = kd;
@@ -2268,7 +2329,7 @@ void Engine::launch_step(int buf, int base) {
     // stay in the ~38-split region
     const bool rs = seqs_[cur_].pos + 2 * (kMaxSpecK + 1) + 8 <= dec38_max();
     for (auto& wp : workers_) wp->attn_rs_ = rs;
-    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd);
+    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look);
     pool_->run([&](int r) {
         Worker& w = *workers_[r];
         if (io) {
@@ -2276,9 +2337,9 @@ void Engine::launch_step(int buf, int base) {
             w.upload_drafts(cur_, io + 17, kv);
         }
         if (r == 0) CUDA_CHECK(cudaEventRecord(tstart_[buf], w.stream));
-        w.run_spec(kv, kd);
+        w.run_spec(kv, kd, true, look);
         if (r == 0) {
-            CUDA_CHECK(cudaMemcpyAsync(emit_host_ + buf * 64, w.spec_.emit, (kv + 2) * 4,
+            CUDA_CHECK(cudaMemcpyAsync(emit_host_ + buf * 64, w.spec_.emit, (w.lk_on() ? 32 : kv + 2) * 4,
                                        cudaMemcpyDeviceToHost, w.stream));
             if (wd)  // the next step's drafts (stop sequences: Seq::drafts)
                 CUDA_CHECK(cudaMemcpyAsync(emit_host_ + buf * 64 + 32, w.spec_.tokens + 1, kd * 4,
@@ -2295,6 +2356,7 @@ void Engine::finish_single() {
     pool_->run([&](int r) { workers_[r]->undo_spec(); });
     inflight_ = false;
     seqs_[cur_].stale = true;
+    lk_slot_ = -1;  // the undone step appended its tokens to the device history
 }
 
 void Engine::finish_batch() {  // undo the batched step queued ahead
@@ -2305,7 +2367,10 @@ void Engine::finish_batch() {  // undo the batched step queued ahead
     pool_->run([&](int r) {
         for (int sl : live) workers_[r]->undo_slot(sl);
     });
-    for (int sl : live) seqs_[sl].stale = true;
+    for (int sl : live) {
+        seqs_[sl].stale = true;
+        if (lkb_on_) lkb_dirty_[sl] = 1;  // the undone step appended its tokens to the slot's history
+    }
     binflight_ = false;
     bdrop_.clear();
 }
@@ -2330,6 +2395,7 @@ void Engine::resync(Seq& q, int slot) {
     pool_->run([&](int r) { workers_[r]->spec_resync(slot, q.pos, q.pending); });
     q.k_avail = 0;
     q.stale = false;
+    if (slot == cur_) lk_slot_ = -1;
 }
 
 void Engine::release(int slot) {
@@ -2339,6 +2405,7 @@ void Engine::release(int slot) {
         seqs_[slot].stale = true;
         bdrop_.push_back(slot);
     }
+    lkb_inval(slot);
     seqs_.at(slot).active = false;
     seqs_[slot].full = false;
     seqs_[slot].end = 0;
@@ -2366,6 +2433,8 @@ bool Engine::trim(int slot, int pos) {
     q.seq.resize(pos);
     q.pos = pos;
     q.stale = true;
+    if (slot == cur_) lk_slot_ = -1;
+    lkb_inval(slot);
     q.k_avail = 0;
     q.rb_epoch = -1;
     return true;
@@ -2382,6 +2451,7 @@ void Engine::resume(int slot) {
 static constexpr int kMaxBatch = kMaxSegs;  // sequences per batched step
 
 void Engine::launch_batch(int buf, bool ahead) {
+    lk_slot_ = -1;  // batched steps do not keep the lookup history
     const int n = bslots_.size();
     int kvs[kMaxBatch];
     // grammar-constrained sequences: (index, masks, spec_io) - the caller's drafts and masks
@@ -2392,15 +2462,141 @@ void Engine::launch_batch(int buf, bool ahead) {
         // a step queued ahead runs after the one in flight: the slot's position then is at most
         // q.pos + that step's drafts + 1 (step_batch keeps a slot out unless a token fits)
         int base = q.pos;
-        if (ahead && q.end > 0) {
+        if (ahead) {
             const auto& f = bstep_[buf ^ 1];
             const auto it = std::find(f.begin(), f.end(), bslots_[i]);
             if (it != f.end()) base += bkvs_[buf ^ 1][it - f.begin()] + 1;
         }
-        kvs[i] = bkvs_[buf][i] = clamp_kv(q, kv0, base);
+        // (the room left after a lookup step in flight: its rows may exceed the drafts step_batch made room for)
+        kvs[i] = bkvs_[buf][i] = std::min(clamp_kv(q, kv0, base), std::max(0, q.max_t - base - 1));
         bclamp_[buf][i] = kvs[i] < kv0;
         if (q.constrained) con.emplace_back(i, mask_buffer(bslots_[i]), spec_io(bslots_[i]));
     }
+    // lookup drafts (QE_LKB): slots in lookup mode verify the drafts their history found at the end of their last
+    // step (on the cards: no host round trip, the step queued ahead keeps its lookahead) within a row budget
+    int lkr[kMaxBatch] = {}, kav[kMaxBatch] = {};
+    bool any_lkr = false;
+    if (lkb_on_) {
+        // histories of the slots not in the step in flight: the host's tokens are exact, upload what the cards lack
+        // the tail goes through a pinned per-slot buffer: a pageable copy may block the host thread behind the
+        // step in flight (no blocking host calls in a unit whose cards run collectives)
+        std::vector<std::pair<int, int>> sync;  // (slot, tail tokens), from = lkb_len_ before
+        std::vector<int> from;
+        for (int i = 0; i < n; i++) {
+            const int s = bslots_[i];
+            const auto& f = bstep_[buf ^ 1];
+            if (ahead && std::find(f.begin(), f.end(), s) != f.end()) continue;  // in flight: its history follows
+            Seq& q = seqs_[s];
+            const int hn = (int)q.seq.size() + 1;
+            int fr = lkb_len_[s];
+            if (fr < 0 || fr > hn) fr = 0;
+            if (fr == hn && !lkb_dirty_[s] && lkb_len_[s] >= 0) {
+                static const bool chk = getenv("QE_LKB_CHECK") && atoi(getenv("QE_LKB_CHECK"));
+                if (chk) {  // debug: the cards' history of a slot that needs no upload equals the host's tokens
+                    Worker& w0 = *workers_[0];
+                    CUDA_CHECK(cudaSetDevice(w0.device));
+                    CUDA_CHECK(cudaStreamSynchronize(w0.stream));
+                    const LookupDev& d = w0.slot_lk(s);
+                    int dn = 0;
+                    CUDA_CHECK(cudaMemcpy(&dn, d.hn, 4, cudaMemcpyDeviceToHost));
+                    std::vector<int> h(std::max(dn, 1));
+                    if (dn > 0) CUDA_CHECK(cudaMemcpy(h.data(), d.hd, (size_t)dn * 4, cudaMemcpyDeviceToHost));
+                    bool ok = dn == hn && h[hn - 1] == q.pending;
+                    for (int j = 0; ok && j + 1 < hn; j++) ok = h[j] == q.seq[j];
+                    CHECK(ok, "QE_LKB_CHECK: slot %d device history %d tokens != host %d", s, dn, hn);
+                }
+                continue;
+            }
+            if ((int)lkb_pin_.size() <= s) lkb_pin_.resize(seqs_.size(), nullptr);
+            if (!lkb_pin_[s]) CUDA_CHECK(cudaHostAlloc((void**)&lkb_pin_[s], (size_t)(kMaxPos + 64) * 4, cudaHostAllocPortable));
+            int nt = 0;
+            for (int j = fr; j < hn && j < kMaxPos + 64; j++) lkb_pin_[s][nt++] = j + 1 < hn ? q.seq[j] : q.pending;
+            sync.emplace_back(s, nt);
+            from.push_back(fr);
+            lkb_len_[s] = hn;
+            lkb_dirty_[s] = 0;
+        }
+        if (!sync.empty())
+            pool_->run([&](int r) {
+                for (size_t j = 0; j < sync.size(); j++)
+                    workers_[r]->lkb_sync(sync[j].first, lkb_pin_[sync[j].first], from[j], from[j] + sync[j].second);
+            });
+        // row budget: the step may grow to lkb_rows_ rows (never past kMaxBatchRows / kMaxSegs segments)
+        int rows = 0, nlk = 0, base_lk = 0;
+        for (int i = 0; i < n; i++) rows += kvs[i] + 1;
+        bool cand[kMaxBatch] = {};
+        for (int i = 0; i < n; i++) {
+            const Seq& q = seqs_[bslots_[i]];
+            if (!lkb_mode_[bslots_[i]] || q.constrained || q.want_drafts) continue;
+            cand[i] = true;
+            nlk++;
+            base_lk += kvs[i] + 1;
+        }
+        // grammar-constrained slots with more planned drafts than the step's cap (forced tokens, the server's lookup
+        // drafts: the model's own drafts never exceed the cap) take them from the same budget first
+        {
+            const int target = std::min(kMaxBatchRows, std::max(rows, lkb_rows_));
+            int spare = target - rows;
+            for (int i = 0; i < n && spare > 0; i++) {
+                Seq& q = seqs_[bslots_[i]];
+                if (!q.constrained) continue;
+                int base = q.pos;
+                {
+                    const auto& f = bstep_[buf ^ 1];
+                    const auto it = std::find(f.begin(), f.end(), bslots_[i]);
+                    if (ahead && it != f.end()) base += bkvs_[buf ^ 1][it - f.begin()] + 1;
+                }
+                const int want = std::min(clamp_kv(q, con_kv(bslots_[i], kMaxSpecK), base),
+                                          std::max(0, q.max_t - base - 1));
+                if (want <= kvs[i]) continue;
+                const int add = std::min(want - kvs[i], spare);
+                kvs[i] = bkvs_[buf][i] = kvs[i] + add;
+                spare -= add;
+                rows += add;
+            }
+        }
+        if (nlk > 0) {
+            // greedy by the slots' recent lookup acceptance: each lookup slot replaces its kv drafts by Li, the extra
+            // rows come from the budget (target - rows); slots that do not fit keep their MTP drafts
+            const int target = std::min(kMaxBatchRows, std::max(rows, lkb_rows_));
+            int spare = target - rows;
+            static const float lkb_mul = getenv("QE_LKB_MUL") ? atof(getenv("QE_LKB_MUL")) : 1.5f;
+            static const bool lkq = !getenv("QE_LKB_Q") || atoi(getenv("QE_LKB_Q"));
+            std::vector<int> order;
+            for (int i = 0; i < n; i++)
+                if (cand[i]) order.push_back(i);
+            std::stable_sort(order.begin(), order.end(), [&](int x, int y) {
+                return lkb_ema_[bslots_[x]] > lkb_ema_[bslots_[y]];
+            });
+            int segs = n;
+            for (int i : order) {
+                Seq& q = seqs_[bslots_[i]];
+                int base = q.pos;
+                {
+                    const auto& f = bstep_[buf ^ 1];
+                    const auto it = std::find(f.begin(), f.end(), bslots_[i]);
+                    if (ahead && it != f.end()) base += bkvs_[buf ^ 1][it - f.begin()] + 1;
+                }
+                int Li = clamp_kv(q, std::min(kMaxLookupK, q.max_t - base - (kMaxSpecK + 1) - 2), base);
+                // rows as the slot's recent lookup steps accepted (EMA x 1.5 + 2: room for a longer run)
+                if (lkb_mul > 0) Li = std::min(Li, (int)(lkb_ema_[bslots_[i]] * lkb_mul + 2.f));
+                Li = std::min(Li, kvs[i] + spare);
+                if (Li + 1 > kMaxGemvTokens && segs + 1 > kMaxSegs) Li = kMaxGemvTokens - 1;
+                // few distinct shapes (every new combination of rows is a graph capture + instantiation, ~20 ms):
+                // 4, 7 (8 rows: one attention segment) or 12 drafts (QE_LKB_Q=0: any count)
+                if (lkq) Li = Li >= 12 ? 12 : Li >= 7 ? 7 : Li >= 4 ? 4 : 0;
+                if (Li < lkb_min_ || Li <= kvs[i]) continue;
+                if (Li + 1 > kMaxGemvTokens) segs++;
+                spare -= Li - kvs[i];
+                lkr[i] = Li;
+                kav[i] = q.k_avail;
+                kvs[i] = bkvs_[buf][i] = Li;
+                bclamp_[buf][i] = false;
+                any_lkr = true;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) blkr_[buf][i] = lkr[i];
     bstep_[buf] = bslots_;
     epoch_++;
     for (int s : bslots_) seqs_[s].launches++;
@@ -2408,18 +2604,18 @@ void Engine::launch_batch(int buf, bool ahead) {
     bkd_[buf] = kd;
     for (int i = 0; i < n; i++) seqs_[bslots_[i]].k_avail = kd;
     for (auto& c : con) std::get<2>(c)[0] = kd;
-    const std::vector<int> kv(kvs, kvs + n);
+    const std::vector<int> kv(kvs, kvs + n), lkv(lkr, lkr + n), kavv(kav, kav + n);
     pool_->run([&](int r) {
         Worker& w = *workers_[r];
         for (auto& [i, mh, io] : con) {
             w.upload_mask(bslots_[i], mh, kvs[i] + 1);
             w.upload_drafts(bslots_[i], io + 17, kvs[i]);
         }
-        w.run_spec_batch(bslots_, kv, kd);
+        w.run_spec_batch(bslots_, kv, kd, any_lkr ? &lkv : nullptr, any_lkr ? &kavv : nullptr);
         if (r == 0) {
             for (int i = 0; i < n; i++)
                 CUDA_CHECK(cudaMemcpyAsync(batch_host_ + (buf * kMaxBatch + i) * 64,
-                                           w.slot_spec(bslots_[i]).emit, (kvs[i] + 2) * 4,
+                                           w.slot_spec(bslots_[i]).emit, (lkb_on_ ? 32 : kvs[i] + 2) * 4,
                                            cudaMemcpyDeviceToHost, w.stream));
             for (int i = 0; i < n; i++)
                 if (kd > 0 && seqs_[bslots_[i]].want_drafts && !seqs_[bslots_[i]].constrained)
@@ -2569,7 +2765,22 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         const int c = em[0];
         cnt[i] = c;
         for (int j = 0; j < c; j++) out[i * 64 + j] = em[1 + j];
-        if (!q.constrained && !bclamp_[bbuf_][from[i]]) observe(bkvs_[bbuf_][from[i]], c - 1);
+        const bool lkstep = blkr_[bbuf_][from[i]] > 0;
+        if (!q.constrained && !bclamp_[bbuf_][from[i]] && !lkstep) observe(bkvs_[bbuf_][from[i]], c - 1);
+        if (lkb_on_) {
+            const int s = sl[i];
+            if (lkb_len_[s] >= 0) lkb_len_[s] += c;
+            static const float ema_min = getenv("QE_LKB_EMA_MIN") ? atof(getenv("QE_LKB_EMA_MIN")) : 2.f;
+            if (lkstep) {
+                lkb_ema_[s] = 0.7f * lkb_ema_[s] + 0.3f * (c - 1);
+                if (lkb_ema_[s] < ema_min) lkb_mode_[s] = 0, lkb_cool_[s] = 16, lkb_ema_[s] = 3.5f;  // no better than MTP
+            }
+            if (lkb_cool_[s] > 0) lkb_cool_[s]--;
+            else if (em[31] > 0) lkb_mode_[s] = 1, lkb_miss_[s] = 0;
+            else if (++lkb_miss_[s] >= lkb_hold_) lkb_mode_[s] = 0;
+            lkb_slotsteps_++;
+            if (lkstep) lkb_steps_++, lkb_rows_sum_ += blkr_[bbuf_][from[i]], lkb_tok_ += c;
+        }
         if (q.want_drafts) q.drafts.assign(em + 32, em + 32 + bkd_[bbuf_]);
         q.rb_pos = q.pos;
         q.rb_rows = c;
@@ -2584,6 +2795,11 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
     }
     bbuf_ ^= 1;
     binflight_ = ahead;
+    static const int lks = getenv("QE_LKB_STATS") ? atoi(getenv("QE_LKB_STATS")) : 0;
+    if (lkb_on_ && lks > 0 && ++lkb_bsteps_ % lks == 0)
+        fprintf(stderr, "[lkb] %lld batched steps, %lld slot-steps, lookup %lld (%.1f%%), %.2f rows %.2f tok per lookup step\n",
+                lkb_bsteps_, lkb_slotsteps_, lkb_steps_, 100.0 * lkb_steps_ / std::max(1LL, lkb_slotsteps_),
+                (double)lkb_rows_sum_ / std::max(1LL, lkb_steps_), (double)lkb_tok_ / std::max(1LL, lkb_steps_));
 }
 
 int Engine::spec_step(int* out) {
@@ -2603,24 +2819,49 @@ int Engine::spec_step(int* out) {
         return 1;
     }
     CHECK(q.pos + k_ + 1 <= q.max_t, "context full");
+    // lookup drafts (QE_LOOKUP): the device history must be this sequence's; a lookup step is launched once the
+    // previous step's result is known (no step queued ahead while the text is being copied)
+    const bool lk_ok = lk_on_ && !q.constrained && !q.want_drafts;
+    if (lk_ok && !inflight_ && lk_slot_ != cur_) {
+        std::vector<int> h(q.seq);
+        h.push_back(q.pending);
+        pool_->run([&](int r) { workers_[r]->lk_set_history(h.data(), (int)h.size()); });
+        CUDA_CHECK(cudaSetDevice(workers_[0]->device));
+        CUDA_CHECK(cudaMemcpy(&lk_next_, workers_[0]->lk_dev_ptr(), 4, cudaMemcpyDeviceToHost));
+        lk_slot_ = cur_;
+    }
+    const bool lk_live = lk_ok && lk_slot_ == cur_;
     if (!inflight_) {
-        launch_step(buf_, q.pos);
+        int L = lk_live ? lk_next_ : 0;
+        if (L > 0) {  // room for the lookup rows and a following MTP step
+            const int need = q.pos + L + 2 * (k_ + 1) + 1;
+            if (need > q.max_t) ensure_cap(cur_, std::min(need, max_ctx_));
+            L = std::min(L, std::max(0, q.max_t - q.pos - 2 * (k_ + 1) - 1));
+        }
+        launch_step(buf_, q.pos, L);
         inflight_ = true;
     }
     // queue the next step before waiting for this one (if two steps still fit the slot, and the
     // reply's limit leaves room for a token even if every draft of this one is accepted)
     const int worst = q.pos + buf_kv_[buf_] + 1;  // the slot's position after this step, at most
     ahead_ = lookahead_ && !q.constrained && !q.no_ahead && q.pos + 2 * (k_ + 1) <= q.max_t &&
-             (q.end == 0 || worst < q.end);
-    if (ahead_) launch_step(buf_ ^ 1, worst);
+             (q.end == 0 || worst < q.end) && !(lk_live && (lk_next_ > 0 || buf_lk_[buf_]));
+    if (ahead_) launch_step(buf_ ^ 1, worst, 0);
     CUDA_CHECK(cudaSetDevice(workers_[0]->device));
     CUDA_CHECK(cudaEventSynchronize(emit_ev_[buf_]));
     const int* em = emit_host_ + buf_ * 64;
     const int cnt = em[0];
     for (int i = 0; i < cnt; i++) out[i] = em[1 + i];
-    if (!q.constrained) {  // kd = 0 steps would skew the draft statistics / step-time model
+    if (!q.constrained && !buf_lk_[buf_]) {  // kd = 0 / lookup steps would skew the draft statistics / step-time model
         if (!buf_clamped_[buf_]) observe(buf_kv_[buf_], cnt - 1);  // capped drafts: biased
         observe_time(buf_);
+    }
+    if (lk_live) {
+        lk_next_ = em[31];  // the lookup drafts this step found for the next one
+        lk_steps_ += buf_lk_[buf_];
+        lk_rows_ += buf_lk_[buf_] ? buf_kv_[buf_] : 0;
+        lk_tok_ += buf_lk_[buf_] ? cnt : 0;
+        steps_all_++;
     }
     if (q.want_drafts) q.drafts.assign(em + 32, em + 32 + buf_kd_[buf_]);
     q.rb_pos = q.pos;

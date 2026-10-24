@@ -448,7 +448,10 @@ void dn_replay_seg(const DnReplaySegs& r, int nlayers, int ch, const DeltaShape&
 // reads the state first runs dn_flush. Per step: one state read + one write instead of 2 + 1.
 // pn points at 2 ints: pending rows, and the pending rows to restore when the step is undone.
 // Single-row sequences (fin) write the state directly (nothing pending afterwards).
-constexpr int kPendRows = kMaxSpecK + 1;
+// verification rows of a single-sequence step: 1 + up to 15 lookup drafts (MTP steps: k + 1 <= 8); the callers'
+// output buffers hold 16 tokens
+constexpr int kMaxLookupK = 12;  // rows <= 13: the conv history ring (kConvRing 16 >= conv_k - 1 + m)
+constexpr int kPendRows = kMaxLookupK + 1;
 __host__ __device__ inline int dn_pend_row_floats(const DeltaShape& s) {
     return s.nk * 128 + s.nv * 128 + 2 * s.nv;
 }
