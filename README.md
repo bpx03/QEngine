@@ -202,7 +202,7 @@ docker pull ghcr.io/bpx03/qengine:latest          # ~0.27 GB, no image input
 docker pull ghcr.io/bpx03/qengine:vision          # ~3 GB, with the vision encoder (torch)
 ```
 
-Tags: `latest` / `1.1` / `sha-<commit>` and `vision` / `1.1-vision` / `sha-<commit>-vision`. Use
+Tags: `latest` / `1.2` / `sha-<commit>` and `vision` / `1.2-vision` / `sha-<commit>-vision`. Use
 `ghcr.io/bpx03/qengine:latest` in place of `qengine` in the commands below, or build the image yourself.
 
 ### Build
