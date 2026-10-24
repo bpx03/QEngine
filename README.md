@@ -4,6 +4,10 @@ QEngine is a source-available inference engine for one model on one kind of mach
 **Qwen3.8-27B INT4** (the RedHatAI W4A16 checkpoint plus its MTP head) on **three NVIDIA RTX 3090s**
 with tensor parallelism 3 over PCIe.
 
+**The fastest engine we know of for this model on RTX 3090s**: 1.2–2.8× vLLM 0.28's output throughput
+in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
+in our quick tests.
+
 - C++/CUDA engine (`src/`, about 26k lines), built as a shared library (`libqengine.so`).
 - Python server (`server/`) that loads the library through ctypes and exposes an OpenAI-compatible
   API (`/v1/chat/completions`, `/v1/models`) and an Anthropic-compatible API (`/v1/messages`,
@@ -17,10 +21,8 @@ with tensor parallelism 3 over PCIe.
   GPUs `0,1,2` by default. The weight and KV-head split, kernels and tuning (82 SMs, tile shapes, split
   counts, wave sizing, memory budgets) target this setup; it is the configuration behind the main
   benchmark.
-- **2× RTX 3090 also measured**: the full benchmark suite on two cards is in
-  [`bench/results/compare_2026-10_2gpu/`](bench/results/compare_2026-10_2gpu/README.md), e.g. 1.2–2.0×
-  vLLM's output throughput on the same two GPUs up to 16 concurrent requests (short, agent and ShareGPT), at 72–85% of the 3-GPU
-  throughput.
+- **2× RTX 3090 also measured**: 1.2–2.0× vLLM's output throughput on the same two GPUs up to 16
+  concurrent requests (short, agent and ShareGPT), at 72–85% of the 3-GPU throughput.
 - **1× RTX 3090 is experimental**: it starts only with `QE_MAX_SEQS` ≤ 4 (about 85K–112K tokens of context,
   around 100 tok/s for a single user).
 - **Device selection**: `QE_DEVICES=0,2 server/run.sh 8080` (physical GPU ids), `--devices` (indices within
@@ -105,7 +107,7 @@ Two additional files are published as **release assets** of this repository (not
 | file | size | what |
 |---|---:|---|
 | `token_rank.bin` | 992,308 B | token-frequency ranking for the MTP draft vocabulary (`tools/draft_vocab.py`) |
-| `model_mtp_ft.safetensors` | 849,400,392 B | MTP head fine-tuned on the engine's own answers (`tools/mtp_data.py`, `tools/mtp_train.py`) |
+| `model_mtp_ft.safetensors` | 849,400,392 B | MTP head fine-tuned on the engine's own answers |
 
 Check them with `sha256sum -c SHA256SUMS` (also a release asset). Without them the engine still runs:
 without `token_rank.bin` the drafts use the full vocabulary, and without `model_mtp_ft.safetensors` it
@@ -265,13 +267,18 @@ Prefill of a single new prompt (median time to first token): 32K tokens 5.35 s v
 50.7 s vs 130.5 s. vLLM is ahead on a few latency points (e.g. RAG 15K-token prompts at c=8: lower
 median TTFT, at the cost of 115–165 ms per output token vs 9.6 ms).
 
-![QEngine vs vLLM summary](bench/results/compare_2026-10/charts/hero.png)
+![QEngine vs vLLM summary](docs/hero.png)
 
-Full results, methodology, raw `vllm bench serve` JSON and logs:
-[`bench/results/compare_2026-10/`](bench/results/compare_2026-10/README.md); the same suite with QEngine on
-2 GPUs: [`bench/results/compare_2026-10_2gpu/`](bench/results/compare_2026-10_2gpu/README.md); charts:
-[`bench/results/compare_2026-10/charts/`](bench/results/compare_2026-10/charts/) (`index.html`). The
-benchmark is scripted in `bench/serving_suite.py`, `bench/vllm_cfg_best.sh` and `bench/compare/`.
+Numbers from October 2026 (QEngine v1.0). The benchmark is scripted in `bench/serving_suite.py`,
+`bench/vllm_cfg_best.sh` and `bench/compare/`. To measure your own setup, run the quick suite (short at c=1
+plus two live-traffic scenarios, about 8 minutes):
+
+```bash
+python3 bench/serving_suite.py --engine-name qengine --base-url http://127.0.0.1:8080 \
+    --model qwen3.8-27b-qengine --quick
+```
+
+
 The ShareGPT scenario needs `ShareGPT_V3_unfiltered_cleaned_split.json` from
 https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered in `bench/data/`.
 
@@ -283,9 +290,8 @@ src/kernels/      GEMV / GEMM (INT4, INT8), attention (prefill + FP8 decode), De
 server/           app.py (OpenAI + Anthropic API, tool calls, grammars), engine.py (ctypes), vision.py,
                   metrics.py + dashboard.html + qetop.py (monitoring), templates/ (chat template), run.sh
 tests/            regression tests: caches, slots, pool, batching, MTP, sampling, grammars, kernels
-tools/            reference.py / reference_vision.py (HF golden dumps), draft_vocab.py, mtp_data.py,
-                  mtp_train.py, mtp_eval.py (draft vocabulary and MTP head fine-tuning)
-bench/            serving_suite.py, vllm_cfg_best.sh, compare/ (harness), results/compare_2026-10{,_2gpu}/
+tools/            reference.py / reference_vision.py (HF golden dumps), draft_vocab.py (MTP draft vocabulary)
+bench/            serving_suite.py (vllm bench serve suite), vllm_cfg_best.sh, compare/ (harness)
 ```
 
 ## Tests

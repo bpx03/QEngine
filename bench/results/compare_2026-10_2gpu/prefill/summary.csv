@@ -1,6 +1,0 @@
-engine,target_len,prompt_tokens,reps,ttft_ms_rep1,ttft_ms_rep2,ttft_ms_rep3,ttft_ms_median,ttft_ms_min,ttft_ms_max,prompt_tok_s_median,status,raw_files
-qengine-2gpu,1024,1037,1,242.6,,,242.6,242.6,242.6,4274.0,ok,prefill/qengine-2gpu/len1024_rep1.json
-qengine-2gpu,8192,8205,1,1777.2,,,1777.2,1777.2,1777.2,4617.0,ok,prefill/qengine-2gpu/len8192_rep1.json
-qengine-2gpu,32768,32781,1,7668.5,,,7668.5,7668.5,7668.5,4275.0,ok,prefill/qengine-2gpu/len32768_rep1.json
-qengine-2gpu,100000,100012,1,28834.7,,,28834.7,28834.7,28834.7,3468.0,ok,prefill/qengine-2gpu/len100000_rep1.json
-qengine-2gpu,200000,200012,1,74128.2,,,74128.2,74128.2,74128.2,2698.0,ok,prefill/qengine-2gpu/len200000_rep1.json
