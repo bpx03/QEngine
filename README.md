@@ -204,7 +204,7 @@ What the engine does for this model (48 layers: 36 Gated DeltaNet + 12 sparse-at
 with top-10 + a shared expert, 4-stream hyper-connections, a per-layer n-gram embedding table):
 
 - experts split across the three cards in 128-wide groups (weighted 176/160/176, so the middle card can drive a
-  desktop), INT4 expert GEMV/GEMM, the dense parts INT8;
+  desktop), INT4 expert GEMV/GEMM; dense parts INT4 (RTN, group 128) or INT8 (QSA attention, lm_head, converted at load);
 - an expert cache: the least-used expert groups live in pinned host memory and are copied into a part of the KV
   pool while they are hot;
 - attention KV in FP8, split by position over the three cards, with the indexer's top-512 block selection beyond 2K
@@ -255,7 +255,7 @@ Everything needed is in this repository plus Intel's checkpoint (169 GB download
 ```bash
 # 1. Intel's INT4 AutoRound checkpoint
 hf download Intel/Qwen3.8-Flash-Next-W4A16-AutoRound --local-dir models/Qwen3.8-Flash-Next-W4A16-AutoRound
-# 2. convert -> models/Qwen3.8-Flash-Next-QE-INT4 (experts repacked, dense parts RTN INT4 / BF16, INT4 MTP head)
+# 2. convert -> models/Qwen3.8-Flash-Next-QE-INT4 (experts repacked, dense parts RTN INT4 / BF16 (the engine makes QSA attention and lm_head INT8 at load), INT4 MTP head)
 python3 tools/convert_flash_next.py --mtp-int4
 # 3. INT8 n-gram table -> models/Qwen3.8-Flash-Next-QE-INT4/ngram_int8.safetensors (51.8 GB)
 python3 tools/convert_ngram_int8.py
