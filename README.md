@@ -10,9 +10,8 @@ in our quick tests.
 
 > **New: Qwen3.8-Flash-Next preview.** QEngine 1.3 preview 1 adds an engine for Qwen3.8-Flash-Next (INT4) on
 > the same 3× RTX 3090: see [Qwen3.8-Flash-Next (experimental preview)](#qwen38-flash-next-experimental-preview),
-> the [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3-preview.1), the ready-to-run model on
-> [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine) and the Docker image
-> `ghcr.io/bpx03/qengine:flash-preview`.
+> the [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3-preview.1) and the ready-to-run model on
+> [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine); the `latest` Docker image runs both models.
 
 - C++/CUDA engine (`src/`, about 26k lines), built as a shared library (`libqengine.so`).
 - Python server (`server/`) that loads the library through ctypes and exposes an OpenAI-compatible
@@ -379,18 +378,20 @@ host driver, not on the image): check for the `P2P:` line in the startup log.
 ### Prebuilt image
 
 ```bash
-docker pull ghcr.io/bpx03/qengine:latest          # ~0.27 GB, no image input
+docker pull ghcr.io/bpx03/qengine:latest          # ~0.3 GB, no image input
 docker pull ghcr.io/bpx03/qengine:vision          # ~3 GB, with the vision encoder (torch)
 ```
 
-Tags: `latest` / `1.2` / `sha-<commit>` and `vision` / `1.2-vision` / `sha-<commit>-vision`. Use
-`ghcr.io/bpx03/qengine:latest` in place of `qengine` in the commands below, or build the image yourself.
+Tags: `latest` / `sha-<commit>` and `vision` / `sha-<commit>-vision`, built from `main` (1.3 preview 1; both
+engine libraries, so the same image serves Qwen3.8-27B and Qwen3.8-Flash-Next). The previous release stays
+available as `1.2` / `1.2-vision`. Use `ghcr.io/bpx03/qengine:latest` in place of `qengine` in the commands below,
+or build the image yourself.
 
 ### Build
 
 ```bash
 docker build -t qengine .                       # with vision (--vision 1): includes PyTorch, ~3 GB compressed
-docker build -t qengine --build-arg VISION=0 .  # text only, no PyTorch: ~0.27 GB compressed
+docker build -t qengine --build-arg VISION=0 .  # text only, no PyTorch: ~0.3 GB
 ```
 
 ### Run
@@ -431,17 +432,16 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Performance in the container matches bare metal (single-user decode, same GPUs).
 
-**Flash-Next (experimental preview)** has its own image, `ghcr.io/bpx03/qengine:flash-preview` (also tagged `1.3-preview.1` and
-`sha-<commit>-flash-preview`; text only, built from the
-`flash-next-preview` branch with `--build-arg VISION=0`; it contains both engine libraries). Point `QE_MODEL` at the converted directory and pass
-the `FLASH_*` variables with `-e`:
+**Flash-Next (experimental preview)** runs in the same `latest` image (also as `flash-preview` / `1.3-preview.1`,
+the image of the 1.3 preview 1 release). Point `QE_MODEL` at the Flash-Next model directory and pass the `FLASH_*`
+variables with `-e`:
 
 ```bash
 docker run -d --name qengine-flash --gpus all --ipc=host --ulimit memlock=-1 \
   -p 8080:8080 -p 127.0.0.1:9393:9393 \
   -v /path/to/models:/app/models:ro -v qengine-cache:/root/.cache/qengine \
-  -e QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4 -e FLASH_MAX_SEQS=16 \
-  ghcr.io/bpx03/qengine:flash-preview
+  -e QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4 \
+  ghcr.io/bpx03/qengine:latest
 ```
 
 Add `-e FLASH_NGRAM_PIN=0` for disk mode on a low-RAM host (see [Hardware and host memory](#hardware-and-host-memory)).
