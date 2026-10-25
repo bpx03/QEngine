@@ -440,6 +440,12 @@ docker run -d --name qengine-flash --gpus all --ipc=host --ulimit memlock=-1 \
 
 Add `-e FLASH_NGRAM_PIN=0` for disk mode on a low-RAM host (see [Hardware and host memory](#hardware-and-host-memory)).
 
+If you built the model yourself and kept the BF16 n-gram table (skipped step 5), `model-00016-of-00017.safetensors`
+in the converted directory is a link into the original download. Mount that download at the same absolute path
+inside the container as well (e.g. `-v /path/to/models/Qwen3.8-Flash-Next-W4A16-AutoRound:/path/to/models/Qwen3.8-Flash-Next-W4A16-AutoRound:ro`),
+otherwise the link is dangling in the container and the engine cannot open it. The Hugging Face download and the
+INT8 table need no extra mount.
+
 ## Benchmark summary
 
 Serving benchmark (October 2026) against vLLM 0.28.0 (club-3090 "dual-fast" recipe, best of MTP / no-spec per point)
