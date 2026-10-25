@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(ROOT, "server"))
 from engine import Engine
 from tokenizers import Tokenizer
 
-MODEL = os.path.join(ROOT, "models", "Qwen3.8-27B-INT4")
+MODEL = os.environ.get("QE_TEST_MODEL") or os.path.join(ROOT, "models", "Qwen3.8-27B-INT4")  # QE_TEST_MODEL: another model (e.g. Flash-Next with QE_LIB)
 CHUNK = int(sys.argv[1]) if len(sys.argv) > 1 else 512
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 300
 tok = Tokenizer.from_file(os.path.join(MODEL, "tokenizer.json"))

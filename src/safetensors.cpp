@@ -18,6 +18,7 @@ void SafeTensors::open(const std::string& path) {
     ::close(fd);
     if (base == MAP_FAILED) throw std::runtime_error("mmap failed " + path);
     maps_.push_back({base, size});
+    paths_.push_back(path);
 
     uint64_t hlen;
     memcpy(&hlen, base, 8);
@@ -34,6 +35,17 @@ void SafeTensors::open(const std::string& path) {
         t.nbytes = e - b;
         tensors_[name] = t;
     }
+}
+
+std::string SafeTensors::file_of(const void* p, size_t* off) const {
+    for (size_t i = 0; i < maps_.size(); i++) {
+        const char* b = (const char*)maps_[i].first;
+        if ((const char*)p >= b && (const char*)p < b + maps_[i].second) {
+            *off = (const char*)p - b;
+            return paths_[i];
+        }
+    }
+    return std::string();
 }
 
 SafeTensors::~SafeTensors() {

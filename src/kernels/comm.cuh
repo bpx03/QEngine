@@ -100,6 +100,11 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
                    __half* xh = nullptr, bool defer = false, int rs_off = 0, bool part_bf16 = false,
                    const OwnFin* of = nullptr);
 bool allreduce_ownfin_ok(const Comm& c, int h);
+bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, int h, const Comm& c, int rank,
+                      const CommCounters& ctr, cudaStream_t st, int blocks, bool own_rows = false);
+// own_rows (sequence-parallel HC): R += inj * sum only on the rows this rank owns (rows [m * rank / ngpu,
+// m * (rank + 1) / ngpu)), nothing published; allreduce_hc_ok tells whether this path applies to m rows
+bool allreduce_hc_ok(const Comm& c, int m, int h);
 
 // Copy-engine deferred prefill all-reduce: the rows move by DMA (cudaMemcpyAsync on the peers'
 // copy streams, issued by a copy thread - comm.cu has no host code for it), only local work runs

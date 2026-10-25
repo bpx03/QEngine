@@ -277,12 +277,15 @@ __global__ void allreduce_rows_kernel(float* __restrict__ resid, const float* __
 // PB: the partial rows are already bf16 (the GEMM epilogue rounded them, RN as pack_bf16x4):
 // half the local reads, the same packed words, so bit-identical sums
 // OFG >= 0: owner-finished (OwnFin, G = OFG; wxn also writes the bf16 rows); finish must be false
-template <bool PB = false, int OFG = -1>
+template <bool PB = false, int OFG = -1, bool HCW = false>
 __global__ void allreduce_rs_rows_kernel(float* __restrict__ resid, const float* __restrict__ partial,
                                          int m, int h, Comm c, int rank, CommCounters ctr,
                                          const bf16* __restrict__ norm_w, float eps,
                                          bf16* __restrict__ xn, int rs_off, bool finish, bool wxn = false,
-                                         bool v2 = false, int dbg = 0) {
+                                         bool v2 = false, int dbg = 0, const float* __restrict__ hc_inj = nullptr,
+                                         bool hc_own = false) {
+    // HCW (Flash-Next hyper-connections): resid is the 4-stream residual R [m][4][h] and the tail adds
+    // hc_inj[r][i] * sum to every stream i (= allreduce into y + k_hc_write, same arithmetic)
     // dbg (QE_DBG_AR, timing ablations only, results wrong): 1 = no phase-1 row transfers, 2 = no
     // phase-2 sums / publication, 4 = no cross-GPU exchange (flags), 8 = partial reads replaced by 0
     __shared__ unsigned s_seq;
@@ -431,6 +434,37 @@ __global__ void allreduce_rs_rows_kernel(float* __restrict__ resid, const float*
         bump_seq(ctr, s2);
         return;
     }
+    if constexpr (HCW) {
+        if (hc_own && pp) {
+            // sequence-parallel HC (Flash prefill): the owner adds hc_inj * bf16(sum) to its own rows only (the same
+            // rounded sums and arithmetic as the HCW tail below); nothing is published. The second exchange stays as
+            // the barrier that keeps the next call's phase-1 writes off these receive rows until they are read.
+            for (int r = ob + blockIdx.x; r < oe; r += gridDim.x) {
+                const float j0 = hc_inj[r * 4], j1 = hc_inj[r * 4 + 1], j2 = hc_inj[r * 4 + 2], j3 = hc_inj[r * 4 + 3];
+                const float jj[4] = {j0, j1, j2, j3};
+                for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+                    const int idx = r * h4 + i;
+                    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                    for (int g = 0; g < c.ngpu; g++) {
+                        const uint2* src = c.prs1[rank] + ((size_t)g * c.rs_own + (r - ob)) * h4 + i;
+                        const float4 x = g == rank ? unpack_bf16x4(pk(idx)) : unpack_bf16x4(__ldcv(src));
+                        v.x += x.x; v.y += x.y; v.z += x.z; v.w += x.w;
+                    }
+                    const float4 vb = unpack_bf16x4(pack_bf16x4(v));
+                    float4* rr = r4 + (size_t)r * 4 * h4 + i;
+#pragma unroll
+                    for (int s4 = 0; s4 < 4; s4++) {
+                        float4 x = rr[s4 * h4];
+                        x.x += jj[s4] * vb.x; x.y += jj[s4] * vb.y; x.z += jj[s4] * vb.z; x.w += jj[s4] * vb.w;
+                        rr[s4 * h4] = x;
+                    }
+                }
+            }
+            if (!(dbg & 4)) exchange(c, rank, ctr, s2, pp, kWdArRowsExchange);
+            bump_seq(ctr, s2);
+            return;
+        }
+    }
     // reduce the owned rows, publish the bf16 sums
     uint2* mine2 = reinterpret_cast<uint2*>(slot_ptr(c, rank, slot2));
     if (pp && (dbg & 16) && !(dbg & 2)) {  // 16-byte stores: two float4 of sums per thread
@@ -473,6 +507,28 @@ __global__ void allreduce_rs_rows_kernel(float* __restrict__ resid, const float*
         }
     if (!(dbg & 4)) exchange(c, rank, ctr, s2, pp, kWdArRowsExchange);
     if (!finish) {
+        bump_seq(ctr, s2);
+        return;
+    }
+    if constexpr (HCW) {
+        for (int r = blockIdx.x; r < m; r += gridDim.x) {
+            int og = 0;
+            while (og + 1 < c.ngpu && r >= owner_begin(og + 1)) og++;
+            const uint2* src = pp ? c.prs2[rank] + (size_t)rs_off * h4 : reinterpret_cast<const uint2*>(slot_ptr(c, og, slot2));
+            const float j0 = hc_inj[r * 4], j1 = hc_inj[r * 4 + 1], j2 = hc_inj[r * 4 + 2], j3 = hc_inj[r * 4 + 3];
+            for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+                const int idx = r * h4 + i;
+                const float4 v = unpack_bf16x4((og == rank && !pp) ? src[idx] : __ldcv(src + idx));
+                float4* rr = r4 + (size_t)r * 4 * h4 + i;
+                const float jj[4] = {j0, j1, j2, j3};
+#pragma unroll
+                for (int s4 = 0; s4 < 4; s4++) {
+                    float4 x = rr[s4 * h4];
+                    x.x += jj[s4] * v.x; x.y += jj[s4] * v.y; x.z += jj[s4] * v.z; x.w += jj[s4] * v.w;
+                    rr[s4 * h4] = x;
+                }
+            }
+        }
         bump_seq(ctr, s2);
         return;
     }
@@ -1490,6 +1546,22 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
             allreduce_rows_kernel<<<nb, 512, 0, st>>>(resid, partial, m, h, c, rank, ctr, norm_w,
                                                       eps, xn);
     }
+}
+
+// Flash-Next: R[i] += inj_i * allreduce(partial) for the 4 hyper-connection streams (rows >= 3 * ngpu, P2P);
+// returns false when the shape needs the generic path (allreduce_add into y + the residual update kernel)
+bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, int h, const Comm& c, int rank,
+                      const CommCounters& ctr, cudaStream_t st, int blocks, bool own_rows) {
+    if (!allreduce_hc_ok(c, m, h)) return false;
+    const int nb = std::min(m, blocks);
+    static const int w16 = env_int("FLASH_AR_W16", 0) ? 16 : 0;  // 16-byte P2P stores in phase 1 (and the sums)
+    allreduce_rs_rows_kernel<false, -1, true><<<nb, 512, 0, st>>>(R, partial, m, h, c, rank, ctr, nullptr, 0.f, nullptr, 0,
+                                                                  true, false, false, w16, inj, own_rows);
+    return true;
+}
+bool allreduce_hc_ok(const Comm& c, int m, int h) {
+    return c.p2p && c.ngpu > 1 && m >= 3 * c.ngpu && m > kMaxGemvW4Tokens && m <= c.rs_rows && h == c.ll_hidden &&
+           c.prs1[0] != nullptr && c.pflags[0] != nullptr && m * h <= c.max_elems;
 }
 
 // ---------------------------------------------------------------- copy-engine prefill all-reduce

@@ -28,6 +28,9 @@ void topk_local(const float* logits, int v, int m, int vocab_off, float* pairs, 
 // Plain sampling: tokens[mi] ~ p(row mi) from gathered candidates [ngpu][m][kTopK][2].
 void sample_rows(const float* gathered, int ngpu, int m, SampleParams* p, int* tokens,
                  cudaStream_t st);
+// batched rows of several sequences: row mi samples with base[rowslot[mi]], greedy (top candidate) when !on[slot]
+void sample_rows_slots(const float* gathered, int ngpu, int m, SampleParams* base, const int* rowslot,
+                       const int* on, int* tokens, cudaStream_t st);
 
 // Speculative verification with sampling (lossless for greedy drafts): row j accepts draft
 // tokens[j+1] with probability p_j(draft), otherwise samples from p_j without the draft and
