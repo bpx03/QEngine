@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # QEngine: Qwen3.8-27B INT4 inference server for 3x RTX 3090 (sm_86, tensor parallel 3).
 # The model is NOT baked in: mount it at /app/models/Qwen3.8-27B-INT4 (see docker-compose.yml).
+# Qwen3.8-Flash-Next (preview): mount it too and set QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4.
 #
 #   docker build -t qengine .                       # with vision (torch, ~+4 GB)
 #   docker build -t qengine --build-arg VISION=0 .  # text only, no torch
@@ -41,6 +42,8 @@ RUN if [ "$VISION" = "1" ]; then \
 WORKDIR /app
 COPY server ./server
 COPY --from=build /src/build/libqengine.so ./build/libqengine.so
+# Qwen3.8-Flash-Next engine (preview): picked by the server when QE_MODEL points to a Flash-Next directory
+COPY --from=build /src/build/libqflash.so ./build/libqflash.so
 COPY LICENSE ./
 
 # Entry point: server/run.sh with the container defaults (listen on 0.0.0.0).
@@ -74,7 +77,7 @@ ENTRYPOINT ["/usr/local/bin/qengine-entrypoint"]
 ARG REVISION=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
-      org.opencontainers.image.description="QEngine: Qwen3.8-27B INT4 inference server for RTX 3090 (sm_86), OpenAI/Anthropic-compatible API; model not included" \
+      org.opencontainers.image.description="QEngine: Qwen3.8-27B INT4 (and Qwen3.8-Flash-Next preview) inference server for RTX 3090 (sm_86), OpenAI/Anthropic-compatible API; model not included" \
       org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"

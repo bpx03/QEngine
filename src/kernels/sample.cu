@@ -145,6 +145,32 @@ __global__ void sample_rows_kernel(const float* gathered, int ngpu, int m, Sampl
     pp->counter = p.counter + 1;
 }
 
+// rows of several sequences, row mi with base[rowslot[mi]] (on[slot] == 0: greedy, the top candidate); every
+// sampling slot's counter advances once
+__global__ void sample_rows_slots_kernel(const float* gathered, int ngpu, int m, SampleParams* base,
+                                         const int* rowslot, const int* on, int* tokens) {
+    if (threadIdx.x != 0) return;
+    unsigned long long touched = 0ull;
+    for (int mi = 0; mi < m; mi++) {
+        const int s = rowslot[mi];
+        const SampleParams p = base[s];
+        float prob[kTopK];
+        int tok[kTopK];
+        if (!on[s]) {
+            SampleParams g = p;
+            g.top_k = 1;
+            row_probs(gathered, ngpu, m, mi, g, prob, tok);
+            tokens[mi] = tok[0];
+            continue;
+        }
+        const int n = row_probs(gathered, ngpu, m, mi, p, prob, tok);
+        tokens[mi] = draw(prob, tok, n, uniform(p, mi, 0), -1, 0.f);
+        touched |= 1ull << (s & 63);
+    }
+    for (int s = 0; s < 64; s++)
+        if ((touched >> s) & 1ull) base[s].counter += 1;
+}
+
 __device__ void accept_sampled_dev(const float* gathered, int ngpu, int k, SampleParams* pp,
                                    const SpecState& s, int m, int r0) {
     const SampleParams p = *pp;
@@ -233,6 +259,10 @@ void topk_local(const float* logits, int v, int m, int vocab_off, float* pairs, 
     topk_kernel<<<m, kSelThreads, 0, st>>>(logits, v, vocab_off, pairs);
 }
 
+void sample_rows_slots(const float* gathered, int ngpu, int m, SampleParams* base, const int* rowslot,
+                       const int* on, int* tokens, cudaStream_t st) {
+    sample_rows_slots_kernel<<<1, 32, 0, st>>>(gathered, ngpu, m, base, rowslot, on, tokens);
+}
 void sample_rows(const float* gathered, int ngpu, int m, SampleParams* p, int* tokens,
                  cudaStream_t st) {
     sample_rows_kernel<<<1, 32, 0, st>>>(gathered, ngpu, m, p, tokens);

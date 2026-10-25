@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 from engine import Engine
 from transformers import AutoTokenizer
 
-MODEL = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.8-27B-INT4")
+MODEL = os.environ.get("QE_TEST_MODEL") or os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.8-27B-INT4")  # QE_TEST_MODEL: another model (e.g. Flash-Next with QE_LIB)
 W = int(sys.argv[1]) if len(sys.argv) > 1 else 5
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 K = 7

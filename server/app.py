@@ -23,12 +23,18 @@ import jinja2
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from tokenizers import Tokenizer
 
 from engine import Engine
 from grammar import GrammarError, Grammars, TokenLookup, schema_of
+from model_profile import Profile, drop_empty_turns, merge_leading_system
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+
+# QE_STEP_PROF=1: per-step host timing of the single-sequence decode loop (ctypes step call, metrics,
+# feed = detokenize + parser hand-off, check_done, the rest of the loop iteration), one JSON line per
+# request to $QE_STEP_PROF_FILE (default step_prof.jsonl) with the prompt ids, plus a log summary
+STEP_PROF = os.environ.get("QE_STEP_PROF", "0") not in ("", "0")
+_pc = time.perf_counter
 
 # ----------------------------------------------------------------------------- template
 
@@ -280,7 +286,9 @@ class Ids(list):
 class Generator:
     def __init__(self, args):
         self.args = args
-        self.tok = Tokenizer.from_file(os.path.join(args.model, "tokenizer.json"))
+        self.profile = prof = getattr(args, "profile", None) or Profile(args.model)
+        self.tok, tok_json, tok_note = prof.tokenizer(getattr(args, "tokenizer", None))
+        print(f"model {prof.family} ({prof.model_type or 'no model_type'}), tokenizer {tok_note}", flush=True)
         self.tmpl = Template(args.template)
         self.im_start_user = self.tok.encode("<|im_start|>user", add_special_tokens=False).ids
         self.seg_cache = collections.OrderedDict()
@@ -290,16 +298,13 @@ class Generator:
         self.im_start = self.tok.token_to_id("<|im_start|>")
         self.im_end_nl = self.tok.encode("<|im_end|>\n", add_special_tokens=False).ids
         self.seg_lock = threading.Lock()
-        self.eos = {self.tok.token_to_id(t) for t in ("<|im_end|>", "<|endoftext|>")
-                    if self.tok.token_to_id(t) is not None}
-        gc = {}
-        try:
-            gc = json.load(open(os.path.join(args.model, "generation_config.json")))
-        except Exception:
-            pass
-        self.sampling_defaults = {"top_p": args.top_p or gc.get("top_p") or 0.95,
-                                  "top_k": args.top_k or gc.get("top_k") or 20,
-                                  "min_p": args.min_p if args.min_p is not None else gc.get("min_p", 0.0)}
+        # end of turn: generation_config.json eos_token_id ([<|im_end|>, <|endoftext|>] for both
+        # models) plus those two tokens by name
+        self.eos = set(prof.eos_ids) | {self.tok.token_to_id(t) for t in ("<|im_end|>", "<|endoftext|>")
+                                        if self.tok.token_to_id(t) is not None}
+        sd = prof.sampling(args.temperature, args.top_p, args.top_k, args.min_p)
+        args.temperature = sd.pop("temperature")
+        self.sampling_defaults = sd
         print("sampling defaults (when the request has none): temperature %.2f, top_p %.2f, top_k %d, min_p %.2f"
               % (args.temperature, self.sampling_defaults["top_p"], self.sampling_defaults["top_k"],
                  self.sampling_defaults["min_p"]), flush=True)
@@ -312,11 +317,20 @@ class Generator:
             self.vision_lock = threading.Lock()
             print(f"vision encoder on {dev} in {time.time() - t0:.1f}s "
                   f"(max {args.max_image_pixels / 1e6:.1f} MPix per image)", flush=True)
-        self.engine = Engine(args.model, args.devices, args.max_ctx)
+        self.engine = Engine(args.model, args.devices, args.max_ctx, getattr(args, "split", "") or "",
+                             lib_path=getattr(args, "engine_lib", None) or None,
+                             vocab=prof.vocab_size)
+        if not self.engine.has("stops"):  # no undo of the steps past a stop sequence
+            global STOP_ROLLBACK
+            STOP_ROLLBACK = 0
+        missing = self.engine.missing_optional()
+        if missing:
+            print(f"engine: optional C API not provided (fallbacks in use): {', '.join(missing)}", flush=True)
         # structured output (response_format): llguidance matchers, masks written into the engine
-        with open(os.path.join(args.model, "tokenizer.json")) as f:
-            self.grammars = Grammars(f.read(), self.engine.vocab(), sorted(self.eos))
-        self.grammars.prepare()
+        self.grammars = None
+        if self.engine.has("grammar"):
+            self.grammars = Grammars(tok_json, self.engine.vocab(), sorted(self.eos))
+            self.grammars.prepare()
         from metrics import Metrics
         stats = os.path.expanduser(args.stats_file)
         self.metrics = Metrics(stats, args.served_name)
@@ -353,6 +367,7 @@ class Generator:
                 else:
                     parts.append({"type": "text", "text": "[image omitted: this server runs without vision]"})
             m["content"] = parts
+        messages = self.clean_history(messages)
         text = self.tmpl.render(messages, tools, **kw)
         sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
         label = agent_label(sys_txt, messages)
@@ -375,6 +390,16 @@ class Generator:
             ids.img = (len(images), emb.shape[0])
             print(f"{len(images)} image(s): {emb.shape[0]} tokens, encoded in {time.time() - t0:.2f}s", flush=True)
         return ids, affinity
+
+    def clean_history(self, messages):
+        """Model-specific history fixes before the template (--merge-system, --drop-empty-turns)."""
+        if self.args.merge_system:
+            messages = merge_leading_system(messages)
+        if self.args.drop_empty_turns:
+            messages, n = drop_empty_turns(messages)
+            if n:
+                print(f"history: dropped {n} assistant turn(s) with only reasoning (HF #50)", flush=True)
+        return messages
 
     def encode(self, text):
         """Tokenize chat text segment by segment (each starts with <|im_start|>, an atomic special
@@ -553,6 +578,7 @@ class Generator:
             return None
 
         trace = open(os.environ["QE_SCHED_TRACE"], "w", buffering=1) if os.environ.get("QE_SCHED_TRACE") else None
+        prof_last = 0.0  # QE_STEP_PROF: return time of the last single step (0: none to chain from)
 
         def tr(kind, t0, n=0, toks=0):  # scheduler trace (QE_SCHED_TRACE=file): one JSON line per event
             if trace:
@@ -613,6 +639,7 @@ class Generator:
                         print(f"[sched] no room for {need} tokens next to the running sequences", flush=True)
             if admit is not None:
                 self.dirty = True
+                prof_last = 0.0  # QE_STEP_PROF: no gap across a prefill
                 try:
                     tb = time.time()
                     admit.begin_start()
@@ -658,6 +685,7 @@ class Generator:
             if len(active) < n_active:
                 bg_done = False  # a conversation went idle: worth archiving
             if not active:
+                prof_last = 0.0
                 if self.queue and not prefills:  # nothing running and nothing admitted
                     with self.cv:
                         self.cv.wait(0.05)
@@ -672,10 +700,22 @@ class Generator:
                         e.resume(j.slot)
                         self.cur_slot = j.slot
                     ts = time.time()
+                    if STEP_PROF:
+                        p0 = _pc()
                     toks = e.step()
+                    if STEP_PROF:
+                        p1 = _pc()
                     tr("step", ts, 1, len(toks))
                     self.metrics.step(active, [len(toks)], time.time() - ts)
+                    if STEP_PROF:
+                        p2 = _pc()
                     j.feed(toks)
+                    if STEP_PROF:
+                        p3 = _pc()
+                        gap = p0 - prof_last if prof_last else 0.0  # previous step's return -> this call
+                        j.prof.append((p1 - p0, len(toks), p2 - p1, p3 - p2, gap, j.prof_detok, j.prof_emit))
+                        j.prof_detok = j.prof_emit = 0.0
+                        prof_last = p1
                 else:
                     self.cur_slot = -1  # batch steps undo the queued-ahead single step
                     ts = time.time()
@@ -727,6 +767,7 @@ class Job:
         # (it returns after its subagents); a subagent that ended its turn without a tool call
         # is finished and goes first
         self.prio = 2 if getattr(ids, "label", "") == "main agent" else 1
+        self.prof, self.prof_detok, self.prof_emit = [], 0.0, 0.0  # QE_STEP_PROF
 
     def begin_start(self):
         g, e, p = self.gen, self.gen.engine, self.p
@@ -825,7 +866,11 @@ class Job:
                 pending = pending[:i]
                 break
         self.n += len(pending)
+        if STEP_PROF:
+            q0 = _pc()
         s = self.det.push(pending) if pending else ""
+        if STEP_PROF:
+            self.prof_detok += _pc() - q0
         if s:
             self.text_all += s
             hit = next((x for x in self.stops if x in self.text_all[-len(s) - 64:]), None)
@@ -837,7 +882,11 @@ class Job:
                 self.finish, stop_now = "stop", True
                 self.cut = True
             if s:
+                if STEP_PROF:
+                    q0 = _pc()
                 self.on_text(s)
+                if STEP_PROF:
+                    self.prof_emit += _pc() - q0
         if not stop_now and g.args.loop_guard_tokens and not self.p.get("ignore_eos") and self.n - self.loop_checked >= 64:
             self.loop_checked = self.n
             p = repetition_period(self.det.ids, min_span=g.args.loop_guard_tokens)
@@ -905,6 +954,7 @@ class Job:
                 out = self.det.ids if not self.cut else self.det.ids[:self.keep]
                 self.gen.remember(self.affinity, self.ids, out)
                 self.gen.remember_turn(self.ids, out)
+                self.gen.engine.add_corpus(out)
             t2 = time.time()
             self.stats = {"prompt_tokens": len(self.ids), "cached_tokens": self.reused,
                           "cache_src": self.src,
@@ -917,6 +967,8 @@ class Job:
                 self.stats["grammar_steps"] = self.gsteps
                 self.stats["grammar_forced"] = self.grammar.n_forced
             self.gen.metrics.finished(self)
+            if STEP_PROF and self.prof:
+                prof_write(self)
             self.done.set()
         return True
 
@@ -930,6 +982,32 @@ class Job:
         self.finished = True
         self.gen.metrics.finished(self, ex)
         self.done.set()
+
+
+def _pstats(v):
+    v = sorted(v)
+    return {"mean": sum(v) / len(v), "p50": v[len(v) // 2], "p90": v[len(v) * 9 // 10], "max": v[-1]}
+
+
+def prof_write(job):
+    """QE_STEP_PROF: per-request step profile (seconds) -> JSONL + one summary line."""
+    P = job.prof
+    keys = ("step", "ntok", "metrics", "feed", "gap", "detok", "emit")
+    cols = {k: [r[i] for r in P] for i, k in enumerate(keys)}
+    gaps = [g for g in cols["gap"] if g > 0]
+    rec = {"prompt_n": len(job.ids), "gen": job.n, "steps": len(P), "decode_s": time.time() - job.t1,
+           "prefill_s": job.t1 - job.t0, "ids": list(job.ids), "cols": cols,
+           "sum": {k: _pstats(v) for k, v in cols.items() if v}}
+    if gaps:
+        rec["sum"]["gap"] = _pstats(gaps)
+    with open(os.environ.get("QE_STEP_PROF_FILE", "step_prof.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    S = rec["sum"]
+    print(f"[prof] {len(P)} steps, {job.n / len(P):.2f} tok/step | step call mean {S['step']['mean'] * 1e3:.3f} ms "
+          f"p90 {S['step']['p90'] * 1e3:.3f} | between steps mean {S.get('gap', S['step'])['mean'] * 1e6:.0f} us "
+          f"p90 {S.get('gap', S['step'])['p90'] * 1e6:.0f} (metrics {S['metrics']['mean'] * 1e6:.0f}, feed "
+          f"{S['feed']['mean'] * 1e6:.0f} = detok {S['detok']['mean'] * 1e6:.0f} + emit {S['emit']['mean'] * 1e6:.0f} + rest)",
+          flush=True)
 
 
 def stream_bridge(gen, ids, params, affinity=0):
@@ -996,6 +1074,8 @@ def structured(gen, body, kw):
     schema = schema_of(body)
     if schema is None:
         return None
+    if gen.grammars is None:
+        raise GrammarError("structured output is not supported by this engine (no grammar C API)")
     kw["enable_thinking"] = False
     return gen.grammars.matcher(schema)
 
@@ -1221,6 +1301,7 @@ def build_app(gen: Generator, args):
                         d.update(extra)
                     return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
                 started = False
+                sse_s = [0.0, 0]  # QE_STEP_PROF: event-loop time of parser + chunk JSON, chunks
                 async for item in stream_bridge(gen, ids, params, aff):
                     if not started:  # role chunk with the first token: clients measure TTFT on it
                         started = True
@@ -1239,9 +1320,20 @@ def build_app(gen: Generator, args):
                                                      "model": model_name, "choices": [], "usage": usage(st)}) + "\n\n"
                         yield "data: [DONE]\n\n"
                         log_stats("chat", st)
+                        if STEP_PROF and sse_s[1]:
+                            print(f"[prof] sse: {sse_s[1]} chunks, parser + JSON {sse_s[0] / sse_s[1] * 1e6:.0f} us/chunk "
+                                  f"(event-loop thread)", flush=True)
                         return
+                    if STEP_PROF:
+                        a0 = _pc()
                     for kind, t in parser.feed(item):
-                        yield chunk({"reasoning_content" if kind == "reasoning" else "content": t})
+                        c = chunk({"reasoning_content" if kind == "reasoning" else "content": t})
+                        if STEP_PROF:
+                            sse_s[0] += _pc() - a0
+                            sse_s[1] += 1
+                        yield c
+                        if STEP_PROF:
+                            a0 = _pc()
             return StreamingResponse(sse(), media_type="text/event-stream")
 
         parts = {"reasoning": "", "content": ""}
@@ -1394,7 +1486,29 @@ def build_app(gen: Generator, args):
     return app
 
 
-def main():
+def resolve_model_args(args):
+    """Fill the per-model defaults (None on the command line) from the model profile."""
+    prof = args.profile = Profile(args.model)
+    d = prof.defaults
+    if args.served_name is None:
+        args.served_name = d["served_name"]
+    if args.mtp_k is None:
+        args.mtp_k = d["mtp_k"]
+    if args.split is None:
+        args.split = d["split"]
+    for k in ("drop_empty_turns", "merge_system"):
+        v = getattr(args, k)
+        setattr(args, k, bool(d[k]) if v is None else bool(v))
+    if not args.engine_lib and not os.environ.get("QE_LIB"):
+        lib = os.path.join(ROOT, d["lib"])
+        args.engine_lib = lib if os.path.exists(lib) else os.path.join(ROOT, "build", "libqengine.so")
+    if args.vision and not d["vision"]:
+        print(f"vision is not available for {prof.family} yet: --vision ignored", flush=True)
+        args.vision = 0
+    return args
+
+
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.path.join(ROOT, "models/Qwen3.8-27B-INT4"))
     default_tmpl = os.path.join(ROOT, "server/templates/qwen38_syssafe.jinja")
@@ -1402,13 +1516,32 @@ def main():
                     help="chat template (default: server/templates/qwen38_syssafe.jinja, else the model's own)")
     ap.add_argument("--devices", default="0,1,2")
     ap.add_argument("--max-ctx", type=int, default=262144)
-    ap.add_argument("--mtp-k", type=int, default=7, help="max MTP drafts per step (adaptive)")
-    ap.add_argument("--temperature", type=float, default=0.6, help="default when request has none")
+    ap.add_argument("--mtp-k", type=int, default=None,
+                    help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="default when request has none (27B 0.6, Flash-Next generation_config 1.0)")
     ap.add_argument("--top-p", type=float, default=None, help="default when request has none (generation_config)")
     ap.add_argument("--top-k", type=int, default=None, help="default when request has none (generation_config)")
     ap.add_argument("--min-p", type=float, default=None, help="default when request has none (generation_config)")
+    ap.add_argument("--mtp-file", default=None,
+                    help="MTP head weights for the engine (sets $QE_MTP_FILE; default: the engine's own choice, "
+                         "for 27B model_mtp_ft.safetensors when present)")
     ap.add_argument("--think", type=int, default=1, help="default enable_thinking")
-    ap.add_argument("--served-name", default="qwen3.8-27b-qengine")
+    ap.add_argument("--served-name", default=None,
+                    help="model id in the API (default per model: qwen3.8-27b-qengine / qwen3.8-flash-next-qengine)")
+    ap.add_argument("--tokenizer", default=None,
+                    help="tokenizer.json to use as is (default: the model's, Flash-Next pre-tokenizer patched in)")
+    ap.add_argument("--engine-lib", default=None,
+                    help="engine shared library (default: $QE_LIB, else build/libqengine.so for 27B, "
+                         "build/libqflash.so for Flash-Next if present)")
+    ap.add_argument("--split", default=None,
+                    help="per-GPU weight split passed to qe_create (Flash-Next default 176,160,176 expert groups)")
+    ap.add_argument("--drop-empty-turns", type=int, default=None,
+                    help="1: drop earlier assistant turns with only reasoning from the history "
+                         "(default per model: Flash-Next 1, 27B 0)")
+    ap.add_argument("--merge-system", type=int, default=None,
+                    help="1: merge several leading system messages into one before the template "
+                         "(default per model: Flash-Next 1, 27B 0; qwen38_syssafe.jinja merges them anyway)")
     ap.add_argument("--vision", type=int, default=0,
                     help="1: load the vision encoder (images in prompts; ~1 GB on one GPU, less KV cache)")
     ap.add_argument("--vision-device", default="", help="torch device of the encoder (default: last GPU)")
@@ -1451,17 +1584,25 @@ def main():
     ap.add_argument("--disk-cache-gb", type=float, default=200)
     ap.add_argument("--persist-idle", type=float, default=120,
                     help="seconds idle before live conversations are saved to the disk cache")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    resolve_model_args(args)
     if not args.template:
         args.template = os.path.join(args.model, "chat_template.jinja")
     args.think = bool(args.think)
     # the MTP head fine-tuned on the engine's own answers: +8% accepted drafts
     ft = os.path.join(args.model, "model_mtp_ft.safetensors")
-    if "QE_MTP_FILE" not in os.environ and os.path.exists(ft):
+    if args.mtp_file:
+        os.environ["QE_MTP_FILE"] = args.mtp_file
+    elif "QE_MTP_FILE" not in os.environ and os.path.exists(ft):
         os.environ["QE_MTP_FILE"] = ft
     if args.disk_cache:
         os.environ["QE_DISK_CACHE"] = args.disk_cache
         os.environ["QE_DISK_CACHE_GB"] = str(args.disk_cache_gb)
+    return args
+
+
+def main():
+    args = parse_args()
     gen = Generator(args)
     uvicorn.run(build_app(gen, args), host=args.host, port=args.port, log_level="warning")
     gen.metrics.save()
