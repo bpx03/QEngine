@@ -8,6 +8,12 @@ with tensor parallelism 3 over PCIe.
 in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
 in our quick tests.
 
+> **New: Qwen3.8-Flash-Next preview.** QEngine 1.3 preview 1 adds an engine for Qwen3.8-Flash-Next (INT4) on
+> the same 3× RTX 3090: [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3-preview.1),
+> code and docs on the [`flash-next-preview`](https://github.com/bpx03/QEngine/tree/flash-next-preview) branch,
+> ready-to-run model on [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine),
+> Docker image `ghcr.io/bpx03/qengine:flash-preview`.
+
 - C++/CUDA engine (`src/`, about 26k lines), built as a shared library (`libqengine.so`).
 - Python server (`server/`) that loads the library through ctypes and exposes an OpenAI-compatible
   API (`/v1/chat/completions`, `/v1/models`) and an Anthropic-compatible API (`/v1/messages`,
