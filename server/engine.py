@@ -7,6 +7,8 @@ otherwise (contract: server/qe_capi.h)."""
 import ctypes
 import os
 
+from steering import SteeringMixin
+
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 c_void_p, c_int, c_char_p, c_float = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_float
@@ -66,6 +68,10 @@ SIGS = {
     "qe_constrained": (c_int, [c_void_p, c_int]),
     "qe_start_mm": (c_int, [c_void_p, P_int, c_int, c_int, c_u64, c_int, c_void_p, c_int, P_int, c_int]),
     "qe_lookup_corpus": (None, [c_void_p, P_int, c_int]),
+    "qe_set_steering": (c_int, [c_void_p, c_int, c_float]),
+    "qe_set_steering_ex": (c_int, [c_void_p, c_int, c_float, c_int, c_int, c_int]),
+    "qe_steer_info": (c_char_p, [c_void_p]),
+    "qe_capture": (c_int, [c_void_p, P_int, c_int, c_int, ctypes.POINTER(c_float)]),
 }
 REQUIRED = ("qe_create", "qe_destroy", "qe_max_context", "qe_set_sampling", "qe_start3", "qe_spec_step",
             "qe_last_reused", "qe_last_slot", "qe_release")
@@ -98,7 +104,7 @@ def bind(lib):
     return have
 
 
-class Engine:
+class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/steering.py)
     def __init__(self, model_dir, devices="0,1,2", max_t=262144, split="", lib_path=None, vocab=None):
         self.lib_path = lib_path or os.environ.get("QE_LIB") or os.path.join(_ROOT, "build", "libqengine.so")
         self.lib = ctypes.CDLL(self.lib_path)
@@ -137,6 +143,8 @@ class Engine:
 
     def missing_optional(self):
         return [g for g, ok in self.caps.items() if not ok] + [f for f in SINGLE if f not in self.fns]
+
+    # activation steering: steer_info / set_steering / capture come from server/steering.py (SteeringMixin)
 
     # ------------------------------------------------------------------ sequences
     def set_sampling(self, temperature, top_p=1.0, top_k=40, min_p=0.0, seed=0):

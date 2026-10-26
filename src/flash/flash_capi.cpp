@@ -27,6 +27,7 @@
 
 #include "../json.h"
 #include "flash.h"
+#include "flash_steer.h"
 
 using namespace flash;
 
@@ -43,11 +44,13 @@ std::vector<std::string> split(const std::string& s, char c) {
 }
 
 void ngram_row(const HostTables& ht, const std::vector<int>& h, int t, bf16* out) {
-    int seg = 0;
-    for (int i = t - 1; i >= 0; i--)
-        if (h[i] == EOS) { seg = i + 1; break; }
+    // shifted token s is used iff no EOS sits in [t - s, t - 1] (the previous EOS ends the segment): only the two
+    // previous positions decide (prefill-r4: the scan back to the last EOS was O(t) per token, O(n^2) per prompt:
+    // 100K prompt 14 -> 60 ms of host time per 4K batch, serial with the GPU)
     long long sh[3];
-    for (int s = 0; s < 3; s++) sh[s] = (t - s >= seg && t - s >= 0) ? h[t - s] : EOS;
+    sh[0] = h[t];
+    sh[1] = (t >= 1 && h[t - 1] != EOS) ? h[t - 1] : EOS;
+    sh[2] = (t >= 2 && h[t - 1] != EOS && h[t - 2] != EOS) ? h[t - 2] : EOS;
     auto mul = [](long long a, long long b) { return (long long)((unsigned long long)a * (unsigned long long)b); };
     const long long big = mul(sh[0], ht.mult[0]) ^ mul(sh[1], ht.mult[1]);
     const long long tri = big ^ mul(sh[2], ht.mult[2]);
@@ -57,6 +60,20 @@ void ngram_row(const HostTables& ht, const std::vector<int>& h, int t, bf16* out
         const long long row = r + ht.voff[k];
         ht.row(row, out + k * PLE_DIM);
     }
+}
+
+// rows t0 .. t0 + m - 1 of the n-gram embedding (PLE input) in parallel: host reads of the n-gram table, serial with
+// the GPU between prefill batches (prefill-r4)
+static void ngram_rows(const HostTables& ht, const std::vector<int>& h, int t0, int m, bf16* out) {
+    const int nt = m >= 256 ? 8 : 1;
+    auto part = [&](int k) {
+        for (int j = (int)((long)m * k / nt); j < (int)((long)m * (k + 1) / nt); j++) ngram_row(ht, h, t0 + j, out + (size_t)j * H);
+    };
+    if (nt == 1) { part(0); return; }
+    std::vector<std::thread> th;
+    for (int k = 1; k < nt; k++) th.emplace_back(part, k);
+    part(0);
+    for (auto& x : th) x.join();
 }
 
 // ---------------------------------------------------------------- host memory of the KV archive
@@ -200,6 +217,7 @@ struct Conv {
     std::vector<std::shared_ptr<State>> ck;   // committed states at positions <= kv_n (resident: <= live tokens)
     int prio = 1;                             // eviction value: 0 finished, 1 normal, 2 main thread
     unsigned long long used = 0, affinity = 0;
+    long long steer = -1;                     // steering key it was computed with (FE::steer_key): KV / states never serve another
 };
 
 // A sequence slot: its recurrent state on the GPUs (Worker slot s) and a region of the KV pool in periods.
@@ -219,6 +237,14 @@ struct Slot {
     bool want_drafts = false;
     bool con = false;         // grammar-constrained (qe_constrain); its host buffers live in FE (mask_host / spec_io)
     unsigned long long used = 0;
+    // draft statistics since the slot was created (qe_draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
+    long long ds[5] = {0, 0, 0, 0, 0};
+    void count_step(bool lookup, int drafted, int emitted) {
+        const int acc = std::max(0, emitted - 1);
+        ds[0]++;
+        ds[lookup ? 3 : 1] += std::max(drafted, acc);
+        ds[lookup ? 4 : 2] += acc;
+    }
 };
 
 struct FE {
@@ -297,6 +323,30 @@ struct FE {
     }
     int last_reused = 0, last_copied = 0;
     bool last_from_archive = false;
+    // activation steering (QE_STEER / QE_STEER_DIR): vectors loaded at startup; the next start's (vector, mode, layers,
+    // scale) (qe_set_steering_ex, sticky; default: the server default vector with its defaults at scale 1) keys the
+    // prefix match, the checkpoints and the archive: different keys never share KV
+    std::vector<SteerSpec> steer;
+    int steer_def = -1, steer_vec = -1, steer_mode = 0, steer_lo = 0, steer_hi = -1;
+    float steer_scale = 1.f;
+    std::string steer_json = "{\"default\": null, \"vectors\": []}";
+    // key = vector | mode | lo | hi | scale bits (-1: off); steer_unkey decodes it
+    long long steer_key() const {
+        if (steer_vec < 0) return -1;
+        uint32_t b;
+        memcpy(&b, &steer_scale, 4);
+        return ((((((long long)steer_vec * 2 + steer_mode) * 64 + steer_lo) * 64 + steer_hi)) << 32) | b;
+    }
+    static void steer_unkey(long long k, int& vec, int& mode, int& lo, int& hi, float& scale) {
+        if (k < 0) { vec = -1; mode = 0; lo = 0; hi = -1; scale = 0.f; return; }
+        const uint32_t b = (uint32_t)(k & 0xffffffffu);
+        memcpy(&scale, &b, 4);
+        long long h = k >> 32;
+        hi = (int)(h % 64); h /= 64;
+        lo = (int)(h % 64); h /= 64;
+        mode = (int)(h % 2);
+        vec = (int)(h / 2);
+    }
     std::vector<bf16> ple;
     std::vector<int> outs;
 
@@ -616,10 +666,12 @@ struct FE {
     // maxm: the longest common prefix with any known sequence (a divergence point worth a checkpoint)
     struct Src { Conv* c = nullptr; int L = 0; std::shared_ptr<State> st; bool live = false; int maxm = 0; };
     Src best(const int* ids, int n, bool any_slot) {
+        const long long sk = steer_key();
         Src b;
         int brank = -1, maxm = 0;
         auto better = [&](int L, int rank) { return L > b.L || (L == b.L && L > 0 && rank > brank); };
         for (auto& c : convs) {
+            if (c.steer != sk) continue;  // steered KV never serves an unsteered request, nor the reverse
             const bool res = c.slot >= 0;
             // a generating slot: its checkpoints (rows below them do not change), not its live end
             const bool busy = res && sl[c.slot].active && !any_slot;
@@ -670,19 +722,34 @@ struct FE {
 }  // namespace
 
 extern "C" {
+int qe_set_steering_ex(void* p, int vec, float scale, int mode, int lo, int hi);
 
 void* qe_create(const char* model_dir, const char* devices, int max_t, const char* split_s) {
     FE* e = new FE();
     const std::string model = model_dir;
     for (auto& x : split(devices && *devices ? devices : "0,1,2", ',')) e->devs.push_back(std::stoi(x));
     e->ng = e->devs.size();
-    if (e->ng != 3) { fprintf(stderr, "qflash: 3 GPUs required\n"); delete e; return nullptr; }
+    if (e->ng != 2 && e->ng != 3) { fprintf(stderr, "qflash: 2 or 3 GPUs required (%d given)\n", e->ng); delete e; return nullptr; }
     e->ctx = max_t > 0 ? std::min(max_t, 262144) : 262144;
     e->kmax = getenv("FLASH_MTP_K") ? atoi(getenv("FLASH_MTP_K")) : 3;
-    std::vector<double> wts = {176, 160, 176};
+    // QE_STEER / QE_STEER_DIR (flash_steer.h): checked first, a refused vector stops the start
+    try {
+        e->steer = steer_load_env(H, LAYERS, model, &e->steer_def);
+    } catch (std::exception& ex) {
+        fprintf(stderr, "qflash: %s\n", ex.what());
+        delete e;
+        return nullptr;
+    }
+    if (e->steer.size() > 4096) { fprintf(stderr, "qflash: steering: more than 4096 vectors\n"); delete e; return nullptr; }
+    static_assert(LAYERS <= 64, "steer_key: 6 bits per layer index");
+    qe_set_steering_ex(e, -2, 1.f, -1, -1, -1);
+    // expert groups per card: the split (one weight per GPU), else the default for the GPU count (3: 176,160,176)
+    std::vector<double> wts = default_group_weights(e->ng);
     if (split_s && *split_s) {
-        wts.clear();
-        for (auto& x : split(split_s, ',')) wts.push_back(std::stod(x));
+        std::vector<double> v;
+        for (auto& x : split(split_s, ',')) v.push_back(std::stod(x));
+        if ((int)v.size() == e->ng) wts = v;
+        else fprintf(stderr, "qflash: split %s has %zu weights for %d GPUs: default split used\n", split_s, v.size(), e->ng);
     }
     auto t0 = std::chrono::steady_clock::now();
     auto secs = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
@@ -718,6 +785,18 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     // n-gram table pinned + mapped (device-side gather in the speculative step; host gathers of prompt rows read the
     // pinned copy too: the file pages may be evicted): copied in the background while the workers load the weights
     std::vector<const char*> ng_host(128);
+    // NUMA (several nodes): the n-gram table interleaved over the GPUs' nodes, cold experts on each GPU's node
+    std::vector<int> ng_nodes;
+    if (numa_nodes() > 1) {
+        std::string nl;
+        for (int d : e->devs) {
+            const int nd = gpu_numa_node(d);
+            nl += (nl.empty() ? "" : ", ") + std::string("GPU") + std::to_string(d) + " node " + std::to_string(nd);
+            if (nd >= 0 && std::find(ng_nodes.begin(), ng_nodes.end(), nd) == ng_nodes.end()) ng_nodes.push_back(nd);
+        }
+        fprintf(stderr, "[qflash] NUMA: %s; cold experts on each GPU's node, n-gram table %s\n", nl.c_str(),
+                ng_nodes.size() > 1 ? "interleaved over the GPUs' nodes" : "on the GPUs' node");
+    }
     double ng_secs = 0;
     size_t ng_bytes = 0;
     std::promise<void> ng_prom;
@@ -750,7 +829,8 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                 madvise((void*)(lo & ~(uintptr_t)4095), hi - (lo & ~(uintptr_t)4095), MADV_RANDOM);
         }
         char* pin = !pinned ? (char*)lo
-                  : fpath.empty() ? pin_host((const void*)lo, hi - lo, 32, true) : pin_host_file(fpath, foff, hi - lo, (const void*)lo);
+                  : fpath.empty() ? pin_host((const void*)lo, hi - lo, 32, true, ng_nodes)
+                                  : pin_host_file(fpath, foff, hi - lo, (const void*)lo, 32, ng_nodes);
         for (int i = 0; i < 128; i++) {
             const char* h = pin + ((uintptr_t)tens(i).data - lo);
             void* dp = (void*)h;
@@ -764,8 +844,9 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         ng_secs = secs() - a;
         ng_prom.set_value();
     });
-    e->comm = comm_create(e->ng, PFM * H, H);
+    e->comm = comm_create(e->ng, ARU_MAX * H, H);
     comm_enable_p2p(e->comm, e->devs.data());
+    comm_select_path(e->comm, e->devs.data(), "FLASH_COMM", true);  // probe + prefill transfer path (before the workers)
     e->plans = make_plan(e->ng, wts);
     std::vector<int> draft_ids;
     if (FILE* f = fopen((model + "/token_rank.bin").c_str(), "rb")) {
@@ -819,6 +900,20 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         for (auto& t : th) t.join();
     }
     fprintf(stderr, "[qflash %.0fs] weights loaded\n", secs());
+    if (!e->steer.empty()) {  // activation steering vectors (validated before the load)
+        const int nv = e->steer.size();
+        std::vector<int> lo(nv), hi(nv);
+        std::vector<float> w;
+        for (int v = 0; v < nv; v++) {
+            lo[v] = e->steer[v].flo; hi[v] = e->steer[v].fhi;
+            w.insert(w.end(), e->steer[v].w.begin(), e->steer[v].w.end());
+            fprintf(stderr, "%s\n", e->steer[v].log_line().c_str());
+        }
+        for (int r = 0; r < e->ng; r++) e->W[r]->set_steer(nv, lo.data(), hi.data(), w.data());
+        e->steer_json = steer_info_json(e->steer, e->steer_def);
+        for (auto& x : e->steer) x.w.clear();
+        fprintf(stderr, "steering: %d vector(s), default %s\n", nv, e->steer_def >= 0 ? e->steer[e->steer_def].name.c_str() : "off");
+    }
     ng_th.join();
     for (int i = 0; i < 128; i++) {
         if (ng8) e->ht.ngram8[i] = (const uint8_t*)ng_host[i];
@@ -894,6 +989,31 @@ void qe_destroy(void* p) {
 int qe_max_context(void* p) { return ((FE*)p)->ctx; }
 int qe_vocab(void*) { return VOCAB; }
 
+// activation steering of the next start (QE_STEER / QE_STEER_DIR): vector, scale, mode and layers. Sticky until the
+// next call; the server calls it before every start. A conversation keeps the key it started with (prefix reuse,
+// checkpoints and the archive never mix KV of different (vector, mode, layers, scale): a changed request starts a
+// fresh KV). vec: index in qe_steer_info's list, -1 off, -2 the server default (its defaults, scale 1); scale
+// multiplies the mode's sidecar scale; mode -1 / 0 add / 1 project and lo, hi (-1, -1: the mode's default range;
+// else inside the vector's file layers). Returns 0, or -1 for a bad value (nothing changed).
+int qe_set_steering_ex(void* p, int vec, float scale, int mode, int lo, int hi) {
+    FE* e = (FE*)p;
+    if (vec == -2) { vec = e->steer_def; scale = 1.f; mode = -1; lo = hi = -1; }
+    if (vec < -1 || vec >= (int)e->steer.size() || !std::isfinite(scale)) return -1;
+    if (vec < 0) {
+        e->steer_vec = -1; e->steer_mode = 0; e->steer_lo = 0; e->steer_hi = -1; e->steer_scale = 1.f;
+        return 0;
+    }
+    if (!steer_resolve(e->steer[vec], mode, lo, hi).empty()) return -1;
+    e->steer_vec = vec;
+    e->steer_mode = mode;
+    e->steer_lo = lo;
+    e->steer_hi = hi;
+    e->steer_scale = scale;
+    return 0;
+}
+int qe_set_steering(void* p, int vec, float scale) { return qe_set_steering_ex(p, vec, scale, -1, -1, -1); }
+const char* qe_steer_info(void* p) { return ((FE*)p)->steer_json.c_str(); }
+
 void qe_set_sampling(void* p, float temperature, float top_p, int top_k, float min_p, unsigned long long seed) {
     FE* e = (FE*)p;
     e->drain();
@@ -935,6 +1055,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         for (int r = 0; r < e->ng; r++) e->W[r]->ec_reset_stats();
     }
     if (n <= 0 || n + 2 > qe_max_context(p)) return -1;
+    const long long sk = e->steer_key();  // qe_set_steering before the start (the server sets it for every request)
     e->k = std::max(0, std::min(k, std::min(e->kmax, MAXM - 1)));
     FE::Pf pf;
     pf.t_begin = FE::now_ms();
@@ -947,6 +1068,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     auto new_conv = [&](const FE::Src* from) -> Conv* {
         Conv d;
         d.id = e->next_id++;
+        d.steer = sk;
         if (from) {
             for (auto& g : from->c->segs)
                 if (g->t0 < from->L) d.segs.push_back(g);
@@ -1081,7 +1203,11 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     q.want_drafts = false;
     // a new request starts unconstrained, also on the devices (evict_slot / qe_reset clear only the host flag)
     q.con = false;
-    e->job = [&](int r) { e->W[r]->set_constrained(y, false); };
+    // the slot's steering flag follows its conversation's key (device flag at a fixed address: no graph changes)
+    int sv, smd, slo, shi;  // the slot's steering follows its conversation's key
+    float ssc;
+    FE::steer_unkey(target->steer, sv, smd, slo, shi, ssc);
+    e->job = [&](int r) { e->W[r]->set_constrained(y, false); e->W[r]->set_steer_slot(y, sv, smd, slo, shi, ssc); };
     e->run();
     q.active = true;  // taken (not evicted by another start) until released
     pf.ids.assign(ids, ids + n);
@@ -1126,7 +1252,9 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
     const int* ids = pf.ids.data();
     auto& hist = e->S().hist;
     static const bool pfb = !(getenv("FLASH_PFB") && atoi(getenv("FLASH_PFB")) == 0);
-    const int B = pfb ? e->W[0]->pf_batch() : 0;
+    // big batches (past pf_batch_base(), buffers borrowed from the expert cache) only when the chunk budget asks for
+    // them: the server's 2048-token chunks keep the base batch
+    const int B = pfb ? (budget > e->W[0]->pf_batch_base() - PFM ? e->W[0]->pf_batch() : e->W[0]->pf_batch_base()) : 0;
     int done_tok = 0;
     while (pf.i < n && done_tok < budget) {
         const int i = pf.i;
@@ -1136,10 +1264,8 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
         while (!pf.cks.empty() && pf.cks.front() <= i) pf.cks.erase(pf.cks.begin());
         if (!pf.cks.empty() && pf.cks.front() < i + m) m = pf.cks.front() - i;  // a batch ends at the next checkpoint
         std::vector<bf16> rows((size_t)m * H);
-        for (int j = 0; j < m; j++) {
-            hist.push_back(ids[i + j]);
-            ngram_row(e->ht, hist, (int)hist.size() - 1, rows.data() + (size_t)j * H);
-        }
+        for (int j = 0; j < m; j++) hist.push_back(ids[i + j]);
+        ngram_rows(e->ht, hist, (int)hist.size() - m, m, rows.data());
         const bool lastb = i + m >= n;
         int o = 0, d = 0;
         if (pfb) {  // batched prefill (MoE half over the whole batch), then the MTP fill
@@ -1281,6 +1407,7 @@ int qe_spec_step(void* p, int* out) {
         const int t = e->forward({q.pending}, pos);
         q.pending = t;
         out[0] = t;
+        q.count_step(false, 0, 1);
         return 1;
     }
     if (q.con) {  // grammar-constrained: the caller's drafts (spec_io[16..]) verified with its masks, no lookahead / lookup
@@ -1316,6 +1443,7 @@ int qe_spec_step(void* p, int* out) {
         for (int r = 0; r < e->ng; r++) e->W[r]->set_prev_m(cnt);
         for (int i = 0; i < cnt; i++) out[i] = em[i];
         if (q.remain >= 0) q.remain = std::max(0, q.remain - cnt);
+        q.count_step(false, kv, cnt);
         return cnt;
     }
     if (!e->inflight) {  // the slot's speculative state may be in its stash (batched steps / a switch)
@@ -1364,6 +1492,7 @@ int qe_spec_step(void* p, int* out) {
     for (int r = 0; r < e->ng; r++) e->W[r]->set_prev_m(cnt);
     for (int i = 0; i < cnt; i++) out[i] = em[i];
     if (q.remain >= 0) q.remain = std::max(0, q.remain - cnt);  // 0: exhausted (-1: no limit)
+    q.count_step(lk, ks, cnt);
     // lookahead: queue the next step now, so the GPU runs it while the caller handles these tokens. Not after an
     // end token, past the reply's limit, near a stop string (qe_set_no_ahead) or while a prefill waits.
     bool eos = false;
@@ -1465,7 +1594,16 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
         if (q.remain >= 0) q.remain = std::max(0, q.remain - m);
         for (int t = 0; t < m; t++) out[i * 64 + t] = o[(size_t)j * 64 + t];
         cnt[i] = m;
+        q.count_step(false, lims[j], m);
     }
+}
+
+// draft statistics of a slot since it was created: {steps, MTP drafted, MTP accepted, lookup drafted, lookup accepted}
+// (the server takes the difference over a request)
+void qe_draft_stats(void* p, int slot, long long* out) {
+    FE* e = (FE*)p;
+    const Slot& q = e->batch_api ? e->sl.at(slot) : e->S();
+    for (int i = 0; i < 5; i++) out[i] = q.ds[i];
 }
 
 // expert cache counters since the last start (all cards): {decode steps, cold reads, of them misses (host), copies,
@@ -1590,6 +1728,40 @@ void qe_debug_ikb(void* p, int r, const char* path, int nb) {
     e->drain();
     e->W[r]->dump_ikb(path, nb);
 }
+// Activation capture (steering/make_vector.py): prefill ids[0, n) unsteered in a scratch slot (no prefix reuse, the
+// conversations stay as they are) and write out[LAYERS][H] = the mean over the positions [r0, n) of each layer
+// output's residual (mean of the 4 HC streams), the point the steering vectors act on. Eager (no graphs). Returns 0,
+// or -1 (prompts in flight / no slot).
+int qe_capture(void* p, const int* ids, int n, int r0, float* out) {
+    FE* e = (FE*)p;
+    if (!e->pfs.empty() || n <= 0 || r0 < 0 || r0 >= n || n + 2 > e->ctx) return -1;
+    e->drain();
+    const int y = acquire_slot(e, n, {});
+    if (y < 0) return -1;
+    e->bind(y);
+    e->job = [&](int r) { e->W[r]->reset_slot(y); e->W[r]->set_steer_slot(y, -1, 0, 0, -1, 1.f); e->W[r]->cap_begin(); };
+    e->run();
+    std::vector<int> hist;
+    for (int i = 0; i < n; i += PFM) {
+        const int m = std::min(PFM, n - i);
+        std::vector<bf16> rows((size_t)m * H);
+        for (int j = 0; j < m; j++) {
+            hist.push_back(ids[i + j]);
+            ngram_row(e->ht, hist, (int)hist.size() - 1, rows.data() + (size_t)j * H);
+        }
+        const int skip = std::max(0, std::min(m, r0 - i));
+        e->job = [&](int r) { int o; e->W[r]->cap_skip(skip); e->W[r]->prefill(ids + i, i, m, rows.data(), &o, nullptr, nullptr); };
+        e->run();
+    }
+    e->job = [&](int r) { e->W[r]->cap_end(r == 0 ? out : nullptr); };
+    e->run();
+    for (int k = 0; k < LAYERS * H; k++) out[k] /= (float)(n - r0);
+    e->evict_slot(y);  // scratch: nothing to keep
+    e->update_top();
+    e->rebind();
+    return 0;
+}
+
 void qe_reset(void* p) {
     FE* e = (FE*)p;
     e->drain();

@@ -99,6 +99,25 @@ int qe_constrained(void* e, int slot);
 int qe_start_mm(void* e, const int* ids, int n, int k, unsigned long long affinity, int hint,
                 const void* img, int img_rows, const int* rope3, int delta);
 
+// ======================================================= TIER 10 "steering": activation steering (each optional)
+// Vectors are loaded at qe_create (QE_STEER=<file.gguf>, QE_STEER_DIR=<dir>, QE_STEER_DEFAULT=<name>).
+// qe_set_steering: the next start's vector (index in qe_steer_info, -1 off, -2 the server default) and scale
+// (multiplies the sidecar scale); sticky; the engine keys its prefix reuse / checkpoints / archive by the selection.
+int qe_set_steering(void* e, int vec, float scale);  // 0, or -1 for a bad index / scale
+// the same with a per-request mode (-1 the vector's default, 0 add, 1 project) and layer range (lo, hi; -1, -1: the
+// mode's default, else inside the vector's file_layers); the key is (vector, mode, layers, scale). 0, or -1 (unchanged)
+int qe_set_steering_ex(void* e, int vec, float scale, int mode, int lo, int hi);
+// JSON {"default": name|null, "vectors": [{name, mode, layers, scale (the defaults), file_layers, modes: {add|project:
+// {layers, scale}}, description, intended, file}]}
+const char* qe_steer_info(void* e);
+// mean layer-output residual over positions [r0, n) of an unsteered scratch prefill -> out[layers][hidden]
+int qe_capture(void* e, const int* ids, int n, int r0, float* out);
+
+// ======================================================= TIER 11 "stats": per-request statistics (optional)
+// draft statistics of a slot since its creation: out[5] = {verify steps, MTP drafted, MTP accepted, lookup drafted,
+// lookup accepted}; the server prints their difference over a request (server/engine_stats.py, QE_STATS_LOG)
+void qe_draft_stats(void* e, int slot, long long* out);
+
 #ifdef __cplusplus
 }
 #endif

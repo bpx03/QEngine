@@ -157,7 +157,12 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         std::stringstream s2(split);
         for (std::string x; std::getline(s2, x, ',');) w.push_back(std::stod(x));
     }
-    return new Engine(model_dir, devs, max_t, w);
+    try {
+        return new Engine(model_dir, devs, max_t, w);
+    } catch (std::runtime_error& ex) {  // a refused steering vector (QE_STEER / QE_STEER_DIR): no engine
+        fprintf(stderr, "qengine: %s\n", ex.what());
+        return nullptr;
+    }
 }
 void qe_destroy(void* e) { delete (Engine*)e; }
 void qe_reset(void* e) { ((Engine*)e)->reset(); }
@@ -208,6 +213,7 @@ void qe_slot_info(void* e, int i, long long* out) { ((Engine*)e)->slot_info(i, o
 void qe_archive_info(void* e, double* out) { ((Engine*)e)->archive_info(out); }
 void qe_pool_counters(void* e, long long* out) { ((Engine*)e)->pool_counters(out); }
 int qe_spec_step(void* e, int* out) { return ((Engine*)e)->spec_step(out); }
+void qe_draft_stats(void* e, int slot, long long* out) { ((Engine*)e)->draft_stats(slot, out); }
 void qe_finish(void* e) { ((Engine*)e)->finish(); }
 double qe_warmup(void* e, int modes) { return ((Engine*)e)->warmup(modes); }
 int qe_last_copied(void* e) { return ((Engine*)e)->last_copied(); }
@@ -233,6 +239,16 @@ int qe_constrained(void* e, int slot) { return ((Engine*)e)->constrained(slot) ?
 int qe_last_reused(void* e) { return ((Engine*)e)->last_reused(); }
 int qe_vocab(void* e) { return ((Engine*)e)->config().vocab; }
 int qe_layers(void* e) { return ((Engine*)e)->config().layers; }
+// activation steering (QE_STEER / QE_STEER_DIR / QE_STEER_DEFAULT, src/steer.h; server/qe_capi.h tier 10): the next
+// start's vector (index in qe_steer_info, -1 off, -2 the server default), scale, mode (-1 / 0 add / 1 project) and
+// layers (-1, -1: the mode's default); sticky. Returns 0, or -1 for a bad value (unchanged).
+int qe_set_steering_ex(void* e, int vec, float scale, int mode, int lo, int hi) {
+    return ((Engine*)e)->set_steering(vec, scale, mode, lo, hi);
+}
+int qe_set_steering(void* e, int vec, float scale) { return ((Engine*)e)->set_steering(vec, scale, -1, -1, -1); }
+const char* qe_steer_info(void* e) { return ((Engine*)e)->steer_info(); }
+// mean layer-output residual over positions [r0, n) of an unsteered prefill from position 0 -> out[layers][hidden]
+int qe_capture(void* e, const int* ids, int n, int r0, float* out) { return ((Engine*)e)->capture(ids, n, r0, out); }
 }
 
 // ---- comm microbenchmark ----

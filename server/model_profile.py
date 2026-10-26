@@ -28,7 +28,7 @@ FAMILIES = {
     # 27B defaults are the ones the server always had (unchanged)
     "qwen38-27b": dict(
         served_name="qwen3.8-27b-qengine", temperature=0.6, mtp_k=7, split="",
-        lib="build/libqengine.so", vision=True,
+        lib="build/libqengine.so", vision=True, prefill_chunk_idle=0,
         drop_empty_turns=False,   # HF #50 cleanup: off (would change 27B prompts)
         merge_system=False,       # server-side merge of leading system messages (syssafe does it)
     ),
@@ -38,6 +38,7 @@ FAMILIES = {
         mtp_k=3,                  # best k 2..4 at c=1 (measured)
         split="176,160,176",      # expert groups per card (the middle card, often the desktop one, less)
         lib="build/libqflash.so", vision=False,
+        prefill_chunk_idle=4096,  # a prompt alone on the server: the engine's big batch (prefill-r3)
         drop_empty_turns=True, merge_system=True,
     ),
 }

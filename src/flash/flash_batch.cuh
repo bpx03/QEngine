@@ -459,8 +459,8 @@ void Worker::gdn_b(Layer& L, int li, int m, int rps) {
     } else
     k_dn_rec_b<<<dim3(vl, 16, m / rps), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, tab(TB_S, li), tab(TB_RP, li),
                                                        rslot_, bpn_, stepcs_, o, rps);
-    k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, 2048);
-    gemv_w4h(L.dn_out, ah_, 2048, part_, H, m, st_);
+    k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, vl * DV);
+    gemv_w4h(L.dn_out, ah_, vl * DV, part_, H, m, st_);
     KCHK("gdn_b");
 }
 
@@ -489,9 +489,10 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     xi.seq = xiseq_;
     xi.done = xidone_;
     k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb);
-    k_idx_local<<<m, 1024, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
+    if (idx_gk_) k_idx_local<true><<<m, 1024, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
+    else k_idx_local<<<m, 1024, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
     k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_);
-    k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp);
+    k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp, idx_gk_);
     KCHK("qsa_b select");
     AttnDst d{};
     d.o[0] = attn_x_;
@@ -552,6 +553,7 @@ void Worker::trunk_b(int m, const int* toks, int nseg, int rps) {
         hc_read(L.hcm, m, true);
         moe(L, m);
         hc_write(m);
+        steer_mark(li, rslot_);  // the layer output; per row its slot's vector
         bdump(li, 1, m, rps);
     }
     flush_y(m);

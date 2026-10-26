@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "model.h"
+#include "steer.h"
 
 // One persistent host thread per GPU; run() executes a job on all of them concurrently.
 class GpuPool {
@@ -80,6 +81,11 @@ public:
     // ahead would be undone before the next prefill chunk (losing its MTP drafts)
     void set_lookahead(bool on) { lookahead_ = on; }
     int spec_step(int* out);
+    // draft statistics of a slot since its creation: {steps, MTP drafted, MTP accepted, lookup drafted, lookup accepted}
+    void draft_stats(int slot, long long* out) const {
+        const Seq& q = seqs_.at(slot);
+        for (int i = 0; i < 5; i++) out[i] = q.ds[i];
+    }
     // End generation: waits for the step queued ahead and undoes it.
     void finish();
     // Concurrent sequences. start() marks its slot active (other starts avoid it) until
@@ -123,6 +129,18 @@ public:
     void set_dump_hidden(uint16_t* out) { for (auto& w : workers_) w->dump_hidden = out; }
     // Full logits of the last forward ([m][vocab]).
     void logits(float* out, int m);
+    // Activation steering (QE_STEER / QE_STEER_DIR / QE_STEER_DEFAULT, src/steer.h; vectors loaded at construction):
+    // the next start's vector (index in steer_info()'s list, -1 off, -2 the server default with its defaults at scale
+    // 1), scale (multiplies the mode's sidecar scale), mode (-1 the vector's default, 0 add, 1 project) and layers
+    // (lo, hi = -1, -1: the mode's default range; else inside the vector's file layers). Sticky until the next call.
+    // A conversation keeps the key it was computed with: prefix reuse, checkpoints, the archive and shared prefixes
+    // never mix KV of different (vector, mode, layers, scale). Returns 0, or -1 for a bad value (nothing changed).
+    int set_steering(int vec, float scale, int mode, int lo, int hi);
+    const char* steer_info() const { return steer_json_.c_str(); }
+    // Activation capture (steering/make_vector.py): prefill ids[0, n) unsteered from position 0 in a slot (no prefix
+    // reuse) and write out[layers][hidden] = the mean over positions [r0, n) of every layer output's residual (the
+    // point the vectors act on). Returns 0, or -1 (prompts in flight / no room).
+    int capture(const int* ids, int n, int r0, float* out);
 
     const Config& config() const { return cfg_; }
     int pos() const { return seqs_[cur_].pos; }
@@ -182,6 +200,16 @@ public:
 
 private:
     void step(const int* ids, int m, bool want_logits);
+    // steering (set_steering): the loaded vectors, the server default, the next start's selection and its key
+    // (vector | mode | lo | hi | scale bits, -1 off); every cached state carries the key it was computed with (sk)
+    std::vector<qsteer::SteerSpec> steer_;
+    int steer_def_ = -1, steer_vec_ = -1, steer_mode_ = 0, steer_lo_ = 0, steer_hi_ = -1;
+    float steer_scale_ = 1.f;
+    std::string steer_json_ = "{\"default\": null, \"vectors\": []}";
+    long long steer_key() const;
+    static void steer_unkey(long long k, int& vec, int& mode, int& lo, int& hi, float& scale);
+    void steer_slot(int slot);   // the slot's device steering follows its conversation's key (Seq::sk)
+    bool no_reuse_ = false;      // capture(): the next start computes the prompt from position 0
     void reset_slot();  // the current slot starts from position 0
     void plan_slots(int main_cap);
     // KV pool (see plan_slots)
@@ -213,6 +241,7 @@ private:
         std::vector<void*> bufs;    // one pinned host buffer per GPU
         unsigned long long used = 0;
         int kind = 0;               // 0 checkpoint (every 8K / divergence), 1 prompt end (own quota: snap_policy.h)
+        long long sk = -1;          // steering key it was computed with (set_steering)
     };
     // Host-side mirror of one sequence slot.
     struct Seq {
@@ -240,6 +269,15 @@ private:
         // shared prefix (stage 4): keys [0, split) are read from the prefix region pres_[pre];
         // the own region holds keys [split, max_t) (max_t stays the logical capacity)
         int split = 0, pre = -1;
+        long long sk = -1;          // steering key of its KV / state (set_steering): never served to another key
+        // draft statistics (draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
+        long long ds[5] = {0, 0, 0, 0, 0};
+        void count_step(bool lookup, int drafted, int emitted) {
+            const int acc = emitted > 1 ? emitted - 1 : 0;
+            ds[0]++;
+            ds[lookup ? 3 : 1] += drafted > acc ? drafted : acc;
+            ds[lookup ? 4 : 2] += acc;
+        }
     };
     // Shared prefix regions: the KV rows [0, n) of a pinned prefix once in the pool, read by every
     // slot attached to it (Seq::pre); the delta-net state comes from the pinned archive. Placed
@@ -250,13 +288,14 @@ private:
         int n = 0, refs = 0;
         size_t off = 0;
         unsigned long long used = 0;
+        long long sk = -1;  // steering key of its rows
     };
     std::vector<GpuPrefix> pres_;
     bool share_prefix_ = true;  // QE_SHARE_PREFIX (0: prefixes are copied into every slot as before)
     int rows_of(const Seq& q) const { return q.max_t > 0 ? q.max_t - q.split : 0; }
     size_t units_of(const Seq& q) const { return units(rows_of(q)); }
     void used_intervals(std::vector<std::pair<size_t, size_t>>& out) const;
-    int find_prefix(const int* ids, int n) const;
+    int find_prefix(const int* ids, int n, long long sk) const;
     int materialize_prefix(const KvArchive& a, const std::vector<int>& protect);
     size_t prefix_room(int n, const std::vector<int>& protect);
     bool drop_lru_prefix();
@@ -400,6 +439,7 @@ private:
         // > 0: a start() is restoring from it; making room (prefix materialization, ensure_cap
         // evictions archiving other slots) must not drop it before its rows / state are copied
         mutable int hold = 0;
+        long long sk = -1;                  // steering key of its KV / states (set_steering); steered ones stay in RAM
         size_t bytes() const { return total; }
     };
     std::vector<int> devs_;  // CUDA devices of the workers (P2P buffers are per device)

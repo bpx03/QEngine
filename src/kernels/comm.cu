@@ -576,7 +576,8 @@ template <int G, int FMT = 1>
 __global__ void __launch_bounds__(512) ar_finish_kernel(float* __restrict__ resid, const uint2* __restrict__ sums,
                                                         int h, const bf16* __restrict__ norm_w, float eps,
                                                         bf16* __restrict__ xn, int8_t* __restrict__ xq,
-                                                        float* __restrict__ xsc, int* __restrict__ ctr, bool wxn) {
+                                                        float* __restrict__ xsc, int* __restrict__ ctr, bool wxn,
+                                                        const SteerArg sa) {
     __shared__ float s_w[16];  // 512 threads as the fused tail: identical summation order
     const int r = blockIdx.x, h4 = h >> 2;
     // stream-K work counter of the W4A8 GEMM that consumes these rows next on this stream (replaces a
@@ -605,6 +606,50 @@ __global__ void __launch_bounds__(512) ar_finish_kernel(float* __restrict__ resi
         rr.x += v.x; rr.y += v.y; rr.z += v.z; rr.w += v.w;
         r4[i] = rr;
         q += rr.x * rr.x + rr.y * rr.y + rr.z * rr.z + rr.w * rr.w;
+    }
+    {  // layer-output steering of this row (steer.cuh) before the norm: h += c w, c = scale or -scale (h . w)
+        float ssc = 0.f;
+        int smode = 0;
+        const float* sdir = steer_dir(sa, r, h, ssc, smode);
+        if (sdir) {  // block-uniform
+            const float4* w4 = reinterpret_cast<const float4*>(sdir);
+            float c = ssc;
+            if (smode == 1) {
+                float d = 0.f;
+#pragma unroll
+                for (int it = 0; it < KEEP; it++) {
+                    const int i = threadIdx.x + it * blockDim.x;
+                    if (i < h4) {
+                        const float4 v = w4[i];
+                        d += keep[it].x * v.x + keep[it].y * v.y + keep[it].z * v.z + keep[it].w * v.w;
+                    }
+                }
+                for (int i = threadIdx.x + KEEP * blockDim.x; i < h4; i += blockDim.x) {
+                    const float4 v = w4[i], x = r4[i];
+                    d += x.x * v.x + x.y * v.y + x.z * v.z + x.w * v.w;
+                }
+                c = -ssc * steer_block_sum<512>(d);
+            }
+            q = 0.f;
+#pragma unroll
+            for (int it = 0; it < KEEP; it++) {
+                const int i = threadIdx.x + it * blockDim.x;
+                if (i < h4) {
+                    const float4 v = w4[i];
+                    float4& x = keep[it];
+                    x.x += c * v.x; x.y += c * v.y; x.z += c * v.z; x.w += c * v.w;
+                    r4[i] = x;
+                    q += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+                }
+            }
+            for (int i = threadIdx.x + KEEP * blockDim.x; i < h4; i += blockDim.x) {
+                const float4 v = w4[i];
+                float4 x = r4[i];
+                x.x += c * v.x; x.y += c * v.y; x.z += c * v.z; x.w += c * v.w;
+                r4[i] = x;
+                q += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+            }
+        }
     }
     if (!norm_w) return;
 #pragma unroll
@@ -840,13 +885,45 @@ __device__ __forceinline__ void ll16_consume(const uint4* p) {
 //   bit-identical results, so the protocol may be picked per row count (MTP == greedy holds).
 //   Buffers: partials for my words land in pregion(me, sender) at word w; the owner's sum of word
 //   w lands in pregion(peer, owner) at word w (a location the reduce-scatter never writes).
+// Layer-output steering in the 7-value tail of the LL16 / LLC all-reduces (steer.cuh): the row's values v (already
+// residual + sum, stored to rr) get + c w with c = scale (add) or -scale (v . w) (project, a block reduction), are
+// stored again and the norm's sum of squares q is recomputed in the same order. Called block-uniformly (a steered row).
+template <class IDX>
+__device__ __forceinline__ void steer_vals7(const float* __restrict__ w, float sc, int mode, float (&v)[7], IDX cidx,
+                                            bool on, int h, float* __restrict__ rr, float& q) {
+    float wv[7];
+    float d = 0.f;
+#pragma unroll
+    for (int e = 0; e < 7; e++) {
+        const int i = cidx(e);
+        const bool ok = on && i < h;
+        wv[e] = ok ? w[i] : 0.f;
+        if (ok) d += v[e] * wv[e];
+    }
+    const float c = mode == 1 ? -sc * steer_block_sum<kLL16Threads>(d) : sc;
+    q = 0.f;
+    if (on)
+#pragma unroll
+        for (int e = 0; e < 7; e++) {
+            const int i = cidx(e);
+            if (i >= h) break;
+            const float r = v[e] + c * wv[e];
+            rr[i] = r;
+            v[e] = r;
+            q += r * r;
+        }
+}
+
 template <int MODE>
 __global__ void __launch_bounds__(kLL16Threads) allreduce_ll16_kernel(
     float* __restrict__ resid, const float* __restrict__ partial, int h, Comm c, int rank,
     CommCounters ctr, int idx, const bf16* __restrict__ norm_w, float eps,
-    bf16* __restrict__ xn, __half* __restrict__ xh) {
+    bf16* __restrict__ xn, __half* __restrict__ xh, const SteerArg sa) {
     __shared__ float s_w[kLL16Threads / 32];
     const int row = blockIdx.x, tid = threadIdx.x;
+    float ssc = 0.f;
+    int smode = 0;
+    const float* sdir = steer_dir(sa, row, h, ssc, smode);  // layer-output steering of this row (steer.cuh), or null
     const unsigned ep = *ctr.epoch;
     const uint32_t tag = ((ep * 1024u + idx) % 65535u + 1u) << 16;  // never 0
     const int slot = ((ep & 1) << 1) | (idx & 1);
@@ -944,6 +1021,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_ll16_kernel(
             acc[e] = r;
             q += r * r;
         }
+    if (sdir) steer_vals7(sdir, ssc, smode, acc, cidx, on, h, rr, q);
     if (!norm_w) return;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
@@ -1021,10 +1099,13 @@ __device__ __forceinline__ void dec9(uint4 a, uint32_t (&b)[kCE]) {
 __global__ void __launch_bounds__(kLL16Threads) allreduce_llc_kernel(
     float* __restrict__ resid, const float* __restrict__ partial, int h, Comm c, int rank,
     CommCounters ctr, int idx, const bf16* __restrict__ norm_w, float eps,
-    bf16* __restrict__ xn, __half* __restrict__ xh) {
+    bf16* __restrict__ xn, __half* __restrict__ xh, const SteerArg sa) {
     extern __shared__ float s_sum[];  // [h]
     __shared__ float s_w[kLL16Threads / 32];
     const int row = blockIdx.x, tid = threadIdx.x;
+    float ssc = 0.f;
+    int smode = 0;
+    const float* sdir = steer_dir(sa, row, h, ssc, smode);  // as allreduce_ll16_kernel
     const unsigned ep = *ctr.epoch;
     const uint32_t tagc = ((ep * 1024u + idx) % 32767u + 1u) << 17;
     const int slot = ((ep & 1) << 1) | (idx & 1);
@@ -1125,6 +1206,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_llc_kernel(
             acc[e] = r;
             q += r * r;
         }
+    if (sdir) steer_vals7(sdir, ssc, smode, acc, cidx, on, h, rr, q);
     if (!norm_w) return;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
@@ -1434,22 +1516,24 @@ bool allreduce_deferrable(const Comm& c, int m, int h, int rs_off) {
     return on && rs_rows_p2p(c, m, h) && rs_off + m <= c.rs_rows;
 }
 void allreduce_finish(float* resid, int m, int h, const Comm& c, int rank, const bf16* norm_w, float eps,
-                      bf16* xn, int rs_off, cudaStream_t st, int8_t* xq, float* xsc, int G, int* ctr, bool wxn) {
+                      bf16* xn, int rs_off, cudaStream_t st, int8_t* xq, float* xsc, int G, int* ctr, bool wxn,
+                      const SteerArg* sa) {
     const uint2* sums = c.prs2[rank] + (size_t)rs_off * (h >> 2);
+    const SteerArg S = sa ? *sa : SteerArg();  // layer-output steering fused before the norm
     if (xq && G) CHECK((h >> 2) % 32 == 0, "fused quantization needs h %% 128 == 0 (%d)", h);
-    if (!xq || !G) ar_finish_kernel<0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, nullptr, nullptr, ctr, true);
+    if (!xq || !G) ar_finish_kernel<0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, nullptr, nullptr, ctr, true, S);
     else if (gemm_i8_variant() >= 2) {
-        if (G == 128) ar_finish_kernel<128, 2><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
-        else if (G == 64) ar_finish_kernel<64, 2><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
-        else ar_finish_kernel<32, 2><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
+        if (G == 128) ar_finish_kernel<128, 2><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
+        else if (G == 64) ar_finish_kernel<64, 2><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
+        else ar_finish_kernel<32, 2><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
     } else if (gemm_i8_variant()) {
-        if (G == 128) ar_finish_kernel<128><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
-        else if (G == 64) ar_finish_kernel<64><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
-        else ar_finish_kernel<32><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
+        if (G == 128) ar_finish_kernel<128><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
+        else if (G == 64) ar_finish_kernel<64><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
+        else ar_finish_kernel<32><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
     } else {
-        if (G == 128) ar_finish_kernel<128, 0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
-        else if (G == 64) ar_finish_kernel<64, 0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
-        else ar_finish_kernel<32, 0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn);
+        if (G == 128) ar_finish_kernel<128, 0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
+        else if (G == 64) ar_finish_kernel<64, 0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
+        else ar_finish_kernel<32, 0><<<m, 512, 0, st>>>(resid, sums, h, norm_w, eps, xn, xq, xsc, ctr, wxn, S);
     }
 }
 
@@ -1465,8 +1549,13 @@ static int ar_rs_min() {  // min rows of the decode reduce-scatter + all-gather 
 void allreduce_add(float* resid, const float* partial, int m, int h, const Comm& c, int rank,
                    const CommCounters& ctr, cudaStream_t st, const bf16* norm_w, float eps,
                    bf16* xn, int ll_idx, bool overlapped, __half* xh, bool defer, int rs_off, bool part_bf16,
-                   const OwnFin* of) {
+                   const OwnFin* of, const SteerArg* sa) {
     if (qe_fault_skip(rank, "ar")) return;  // test only (QE_FAULT_SKIP_AR_RANK): this rank skips the collective
+    // layer-output steering (steer.cuh): fused into the LL16 / LLC kernels below; after the others, the separate
+    // steer_fix (a deferred all-reduce gets it in allreduce_finish instead)
+    CHECK(!sa || sa->li < 0 || (!defer && !of), "steering: a deferred all-reduce is steered by allreduce_finish");
+    const SteerArg S = sa && !defer ? *sa : SteerArg();
+    bool fused = false;
     CHECK(!defer || allreduce_deferrable(c, m, h, rs_off), "allreduce defer %d", m);
     CHECK(!part_bf16 || (defer && m > kMaxGemvW4Tokens), "bf16 partials: deferred prefill rows only");
     CHECK(!of || (defer && allreduce_ownfin_ok(c, h) && norm_w), "owner-finished AR: deferred P2P rows only");
@@ -1496,16 +1585,16 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
             static const int lossless = getenv("QE_AR_LOSSLESS") ? atoi(getenv("QE_AR_LOSSLESS")) : 8;
             if (mode == 2 && lossless > 0 && m >= lossless)
                 allreduce_llc_kernel<<<m, kLL16Threads, h * sizeof(float), st>>>(resid, partial, h, c, rank, ctr, ll_idx,
-                                                                             norm_w, eps, xn, xh);
+                                                                             norm_w, eps, xn, xh, S), fused = true;
             else if (mode == 2)
                 allreduce_ll16_kernel<2><<<m, kLL16Threads, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx,
-                                                                     norm_w, eps, xn, xh);
+                                                                     norm_w, eps, xn, xh, S), fused = true;
             else if (mode == 1)
                 allreduce_ll16_kernel<1><<<m, kLL16Threads, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx,
-                                                                     norm_w, eps, xn, xh);
+                                                                     norm_w, eps, xn, xh, S), fused = true;
             else
                 allreduce_ll16_kernel<0><<<m, kLL16Threads, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx,
-                                                                     norm_w, eps, xn, xh);
+                                                                     norm_w, eps, xn, xh, S), fused = true;
         } else {
             allreduce_ll_kernel<<<m, kLLThreads, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx,
                                                           norm_w, eps, xn, xh, mode != 0);
@@ -1546,13 +1635,118 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
             allreduce_rows_kernel<<<nb, 512, 0, st>>>(resid, partial, m, h, c, rank, ctr, norm_w,
                                                       eps, xn);
     }
+    if (!fused && S.li >= 0) steer_fix(resid, m, h, S, norm_w, eps, xn, xh, st);
 }
 
 // Flash-Next: R[i] += inj_i * allreduce(partial) for the 4 hyper-connection streams (rows >= 3 * ngpu, P2P);
 // returns false when the shape needs the generic path (allreduce_add into y + the residual update kernel)
+static void allreduce_hc_staged(float* R, const float* inj, const float* partial, int m, int h, const Comm& c, int rank,
+                                cudaStream_t st, int blocks, bool own_rows);  // c.xfer != kXferP2P (below)
+// Pull variant of allreduce_rs_rows_kernel<HCW> (prefill-r4): SM stores into a peer's memory (P2P over PCIe) stall the
+// memory system of the sending card for every kernel next to them (W4A8 GEMM next to a 16-block store stream: 4.3x
+// slower; next to SM loads of the same bytes from the peer: +12 %; tools/mb/mb_gdn.cu), so the rows move by loads where
+// the probe allows it (c.pullm bit 4 i + j: rank i reads rank j's rows; else j stores them into i's memory, as before).
+// Every card packs its rows (bf16) into its staging rows c.pstage (pulled pairs, local stores) or the owner's prs1
+// (pushed pairs), raises the RS flags; the owner of a row range reads the peers' rows of its range and sums them in the
+// fixed GPU order (the same values and order as the push path: bit-identical); the second exchange is the barrier that
+// keeps the next call's writes off rows a peer may still read. Full mode (!own_rows): the owner writes its sums into
+// its own prs2 rows (and stores them into pushed peers' prs2), every card reads the owners' sums after the second
+// exchange (the next call's sums are written only after its first exchange, i.e. after every peer finished this tail).
+__device__ __forceinline__ bool pull_pair(const Comm& c, int reader, int owner) { return (c.pullm >> (4 * reader + owner)) & 1u; }
+__global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restrict__ R, const float* __restrict__ partial,
+                                                                 int m, int h, Comm c, int rank, CommCounters ctr,
+                                                                 const float* __restrict__ inj, bool own_rows) {
+    __shared__ unsigned s_seq;
+    if (threadIdx.x == 0) s_seq = *ctr.seq + 1;
+    __syncthreads();
+    const unsigned s1 = s_seq, s2 = s_seq + 1;
+    const int h4 = h >> 2;
+    const float4* p4 = reinterpret_cast<const float4*>(partial);
+    float4* r4 = reinterpret_cast<float4*>(R);
+    auto owner_begin = [&](int g) { return (int)((long)m * g / c.ngpu); };
+    const int ob = owner_begin(rank), oe = owner_begin(rank + 1);
+    uint2* const stage = c.pstage[rank];
+    for (int r = blockIdx.x; r < m; r += gridDim.x) {
+        if (r >= ob && r < oe) continue;
+        int og = 0;
+        while (og + 1 < c.ngpu && r >= owner_begin(og + 1)) og++;
+        uint2* const dst = pull_pair(c, og, rank) ? stage + (size_t)r * h4
+                                                  : c.prs1[og] + ((size_t)rank * c.rs_own + (r - owner_begin(og))) * h4;
+        for (int i = threadIdx.x; i < h4; i += blockDim.x) dst[i] = pack_bf16x4(p4[(size_t)r * h4 + i]);
+    }
+    exchange(c, rank, ctr, s1, true, kWdArRowsExchange);
+    uint2* const sums = c.prs2[rank];
+    for (int r = ob + blockIdx.x; r < oe; r += gridDim.x) {
+        const float jj[4] = {inj[r * 4], inj[r * 4 + 1], inj[r * 4 + 2], inj[r * 4 + 3]};
+        for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+            const size_t idx = (size_t)r * h4 + i;
+            uint2 pv[4];
+#pragma unroll
+            for (int g = 0; g < 4; g++)
+                if (g < c.ngpu)
+                    pv[g] = g == rank ? pack_bf16x4(p4[idx])
+                                      : __ldcv(pull_pair(c, rank, g) ? c.pstage[g] + idx
+                                                                     : c.prs1[rank] + ((size_t)g * c.rs_own + (r - ob)) * h4 + i);
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+            for (int g = 0; g < 4; g++)
+                if (g < c.ngpu) {
+                    const float4 x = unpack_bf16x4(pv[g]);
+                    v.x += x.x; v.y += x.y; v.z += x.z; v.w += x.w;
+                }
+            if (!own_rows) {
+                const uint2 pk = pack_bf16x4(v);
+                sums[idx] = pk;
+                for (int g = 0; g < c.ngpu; g++)
+                    if (g != rank && !pull_pair(c, g, rank)) c.prs2[g][idx] = pk;
+                continue;
+            }
+            const float4 vb = unpack_bf16x4(pack_bf16x4(v));
+            float4* rr = r4 + (size_t)r * 4 * h4 + i;
+#pragma unroll
+            for (int s4 = 0; s4 < 4; s4++) {
+                float4 x = rr[s4 * h4];
+                x.x += jj[s4] * vb.x; x.y += jj[s4] * vb.y; x.z += jj[s4] * vb.z; x.w += jj[s4] * vb.w;
+                rr[s4 * h4] = x;
+            }
+        }
+    }
+    exchange(c, rank, ctr, s2, true, kWdArRowsExchange);
+    if (!own_rows) {
+        for (int r = blockIdx.x; r < m; r += gridDim.x) {
+            int og = 0;
+            while (og + 1 < c.ngpu && r >= owner_begin(og + 1)) og++;
+            const uint2* const src = (og != rank && pull_pair(c, rank, og)) ? c.prs2[og] : c.prs2[rank];
+            const float jj[4] = {inj[r * 4], inj[r * 4 + 1], inj[r * 4 + 2], inj[r * 4 + 3]};
+            for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+                const size_t idx = (size_t)r * h4 + i;
+                const float4 v = unpack_bf16x4(__ldcv(src + idx));
+                float4* rr = r4 + (size_t)r * 4 * h4 + i;
+#pragma unroll
+                for (int s4 = 0; s4 < 4; s4++) {
+                    float4 x = rr[s4 * h4];
+                    x.x += jj[s4] * v.x; x.y += jj[s4] * v.y; x.z += jj[s4] * v.z; x.w += jj[s4] * v.w;
+                    rr[s4 * h4] = x;
+                }
+            }
+        }
+    }
+    bump_seq(ctr, s2);
+}
+
 bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, int h, const Comm& c, int rank,
                       const CommCounters& ctr, cudaStream_t st, int blocks, bool own_rows) {
     if (!allreduce_hc_ok(c, m, h)) return false;
+    if (c.xfer != kXferP2P && c.xcnt[rank]) {
+        allreduce_hc_staged(R, inj, partial, m, h, c, rank, st, blocks, own_rows);
+        return true;
+    }
+    bool stg = c.pullm != 0 && c.ngpu <= 4;
+    for (int g = 0; g < c.ngpu; g++) stg = stg && c.pstage[g] && c.prs2[g];
+    if (stg) {
+        allreduce_hc_pull_kernel<<<std::min(m, blocks), 512, 0, st>>>(R, partial, m, h, c, rank, ctr, inj, own_rows);
+        return true;
+    }
     const int nb = std::min(m, blocks);
     static const int w16 = env_int("FLASH_AR_W16", 0) ? 16 : 0;  // 16-byte P2P stores in phase 1 (and the sums)
     allreduce_rs_rows_kernel<false, -1, true><<<nb, 512, 0, st>>>(R, partial, m, h, c, rank, ctr, nullptr, 0.f, nullptr, 0,
@@ -1783,6 +1977,156 @@ CeCopy ce_ag_copy(const Comm& c, int rank, int peer, int m, int h, int rs_off, u
     return x;
 }
 
+// ---- staged HC all-reduce (c.xfer kXferCE / kXferHost): the rows move by copies, only local work runs on SMs.
+// Same arithmetic as allreduce_rs_rows_kernel<HCW> (owner sums in the fixed GPU order, own term rounded to bf16 as the
+// packed rows, bf16 sums), so the results are bit-identical to the SM-store path.
+//   pack (partial -> bf16 rows; host: -> own pinned rows), flag RS | wait RS, pull the owner rows of every peer into the
+//   local prs1 (CE: from the peers' staging rows, host: from their pinned rows) | sum (own rows: R += inj * sum, or bf16
+//   sums -> prs2; host: -> own pinned rows), flag AG | wait AG (full: pull the owners' sum rows into the local prs2) |
+//   tail (full): R += inj * sums of every row. The AG flags are also the barrier that keeps the next call off rows a
+//   peer is still copying (own-rows mode: the flag only).
+namespace {
+__global__ void xs_seqw_kernel(unsigned* w, const unsigned* cnt) { *w = *cnt + 1; }  // CE: the call's flag value
+__global__ void xs_flag_kernel(Comm c, int rank, int kind) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *c.xcnt[rank] + 1;
+    __threadfence_system();
+    for (int g = 0; g < c.ngpu; g++)
+        if (g != rank) st_release_sys(c.xfl[g] + kind * c.ngpu + rank, s);
+}
+__global__ void xs_wait_kernel(Comm c, int rank, int kind, bool bump) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *c.xcnt[rank] + 1;
+    for (int g = 0; g < c.ngpu; g++)
+        if (g != rank) {
+            const unsigned* f = c.xfl[rank] + kind * c.ngpu + g;
+            for (unsigned ws = 0; (int)(ld_acquire_sys(f) - s) < 0;) {
+                __nanosleep(64);
+                QE_WD_POLL(ws, kWdCeFlags, g, s, ld_acquire_sys(f));
+            }
+        }
+    __threadfence_system();
+    if (bump) *c.xcnt[rank] = s;
+}
+// owner rows: sum of every GPU's bf16 rows (own term from the fp32 partial); own_rows: R += inj * bf16(sum), else the
+// bf16 sums into the local prs2 rows
+__global__ void __launch_bounds__(512) xs_sum_kernel(float* __restrict__ R, const float* __restrict__ inj,
+                                                     const float* __restrict__ partial, int m, int h, Comm c, int rank,
+                                                     bool own_rows) {
+    const int h4 = h >> 2;
+    auto owner_begin = [&](int g) { return (int)((long)m * g / c.ngpu); };
+    const int ob = owner_begin(rank), oe = owner_begin(rank + 1);
+    const float4* p4 = reinterpret_cast<const float4*>(partial);
+    float4* r4 = reinterpret_cast<float4*>(R);
+    for (int r = ob + blockIdx.x; r < oe; r += gridDim.x) {
+        const float j0 = inj[r * 4], j1 = inj[r * 4 + 1], j2 = inj[r * 4 + 2], j3 = inj[r * 4 + 3];
+        const float jj[4] = {j0, j1, j2, j3};
+        for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+            const size_t idx = (size_t)r * h4 + i;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int g = 0; g < c.ngpu; g++) {
+                const float4 x = g == rank ? unpack_bf16x4(pack_bf16x4(p4[idx]))
+                                           : unpack_bf16x4(__ldcv(c.prs1[rank] + ((size_t)g * c.rs_own + (r - ob)) * h4 + i));
+                v.x += x.x; v.y += x.y; v.z += x.z; v.w += x.w;
+            }
+            if (!own_rows) {
+                c.prs2[rank][idx] = pack_bf16x4(v);
+                continue;
+            }
+            const float4 vb = unpack_bf16x4(pack_bf16x4(v));
+            float4* rr = r4 + (size_t)r * 4 * h4 + i;
+#pragma unroll
+            for (int s4 = 0; s4 < 4; s4++) {
+                float4 x = rr[s4 * h4];
+                x.x += jj[s4] * vb.x; x.y += jj[s4] * vb.y; x.z += jj[s4] * vb.z; x.w += jj[s4] * vb.w;
+                rr[s4 * h4] = x;
+            }
+        }
+    }
+}
+__global__ void __launch_bounds__(512) xs_tail_kernel(float* __restrict__ R, const float* __restrict__ inj, int m, int h,
+                                                      const uint2* __restrict__ sums) {
+    const int h4 = h >> 2;
+    float4* r4 = reinterpret_cast<float4*>(R);
+    for (int r = blockIdx.x; r < m; r += gridDim.x) {
+        const float j0 = inj[r * 4], j1 = inj[r * 4 + 1], j2 = inj[r * 4 + 2], j3 = inj[r * 4 + 3];
+        const float jj[4] = {j0, j1, j2, j3};
+        for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+            const float4 v = unpack_bf16x4(__ldcv(sums + (size_t)r * h4 + i));
+            float4* rr = r4 + (size_t)r * 4 * h4 + i;
+#pragma unroll
+            for (int s4 = 0; s4 < 4; s4++) {
+                float4 x = rr[s4 * h4];
+                x.x += jj[s4] * v.x; x.y += jj[s4] * v.y; x.z += jj[s4] * v.z; x.w += jj[s4] * v.w;
+                rr[s4 * h4] = x;
+            }
+        }
+    }
+}
+}  // namespace
+
+static void allreduce_hc_staged(float* R, const float* inj, const float* partial, int m, int h, const Comm& c, int rank,
+                                cudaStream_t st, int blocks, bool own_rows) {
+    // Host staging: every card PULLS the rows it needs (owner: the peers' partial rows of its range; full mode: the
+    // owners' sums) from the peers' pinned rows after their flags (SM stores into host-mapped words).
+    // Copy engine: every card PUSHES its rows into the peers' receive rows by peer copies and then its flag word by a
+    // copy of the same stream (xs_ce_flags): the flag lands after the rows it covers (an SM flag store after a pushed
+    // copy had no ordering with it; the receiver-pull variant of c0e8ac3 hung the first prefill batch).
+    const int h4 = h >> 2, ng = c.ngpu;
+    const size_t row = (size_t)h * 2;
+    auto ob = [&](int g) { return (int)((long)m * g / ng); };
+    const int o0 = ob(rank), o1 = ob(rank + 1);
+    const bool host = c.xfer == kXferHost;
+    uint2* stage = c.pstage[rank];
+    ce_pack_kernel<<<std::max(1, std::min(m, blocks)), 512, 0, st>>>(partial, m, h4, stage);
+    auto ce_flags = [&](int kind) {  // the call's sequence number -> every peer's flag word [kind][rank]
+        for (int g = 0; g < ng; g++)
+            if (g != rank)
+                CUDA_CHECK(cudaMemcpyAsync(c.xfl[g] + kind * ng + rank, c.xsw[rank], 4, cudaMemcpyDeviceToDevice, st));
+    };
+    if (host) {
+        CUDA_CHECK(cudaMemcpyAsync(c.hrs[rank], stage, (size_t)m * row, cudaMemcpyDeviceToHost, st));
+        xs_flag_kernel<<<1, 32, 0, st>>>(c, rank, 0);
+    } else {
+        for (int g = 0; g < ng; g++)
+            if (g != rank && ob(g + 1) > ob(g))
+                CUDA_CHECK(cudaMemcpyAsync(c.prs1[g] + (size_t)rank * c.rs_own * h4, stage + (size_t)ob(g) * h4,
+                                           (size_t)(ob(g + 1) - ob(g)) * row, cudaMemcpyDeviceToDevice, st));
+        xs_seqw_kernel<<<1, 1, 0, st>>>(c.xsw[rank], c.xcnt[rank]);
+        ce_flags(0);
+    }
+    xs_wait_kernel<<<1, 32, 0, st>>>(c, rank, 0, false);
+    if (host && o1 > o0)
+        for (int g = 0; g < ng; g++)
+            if (g != rank)
+                CUDA_CHECK(cudaMemcpyAsync(c.prs1[rank] + (size_t)g * c.rs_own * h4, c.hrs[g] + (size_t)o0 * h4,
+                                           (size_t)(o1 - o0) * row, cudaMemcpyHostToDevice, st));
+    if (o1 > o0) xs_sum_kernel<<<std::max(1, std::min(o1 - o0, blocks)), 512, 0, st>>>(R, inj, partial, m, h, c, rank, own_rows);
+    // AG flag: the sums are ready (full mode) and this card is done with its receive rows (both modes: the barrier that
+    // keeps the next call's rows off receive rows a peer is still reading / copying)
+    if (host) {
+        if (!own_rows && o1 > o0)
+            CUDA_CHECK(cudaMemcpyAsync(c.hag[rank] + (size_t)o0 * h4, c.prs2[rank] + (size_t)o0 * h4, (size_t)(o1 - o0) * row,
+                                       cudaMemcpyDeviceToHost, st));
+        xs_flag_kernel<<<1, 32, 0, st>>>(c, rank, 1);
+    } else {
+        if (!own_rows && o1 > o0)
+            for (int g = 0; g < ng; g++)
+                if (g != rank)
+                    CUDA_CHECK(cudaMemcpyAsync(c.prs2[g] + (size_t)o0 * h4, c.prs2[rank] + (size_t)o0 * h4, (size_t)(o1 - o0) * row,
+                                               cudaMemcpyDeviceToDevice, st));
+        ce_flags(1);
+    }
+    xs_wait_kernel<<<1, 32, 0, st>>>(c, rank, 1, true);
+    if (own_rows) return;
+    if (host)
+        for (int g = 0; g < ng; g++)
+            if (g != rank && ob(g + 1) > ob(g))
+                CUDA_CHECK(cudaMemcpyAsync(c.prs2[rank] + (size_t)ob(g) * h4, c.hag[g] + (size_t)ob(g) * h4,
+                                           (size_t)(ob(g + 1) - ob(g)) * row, cudaMemcpyHostToDevice, st));
+    xs_tail_kernel<<<std::max(1, std::min(m, blocks)), 512, 0, st>>>(R, inj, m, h, c.prs2[rank]);
+}
+
 bool allreduce_ownfin_ok(const Comm& c, int h) {
     return c.p2p && c.pxq[0] && h == c.ll_hidden && (h >> 2) <= 4 * 512 && (h >> 2) % 32 == 0 && h % 128 == 0;
 }
@@ -1796,3 +2140,5 @@ void allgather_small(const float* src, int n, float* out, const Comm& c, int ran
     if (qe_fault_skip(rank, "ar")) return;  // test only (QE_FAULT_SKIP_AR_RANK)
     allgather_kernel<<<1, 256, 0, st>>>(src, n, out, c, rank, ctr);
 }
+
+#include "comm_probe.cuh"

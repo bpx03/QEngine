@@ -1,5 +1,5 @@
 #pragma once
-// Qwen3.8-Flash-Next (qwen4_exp) decode engine for 3 GPUs: EP experts, TP GDN / QSA heads, QSA KV split by
+// Qwen3.8-Flash-Next (qwen4_exp) decode engine for 2 or 3 GPUs: EP experts, TP GDN / QSA heads, QSA KV split by
 // token position across the cards (each card owns `own` of every `period` positions), hyper-connection
 // residual 4 x 2560 replicated in fp32.
 #include <string>
@@ -20,6 +20,7 @@
 #include "../safetensors.h"
 
 namespace flash {
+struct Xchg;  // flash_kernels.cuh: a QSA exchange (receive buffers, flags, counters)
 
 constexpr int H = 2560, HC = 4, RW = HC * H, LAYERS = 48, NE = 512, TOPK = 10, INTER = 640;
 constexpr int VOCAB = 248320, NQ = 24, NKV = 2, HD = 256, ROT = 64;
@@ -32,6 +33,9 @@ constexpr int IDX_NH = 4, IDX_HD = 128, IDX_BUDGET = 2048, IDX_R = 4, IDX_TOPB =
 constexpr int IDX_TAIL = 32;
 constexpr int PLE_LAYER = 1, PLE_HEADS = 16, PLE_DIM = 160, PLE_CONV = 4, PLE_DIL = 3, NGRAM_ROWS = 2500012;
 constexpr int PFM = 512;               // rows per prefill chunk
+// rows of one prefill collective (all-reduce + HC on own rows + row all-gather) at most: a collective covers whole
+// mixer chunks (FLASH_ARU, default 2 chunks), the MoE half runs per collective unit (prefill-r2)
+constexpr int ARU_MAX = 2 * PFM;
 constexpr int MAXM = 32;
 constexpr int MAXP = 17;                // rows of a deferred-commit forward (verify: 1 + drafts); prompts use prefill()                // rows per forward (decode / verify / prefill chunks): 8-token mma tiles x 4
 constexpr float EPS = 1e-6f;
@@ -42,6 +46,18 @@ constexpr int EOS = 248044;
 // pending, indexer key ring
 enum { TB_S = 0, TB_CH, TB_CP, TB_RP, TB_PH, TB_PP, TB_IT, TB_N };
 
+// activation steering arguments of a kernel (see k_steer, flash_kernels.cuh)
+struct SteerArg {
+    const float* w = nullptr;    // [vectors][2 modes][LAYERS][H]
+    const float* dw = nullptr;   // [vectors][2 modes][LAYERS][HC][HCD_ROWS]
+    const int* sl = nullptr;     // per slot {vector (-1 off), mode, lo, hi}
+    const float* sc = nullptr;   // per slot scale
+    const int* rslot = nullptr;
+    int li = -1;  // layer whose output is steered (-1: none)
+};
+
+// ranks: 2 or 3 (every split below divides: 24 QSA q heads, 48 DeltaNet value / 16 key heads, 512-position KV
+// ownership per period of 512 x ngpu positions)
 struct Plan {
     int rank = 0, ngpu = 3;
     std::vector<int> gcard;  // expert group (e * 5 + g, e = 512 shared) -> card
@@ -53,6 +69,10 @@ struct Plan {
 };
 // weights: relative share of expert groups per card (e.g. 176,160,176)
 std::vector<Plan> make_plan(int ngpu, const std::vector<double>& group_weights);
+// default expert-group weights for ngpu cards: 3 -> 176,160,176 (the desktop card GPU1 gets less), else equal
+std::vector<double> default_group_weights(int ngpu);
+// local expert groups of a card under a plan (the shared expert's included): bound of its MoE job lists
+int plan_groups(const Plan& p);
 
 struct HcW {     // one hyper-connection read: Wd (+ inject rows) and Wu, INT8 g128
     W8 down, up;
@@ -72,7 +92,8 @@ constexpr int GRP = 128, NGRP = INTER / GRP;
 constexpr size_t GG_Q = (size_t)2 * GRP * H / 2, GG_S = (size_t)2 * GRP * (H / 128) * 2;
 constexpr size_t GD_Q = (size_t)H * GRP / 2, GD_S = (size_t)H * (GRP / 128) * 2;
 constexpr size_t GRP_BYTES = GG_Q + GG_S + GD_Q + GD_S;
-constexpr int MAXJOB = 896;              // >= the expert groups of any card (2565 x 0.34 + margin)
+constexpr int MAXJOB = 896;              // job lists: at least this (3 cards: >= the groups of any card, 2565 x 0.34 + margin);
+                                         // a card with more local groups (2 cards: ~1283) sizes them by plan_groups
 constexpr int PF_SHJ = 64;               // prefill: rows per shared-expert job (the shared expert sees every row)
 constexpr int MAXJOB_PF = 3072;  // prefill jobs: (expert, 64-row chunk, local group) <= 896 + 2 x rows x 11 / 64 (4096 rows)
 struct MoeJob {            // device descriptor of one local expert group
@@ -162,12 +183,14 @@ struct NgramDev {          // n-gram table for the device-side gather (pinned + 
 // cudaHostRegister(Mapped | Portable) as soon as it is filled (chunked: ~8-12 GB/s for the 102 GB n-gram file vs
 // 2.7); chunked memory is for kernel access only (a cudaMemcpy across two registrations fails with invalid value),
 // otherwise one registration of the whole buffer after the fill. Device address == host address (UVA). Never freed.
-char* pin_host(const void* src, size_t n, int threads = 32, bool chunked = false);
+// numa: NUMA nodes for the pages (one: preferred, several: interleaved; empty or a single-node machine: default)
+char* pin_host(const void* src, size_t n, int threads = 32, bool chunked = false, const std::vector<int>& numa = {});
 // The same for n bytes of a file at off whose mapping is src (chunked registration): 8 MB blocks resident in the
 // page cache are copied, the others read with O_DIRECT (no page-cache churn: the file is larger than what stays
 // cached next to its pinned copy, and its reads evicted the expert weights read next); the file's cached pages are
 // dropped afterwards (POSIX_FADV_DONTNEED). Returns the address of byte off (the buffer may start up to 4 KB earlier).
-char* pin_host_file(const std::string& path, size_t off, size_t n, const void* src, int threads = 32);
+char* pin_host_file(const std::string& path, size_t off, size_t n, const void* src, int threads = 32,
+                    const std::vector<int>& numa = {});
 
 constexpr int NGRAM_Q8_ROW = PLE_DIM + 2;  // INT8 n-gram row: 160 int8, then the fp16 scale (x = q * scale)
 struct HostTables {        // shared by the workers (host memory)
@@ -209,6 +232,9 @@ public:
     // batched prefill of n <= pf_batch() rows: layer by layer, the mixer (attention / DeltaNet) in chunks of PFM rows,
     // the MoE half over all n rows at once (each expert group read once per batch); argmax/sample of the last row
     int pf_batch() const { return pfbn_; }
+    // rows of a prefill batch whose buffers never take memory from the expert cache (the rest of pf_batch() is
+    // borrowed from it for the batch, prefill-r3)
+    int pf_batch_base() const { return pfbn_base_; }
     // mtp_toks (optional): the MTP fill as a 49th layer of the batch (last: the prompt's last batch, the last row's MTP
     // token is the sampled one); *draft = the MTP draft of the last row, or -2 when the caller must run prefill_batch_mtp
     void prefill_batch(const int* tokens, int pos, int n, const bf16* ple_rows, int* out, const int* mtp_toks = nullptr,
@@ -256,7 +282,7 @@ public:
         long long dec_steps = 0, dec_touch = 0, dec_miss = 0;  // decode launches, cold-group reads, of them from host
         long long pf_calls = 0, pf_touch = 0, pf_miss = 0;     // prefill / other launches
         long long copies = 0, ev_kv = 0, ev_freq = 0, revived = 0, ev_kv_pend = 0;  // ev_kv_pend: reclaimed with a copy in flight
-        int ncold = 0, resident = 0, live_slots = 0, slots = 0;
+        int ncold = 0, resident = 0, live_slots = 0, slots = 0, bt_slots = 0;  // bt_slots: of them in the borrowed big-batch tails
         double seed_gbs = 0;   // H2D bandwidth of the startup seed copy
         std::vector<unsigned short> step_miss;  // per decode launch (this card)
     };
@@ -341,6 +367,21 @@ public:
     void set_bhist(int slot, const int* ids, int n);  // batched lookup: the slot's token history (prompt + emitted)
     bool batch_lookup() const { return blk_; }
     std::vector<float> bgpu_ms_;  // GPU time of every batched step
+    // activation steering (QE_STEER / QE_STEER_DIR, flash_steer.h): nv vectors, w = [nv][2 modes][LAYERS][H] with the
+    // sidecar strength folded in (add: alpha v; project: sqrt(alpha) unit v), vector v present on layers flo[v]..fhi[v];
+    // applied to every HC stream of the residual at the output of the slot's layers. Set once after alloc_state,
+    // before any forward (graphs capture the buffer addresses).
+    void set_steer(int nv, const int* flo, const int* fhi, const float* w);
+    bool steer_loaded() const { return steer_w_ != nullptr; }
+    // per slot: the vector (-1: off, the default), its mode (0 add, 1 project), layers lo..hi (inside the vector's) and
+    // scale (device values at fixed addresses: no graph changes)
+    void set_steer_slot(int s, int vec, int mode, int lo, int hi, float scale);
+    int steer_vec(int s) const { return steer_w_ ? steer_sl_h_.at((size_t)s * 4) : -1; }
+    // activation capture (qe_capture, eager prefill): per layer the sum over rows >= skip of the layer output's stream
+    // mean; cap_begin zeroes, cap_skip sets the rows to skip in the next forward, cap_end copies out [LAYERS][H]
+    void cap_begin();
+    void cap_skip(int skip) { cap_skip_ = skip; }
+    void cap_end(float* host);
 
 private:
     struct SlotState {
@@ -446,8 +487,30 @@ private:
     __half* sp_hh_ = nullptr;
     unsigned long long* sp_det_ = nullptr;
     void hc_rows(const HcW& w, float* R, float* inj, bf16* x, __half* xh, int m, cudaStream_t s);
-    void row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch);  // ch: protocol channel (one per stream)
+    // ch: protocol channel (one per stream); rr: [2 * rank] row range of every card (needed by the host-staged path)
+    void row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, const int* rr = nullptr);
+    // staged prefill transfers (comm_.xfer != kXferP2P, comm_select_path): pinned host staging of the row all-gather
+    // ([x, xh, R] regions of AG_CAP own rows) and of the QSA exchanges ([4 peers][XROWS][XPER] for q and partials), the
+    // host-mapped flag words, the device outbox of the staged exchanges, and the exchange counters of the batch
+    static constexpr int AG_CAP = ARU_MAX / 2 + 2;
+    char* hag_h_ = nullptr;
+    unsigned* hagf_ = nullptr;          // [2 channels][data, ack][4 senders]
+    char* hag_p_[4] = {};
+    unsigned* hagf_p_[4] = {};
+    float *xout_ = nullptr, *xoutc_ = nullptr, *hxq_ = nullptr, *hxc_ = nullptr;  // device outboxes of q / partials
+    unsigned *xsw_ = nullptr, *agw_ = nullptr;  // CE: sequence-number words copied into the peers' flags after the rows
+    unsigned* hxf_ = nullptr;           // [q, partials][4 senders]
+    float *hxq_p_[4] = {}, *hxc_p_[4] = {};
+    unsigned* hxf_p_[4] = {};
+    unsigned* xdummy_ = nullptr;        // flag words the send kernels of a staged exchange raise (the copies follow)
+    bool xstage_ = false;               // inside a prefill batch (counters aligned by k_xpar_align)
+    int xq_k_ = 0, xc_k_ = 0;           // QSA exchanges of the batch so far
+    void alloc_staging();
+    void xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per, cudaStream_t sx = nullptr);  // after the send kernel (into the outbox)
+    Xchg xchg_outbox(int e, const Xchg& x, int par, size_t per) const;        // the send kernel's view: outbox + dummy flags
     void trunk_batch_sp(int n, unsigned selmask);
+    void trunk_batch_sp1(int n, unsigned selmask);  // per-chunk collectives (FLASH_PFU=0)
+    int pf_units(int n, int* ub, int* cb) const;
     bool hcsp_ok(int n) const;
     char* pfs_ring_ = nullptr;          // mode 1: [2][pfs_cap_] groups
     std::vector<int> pfs_slots_;        // mode 2: the expert-cache slots of the ring (highest KV offsets)
@@ -467,7 +530,7 @@ private:
     ColdTab stab(const Layer& L) const { return ColdTab(pfs_tab_d_ + L.coff, pfs_touch_d_ + L.coff); }
     void pfs_init();
     void pfs_copy(int li);
-    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool pf = false; };  // pf: lent to the prefill staging ring
+    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool pf = false; bool bt = false; int prev = -1; };  // pf: lent to the prefill staging ring; bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
     std::vector<float> ec_prior_;
     std::vector<EcSlot> ec_slots_;
     std::vector<int> ec_slot_of_;      // cold group -> slot or -1
@@ -499,6 +562,17 @@ private:
     void trunk_batch(int n, unsigned selmask);
     unsigned batch_sel(int pos, int n);  // chunks with block selection -> bits; also stages the chunk positions
     int pfbn_ = PFM;
+    __half* moe_slots_ = nullptr;  // MoE down slot buffer (aliases the mixer chunk scratch, alloc_rows)
+    int moe_slot_rows_ = 0;
+    __half* moe_slots2_ = nullptr;  // its extension for the MoE parts of big batches (a borrowed region)
+    int moe_slot_rows2_ = 0;
+    // big prefill batches (prefill-r3): the batch buffers hold pfbn_ rows, their rows past pfbn_base_ (and the slot
+    // extension) are expert cache slots outside such batches (bt_regs_: [address, bytes]); bt_want_: the coming
+    // launch needs them, bt_taken_: given back by the cache
+    int pfbn_base_ = PFM;
+    std::vector<std::pair<char*, size_t>> bt_regs_;
+    bool bt_want_ = false, bt_taken_ = false;
+    int* pfinv_ = nullptr;         // slot of every (row, k) of the batch's routing
     bool mtpb_ = false, mtpb_last_ = false;  // prefill_batch with the MTP layer
     float* dnqk_ = nullptr;  // chunked DeltaNet inputs: normalized q / k [PFM][2][nk][128], decay / beta [PFM][2][nv]
     float* dngb_ = nullptr;
@@ -520,6 +594,10 @@ private:
     int* pftl_ = nullptr;
     float* pfwl_ = nullptr;
     __half* pfact_ = nullptr;
+    size_t pfact_bytes_ = 0;
+    bool rq_attr_ = false;
+    size_t qpf_attr_ = 0;
+    int maxloc_ = 0;  // most local groups of one expert on this card  // k_qsa_pfsel's dynamic shared memory set on this device  // k_rows_q's dynamic shared memory set on this device
     int* possub_ = nullptr;
     bool pf_ = false;          // prefill forward (m > MAXM): GEMM / gathered-MoE paths, rows committed at once
     void prefill_body(int m, bool mtp_fill, int hrow_last);
@@ -545,6 +623,16 @@ private:
     void gdn(Layer& L, int li, int pos, int m);
     void qsa(Layer& L, int li, int pos, int m);
     void moe(Layer& L, int m);
+    // pipelined QSA prefill chunks (prefill-r3, FLASH_QSA_PIPE): qsa() with qsa_split_ = 1 stops after sending the
+    // chunk's partials (buffers of slot qsa_buf_), qsa_back(slot) combines them and runs o_proj later, after the next
+    // chunk's front half (the partial exchange flies under it)
+    void qsa_back(int slot);
+    struct QsaBack { Layer* L = nullptr; const float* prow = nullptr; float* ax = nullptr; int mr = 0, ld = 0, ql = 0, nqp = 0; };
+    QsaBack qpend_[2];
+    int qsa_split_ = 0, qsa_buf_ = 0, qsa_ahead_ = 0;
+    float *projB_ = nullptr, *attnB_ = nullptr;  // slot 1 copies of proj_ / attn_x_ (in the MoE activation buffer)
+    // prefill row GEMM of a W8 matrix: W8A8 (k_rows_q, FLASH_ROWS_Q) for m >= 64 prefill rows, else gemv_w8_rows
+    void rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st);
     void ple(Layer& L, int pos, int m, const bf16* rows);
 
     Plan p_;
@@ -591,7 +679,8 @@ private:
     float* gates_ = nullptr;  // [MAXM][10240]
     bf16* x_ = nullptr;       // block input [MAXM][2560]
     __half* xh_ = nullptr;    // the same in XH layout
-    float* proj_ = nullptr;   // [MAXM][9216]
+    int projw_ = 9216, outw_ = 2048;  // row widths of proj_ (in-projections) and ah_ / ab_ (out-projection inputs)
+    float* proj_ = nullptr;   // [MAXM][projw_]
     float* proj2_ = nullptr;  // [MAXM][640]
     __half* ah_ = nullptr;    // XH input of an out projection [MAXM][2048]
     bf16* ab_ = nullptr;      // bf16 input of the INT8 o_proj [MAXM][2048]
@@ -605,7 +694,8 @@ private:
     float* rfpart_ = nullptr;  // router v5: K-split partials
     unsigned* rfcnt_ = nullptr;  // router v5: arrival counter
     int* njobs_ = nullptr;    // device
-    MoeJob* jobs_ = nullptr;  // [MAXJOB]
+    int maxjob_ = MAXJOB, maxjob_pf_ = MAXJOB_PF;  // job list capacities of this card (decode, prefill)
+    MoeJob* jobs_ = nullptr;  // [maxjob_]
     float* jw_ = nullptr;     // job weights [MAXJOB][MAXM]
     __half* acth_ = nullptr;  // weighted GLU activations XH [MAXJOB][MAXM][128]
     int* jrow_ = nullptr;     // grouped MoE (m > 8): per job {row count, rows} [MAXJOB][MAXM + 1]
@@ -665,7 +755,9 @@ private:
     float* xipr_[4] = {};
     unsigned* xipf_[4] = {};
     float* iscore_ = nullptr;
+    bool idx_gk_ = false;     // block-selection keys in global memory (k_idx_local<true>): a card's blocks exceed smem
     int *isel_ = nullptr, *insel_ = nullptr;
+    unsigned long long* selst_ = nullptr;  // FLASH_SELSTAT counters
     unsigned* iloc_ = nullptr;
     bool sampling_ = false;
     SampleParams* sp_ = nullptr;
@@ -683,10 +775,28 @@ private:
     const HcW* next_hc_ = nullptr;          // the HC read after the next all-reduce (prefetch target)
     int hcl2_ = 2;                          // FLASH_HCL2 (default 2): bit 0 down weights during the AR (slower), bit 1 up weights during mid
     std::vector<cudaEvent_t> evp_, evd_;  // per chunk: partial ready (compute), reduced + applied (comm)
-    cudaEvent_t evm_ = nullptr;           // MoE partials of the batch ready
+    cudaEvent_t evm_ = nullptr;
+    cudaEvent_t pfq0_ = nullptr, pfq1_ = nullptr;  // prefill q exchange on the side stream (fork / join)           // MoE partials of the batch ready
     int prev_m_ = 0;
     unsigned* stepc_ = nullptr;
     float* Rmin_ = nullptr;   // MTP chain input row
+    // steering (set_steer): vectors, per-slot {vector, mode, lo, hi} and scale [slots] and the bound slot's copy [1]
+    float *steer_w_ = nullptr, *steer_dw_ = nullptr, *steer_sc_d_ = nullptr, *steer_csc_d_ = nullptr;
+    int *steer_sl_d_ = nullptr, *steer_csl_d_ = nullptr;
+    int steer_nv_ = 0, steer_lo_ = LAYERS, steer_hi_ = -1;  // union of the vectors' file layers
+    std::vector<int> steer_sl_h_, steer_lo_v_, steer_hi_v_;
+    std::vector<float> steer_sc_h_;
+    float* cap_ = nullptr;           // capture accumulators [LAYERS][H] (active between cap_begin / cap_end)
+    float* cap_buf_ = nullptr;
+    int cap_skip_ = 0;
+    int steer_pend_ = -1;                // a layer output to steer, applied by the next HC read (fused) or flush
+    const int* steer_prs_ = nullptr;     // its row -> slot map (nullptr: the bound slot)
+    SteerArg steer_arg(int li, const int* rslot) const;
+    // rows [0, m) of R at layer li's output now (y: pending update or null), or mark it pending (fused into the next
+    // decode HC read; flush_y / an unfused read launch the separate kernel)
+    void steer(int li, int m, const int* rslot, cudaStream_t s, float* R, const float* inj, float* y);
+    void steer_mark(int li, const int* rslot) { if (steer_w_ && li >= steer_lo_ && li <= steer_hi_) { steer_pend_ = li; steer_prs_ = rslot; } }
+    void steer_flush(int m);  // a pending layer-output steering as the separate kernel (before the pending update)
 };
 
 // expert cache statistics of all cards: per decode launch misses summed over the cards (steps aligned)

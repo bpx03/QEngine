@@ -25,6 +25,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from engine import Engine
+import engine_stats
+from steering import DEFAULT as STEER_DEFAULT, resolve_steering
 from grammar import GrammarError, Grammars, TokenLookup, schema_of
 from model_profile import Profile, drop_empty_turns, merge_leading_system
 
@@ -320,6 +322,7 @@ class Generator:
         self.engine = Engine(args.model, args.devices, args.max_ctx, getattr(args, "split", "") or "",
                              lib_path=getattr(args, "engine_lib", None) or None,
                              vocab=prof.vocab_size)
+        self.dstats = engine_stats.DraftStats(self.engine)  # per-slot draft counters (qe_draft_stats)
         if not self.engine.has("stops"):  # no undo of the steps past a stop sequence
             global STOP_ROLLBACK
             STOP_ROLLBACK = 0
@@ -545,6 +548,7 @@ class Generator:
             # (engine probe, no side effects; refreshed at most twice a second)
             for j in self.queue:
                 if j.est is None or now - j.t_est > 0.5:
+                    e.set_steering(*j.p.get("steering_sel", STEER_DEFAULT))  # (cached states are keyed by it)
                     j.est = len(j.ids) - e.probe_cached(j.ids)
                     j.t_est = now
 
@@ -660,6 +664,11 @@ class Generator:
                 # chunks the queue is checked, so a short request can cut in even when nothing
                 # decodes; the decoders' share of the time only applies while they run
                 budget = self.args.prefill_chunk if self.args.prefill_chunk > 0 else 1 << 30
+                # adaptive chunk: no other slot decoding or waiting -> the larger idle chunk (Flash-Next: its
+                # 4096-row batch); decided per chunk, so a request that arrives meanwhile gets 2048 again
+                idle = self.args.prefill_chunk_idle
+                if idle > budget and not busy and len(prefills) == 1 and not self.queue:
+                    budget = idle
                 share = self.args.prefill_share if busy and self.args.prefill_chunk > 0 else 0.0
                 try:
                     if busy and time.time() < decode_until:  # the decoders' share of the GPU time
@@ -781,6 +790,7 @@ class Job:
         self.stops = [s for s in (p.get("stop") or []) if s]
         self.t0 = time.time()
         g.metrics.prefill_start(self)
+        e.set_steering(*p.get("steering_sel", STEER_DEFAULT))  # this request's steering (keys the cached prefixes)
         self.slot = e.start_begin(self.ids, g.args.mtp_k, self.affinity, g.system_end(self.ids),
                                   getattr(self.ids, "mm", None))
         # after start_begin: the engine applies sampling parameters to its current slot, which
@@ -800,6 +810,7 @@ class Job:
         """The prompt is prefilled: first token, then this job decodes with the others."""
         g, e = self.gen, self.gen.engine
         first, self.reused, self.slot = e.start_finish(self.slot)
+        self.ds0 = g.dstats.read(self.slot)  # draft counters of the slot (engine_stats: the per-request stats line)
         # max_tokens in the engine: an MTP step accepting drafts past it would leave tokens in the
         # slot that the reply does not have, and the next turn would miss the live end (resume
         # from the prompt-end checkpoint and recompute the whole reply)
@@ -945,6 +956,7 @@ class Job:
         if not self.done.is_set():
             if self.prio == 1 and self.finish == "stop" and "<tool_call>" not in self.text_all:
                 self.gen.engine.set_prio(self.slot, 0)  # a subagent that is done (no tool to run)
+            ds = engine_stats.delta(getattr(self, "ds0", None), self.gen.dstats.read(self.slot))
             trimmed = None
             if getattr(self, "keep", None) is not None:
                 trimmed = self.gen.engine.trim(self.slot, len(self.ids) + self.keep)
@@ -960,6 +972,8 @@ class Job:
                           "cache_src": self.src,
                           "completion_tokens": self.n, "finish": self.finish, "slot": self.slot,
                           "prefill_s": self.t1 - self.t0, "decode_s": t2 - self.t1}
+            if ds is not None:
+                self.stats["drafts"] = ds  # [steps, MTP drafted, accepted, lookup drafted, accepted]
             if trimmed is not None:
                 self.stats["stop_trim"] = trimmed
             if self.grammar is not None:
@@ -1052,6 +1066,7 @@ def log_stats(kind, st):
           f"{pps:.0f} tok/s) | gen {st['completion_tokens']} @ {tps:.1f} tok/s | {st['finish']}{gr}"
           f"{' | stop trim ' + ('ok' if st['stop_trim'] else 'missed') if 'stop_trim' in st else ''}",
           flush=True)
+    engine_stats.log(st, st.get("drafts"))  # [stats] lines for benchmark log parsers (QE_STATS_LOG=0: off)
 
 
 # ----------------------------------------------------------------------------- request mapping
@@ -1251,6 +1266,11 @@ def anthropic_tools(tools):
 def build_app(gen: Generator, args):
     app = FastAPI()
     model_name = args.served_name
+    gen.steer = gen.engine.steer_info()  # activation steering vectors loaded by the engine (server/steering.py)
+
+    @app.get("/v1/steering")
+    async def steering():
+        return gen.steer
 
     @app.get("/health")
     async def health():
@@ -1271,6 +1291,11 @@ def build_app(gen: Generator, args):
         except GrammarError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "response_format"}}, status_code=400)
+        try:
+            steer = resolve_steering(gen.steer, body)
+        except ValueError as ex:
+            return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
+                                           "param": "steering"}}, status_code=400)
         ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw)
         stop = body.get("stop")
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
@@ -1278,7 +1303,7 @@ def build_app(gen: Generator, args):
                   "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens"),
                   "stop": [stop] if isinstance(stop, str) else stop,
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
-                  "grammar": grammar}
+                  "grammar": grammar, "steering_sel": steer}
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(kw.get("enable_thinking", True))
 
@@ -1379,12 +1404,17 @@ def build_app(gen: Generator, args):
         except GrammarError as ex:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
                                 status_code=400)
+        try:
+            steer = resolve_steering(gen.steer, body)
+        except ValueError as ex:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
+                                status_code=400)
         msgs = anthropic_to_messages(body)
         prev = dict(msgs[-1]) if msgs else None  # before prompt() rewrites image parts
         ids, aff = gen.prompt(msgs, tools, kw)
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
-                  "stop": body.get("stop_sequences"), "grammar": grammar}
+                  "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer}
         mid = "msg_" + uuid.uuid4().hex[:24]
         parser = Parser(kw.get("enable_thinking", True))
         stop_map = {"stop": "end_turn", "length": "max_tokens"}
@@ -1494,8 +1524,15 @@ def resolve_model_args(args):
         args.served_name = d["served_name"]
     if args.mtp_k is None:
         args.mtp_k = d["mtp_k"]
+    if args.devices is None:
+        vis = [x for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+        args.devices = ",".join(str(i) for i in range(len(vis))) if vis else "0,1,2"
     if args.split is None:
-        args.split = d["split"]
+        # the profile's split is per GPU (Flash-Next: 3 values); another GPU count uses the engine's default
+        sp = d["split"] or ""
+        args.split = sp if len([x for x in sp.split(",") if x]) in (0, len(args.devices.split(","))) else ""
+    if args.prefill_chunk_idle is None:
+        args.prefill_chunk_idle = d.get("prefill_chunk_idle", 0)
     for k in ("drop_empty_turns", "merge_system"):
         v = getattr(args, k)
         setattr(args, k, bool(d[k]) if v is None else bool(v))
@@ -1514,7 +1551,9 @@ def parse_args(argv=None):
     default_tmpl = os.path.join(ROOT, "server/templates/qwen38_syssafe.jinja")
     ap.add_argument("--template", default=default_tmpl if os.path.exists(default_tmpl) else None,
                     help="chat template (default: server/templates/qwen38_syssafe.jinja, else the model's own)")
-    ap.add_argument("--devices", default="0,1,2")
+    ap.add_argument("--devices", default=None,
+                    help="GPU indices within CUDA_VISIBLE_DEVICES (default: every visible GPU, else 0,1,2); "
+                         "Flash-Next runs on 2 or 3")
     ap.add_argument("--max-ctx", type=int, default=262144)
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
@@ -1550,6 +1589,9 @@ def parse_args(argv=None):
     ap.add_argument("--prefill-chunk", type=int, default=2048,
                     help="prompt chunk (tokens) between decode bursts of the running sequences "
                          "(0: a prompt is prefilled at once, the others wait)")
+    ap.add_argument("--prefill-chunk-idle", type=int, default=None,
+                    help="prompt chunk (tokens) while no other sequence decodes or waits (default per "
+                         "model: Flash-Next 4096 = its big prefill batch, 27B 0 = --prefill-chunk)")
     ap.add_argument("--prefill-share", type=float, default=0.5,
                     help="share of the GPU time the running sequences keep while another prompt "
                          "is prefilled (0.5: they decode at ~half their speed, the prefill takes "

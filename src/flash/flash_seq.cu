@@ -200,9 +200,12 @@ void Worker::alloc_slots() {
 }
 
 void Worker::bind_slot(int s, int base) {
-    (void)s;
     std::vector<int> v(PFM, base * p_.own);  // XROWS (= PFM) rows
     CUDA_CHECK(cudaMemcpyAsync(rbcur_, v.data(), v.size() * 4, cudaMemcpyHostToDevice, st_));
+    if (steer_csl_d_) {  // the single-sequence paths read the bound slot's steering {vector, mode, lo, hi} / scale
+        CUDA_CHECK(cudaMemcpyAsync(steer_csl_d_, &steer_sl_h_.at((size_t)s * 4), 16, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(steer_csc_d_, &steer_sc_h_.at(s), 4, cudaMemcpyHostToDevice, st_));
+    }
     CUDA_CHECK(cudaStreamSynchronize(st_));
     ctx_off_ = (long long)base * p_.period;
 }
