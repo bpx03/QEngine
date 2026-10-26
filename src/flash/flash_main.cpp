@@ -334,6 +334,12 @@ int main(int argc, char** argv) {
         printf("expert cache: GPU0 %d cold groups, %d slots in the KV pool tail + big-batch buffers (%d of them borrowed tails; %d live, %d resident), seed H2D %.1f GB/s\n",
                es.ncold, es.slots, es.bt_slots, es.live_slots, es.resident, es.seed_gbs);
     }
+    if (getenv("FLASH_GSUM") && atoi(getenv("FLASH_GSUM")))
+        for (int r = 0; r < ng; r++) {
+            unsigned long long e = 0, o = 0;
+            W[r]->gsum(nw[r], &e, &o);
+            printf("GSUM rank %d experts %016llx other %016llx\n", r, e, o);
+        }
     if (getenv("FLASH_CSUM"))
         for (int r = 0; r < ng; r++) printf("  GPU%d weights checksum %llx (%d allocations)\n", devs[r], W[r]->checksum(0, nw[r]), nw[r]);
     // persistent worker threads (spin on a step counter: no thread start per step)
@@ -656,7 +662,7 @@ int main(int argc, char** argv) {
         W[0]->rdump_.clear();
     }
     tp = secs() - tp;
-    if (nrep > 1) printf("prefill run %d: %d tokens in %.1f ms\n", rep, np, tp * 1e3);
+    if (nrep > 1) printf("prefill run %d: %d tokens in %.1f ms; next %d\n", rep, np, tp * 1e3, nxt);
     if (W[0]->dbgh_) {  // determinism check: per layer hashes of this repetition vs the first one (every card)
         static std::vector<std::vector<unsigned long long>> h0(ng);
         static const char* kind[12] = {"R after mixer", "routing", "MoE partial", "x (MoE input)", "x (QSA input)", "qkv proj",
@@ -763,12 +769,29 @@ int main(int argc, char** argv) {
             const double a0 = secs();
             const bool lk = Lnext > 0;
             const int ks = lk ? Lnext : kdraft;  // after a lookup step the chain ran on the device when needed
+            static const bool xrank = getenv("FLASH_XRANK") && atoi(getenv("FLASH_XRANK"));  // debug: per-rank emitted tokens
+            static const int ecv = getenv("FLASH_EC_VERIFY") ? atoi(getenv("FLASH_EC_VERIFY")) : 0;
+            std::vector<std::vector<int>> per(ng);
             job = [&](int r) {
                 std::vector<int> e(MAXM + 1);
                 const int n = W[r]->spec_step(ks, e.data(), lk);
-                if (r == 0) { em = e; em[MAXM] = n; }
+                e[MAXM] = n;
+                per[r].assign(e.begin(), e.begin() + n);
+                per[r].push_back(n);
+                if (ecv >= 2) { char w[40]; snprintf(w, sizeof(w), "after spec step %d", steps); W[r]->ec_verify(w); }
+                if (r == 0) em = e;
             };
             pool_run();
+            if (xrank)
+                for (int r = 1; r < ng; r++)
+                    if (per[r] != per[0]) {
+                        printf("XRANK MISMATCH at step %d: rank 0 emitted", steps);
+                        for (int t : per[0]) printf(" %d", t);
+                        printf(" | rank %d emitted", r);
+                        for (int t : per[r]) printf(" %d", t);
+                        printf("\n");
+                        fflush(stdout);
+                    }
             for (int i = 0; i < em[MAXM]; i++) gen_toks.push_back(em[i]);
             dt.push_back(secs() - a0);
             steps++;
@@ -845,6 +868,11 @@ int main(int argc, char** argv) {
                dt[dt.size() / 2] * 1e3, mean * 1e3, dt[dt.size() / 10] * 1e3, dt[dt.size() * 9 / 10] * 1e3, dt[0] * 1e3);
     }
     printf("decode %s\n", ec_summary(W).c_str());
+    if (getenv("FLASH_EC_VERIFY") && atoi(getenv("FLASH_EC_VERIFY")))
+        for (int r = 0; r < ng; r++) W[r]->ec_verify("after decode");
+    if (getenv("FLASH_JOBCHK") && atoi(getenv("FLASH_JOBCHK"))) {
+        for (int r = 0; r < ng; r++) { CUDA_CHECK(cudaSetDevice(devs[r])); CUDA_CHECK(cudaDeviceSynchronize()); W[r]->jobchk_report(); }
+    }
     if (getenv("FLASH_EC_STEPS")) {  // per decode step: misses (all cards) and host-timed step ms
         FILE* f = fopen(getenv("FLASH_EC_STEPS"), "w");
         std::vector<int> per;

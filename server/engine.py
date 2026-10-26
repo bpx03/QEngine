@@ -341,23 +341,26 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         """Monitoring snapshot (call from the engine thread): slots, archives, pool events."""
         L, h = self.lib, self.h
         slots = []
-        b = (ctypes.c_longlong * 6)()
+        b = (ctypes.c_longlong * 7)()
         for i in range(len(self.slots)):
             if "qe_slot_info" in self.fns:
                 L.qe_slot_info(h, i, b)
-                slots.append({"off": b[0], "cap": b[1], "pos": b[2], "active": bool(b[3]), "used": b[4], "prio": b[5]})
+                slots.append({"off": b[0], "cap": b[1], "pos": b[2], "active": bool(b[3]), "used": b[4], "prio": b[5],
+                              "paused": bool(b[6])})
             else:
-                slots.append({"off": 0, "cap": self.max_t, "pos": 0, "active": i in self._active, "used": 0, "prio": 1})
+                slots.append({"off": 0, "cap": self.max_t, "pos": 0, "active": i in self._active, "used": 0, "prio": 1,
+                              "paused": False})
         a = (ctypes.c_double * 6)()
         if "qe_archive_info" in self.fns:
             L.qe_archive_info(h, a)
-        c = (ctypes.c_longlong * 3)()
+        c = (ctypes.c_longlong * 6)()  # Flash-Next writes the first 3 (no pause / resume)
         if "qe_pool_counters" in self.fns:
             L.qe_pool_counters(h, c)
         return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots,
                 "archives": {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
                              "pinned_bytes": a[4], "pinned_used": a[5]},
-                "events": {"grow": c[0], "move": c[1], "evict": c[2]}}
+                "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},
+                "paused": c[5]}
 
     # ------------------------------------------------------------------ stop sequences
     def watch_stops(self, slot, on=True):

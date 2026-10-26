@@ -193,10 +193,14 @@ public:
     int num_pinned() const;
     // monitoring (host-side state; call from the engine's thread): slot i -> {offset, capacity,
     // cached tokens, active, last use}; archives -> {in RAM, RAM bytes, on disk, disk bytes};
-    // pool events -> {regions grown, regions moved, conversations evicted}
+    // pool events -> {regions grown, regions moved, conversations evicted, active ones paused
+    // (preempted), resumed, paused now}
     void slot_info(int i, long long* out) const;
     void archive_info(double* out) const;
-    void pool_counters(long long* out) const { out[0] = n_grow_; out[1] = n_move_; out[2] = n_evict_; }
+    void pool_counters(long long* out) const {
+        out[0] = n_grow_; out[1] = n_move_; out[2] = n_evict_; out[3] = n_pause_; out[4] = n_unpause_;
+        out[5] = (long long)paused_.size();
+    }
 
 private:
     void step(const int* ids, int m, bool want_logits);
@@ -221,9 +225,10 @@ private:
     size_t units(size_t rows) const { return rows ? rows + slack_ : 0; }
     KvSplit kvs_;
     bool kvs_auto_ = false;  // shares chosen in plan_slots from the free memory after the weights
-    long long n_grow_ = 0, n_move_ = 0, n_evict_ = 0;
+    long long n_grow_ = 0, n_move_ = 0, n_evict_ = 0, n_pause_ = 0, n_unpause_ = 0, n_release_ = 0;
     int max_ctx_ = 0;
     int round_cap(int need) const;
+    int min_cap(int need) const;
     size_t free_after(int s) const;
     void place(int s, size_t off, int cap);
     int held_rows(int s) const;
@@ -231,7 +236,22 @@ private:
     void pack_up_above(int s);
     bool place_in_gap(int s, int want);
     bool try_grow(int s, int want);
-    bool ensure_cap(int s, int need, const std::vector<int>& protect = {});
+    // ensure_cap modes: SQUEEZE as a last resort lets s grow by less than min_cap (active slots
+    // give back their floor too); FLOOR never; FREE takes only free room and idle conversations
+    // (no active slot is trimmed: resuming a paused one must not start a pause / resume cycle)
+    struct KvArchive;
+    enum Room { SQUEEZE, FLOOR, FREE };
+    bool ensure_cap(int s, int need, const std::vector<int>& protect = {}, Room mode = SQUEEZE);
+    // decode steps: ensure_cap, else pause (preempt) active conversations - the lowest prio, the
+    // most recently admitted, the main thread last - until s fits; false: no room (s itself may
+    // be the one paused: Seq::paused)
+    bool room_or_pause(int s, int need);
+    bool pause_slot(int v);
+    bool unpause_slot(int v);
+    // a paused slot: active for its caller (its steps return no tokens), its region freed; the KV
+    // of [0, pos) and the delta-net state at pos wait in a held archive, restored when room frees
+    struct Paused { KvArchive* arch; int pos; std::vector<int> seq; long long seen; unsigned long long at; };
+    std::map<int, Paused> paused_;
     void use_slot(int i);
     int pick_slot(const int* ids, int n, int k, unsigned long long affinity);
     struct KvArchive;  // defined below
@@ -266,6 +286,8 @@ private:
         long long launches = 0, rb_launch = -1;  // the slot's own step launches (batched: stash per slot)
         bool rb_batched = false;
         bool full = false;          // no room to grow (step_batch): ends with its end token until released
+        bool paused = false;        // preempted for room (paused_): its steps return no tokens until resumed
+        long long admit = 0;        // admission order (start_begin): the most recent is paused first
         // shared prefix (stage 4): keys [0, split) are read from the prefix region pres_[pre];
         // the own region holds keys [split, max_t) (max_t stays the logical capacity)
         int split = 0, pre = -1;
@@ -449,7 +471,7 @@ private:
     size_t archive_budget_ = 0, archive_used_ = 0;
     int archive_min_ = 2048;
     bool pool_log_ = false;  // QE_POOL_LOG=1: pool / archive events on stdout
-    void archive_slot(int slot);
+    void archive_slot(int slot, bool force = false);
     // Incremental archiving of idle conversations (archive_more): the archive under
     // construction and each GPU's next piece; completed by archive_slot() if the slot is
     // needed before it is done.

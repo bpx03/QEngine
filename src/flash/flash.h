@@ -21,6 +21,14 @@
 
 namespace flash {
 struct Xchg;  // flash_kernels.cuh: a QSA exchange (receive buffers, flags, counters)
+// block unions of the QSA prefill attention's row groups (flash_pfq.cuh k_qpf_union): U[g], ublk[g][QP_UMAX], um[g][QP_UMAX]
+struct QpUnion {
+    int* U = nullptr;
+    int* ublk = nullptr;
+    unsigned char* um = nullptr;
+    unsigned* ctr = nullptr;  // persistent k_qsa_pfsel: [item fetch counter, exited blocks] (null: one item per block)
+    int S = 0;                // its key splits
+};
 
 constexpr int H = 2560, HC = 4, RW = HC * H, LAYERS = 48, NE = 512, TOPK = 10, INTER = 640;
 constexpr int VOCAB = 248320, NQ = 24, NKV = 2, HD = 256, ROT = 64;
@@ -288,6 +296,12 @@ public:
     };
     const EcStats& ec_stats();   // collects the touches of the last launch first
     void ec_reset_stats();
+    // debug (FLASH_EC_VERIFY=1): every resident expert-cache slot and the staging ring's last two layers checked against
+    // their host groups (checksums); prints the mismatches. Returns their count.
+    int ec_verify(const char* where);
+    // debug (FLASH_GSUM=1): placement-independent weight hashes of this card: every routed expert group by identity
+    // (layer, expert, group) wherever it lives (device or host-backed), and the non-expert weight allocations [0, nw)
+    void gsum(int nw, unsigned long long* experts, unsigned long long* other);
     void set_draft_vocab(const std::vector<int>& ids) { draft_ids_ = ids; }
     double host_gb() const { return host_bytes_ / 1e9; }
     void get_stats(std::vector<int>& out);
@@ -539,6 +553,8 @@ private:
     std::vector<double> ec_ls_;        // decayed access count, log domain: log(score) - t * log(decay)
     std::vector<uintptr_t> ec_host_;   // device-visible host address of every cold group
     std::vector<const char*> ec_src_;  // host address (copy source)
+    std::vector<unsigned long long> ec_hsum_;  // FLASH_EC_VERIFY: host checksum per cold group (0: not computed yet)
+    unsigned long long* ec_vsum_d_ = nullptr;   // FLASH_EC_VERIFY: device checksums [slots + ring]
     uintptr_t* ec_tab_d_ = nullptr;    // device table
     uintptr_t* ec_tab_h_ = nullptr;    // pinned mirror
     unsigned char *ec_touch_h_ = nullptr, *ec_touch_d_ = nullptr;
@@ -597,6 +613,16 @@ private:
     size_t pfact_bytes_ = 0;
     bool rq_attr_ = false;
     size_t qpf_attr_ = 0;
+    QpUnion qpu_;
+    int nsm_ = 0;
+    int maxlg_ = 0;  // most local groups of one expert on this card (prefill job bound)
+    unsigned* jobchk_ = nullptr;  // FLASH_JOBCHK: host-mapped [overflows, max njobs per tag 1..2, bound of that call per tag]
+public:
+    void jobchk_report() const {
+        if (jobchk_) fprintf(stderr, "[jobchk] rank %d: prefill max %u jobs (bound %u), decode max %u (bound %u), %u overflows\n", p_.rank,
+                             jobchk_[2], jobchk_[5], jobchk_[3], jobchk_[6], jobchk_[0]);
+    }
+private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_qpf_union)
     int maxloc_ = 0;  // most local groups of one expert on this card  // k_qsa_pfsel's dynamic shared memory set on this device  // k_rows_q's dynamic shared memory set on this device
     int* possub_ = nullptr;
     bool pf_ = false;          // prefill forward (m > MAXM): GEMM / gathered-MoE paths, rows committed at once

@@ -26,7 +26,7 @@ EN = {"dekoduje": "decoding", "czeka": "waiting", "działa": "up", "start nr": "
       "W na GPU": "W on GPUs", "stan": "state", "kontekst": "context", "z cache": "cached", "wygen.": "generated",
       "nikt teraz nie pracuje": "nobody is working right now", "pula": "pool", "zarezerwowane": "reserved",
       "w użyciu": "in use", "archiwum": "archive", "dysk": "disk", "wzrosty": "grown", "przesunięcia": "moved",
-      "wysiedlenia": "evicted", "od startu": "since start", "łącznie": "all time", "czas pracy": "uptime",
+      "wysiedlenia": "evicted", "wstrzymane": "paused", "wstrzymania": "preempted", "wznowienia": "resumed", "od startu": "since start", "łącznie": "all time", "czas pracy": "uptime",
       "zapytania": "requests", "wygenerowane tokeny": "generated tokens", "tokeny promptów": "prompt tokens",
       "trafienia cache": "cache hits", "śr. tok/s przy pracy": "avg tok/s busy", "energia": "energy",
       "tokenów / dżul": "tokens / joule", "rekord tok/s (10 s)": "record tok/s (10 s)",
@@ -149,7 +149,8 @@ def view(s, width=140, note=None):
                                 style="grey62"),
                      Text(f"{_('archiwum')}: RAM {a['ram']} ({a['ram_bytes'] / 2**30:.1f} GB), {_('dysk')} {a['disk']} "
                           f"({a['disk_bytes'] / 2**30:.1f} GB) · {_('wzrosty')} {ev['grow']}, {_('przesunięcia')} {ev['move']}, "
-                          f"{_('wysiedlenia')} {ev['evict']}", style="grey62"))
+                          f"{_('wysiedlenia')} {ev['evict']} · {_('wstrzymane')} {en.get('paused', 0)} "
+                          f"({_('wstrzymania')} {ev.get('pause', 0)}, {_('wznowienia')} {ev.get('resume', 0)})", style="grey62"))
 
     g = []
     for x in s["gpus"]:

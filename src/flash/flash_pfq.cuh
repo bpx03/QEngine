@@ -579,13 +579,74 @@ __host__ __device__ constexpr size_t qpf_raw_bytes() { return (size_t)QP_NST * (
 __host__ __device__ inline size_t qpf_smem(int lbmax) {
     return qpf_kv_bytes() + qpf_raw_bytes() + (size_t)2 * 3 * QP_KT * 4 + (size_t)QP_UMAX * 4 + QP_UMAX + (size_t)((lbmax + 31) / 32) * 4;
 }
+// The union of the selected blocks of QP_R consecutive rows (ascending list + each row's bit per entry), once per row
+// group (prefill-r4): k_qsa_pfsel built it in every block, i.e. 2 kv heads x S key splits times, ~30 % of its time.
+// grid ceil(m / QP_R), 256 threads, smem (lbmax + 31) / 32 words; out: U[g], ublk[g][QP_UMAX], um[g][QP_UMAX]
+__global__ void __launch_bounds__(256) k_qpf_union(const int* __restrict__ sel, const int* __restrict__ nsel, int m, int lbmax,
+                                                   QpUnion qu) {
+    extern __shared__ unsigned qu_bm[];
+    __shared__ int s_U, s_ns[QP_R];
+    const int t0 = blockIdx.x * QP_R, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nw = (lbmax + 31) / 32;
+    for (int i = threadIdx.x; i < nw; i += blockDim.x) qu_bm[i] = 0;
+    if (threadIdx.x < QP_R) s_ns[threadIdx.x] = t0 + (int)threadIdx.x < m ? nsel[t0 + threadIdx.x] : 0;
+    __syncthreads();
+    for (int r = 0; r < QP_R; r++) {
+        const int ns = s_ns[r];
+        for (int j = threadIdx.x; j < ns; j += blockDim.x) {
+            const int b = sel[(size_t)(t0 + r) * lbmax + j];
+            atomicOr(&qu_bm[b >> 5], 1u << (b & 31));
+        }
+    }
+    __syncthreads();
+    int* const ublk = qu.ublk + (size_t)blockIdx.x * QP_UMAX;
+    unsigned char* const um = qu.um + (size_t)blockIdx.x * QP_UMAX;
+    if (warp == 0) {
+        int run = 0;
+        for (int w0 = 0; w0 < nw; w0 += 32) {
+            const int w = w0 + lane;
+            const int c = w < nw ? __popc(qu_bm[w]) : 0;
+            int x = c;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }
+            int base = run + x - c;
+            if (w < nw) {
+                unsigned bits = qu_bm[w];
+                while (bits) {
+                    const int bb = __ffs(bits) - 1;
+                    bits &= bits - 1;
+                    ublk[base++] = w * 32 + bb;
+                }
+            }
+            run += __shfl_sync(0xffffffffu, x, 31);
+        }
+        if (lane == 0) s_U = run;
+    }
+    __syncthreads();
+    const int U = s_U;
+    // each row's bits: rank of a selected block = popcount of the bitmap words before it (prefix over words)
+    __syncthreads();
+    for (int u = threadIdx.x; u < U; u += blockDim.x) um[u] = 0;
+    __syncthreads();
+    for (int r = 0; r < QP_R; r++) {
+        const int ns = s_ns[r];
+        for (int j = threadIdx.x; j < ns; j += blockDim.x) {
+            const int b = sel[(size_t)(t0 + r) * lbmax + j];
+            int lo = 0, hi = U - 1;
+            while (lo < hi) { const int mid = (lo + hi) >> 1; if (ublk[mid] < b) lo = mid + 1; else hi = mid; }
+            atomicOr(reinterpret_cast<unsigned*>(um + (lo & ~3)), (1u << r) << (8 * (lo & 3)));
+        }
+    }
+    if (threadIdx.x == 0) qu.U[blockIdx.x] = U;
+}
 template <bool PVH, bool QKH>  // fp16-accumulate P.V (per 16-key tile, flushed into fp32) / Q.K^T
 __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restrict__ qb, const uint8_t* __restrict__ kc,
                                                             const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                             const float* __restrict__ vs, const int* __restrict__ pos0,
                                                             AttnDst dst, Plan p, Xchg xq, const int* __restrict__ sel,
                                                             const int* __restrict__ nsel, int lbmax, int m,
-                                                            const int* __restrict__ rbase, bool q16, int dbg = 0) {
+                                                            const int* __restrict__ rbase, bool q16, int dbg = 0,
+                                                            QpUnion qu = QpUnion(), int ngrp = 0) {
     extern __shared__ __align__(16) unsigned char qp_sm[];
     constexpr int HPG = NQ / NKV, NTH = QP_W * 32;
     __half* KV = reinterpret_cast<__half*>(qp_sm);  // [buf][K | V][QP_KT][QD_SROW]
@@ -597,10 +658,31 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     unsigned* bm = reinterpret_cast<unsigned*>(um + QP_UMAX);
     __shared__ unsigned s_s;
     __shared__ int s_rc[QP_R], s_nr[QP_R], s_ns[QP_R], s_U, s_wp[33];
-    const int kvh = blockIdx.x, t0 = blockIdx.y * QP_R, z = blockIdx.z, S = gridDim.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     const int nw = (lbmax + 31) / 32;
     if (rbase) { const size_t rb = rbase[0]; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
+    // persistent (prefill-r4, qu.ctr set): a grid of one block per SM takes the (kv head, key split, row group) items
+    // from a counter (wave quantization: 256 items on 82 SMs were 4 waves, the last one 10 % full); else one item per
+    // block (grid NKV x groups x S)
+    const bool pers = qu.ctr != nullptr;
+    const int S = pers ? qu.S : (int)gridDim.z;
+    const unsigned total = (unsigned)NKV * (pers ? ngrp : (int)gridDim.y) * S;
+    __shared__ unsigned s_item;
+    for (bool first = true;; first = false) {
+    int kvh, t0, z;
+    if (pers) {
+        __syncthreads();
+        if (threadIdx.x == 0) s_item = atomicAdd(qu.ctr, 1u);
+        __syncthreads();
+        const unsigned it = s_item;
+        if (it >= total) break;
+        kvh = it % NKV, z = (it / NKV) % S, t0 = (int)(it / (NKV * S)) * QP_R;
+    } else {
+        if (!first) break;
+        kvh = blockIdx.x, t0 = blockIdx.y * QP_R, z = blockIdx.z;
+    }
+    const int gy = t0 / QP_R;
+    __syncthreads();
     for (int i = threadIdx.x; i < nw; i += NTH) bm[i] = 0;
     if (threadIdx.x < QP_R) {
         const int r = threadIdx.x, t = t0 + r;
@@ -631,55 +713,70 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     if (dbg == 4) {  // debug: handshake only
         if (threadIdx.x == 0) {
             __threadfence();
-            if (atomicAdd(xq.done, 1u) == gridDim.x * gridDim.y * gridDim.z - 1) { *xq.done = 0; *xq.seq = s_s; __threadfence(); }
+            if (atomicAdd(xq.done, 1u) == total - 1) { *xq.done = 0; *xq.seq = s_s; __threadfence(); }
         }
-        return;
+        continue;
     }
+    // union of the rows' selected blocks (bitmap -> ascending list), then each row's bit per union entry: precomputed
+    // per row group by k_qpf_union (qu.U set), else built here
+    if (qu.U) {
+        if (threadIdx.x == 0) s_U = __ldcg(qu.U + gy);
+        __syncthreads();
+        const int U0 = s_U;
+        const int* gb = qu.ublk + (size_t)gy * QP_UMAX;
+        const unsigned char* gm = qu.um + (size_t)gy * QP_UMAX;
+        for (int u = threadIdx.x; u < U0; u += NTH) ublk[u] = __ldcg(gb + u);
+        for (int u = threadIdx.x; u < (U0 + 3) / 4; u += NTH)
+            reinterpret_cast<unsigned*>(um)[u] = __ldcg(reinterpret_cast<const unsigned*>(gm) + u);
+        __syncthreads();
+    } else {
     // union of the rows' selected blocks (bitmap -> ascending list), then each row's bit per union entry
-    for (int r = 0; r < QP_R; r++) {
-        const int ns = s_ns[r];
-        for (int j = threadIdx.x; j < ns; j += NTH) {
-            const int b = sel[(size_t)(t0 + r) * lbmax + j];
-            atomicOr(&bm[b >> 5], 1u << (b & 31));
-        }
-    }
-    __syncthreads();
-    if (warp == 0) {  // word prefix counts (32 words per lane step)
-        int run = 0;
-        for (int w0 = 0; w0 < nw; w0 += 32) {
-            const int w = w0 + lane;
-            const int c = w < nw ? __popc(bm[w]) : 0;
-            int x = c;
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }
-            // exclusive prefix of word w: run + x - c; store into the list by expanding the word's bits
-            int base = run + x - c;
-            if (w < nw) {
-                unsigned bits = bm[w];
-                while (bits) {
-                    const int bb = __ffs(bits) - 1;
-                    bits &= bits - 1;
-                    ublk[base++] = w * 32 + bb;
-                }
+        for (int r = 0; r < QP_R; r++) {
+            const int ns = s_ns[r];
+            for (int j = threadIdx.x; j < ns; j += NTH) {
+                const int b = sel[(size_t)(t0 + r) * lbmax + j];
+                atomicOr(&bm[b >> 5], 1u << (b & 31));
             }
-            run += __shfl_sync(0xffffffffu, x, 31);
-        }
-        if (lane == 0) s_U = run;
-    }
-    __syncthreads();
-    const int U = s_U;
-    for (int u = threadIdx.x; u < U; u += NTH) um[u] = 0;
-    __syncthreads();
-    for (int r = 0; r < QP_R; r++) {  // rank of each selected block in the union list (binary search)
-        const int ns = s_ns[r];
-        for (int j = threadIdx.x; j < ns; j += NTH) {
-            const int b = sel[(size_t)(t0 + r) * lbmax + j];
-            int lo = 0, hi = U - 1;
-            while (lo < hi) { const int mid = (lo + hi) >> 1; if (ublk[mid] < b) lo = mid + 1; else hi = mid; }
-            um[lo] |= (unsigned char)(1u << r);
         }
         __syncthreads();
+        if (warp == 0) {  // word prefix counts (32 words per lane step)
+            int run = 0;
+            for (int w0 = 0; w0 < nw; w0 += 32) {
+                const int w = w0 + lane;
+                const int c = w < nw ? __popc(bm[w]) : 0;
+                int x = c;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }
+                // exclusive prefix of word w: run + x - c; store into the list by expanding the word's bits
+                int base = run + x - c;
+                if (w < nw) {
+                    unsigned bits = bm[w];
+                    while (bits) {
+                        const int bb = __ffs(bits) - 1;
+                        bits &= bits - 1;
+                        ublk[base++] = w * 32 + bb;
+                    }
+                }
+                run += __shfl_sync(0xffffffffu, x, 31);
+            }
+            if (lane == 0) s_U = run;
+        }
+        __syncthreads();
+        const int Ub = s_U;
+        for (int u = threadIdx.x; u < Ub; u += NTH) um[u] = 0;
+        __syncthreads();
+        for (int r = 0; r < QP_R; r++) {  // rank of each selected block in the union list (binary search)
+            const int ns = s_ns[r];
+            for (int j = threadIdx.x; j < ns; j += NTH) {
+                const int b = sel[(size_t)(t0 + r) * lbmax + j];
+                int lo = 0, hi = Ub - 1;
+                while (lo < hi) { const int mid = (lo + hi) >> 1; if (ublk[mid] < b) lo = mid + 1; else hi = mid; }
+                um[lo] |= (unsigned char)(1u << r);
+            }
+            __syncthreads();
+        }
     }
+    const int U = s_U;
     int tmin = 1 << 30, tmax = 0;
 #pragma unroll
     for (int r = 0; r < QP_R; r++)
@@ -698,9 +795,9 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
             if (t >= m) return;
             const int owner = h / QPC(p);
             if (owner == p.rank) f = qb + ((size_t)t * (NQ + 4) + h) * HD;
-            else if (q16) hp = reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & 1) * p.ngpu + owner) * XROWS * qper(p)) +
+            else if (q16) hp = reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p)) +
                                (size_t)t * qper(p) + (h - owner * QPC(p)) * HD;
-            else f = xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
+            else f = xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
         };
         const float *f0, *f1;
         const __half *h0, *h1;
@@ -929,11 +1026,16 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     __syncthreads();
     if (threadIdx.x == 0 && dbg != 3) {
         __threadfence();
-        if (atomicAdd(xq.done, 1u) == gridDim.x * gridDim.y * gridDim.z - 1) {
+        if (atomicAdd(xq.done, 1u) == total - 1) {
             *xq.done = 0;
             *xq.seq = s_s;
             __threadfence();
         }
+    }
+    }  // items
+    if (pers && threadIdx.x == 0) {
+        __threadfence();
+        if (atomicAdd(qu.ctr + 1, 1u) == gridDim.x - 1) { qu.ctr[1] = 0; qu.ctr[0] = 0; __threadfence(); }
     }
 }
 // debug (FLASH_QPF_CMP): normalized partials o / L of two attention outputs; st: {max rel err bits, row, head}

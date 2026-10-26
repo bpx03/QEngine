@@ -710,12 +710,15 @@ W4 Worker::load_w4(const SafeTensors& st, const std::vector<RowSpec>& rows, int 
         const TensorInfo& s = st.get(r.name + ".weight_scale");
         CHECK(q.shape[1] * 8 == K, "K mismatch in %s", r.name.c_str());
         const int h = r.r1 - r.r0;
-        CUDA_CHECK(cudaMemcpy2D(tq + (size_t)off * (kl / 8), kl / 2,
-                                q.data + ((size_t)r.r0 * (K / 8) + c0 / 8) * 4, K / 2, kl / 2, h,
-                                cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy2D(ts + (size_t)off * (kl / 128), kl / 128 * 2,
-                                s.data + ((size_t)r.r0 * (K / 128) + c0 / 128) * 2, K / 128 * 2,
-                                kl / 128 * 2, h, cudaMemcpyHostToDevice));
+        // H2D on the stream of the repack (as the Flash-Next loaders, qfn_prefill_r4): a plain cudaMemcpy2D from the
+        // pageable (mmapped) file runs on the legacy stream and may return before its DMA lands, and `stream` is
+        // non-blocking: the repack could read the reused scratch while it still held the previous tensor
+        CUDA_CHECK(cudaMemcpy2DAsync(tq + (size_t)off * (kl / 8), kl / 2,
+                                     q.data + ((size_t)r.r0 * (K / 8) + c0 / 8) * 4, K / 2, kl / 2, h,
+                                     cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(ts + (size_t)off * (kl / 128), kl / 128 * 2,
+                                     s.data + ((size_t)r.r0 * (K / 128) + c0 / 128) * 2, K / 128 * 2,
+                                     kl / 128 * 2, h, cudaMemcpyHostToDevice, stream));
         off += h;
     }
     W4 w;
@@ -758,9 +761,9 @@ bf16* Worker::gather_bf16(const SafeTensors& st, const std::vector<RowSpec>& row
     for (auto& r : rows) {
         const TensorInfo& t = st.get(r.name);
         CHECK(t.dtype == "BF16" && t.shape[1] == K, "w16 %s", r.name.c_str());
-        CUDA_CHECK(cudaMemcpy2D(tmp + (size_t)off * kl, (size_t)kl * 2,
-                                t.data + ((size_t)r.r0 * K + c0) * 2, (size_t)K * 2,
-                                (size_t)kl * 2, r.r1 - r.r0, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy2DAsync(tmp + (size_t)off * kl, (size_t)kl * 2,
+                                     t.data + ((size_t)r.r0 * K + c0) * 2, (size_t)K * 2,
+                                     (size_t)kl * 2, r.r1 - r.r0, cudaMemcpyHostToDevice, stream));  // ordered with the consumer
         off += round_up(r.r1 - r.r0, pad_to);
     }
     *n_out = n;
@@ -1020,7 +1023,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
             for (int i = 0; i < n; i++)
                 memcpy(&rows[(size_t)i * K], t.data + (size_t)draft_ids[i] * K * 2, (size_t)K * 2);
             bf16* tmp = (bf16*)g_scratch_q.get((size_t)n * K * 2);
-            CUDA_CHECK(cudaMemcpy(tmp, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpyAsync(tmp, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice, stream));  // ordered with the quantize
             draft_head_.is4 = w4;
             if (w4) {
                 int32_t* q = (int32_t*)g_scratch_s.get((size_t)n * K / 2 + (size_t)n * (K / 128) * 2);

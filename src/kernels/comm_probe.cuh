@@ -20,10 +20,34 @@ __global__ void probe_store_kernel(uint4* __restrict__ dst, const uint4* __restr
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t)gridDim.x * blockDim.x)
         dst[i] = src[i];
 }
+// co-run tax probe (prefill-r4): a local memory-bound compute proxy (how much a GEMM / MoE kernel is slowed by a
+// transport running next to it), timed alone and next to each transport's traffic on a side stream. SM stores / loads
+// over a slow link (SYS / cross-NUMA) saturate the memory system and stall every concurrent kernel; the copy engine
+// does not (tests/bench_ar_occupy.py, mb_gdn.cu). This is the signal that picks the prefill transport, not raw
+// bandwidth (on SYS P2P and CE have similar GB/s but P2P stalls compute ~2x).
+__global__ void probe_compute_kernel(const float4* __restrict__ a, size_t n16, int reps, float* __restrict__ sink) {
+    float acc = 0.f;
+    for (int r = 0; r < reps; r++)
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t)gridDim.x * blockDim.x) {
+            const float4 v = __ldcg(a + i);
+            acc += v.x + v.y + v.z + v.w;
+        }
+    if (acc == -1.f) sink[threadIdx.x & 255] = acc;  // keep the loop live (never taken)
+}
+// dst[i] = src[i] until *stop (SM transfer: store to a peer when dst is the peer, load from a peer when src is)
+__global__ void probe_spin_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src, size_t n16,
+                                  const int* __restrict__ stop) {
+    while (!*reinterpret_cast<const volatile int*>(stop))
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t)gridDim.x * blockDim.x)
+            dst[i] = __ldcv(src + i);
+}
 
 struct ProbeBw {
     float sm = 0.f, ce = 0.f, host = 0.f;  // GB/s, directed pair i -> j (i's rows into j's memory)
     float ld = 0.f;                        // GB/s, SM loads: j reads i's rows from i's memory ("pull")
+    // co-run tax: local compute slowdown (x) while this pair's traffic runs on a side stream of the transferring card.
+    // tax_st on card i (push: i stores to j), tax_ld on card j (pull: j loads from i), tax_ce on card i (copy engine)
+    float tax_st = 1.f, tax_ld = 1.f, tax_ce = 1.f;
 };
 
 // best of `reps` timed runs (after one warm-up) of fn() on stream st of the current device, in ms
@@ -116,6 +140,8 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
     CUDA_CHECK(cudaGetDevice(&prev));
     // topology: NUMA node per GPU, P2P performance rank per pair
     std::string topo = "numa";
+    bool cross_numa = false;  // the GPUs sit on different NUMA nodes (SYS: P2P over the CPU interconnect stalls compute)
+    for (int i = 1; i < ng; i++) if (gpu_numa_node(devices[i]) != gpu_numa_node(devices[0])) cross_numa = true;
     for (int i = 0; i < ng; i++) topo += (i ? "," : " ") + std::to_string(gpu_numa_node(devices[i]));
     topo += " (" + std::to_string(numa_nodes()) + " node" + (numa_nodes() > 1 ? "s" : "") + ")";
     if (ng > 1) {
@@ -179,6 +205,62 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                 mn.ce = std::min(mn.ce, b.ce);
                 mn.host = std::min(mn.host, b.host);
             }
+        // co-run tax: a local compute proxy timed alone and next to each transport's traffic (QE_COMM_CORUN=0: off)
+        if (env_int("QE_COMM_CORUN", 1)) {
+            const size_t n16 = bytes / 16;
+            const int reps = std::max(1, env_int("QE_COMM_CORUN_REPS", 8));
+            std::vector<cudaStream_t> stB(ng);
+            std::vector<float*> sink(ng);
+            int* stop = nullptr;  // host-mapped: one flag stops every spin kernel
+            CUDA_CHECK(cudaHostAlloc((void**)&stop, 4, cudaHostAllocMapped | cudaHostAllocPortable));
+            *stop = 0;
+            for (int i = 0; i < ng; i++) {
+                CUDA_CHECK(cudaSetDevice(devices[i]));
+                CUDA_CHECK(cudaStreamCreateWithFlags(&stB[i], cudaStreamNonBlocking));
+                CUDA_CHECK(cudaMalloc(&sink[i], 256 * 4));
+            }
+            // compute proxy on device d (reads src[d]), timed while `setup` keeps a transport busy on stB[d]; `teardown`
+            // stops it. Returns the slowdown vs t_alone[d].
+            std::vector<float> t_alone(ng);
+            for (int d = 0; d < ng; d++) {
+                CUDA_CHECK(cudaSetDevice(devices[d]));
+                t_alone[d] = probe_ms(st[d], [&] {
+                    probe_compute_kernel<<<160, 256, 0, st[d]>>>((const float4*)src[d], n16, reps, sink[d]);
+                });
+            }
+            auto spin_tax = [&](int d, uint4* sd, const uint4* ss) {
+                CUDA_CHECK(cudaSetDevice(devices[d]));
+                *stop = 0;
+                probe_spin_kernel<<<16, 512, 0, stB[d]>>>(sd, ss, n16, stop);
+                const float t = probe_ms(st[d], [&] {
+                    probe_compute_kernel<<<160, 256, 0, st[d]>>>((const float4*)src[d], n16, reps, sink[d]);
+                });
+                *stop = 1;
+                CUDA_CHECK(cudaStreamSynchronize(stB[d]));
+                return t / t_alone[d];
+            };
+            for (int i = 0; i < ng; i++)
+                for (int j = 0; j < ng; j++) {
+                    if (i == j) continue;
+                    ProbeBw& b = bw[(size_t)i * ng + j];
+                    b.tax_st = spin_tax(i, (uint4*)dst[j], (const uint4*)src[i]);  // i pushes to j
+                    b.tax_ld = spin_tax(j, (uint4*)dst[j], (const uint4*)src[i]);  // j pulls from i (reads peer i, writes local)
+                    // copy engine on i: keep it busy with enough peer copies to outlast the timed compute
+                    CUDA_CHECK(cudaSetDevice(devices[i]));
+                    for (int k = 0; k < 12; k++)  // outlast the timed compute (warm + 3 reps)
+                        CUDA_CHECK(cudaMemcpyPeerAsync(dst[j], devices[j], src[i], devices[i], bytes, stB[i]));
+                    b.tax_ce = probe_ms(st[i], [&] {
+                        probe_compute_kernel<<<160, 256, 0, st[i]>>>((const float4*)src[i], n16, reps, sink[i]);
+                    }) / t_alone[i];
+                    CUDA_CHECK(cudaStreamSynchronize(stB[i]));
+                }
+            for (int i = 0; i < ng; i++) {
+                CUDA_CHECK(cudaSetDevice(devices[i]));
+                CUDA_CHECK(cudaStreamDestroy(stB[i]));
+                CUDA_CHECK(cudaFree(sink[i]));
+            }
+            CUDA_CHECK(cudaFreeHost(stop));
+        }
         for (int i = 0; i < ng; i++) {
             CUDA_CHECK(cudaSetDevice(devices[i]));
             CUDA_CHECK(cudaStreamDestroy(st[i]));
@@ -191,11 +273,12 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
             for (int j = 0; j < ng; j++)
                 if (i != j) {
                     const ProbeBw& b = bw[(size_t)i * ng + j];
-                    char s[128];
-                    snprintf(s, sizeof(s), "%s%d->%d %.1f/%.1f/%.1f/%.1f", line.empty() ? "" : ", ", i, j, b.sm, b.ld, b.ce, b.host);
+                    char s[160];
+                    snprintf(s, sizeof(s), "%s%d->%d %.1f/%.1f/%.1f/%.1f (tax %.2f/%.2f/%.2f)", line.empty() ? "" : ", ", i, j,
+                             b.sm, b.ld, b.ce, b.host, b.tax_st, b.tax_ld, b.tax_ce);
                     line += s;
                 }
-        fprintf(stderr, "[comm] probe GB/s (SM stores / SM loads by the receiver / copy engine / host-staged): %s\n", line.c_str());
+        fprintf(stderr, "[comm] probe GB/s (SM store / SM load by receiver / copy engine / host-staged; tax = local compute slowdown store/load/ce): %s\n", line.c_str());
     }
     // P2P SM path, per directed pair (staged engines only, i.e. Flash-Next): the receiver pulls the rows by SM loads
     // unless they are markedly slower than the sender's SM stores (QE_COMM_PULL_RATIO, default 0.7): SM stores over
@@ -203,16 +286,19 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
     // W4A8 GEMM 4.3x vs +12 %), so equal bandwidth favours pull. "pull" / "push" force one mode on every pair.
     unsigned pm = 0;
     std::string pairs;
-    float mn_p2p = 1e30f;
+    float mn_p2p = 1e30f, tax_p2p = 1.f, tax_ce = 1.f;  // tax of the chosen P2P mode / of the copy engine (worst pair)
     if (staged && ng > 1 && c.p2p) {
         static const float pr = getenv("QE_COMM_PULL_RATIO") ? (float)atof(getenv("QE_COMM_PULL_RATIO")) : 0.7f;
         for (int i = 0; i < ng; i++)
             for (int j = 0; j < ng; j++) {
                 if (i == j) continue;
                 const ProbeBw& b = bw[(size_t)i * ng + j];  // i's rows to j: j pulls or i pushes
-                const bool pl = want == "pull" || (want != "push" && (!probe || b.ld >= pr * b.sm));
+                // pull unless its load bandwidth is markedly below the store bandwidth or its tax is markedly worse
+                const bool pl = want == "pull" ||
+                                (want != "push" && (!probe || (b.ld >= pr * b.sm && b.tax_ld <= b.tax_st * 1.1f + 0.05f)));
                 if (pl) pm |= 1u << (4 * j + i);
-                if (probe) mn_p2p = std::min(mn_p2p, pl ? b.ld : b.sm);
+                if (probe) { mn_p2p = std::min(mn_p2p, pl ? b.ld : b.sm); tax_p2p = std::max(tax_p2p, pl ? b.tax_ld : b.tax_st); }
+                tax_ce = std::max(tax_ce, b.tax_ce);
                 pairs += (pairs.empty() ? "" : " ") + std::to_string(j) + "<-" + std::to_string(i) + (pl ? ":pull" : ":push");
             }
         if (probe) mn.sm = mn_p2p;  // the P2P path's bandwidth is the chosen mode's per pair
@@ -235,12 +321,31 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
     } else if (probe) {
         static const float ratio = getenv("QE_COMM_RATIO") ? (float)atof(getenv("QE_COMM_RATIO")) : 0.5f;
         if (staged) {
+            // P2P (pull/push) keeps compute on the memory system it shares with the transfer, so a slow link stalls it
+            // (SYS / cross-NUMA): switch the prefill collectives to the copy engine when the P2P co-run tax is high and
+            // markedly worse than the copy engine's, or when P2P bandwidth is far below the alternatives. The copy
+            // engine leaves the SMs alone (its tax ~1x) and was more stable than host on the SYS tester, so prefer it
+            // over host unless host bandwidth is far higher. Our 1-NUMA PCIe4 box (pull tax ~1.1) stays on P2P.
+            static const float taxcap = getenv("QE_COMM_TAX") ? (float)atof(getenv("QE_COMM_TAX")) : 1.30f;
             const float alt = std::max(mn.ce, mn.host);
-            if (mn.sm < ratio * alt) x = mn.ce >= mn.host ? kXferCE : kXferHost;
+            // The co-run tax proxy (a memory-bound kernel) over-reads the P2P load tax on a fast single-NUMA PCIe link
+            // (~1.4x here vs the real GEMM's ~1.1x), where P2P pull is still the fastest path end to end. The tax only
+            // decides against P2P on a cross-NUMA box (SYS): there the transfer rides the CPU interconnect and genuinely
+            // stalls compute (the tester: P2P ~970 vs CE ~2030 tok/s). QE_COMM_XNUMA=0 lets the tax decide anywhere.
+            static const bool xnuma = !getenv("QE_COMM_XNUMA") || atoi(getenv("QE_COMM_XNUMA"));
+            const bool tax_bad = tax_p2p >= taxcap && tax_p2p > tax_ce * 1.15f && (!xnuma || cross_numa);
+            const bool bw_bad = mn.sm < ratio * alt;
+            if (tax_bad || bw_bad) x = mn.ce >= 0.8f * mn.host ? kXferCE : kXferHost;
+            char w[128];
+            snprintf(w, sizeof(w), "auto: P2P tax %.2f (cap %.2f, %s), CE tax %.2f, P2P %.0f CE %.0f host %.0f GB/s",
+                     tax_p2p, taxcap, cross_numa ? "cross-NUMA" : "1 NUMA node", tax_ce, mn.sm, mn.ce, mn.host);
+            static std::string ws;  // keep the string alive for the final log line
+            ws = w;
+            why = ws.c_str();
         } else {  // engines with a copy-engine prefill all-reduce by default: host staging only if it is markedly faster
             x = std::max(mn.sm, mn.ce) < ratio * mn.host ? kXferHost : kXferCE;
+            why = "auto";
         }
-        why = "auto";
     } else {
         x = staged || ng < 2 ? kXferP2P : kXferCE;  // the engine's default
         why = ng > 1 ? "auto, probe off" : "one GPU";

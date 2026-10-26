@@ -1327,6 +1327,11 @@ struct Xchg {
     unsigned* scnt;       // local per-peer arrival counters of the sending blocks
 };
 constexpr int XROWS = PFM;  // rows of the exchange buffers (a whole prefill chunk)
+// slots of the QSA exchange receive ring (q / partials / indexer); the slot index is s & (XSLOT - 1). 2 slots are
+// enough: the consumer accepts flag >= s, and the per-layer all-reduce keeps the cards within one exchange of each
+// other. (prefill-r4 tried 4 slots and a consumer -> sender credit handshake while hunting the 2-GPU garbage: no
+// effect, the cause was a load-time copy race; bench/patches/qfn_r4_garbage_hunt_full.patch)
+constexpr int XSLOT = 2;
 // per-row floats of a receive slot: the QSA q heads of one card (3 cards: 8, 2 cards: 12) x (HD + 2) partial records;
 // the q exchange uses qper (x HD). Allocations: the plan's value (3 cards: the former constant 8 x (HD + 2))
 __host__ __device__ __forceinline__ int QPC(const Plan& p) { return NQ / p.ngpu; }
@@ -1556,16 +1561,18 @@ __global__ void k_xs_wait(const unsigned* __restrict__ mine, const unsigned* seq
 }
 // receive slots of the QSA exchanges by an even counter at the start of a prefill batch: the host then knows the slot
 // parity of every staged exchange of the batch (its copies are addressed on the host, also in a replayed graph)
+// staged batches: align the exchange counters to a multiple of XSLOT, so exchange k of the batch (host counter k = 1,
+// 2, ...) uses slot k & (XSLOT - 1), the slot the consumers read (s & (XSLOT - 1), s = seq + 1); was parity (2 slots)
 __global__ void k_xpar_align(unsigned* a, unsigned* b) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        *a += *a & 1u;
-        *b += *b & 1u;
+        *a += (XSLOT - *a % XSLOT) % XSLOT;
+        *b += (XSLOT - *b % XSLOT) % XSLOT;
     }
 }
 __global__ void k_xsend(const float* __restrict__ part, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    float* dst = xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * xper(p);
+    float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * xper(p);
     const int h0 = peer * QPC(p);
     for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * xper(p) / 2; idx += gridDim.y * blockDim.x) {
         const int t = idx / (xper(p) / 2), r = idx % (xper(p) / 2);
@@ -1587,7 +1594,7 @@ __global__ void k_qsa_comb2(const float* __restrict__ part, int m, const float* 
     __syncthreads();
     const unsigned s = s_s;
     const int hl = blockIdx.x, t = blockIdx.y, d = threadIdx.x, h = p.q0 + hl;
-    const float* rb = xc.recv[p.rank] + (size_t)(s & 1) * p.ngpu * XROWS * xper(p);
+    const float* rb = xc.recv[p.rank] + (size_t)(s & (XSLOT - 1)) * p.ngpu * XROWS * xper(p);
     float M = -INFINITY;
     for (int g = 0; g < p.ngpu; g++) {
         const float* o = g == p.rank ? part + ((size_t)t * NQ + h) * (HD + 2) : rb + ((size_t)g * XROWS + t) * xper(p) + hl * (HD + 2);
@@ -1830,7 +1837,7 @@ __global__ void k_idx_local(float* __restrict__ scores, const int* __restrict__ 
 __global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    unsigned* dst = reinterpret_cast<unsigned*>(xc.recv[peer]) + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * IDX_TOPB;
+    unsigned* dst = reinterpret_cast<unsigned*>(xc.recv[peer]) + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * IDX_TOPB;
     for (int idx = threadIdx.x; idx < m * IDX_TOPB; idx += blockDim.x) dst[idx] = loc[idx];
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1859,7 +1866,7 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
     __syncthreads();
     const int pos = rpos ? rpos[t] : *pos0 + t, nbg = (pos + 1) / IDX_R;
     if (nbg > IDX_TOPB) {
-        const unsigned* rb = reinterpret_cast<const unsigned*>(xc.recv[p.rank]) + (size_t)(s_s & 1) * p.ngpu * XROWS * IDX_TOPB;
+        const unsigned* rb = reinterpret_cast<const unsigned*>(xc.recv[p.rank]) + (size_t)(s_s & (XSLOT - 1)) * p.ngpu * XROWS * IDX_TOPB;
         for (int i = threadIdx.x; i < p.ngpu * IDX_TOPB; i += blockDim.x) {
             const int g = i / IDX_TOPB, j = i % IDX_TOPB;
             keys[i] = g == p.rank ? loc[(size_t)t * IDX_TOPB + j] : __ldcg(rb + ((size_t)g * XROWS + t) * IDX_TOPB + j);
@@ -1907,7 +1914,7 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
 __global__ void k_qxsend(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    float* dst = xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * qper(p);
+    float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * qper(p);
     for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * qper(p) / 4; idx += gridDim.y * blockDim.x) {
         const int t = idx / (qper(p) / 4), r = idx % (qper(p) / 4);
         reinterpret_cast<float4*>(dst)[idx] = reinterpret_cast<const float4*>(qb + ((size_t)t * (NQ + 4) + p.q0) * HD)[r];
@@ -1920,7 +1927,7 @@ constexpr int XP16 = HD / 2 + 4;  // 128 floats of halves, m, l, pad (16-byte al
 __global__ void k_qxsend16(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    __half* dst = reinterpret_cast<__half*>(xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * qper(p));
+    __half* dst = reinterpret_cast<__half*>(xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * qper(p));
     for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * qper(p) / 8; idx += gridDim.y * blockDim.x) {
         const int t = idx / (qper(p) / 8), r = idx % (qper(p) / 8);
         const float4* src = reinterpret_cast<const float4*>(qb + ((size_t)t * (NQ + 4) + p.q0) * HD) + 2 * r;
@@ -1934,7 +1941,7 @@ __global__ void k_qxsend16(const float* __restrict__ qb, int m, Xchg xc, Plan p)
 __global__ void k_xsend16(const float* __restrict__ part, int m, Xchg xc, Plan p, int ahead = 0) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1 + ahead;
-    float* dst = xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * xper(p);
+    float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * xper(p);
     const int qpc = QPC(p), h0 = peer * qpc;
     for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * qpc * 32; idx += gridDim.y * blockDim.x) {
         const int rec = idx >> 5, l8 = idx & 31, t = rec / qpc, hl = rec - t * qpc;
@@ -1963,7 +1970,7 @@ __global__ void k_qsa_comb16(const float* __restrict__ part, int m, const float*
     __syncthreads();
     const unsigned s = s_s;
     const int hl = blockIdx.x, t = blockIdx.y, d = threadIdx.x, h = p.q0 + hl;
-    const float* rb = xc.recv[p.rank] + (size_t)(s & 1) * p.ngpu * XROWS * xper(p);
+    const float* rb = xc.recv[p.rank] + (size_t)(s & (XSLOT - 1)) * p.ngpu * XROWS * xper(p);
     const float* own = part + ((size_t)t * NQ + h) * (HD + 2);
     float M = __ldcg(own + HD);
     for (int g = 0; g < p.ngpu; g++)
@@ -2018,7 +2025,7 @@ __global__ void k_qsa_attn_b(const float* __restrict__ qb, const uint8_t* __rest
     }
     __syncthreads();
     const float* qsrc = owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                        : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
+                                        : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
     qs[threadIdx.x] = __ldcg(qsrc + threadIdx.x) * (1.f / 16.f);
     __syncthreads();
     const int kvh = h / (NQ / NKV);
@@ -2099,7 +2106,7 @@ __global__ void __launch_bounds__(256) k_qsa_attn_rows(const float* __restrict__
     __syncthreads();
     if (t < m) {
         const float* qsrc = owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                            : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
+                                            : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
         float q8[8];
 #pragma unroll
         for (int e = 0; e < 8; e++) q8[e] = __ldcg(qsrc + lane * 8 + e) * (1.f / 16.f);
@@ -2190,7 +2197,7 @@ __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ q
         float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
         if (t < m) {
             const float* qsrc = owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                                : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
+                                                : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
             v = __ldcg(reinterpret_cast<const float4*>(qsrc) + c4);
         }
         __half2* d = reinterpret_cast<__half2*>(Qs + r * TA_SROW + c4 * 4);
@@ -2380,12 +2387,12 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
             if (tb + t >= m) return nullptr;
             const int tt = tb + t;
             return owner == p.rank ? qb + ((size_t)tt * (NQ + 4) + h) * HD
-                                   : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + tt) * qper(p) + (h - owner * QPC(p)) * HD;
+                                   : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + tt) * qper(p) + (h - owner * QPC(p)) * HD;
         };
         if (Q16 && owner != p.rank) {
             auto qrow16 = [&](int t) -> const __half* {
                 if (tb + t >= m) return nullptr;
-                return reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & 1) * p.ngpu + owner) * XROWS * qper(p)) +
+                return reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p)) +
                        (size_t)(tb + t) * qper(p) + (h - owner * QPC(p)) * HD;
             };
             const __half* h0 = qrow16(r0);
@@ -2634,12 +2641,12 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
         auto qrow = [&](int h) -> const float* {
             const int owner = h / QPC(p);
             return owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                   : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
+                                   : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
         };
         auto qrow16 = [&](int h) -> const __half* {  // fp16 rows of a peer (nullptr: own head, fp32)
             const int owner = h / QPC(p);
             return owner == p.rank || !q16 ? nullptr
-                 : reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & 1) * p.ngpu + owner) * XROWS * qper(p)) +
+                 : reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p)) +
                        (size_t)t * qper(p) + (h - owner * QPC(p)) * HD;
         };
         const int h0 = kvh * HPG + g, h1 = kvh * HPG + g + 8;

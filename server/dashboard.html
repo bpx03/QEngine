@@ -155,7 +155,7 @@ const T = {
     running: "działa", run_no: "start nr", now: "teraz", decode: "dekoduje", prefill: "prefill", queued: "czeka", ended: "zakończony",
     pool: "pula", reserved: "zarezerwowane", in_use: "w użyciu", max_ctx: "maks. kontekst",
     archive: "Archiwum", in_ram: "w RAM", on_disk: "na dysku", events: "zdarzenia puli",
-    grow: "wzrosty", move: "przesunięcia", evict: "wysiedlenia", since: "od startu", total: "łącznie",
+    grow: "wzrosty", move: "przesunięcia", evict: "wysiedlenia", paused: "wstrzymane", pause: "wstrzymania", resume: "wznowienia", since: "od startu", total: "łącznie",
     uptime: "czas pracy", requests: "zapytania (błędy)", gen: "wygenerowane tokeny", prompt: "tokeny promptów",
     hit: "trafienia cache promptu", pre_tok: "prefill policzony", pre_tps: "śr. prefill tok/s",
     avg: "śr. tok/s przy pracy", images: "obrazy (tokeny)", energy: "energia GPU", tpj: "tokenów na dżul",
@@ -175,7 +175,7 @@ const T = {
     running: "up", run_no: "run #", now: "now", decode: "decoding", prefill: "prefill", queued: "waiting", ended: "finished",
     pool: "pool", reserved: "reserved", in_use: "in use", max_ctx: "max context",
     archive: "Archive", in_ram: "in RAM", on_disk: "on disk", events: "pool events",
-    grow: "grown", move: "moved", evict: "evicted", since: "since start", total: "all time",
+    grow: "grown", move: "moved", evict: "evicted", paused: "paused", pause: "preempted", resume: "resumed", since: "since start", total: "all time",
     uptime: "uptime", requests: "requests (errors)", gen: "generated tokens", prompt: "prompt tokens",
     hit: "prompt cache hits", pre_tok: "prefill computed", pre_tps: "avg prefill tok/s",
     avg: "avg tok/s while busy", images: "images (tokens)", energy: "GPU energy", tpj: "tokens per joule",
@@ -287,7 +287,7 @@ function render(s) {
     const a = en.archives, ev = en.events;
     const conv = n => `${n} ${T[LANG].conv(n)}`;
     $("poolnote").textContent = `${t("archive")}: ${conv(a.ram)} ${t("in_ram")} (${fmt(a.ram_bytes / 2 ** 30, 1)} GB), ${conv(a.disk)} ${t("on_disk")} `
-      + `(${fmt(a.disk_bytes / 2 ** 30, 1)} GB) · ${t("events")}: ${t("grow")} ${ev.grow}, ${t("move")} ${ev.move}, ${t("evict")} ${ev.evict}`;
+      + `(${fmt(a.disk_bytes / 2 ** 30, 1)} GB) · ${t("events")}: ${t("grow")} ${ev.grow}, ${t("move")} ${ev.move}, ${t("evict")} ${ev.evict} · ${t("paused")} ${en.paused ?? 0} (${t("pause")} ${ev.pause ?? 0}, ${t("resume")} ${ev.resume ?? 0})`;
   }
 
   // GPUs

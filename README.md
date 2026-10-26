@@ -8,7 +8,7 @@ with tensor parallelism 3 over PCIe.
 in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
 in our quick tests.
 
-> **Qwen3.8-Flash-Next release candidate.** QEngine 1.3 rc1 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s:
+> **Qwen3.8-Flash-Next release candidate.** QEngine 1.3 rc2 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s:
 > see [Qwen3.8-Flash-Next (release candidate)](#qwen38-flash-next-release-candidate) and the ready-to-run model on
 > [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine); the `latest` Docker image runs both models.
 
@@ -49,19 +49,33 @@ memory (the same as `QE_P2P=0`): all-reduces go through pinned host memory, the 
 layout is disabled (smaller KV pool) and decode and prefill are slower than the published numbers.
 
 **Interconnect probe (multi-socket / SYS topologies).** At startup both engines measure every GPU pair for a few
-milliseconds: stores from SMs into the peer's memory, copy-engine peer copies, and copies staged through pinned host
-memory (device to host, then host to device). The log shows the topology and the result (3× RTX 3090, PCIe 4.0 x16,
-one NUMA node):
+milliseconds: stores from SMs into the peer's memory, loads by the receiving card's SMs from the sender's memory,
+copy-engine peer copies, and copies staged through pinned host memory (device to host, then host to device). For each
+transport the probe also measures the co-run tax: how much a local compute kernel slows down while that transfer
+runs next to it. The log shows the topology and the result (3× RTX 3090, PCIe 4.0 x16, one NUMA node):
 
 ```
 [comm] topology: numa -1,-1,-1 (1 node), P2P rank 0-1:0 0-2:0 1-2:0
-[comm] probe GB/s (SM stores / copy engine / host-staged): 0->1 26.2/26.3/13.2, 0->2 26.2/26.3/13.2, 1->0 26.2/26.3/13.2, ...
-[comm] prefill transfers: P2P SM stores (FLASH_COMM=auto, auto)
+[comm] probe GB/s (SM store / SM load by receiver / copy engine / host-staged; tax = local compute slowdown store/load/ce): 0->1 26.2/26.6/26.3/13.2 (tax 15.59/1.36/1.03), ...
+[comm] prefill transfers: P2P SM loads / stores, pairs 1<-0:pull 2<-0:pull 0<-1:pull 2<-1:pull 0<-2:pull 1<-2:pull (FLASH_COMM=auto, auto: P2P tax 1.36 (cap 1.30, 1 NUMA node), CE tax 1.03, P2P 27 CE 26 host 13 GB/s)
 ```
 
-When SM stores into peer memory are markedly slower than the best alternative on some pair (less than half of it,
-`QE_COMM_RATIO`), as on machines where every GPU pair is connected through the CPU (`nvidia-smi topo -m` shows `SYS`,
-e.g. one GPU per NUMA node), the high-volume prefill transfers switch to the faster path. Decode keeps its path.
+With `FLASH_COMM=auto` (the default) Flash-Next chooses the prefill path as follows:
+
+- **P2P, per pair:** the receiving card pulls the rows with SM loads, unless loads are markedly slower than stores
+  on that pair (`QE_COMM_PULL_RATIO`, default 0.7). SM stores over PCIe slow down every kernel next to them on the
+  sending card; loads of the same bytes barely do.
+- **Copy engine on slow or cross-NUMA links:** the prefill transfers leave P2P for the copy engine when one of these
+  holds:
+  - the P2P co-run tax is above `QE_COMM_TAX` (default 1.30), markedly above the copy engine's, and the GPUs sit
+    on different NUMA nodes. This is the `SYS` case (`nvidia-smi topo -m`, e.g. one GPU per CPU socket), where
+    transfers cross the CPU interconnect and stall compute.
+  - P2P bandwidth is below half of the best alternative on some pair (`QE_COMM_RATIO`).
+- **Host staging** replaces the copy engine only when host-staged bandwidth is far higher.
+- **On one NUMA node** the tax alone never moves the transfers off P2P (`QE_COMM_XNUMA=0` lets it decide anywhere),
+  and `QE_COMM_CORUN=0` skips the tax probe.
+
+Decode keeps its path.
 `FLASH_COMM` (Flash-Next) and `QE_COMM` (27B) force a path: `auto` (default), `p2p`, `ce` (copy engine), `host`
 (staged through pinned host memory). For the 27B the prefill all-reduce runs on the copy engine already; `QE_COMM=p2p`
 selects the SM-store all-reduce and `QE_COMM=host` turns peer access off (every collective through host memory,
@@ -96,6 +110,18 @@ GPUs. On a single-node machine nothing changes.
   (`--disk-cache`).
 - **Scheduling**: shortest-prefill-first queue with aging, short requests can preempt long prefills
   between chunks, prefill chunks interleaved with running decodes.
+- **KV pool under pressure** (27B):
+  - A conversation's region grows by at least `QE_POOL_MIN_HEAD` tokens (default 2048, or 1/16 of its size if
+    larger), so a nearly full pool does not re-place regions on every step.
+  - When room runs out, idle conversations are archived to host RAM (least recently used first, finished ones
+    first, the main thread last) before any running conversation is squeezed.
+  - When the running conversations still do not fit, the engine preempts one of them instead of ending its reply.
+    The victim is the lowest priority, then the most recently admitted. Its KV and recurrent state go to the RAM
+    archive (`QE_KV_ARCHIVE_GB`), and its stream pauses without an end token.
+  - Paused conversations resume in priority, then arrival, order, as soon as every running sequence keeps its
+    headroom. They continue exactly where they stopped: drafts and lookup history are kept. This works for any
+    number of conversations.
+  - A reply ends early only when a single conversation is larger than the pool.
 - **Structured output**: `response_format` with `json_object` / `json_schema` through llguidance
   grammars, enforced in the engine together with speculative decoding.
 - **Tool calls** (OpenAI `tools` and Anthropic `tool_use` / `tool_result`) and thinking on/off with
@@ -222,6 +248,7 @@ Useful environment variables:
 |---|---|---|
 | `QE_MAX_SEQS` | 16 | sequence slots (conversations kept in the KV pool), up to 32 |
 | `QE_POOL_TOKENS` | auto | KV pool size in tokens (default: all free memory) |
+| `QE_POOL_MIN_HEAD` | 2048 | least headroom in tokens a conversation's KV region grows by when the pool is tight (or 1/16 of the conversation, if larger) |
 | `QE_RESERVE_GB` | 1.5 | VRAM left outside the KV pool; a list sets it per card, e.g. `1.5,3,1.5` (a short list repeats its last value) |
 | `QE_KV_ARCHIVE_GB` | 32 | host-RAM archive of evicted conversations (0 = off) |
 | `QE_PREFIX_GB` | 8 | host RAM for pinned system-prompt prefixes |
@@ -459,7 +486,8 @@ build/flash_run --model models/Qwen3.8-Flash-Next-QE-INT4 --ids @prompt.ids --ge
 | `FLASH_PF_STAGE` | 1 | prefill batches of ≥ 2048 rows get the cold expert groups of the layer two ahead copied to the GPU by the copy engine while the current layers compute (0 = off: read over PCIe from the kernels; 2 = experimental buffer lent by the expert cache) |
 | `FLASH_MOE_GU2` | 1 | prefill expert gate/up kernel that stages each job's token rows once in shared memory (0 = the previous kernel) |
 | `FLASH_X16_SEL` | 1 | prefill attention exchanges between cards in fp16 also for long prompts (block selection on) |
-| `FLASH_COMM` | auto | prefill transfers between cards (all-reduce, row gather, attention exchanges): `auto` (startup probe), `p2p` (SM stores into peer memory), `ce` (copy-engine peer copies), `host` (staged through pinned host memory); decode unchanged |
+| `FLASH_COMM` | auto | prefill transfers between cards (all-reduce, row gather, attention exchanges): `auto` (startup probe: P2P with receiver pulls per pair, the copy engine on cross-NUMA / slow links, see [Interconnect probe](#hardware-requirements-and-limitations)), `p2p`, `pull` / `push` (P2P with SM loads by the receiver / SM stores into the peer on every pair), `ce` (copy-engine peer copies), `host` (staged through pinned host memory); decode unchanged |
+| `FLASH_QPF_UNION` | 1 | prefill attention with block selection: the union of each 8-row group's selected blocks is built once per group instead of in every attention block (0 = off) |
 | `FLASH_HCSP` | 1 | prefill: each card runs the hyper-connection reads only on the rows it owns in the all-reduce and gathers the results (0 = off: all rows on every card) |
 | `FLASH_PFU` | 1 | prefill: one all-reduce / row gather per 1024 rows (`FLASH_ARU`) and the expert half run in the same units, so each transfer overlaps the next unit's compute (0 = the previous schedule: transfers per 512-row chunk) |
 | `FLASH_MOE_SLOT` | 1 | prefill expert down projection into a per-(token, expert) buffer summed in a fixed order instead of floating-point atomics (0 = atomics) |
@@ -501,6 +529,15 @@ and projection GEMMs, 4096-row batches, the row-tile attention): 3 GPUs 8K 1.33 
 (5.70K tok/s), 100K 18.9 s (5.43K tok/s); 3 GPUs with `FLASH_COMM=host` 8K 1.60 s, 26K 5.84 s, 100K 23.6 s; 2 GPUs 8K
 1.95 s, 26K 6.23 s, 100K 25.0 s (4.09K tok/s). Server, same build: a single 16K prompt reaches its first token in
 2.6–3.0 s; agent c=8 decode is unchanged (865–1008 tok/s across runs, run-to-run spread ±8 %).
+
+**Engine only, October 26, prefill round 4** (`flash_run`, 16 slots, fresh engine, 3 GPUs). Changes:
+
+- The all-reduce and the row gather pull rows with SM loads instead of storing them into the peers.
+- The n-gram rows are computed in O(1) per token on 8 host threads.
+- The attention block unions are built once per row group.
+
+Results: 16K 2.62 s (6.25K tok/s) and 100K 16.08 s (6.37K tok/s). With the round-3 build these took 2.85 s and
+18.9 s.
 
 **Server check, October 25** (build with `FLASH_CKPT_MIN=512`): short c=1 312 tok/s, agent c=8 939 tok/s; the chat
 goodput test (1024-token shared prefix, target TTFT 3 s and TPOT 50 ms) met the target for 100% of requests at
@@ -589,7 +626,7 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Performance in the container matches bare metal (single-user decode, same GPUs).
 
-**Flash-Next (release candidate)** runs in the image `ghcr.io/bpx03/qengine:1.3-rc1` (text only; `latest` is the
+**Flash-Next (release candidate)** runs in the image `ghcr.io/bpx03/qengine:1.3-rc2` (text only; `latest` is the
 image of the 1.3 preview 1 release). Point `QE_MODEL` at the Flash-Next model directory and pass the `FLASH_*`
 variables with `-e`:
 
@@ -598,7 +635,7 @@ docker run -d --name qengine-flash --gpus all --ipc=host --ulimit memlock=-1 \
   -p 8080:8080 -p 127.0.0.1:9393:9393 \
   -v /path/to/models:/app/models:ro -v qengine-cache:/root/.cache/qengine \
   -e QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4 \
-  ghcr.io/bpx03/qengine:1.3-rc1
+  ghcr.io/bpx03/qengine:1.3-rc2
 ```
 
 Add `-e FLASH_NGRAM_PIN=0` for disk mode on a low-RAM host (see [Hardware and host memory](#hardware-and-host-memory)).
