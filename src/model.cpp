@@ -1485,6 +1485,9 @@ void Worker::run_(int m, bool logits) {
     auto key = std::make_tuple(m, logits, mode(), cur_slot_);
     cudaGraphExec_t ge = graphs_.get(key);
     if (!ge) {
+        static const bool log_cap = env_int("QE_LOG_CAPTURE", 0);
+        if (log_cap && rank == 0)
+            fprintf(stderr, "forward graph capture: m %d logits %d mode %d slot %d\n", m, logits, mode(), cur_slot_);
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         forward(m, logits);

@@ -2791,6 +2791,10 @@ void Engine::launch_step(int buf, int base, int lk) {
     const bool rs = seqs_[cur_].pos + 2 * (kMaxSpecK + 1) + 8 <= dec38_max();
     for (auto& wp : workers_) wp->attn_rs_ = rs;
     buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look);
+    static const bool log_cap = env_int("QE_LOG_CAPTURE", 0);  // which step shapes miss the graph cache
+    if (log_cap && buf_captured_[buf])
+        fprintf(stderr, "spec graph capture: kv %d kd %d lookup %d slot %d pos %d row-split %d\n", kv, kd, look,
+                cur_, seqs_[cur_].pos, rs);
     pool_->run([&](int r) {
         Worker& w = *workers_[r];
         if (io) {
