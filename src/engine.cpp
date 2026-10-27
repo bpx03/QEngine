@@ -122,7 +122,8 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     }
     plan_ = make_plan(cfg_, devices.size(), weights, kvs_);
     print_plan(cfg_, plan_);
-    st_.open(model_dir + "/model.safetensors");
+    const std::vector<std::string> weight_files = safetensors_files(model_dir);
+    for (const std::string& f : weight_files) st_.open(f);
     // QE_MTP_FILE: another MTP head (e.g. a fine-tuned one), same tensor names
     const std::string mtp_file = env_str("QE_MTP_FILE") ? env_str("QE_MTP_FILE") : model_dir + "/model_mtp.safetensors";
     if (FILE* f = fopen(mtp_file.c_str(), "rb")) {
@@ -135,7 +136,9 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         std::ostringstream fp;
         char rp[PATH_MAX];
         fp << (realpath(model_dir_.c_str(), rp) ? rp : model_dir_.c_str());
-        for (const std::string& f : {model_dir_ + "/model.safetensors", mtp_file}) {
+        std::vector<std::string> files = weight_files;  // single-file checkpoints keep their old key
+        files.push_back(mtp_file);
+        for (const std::string& f : files) {
             struct stat stt;
             if (stat(f.c_str(), &stt) == 0) fp << "|" << f.substr(f.rfind('/') + 1) << ":" << stt.st_size << ":" << stt.st_mtime;
         }
@@ -1876,9 +1879,11 @@ void Engine::disk_init() {
     // v3: archives written before the KV-pool compaction fix (23781c9) may hold overwritten rows
     fp << "v3|" << (realpath(model_dir_.c_str(), rp) ? rp : model_dir_.c_str());
     if (env_str("QE_MTP_FILE")) fp << "|mtp:" << env_str("QE_MTP_FILE");
-    for (const char* f : {"/model.safetensors", "/model_mtp.safetensors"}) {
+    std::vector<std::string> files = safetensors_files(model_dir_);  // single-file: same key as before
+    files.push_back(model_dir_ + "/model_mtp.safetensors");
+    for (const std::string& f : files) {
         struct stat stt;
-        if (stat((model_dir_ + f).c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;
+        if (stat(f.c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;
     }
     fp << "|g" << workers_.size() << "|" << (env_str("QE_SPLIT") ? env_str("QE_SPLIT") : "");
     if (kvs_.on()) fp << "|kvsplit" << kvs_.period << "," << kvs_.a01 << "," << kvs_.a12;
