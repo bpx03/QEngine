@@ -308,6 +308,9 @@ public:
     // optional per-layer residual dump (host pointer, [layers][m][hidden] floats), debug only
     float* debug_hidden = nullptr;
     uint16_t* dump_hidden = nullptr;  // host: final normed hidden (MTP input) of every prompt row
+    // KV scale calibration (QE_KV_AMAX=1): device [layers + 1][2] max |k|, |v| written to the cache
+    // (index = layer, last = MTP), raw floats before the fp8 cast; null: off
+    float* kv_amax = nullptr;
     // mixed precision (QE_W4_FROM / QE_W4_LAYERS): the layer matrices of the classes in w4_mask come from
     // w4_st (an INT4 checkpoint with the same tensor names) instead of the main checkpoint
     enum { W4C_QKV = 1, W4C_O = 2, W4C_IN = 4, W4C_OUT = 8, W4C_GU = 16, W4C_DOWN = 32 };

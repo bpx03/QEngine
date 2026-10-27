@@ -208,6 +208,7 @@ void qe_debug_hidden(void* e, const int* ids, int n, float* out) {
     ((Engine*)e)->debug_hidden(ids, n, out);
 }
 void qe_logits(void* e, float* out, int m) { ((Engine*)e)->logits(out, m); }
+int qe_kv_amax(void* e, float* out, int reset) { return ((Engine*)e)->kv_amax(out, reset != 0) ? 1 : 0; }
 int qe_start(void* e, const int* ids, int n, int k) { return ((Engine*)e)->start(ids, n, k); }
 int qe_start2(void* e, const int* ids, int n, int k, unsigned long long affinity) {
     return ((Engine*)e)->start(ids, n, k, affinity);

@@ -124,6 +124,18 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     print_plan(cfg_, plan_);
     const std::vector<std::string> weight_files = safetensors_files(model_dir);
     for (const std::string& f : weight_files) st_.open(f);
+    {   // QE_KV_SCALES: fp8 KV scales (<layer>.self_attn.k_scale / v_scale scalars, e.g. from
+        // tools/kv_scales.py) that override the checkpoint's; default <model>/kv_scales.safetensors
+        // if present, "off" = none
+        const char* e = env_str("QE_KV_SCALES");
+        const std::string f = e ? e : model_dir + "/kv_scales.safetensors";
+        struct stat stt;
+        if (f != "off" && (e || stat(f.c_str(), &stt) == 0)) {
+            st_.open(f);
+            kv_scales_file_ = f;
+            fprintf(stderr, "KV scales: %s\n", f.c_str());
+        }
+    }
     // mixed precision: QE_W4_FROM=<INT4 checkpoint dir> supplies the layer matrices of the QE_W4_LAYERS classes
     // (comma list of qkv, o, attn = qkv + o, in, out, dn = in + out, mlp = gate_up + down; default mlp); the
     // rest come from model_dir (e.g. INT8). Same tensor names in both checkpoints; the norms an AWQ checkpoint
@@ -1931,6 +1943,11 @@ void Engine::disk_init() {
         struct stat stt;
         if (stat(f.c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;
     }
+    if (!kv_scales_file_.empty()) {  // archives hold fp8 KV encoded with these scales
+        struct stat stt;
+        fp << "|kvs:" << (realpath(kv_scales_file_.c_str(), rp) ? rp : kv_scales_file_.c_str());
+        if (stat(kv_scales_file_.c_str(), &stt) == 0) fp << ":" << stt.st_size << ":" << stt.st_mtime;
+    }
     fp << w4_key_;  // mixed precision: other weights
     fp << "|g" << workers_.size() << "|" << (env_str("QE_SPLIT") ? env_str("QE_SPLIT") : "");
     if (kvs_.on()) fp << "|kvsplit" << kvs_.period << "," << kvs_.a01 << "," << kvs_.a12;
@@ -3380,6 +3397,21 @@ void Engine::debug_hidden(const int* ids, int n, float* out) {
         workers_[r]->debug_hidden = nullptr;
         cudaFreeHost(bufs[r]);
     }
+}
+
+bool Engine::kv_amax(float* out, bool reset) {
+    const size_t n = (size_t)(cfg_.layers + 1) * 2;
+    std::fill(out, out + n, 0.f);
+    std::vector<float> h(n);
+    for (auto& w : workers_) {
+        if (!w->kv_amax) return false;
+        CUDA_CHECK(cudaSetDevice(w->device));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h.data(), w->kv_amax, n * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < n; i++) out[i] = std::max(out[i], h[i]);
+        if (reset) CUDA_CHECK(cudaMemset(w->kv_amax, 0, n * 4));
+    }
+    return true;
 }
 
 void Engine::logits(float* out, int m) {

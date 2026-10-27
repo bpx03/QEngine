@@ -106,6 +106,13 @@ __global__ void rope_table_seg_kernel(const AttnSegs g, const float* __restrict_
     rope_table_dev(seq_view(c), c.pos, seg_row0(g, blockIdx.y), inv_freq, tab);
 }
 
+// KV calibration: max |x| of the block into *m (all 256 threads reach the cache write together;
+// non-negative floats order like their bit patterns)
+__device__ __forceinline__ void amax_block(float* m, float x) {
+    const unsigned u = __reduce_max_sync(0xffffffffu, __float_as_uint(fabsf(x)));
+    if ((threadIdx.x & 31) == 0) atomicMax((unsigned*)m, u);
+}
+
 __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, int ld, const AttnShape& s,
                                               const SeqView& sv,
                                               const bf16* __restrict__ qn_w, const bf16* __restrict__ kn_w,
@@ -123,6 +130,7 @@ __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, in
         if (!pm_owned(pm, p)) return;
         const float v = row[s.nq * 512 + s.nkv * 256 + j * 256 + d];
         const size_t idx = (head_rows(s, j, sv.max_t) + (pm_rank(pm, p) - pm_rank(pm, sv.split))) * 256 + d;
+        if (s.amax) amax_block(s.amax + 1, v);
         if (s.fp8)
             ((__nv_fp8_storage_t*)vc)[idx] = __nv_cvt_float_to_fp8(v / s.vs, __NV_SATFINITE, __NV_E4M3);
         else
@@ -159,6 +167,7 @@ __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, in
     }
     const PosMap pm = s.kv_pm[j];
     const size_t idx = (head_rows(s, j, sv.max_t) + (pm_rank(pm, p) - pm_rank(pm, sv.split))) * 256 + d;
+    if (s.amax) amax_block(s.amax, y);
     if (s.fp8)
         ((__nv_fp8_storage_t*)kc)[idx] = __nv_cvt_float_to_fp8(y / s.ks, __NV_SATFINITE, __NV_E4M3);
     else

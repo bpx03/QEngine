@@ -984,6 +984,10 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     }
     embed_ = embed_mapped;
     if (env_set("QE_KV_FP8")) kv_fp8_ = env_int("QE_KV_FP8", kv_fp8_) != 0;
+    if (env_int("QE_KV_AMAX", 0)) {
+        kv_amax = (float*)dalloc((size_t)(c_.layers + 1) * 2 * 4, false);
+        CUDA_CHECK(cudaMemset(kv_amax, 0, (size_t)(c_.layers + 1) * 2 * 4));
+    }
     if (env_set("QE_GLU")) glu_ = env_int("QE_GLU", glu_) != 0;
     attention_init();
     attention_prefill_init();
@@ -1059,6 +1063,9 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
                 mtp_ks_ = std::max(mtp_ks_, L.fa.ks);
                 mtp_vs_ = std::max(mtp_vs_, L.fa.vs);
             } else {
+                if (kv_fp8_ && rank == 0)
+                    fprintf(stderr, "no %sk_scale / v_scale: bf16 KV cache (side file: QE_KV_SCALES, tools/kv_scales.py)\n",
+                            a.c_str());
                 kv_fp8_ = false;  // no calibrated scales: keep a bf16 cache
             }
         } else {
@@ -2158,6 +2165,7 @@ AttnShape Worker::layer_shape(const Layer* L, int win) const {
     a.fp8 = L ? kv_fp8_ : mtp_fp8();
     a.ks = L ? L->fa.ks : mtp_ks_ * mtp_sc_mul_;
     a.vs = L ? L->fa.vs : mtp_vs_ * mtp_sc_mul_;
+    if (kv_amax) a.amax = kv_amax + 2 * (L ? (int)(L - layers_.data()) : c_.layers);
     // MTP drafts only need recent context: a sliding window bounds their KV reads at long
     // context. win < 0 means the dec8_first default (32K beyond 144K); the recursive draft
     // passes pass a tighter window (see run_spec), the verification pass keeps full attention.
