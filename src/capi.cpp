@@ -13,6 +13,12 @@ extern "C" {
 void qe_repack_w4(const int32_t* q, const bf16* s, int n, int k, void* dq, void* ds) {
     repack_w4(q, s, n, k, (uint4*)dq, (bf16*)ds, 0);
 }
+void qe_repack_w8(const int32_t* q, const bf16* s, int n, int k, void* dq, void* ds) {
+    repack_w8(q, s, n, k, (uint4*)dq, (bf16*)ds, 0);
+}
+void qe_glu_interleave_rows(const int32_t* q, const bf16* s, int n, int k, int32_t* dq, bf16* ds, int bits) {
+    glu_interleave_rows(q, s, n, k, dq, ds, 0, bits);
+}
 void qe_repack_w16(const bf16* w, int n, int k, void* dw) { repack_w16(w, n, k, (uint4*)dw, 0); }
 
 void qe_gemv_w4(const void* q, const void* s, int n, int k, const bf16* x, float* y, int m) {
@@ -46,6 +52,12 @@ int qe_gemv_w4hxx(const void* q, const void* s, int n, int k, const __half* xh, 
     W4 w{(const uint4*)q, (const bf16*)s, n, k, glu != 0};
     gemv_workspace_init();
     return gemv_w4hx(w, xh, ldx, y, glu ? n / 2 : n, m, 0) ? 1 : 0;
+}
+int qe_skinny_w8(const void* q, const void* s, int n, int k, const bf16* x, float* y, int m) {
+    W8 w{(const uint4*)q, (const bf16*)s, n, k};
+    gemv_workspace_init();
+    skinny_init();
+    return skinny_w8(w, x, k, y, n, m, 0) ? 1 : 0;
 }
 int qe_skinny_w4(const void* q, const void* s, int n, int k, const bf16* x, float* y, int m, int glu) {
     W4 w{(const uint4*)q, (const bf16*)s, n, k, glu != 0};
@@ -95,6 +107,12 @@ void qe_gemm_w16(const void* wp, int n, int k, const bf16* x, float* y, int t) {
 void qe_quantize_w8(const bf16* w, int n, int k, void* dq, void* ds) {
     quantize_w8(w, n, k, (uint4*)dq, (bf16*)ds, 0);
 }
+void qe_gemv_w8_set_p1_min(int m) { gemv_w8_set_p1_min(m); }
+void qe_gemv_w8_glu(const void* q, const void* s, int n, int k, const bf16* x, void* act, int m) {  // act: bf16 [m][n / 2]
+    gemv_workspace_init();
+    W8 w{(const uint4*)q, (const bf16*)s, n, k, true};
+    gemv_w8(w, x, k, (float*)act, n / 2, m, 0);
+}
 void qe_gemv_w8(const void* q, const void* s, int n, int k, const bf16* x, float* y, int m) {
     W8 w{(const uint4*)q, (const bf16*)s, n, k};
     gemv_w8(w, x, k, y, n, m, 0);
@@ -139,6 +157,10 @@ void qe_dnin_ab(int mode, const void* q, const void* s, int n, int k, const __ha
 void qe_gemv_w16(const void* wp, int n, int k, const bf16* x, float* y, int m) {
     W16 w{(const uint4*)wp, n, k};
     gemv_w16(w, x, k, y, n, m, 0);
+}
+void qe_gemv_w16k(const void* wp, int n, int k, const bf16* x, float* y, int m, int ksplit, int ystride) {  // y: [ksplit][m][n] partials
+    W16 w{(const uint4*)wp, n, k};
+    gemv_w16(w, x, k, y, n, m, 0, ksplit, (size_t)ystride);
 }
 }
 

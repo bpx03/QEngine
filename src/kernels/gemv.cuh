@@ -33,11 +33,17 @@ struct W8 {
     const uint4* q = nullptr;
     const bf16* s = nullptr;
     int n = 0, k = 0;
+    bool glu = false;  // GLU row order as in W4 (gate_up): gemv_w8 / gemm_w8 write silu(gate) * up (bf16)
 };
 void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st);
+void gemv_w8_set_p1_min(int m);  // (bench) run-time QE_W8P1_MIN, 0 = environment / default
 // RTN INT8 (group 128) quantization of a row-major bf16 matrix straight into the W8 layout.
 void quantize_w8(const bf16* src, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st);
 inline size_t w8_qbytes(int n, int k) { return (size_t)n * k; }
+// Repack a row-major compressed-tensors INT8 matrix (int32 [N][K/4], bytes LSB-first, stored value
+// u = w+128, so each row is K plain bytes) plus bf16 scales [N][K/128] into the W8 layout.
+void repack_w8(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst_q, bf16* dst_s,
+               cudaStream_t st);
 
 // y[m][n] = sum_k x[m][k] * W[n][k]   (fp32 out, row stride ldy; x bf16 with row stride ldx)
 // For a GLU matrix y is a bf16 activation buffer [m][ldy] (ldy >= n / 2).
@@ -78,6 +84,9 @@ void gemv_x_init();            // once per device (workspace), before any stream
 // QE_GEMV_NW_SMALL rule applies only to them, not to the split-K W16 projections)
 int pick_warps(int tiles, int units, bool w4 = false);
 bool skinny_use(int n, int m); // engine policy (QE_SKINNY, QE_SKINNY_MIN_M, QE_SKINNY_MIN_TILES)
+// skinny GEMM for INT8 layers, 1..32 rows (bit-identical to gemv_w8 for every m); false when unsupported
+bool skinny_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st);
+bool skinny_w8_use(int n, int m);  // engine policy (QE_SKINNY8, QE_SKINNY8_MIN_M, QE_SKINNY8_MIN_TILES)
 // ksplit > 1 splits K across blocks (for tiny N); partial sums go to y + s * ystride and the
 // consumer adds the ksplit slices.
 void gemv_w16(const W16& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st,
@@ -141,10 +150,10 @@ void repack_w4(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst
 // Round-to-nearest symmetric INT4 (group 128) quantization of a row-major bf16 matrix into the
 // compressed-tensors layout consumed by repack_w4 (used for draft-only weights).
 void quantize_w4_rtn(const bf16* src, int n, int k, int32_t* dst_q, bf16* dst_s, cudaStream_t st);
-// Reorder rows [gate 0..I) [up 0..I) of a compressed-tensors int4 matrix (+ scales) into the
-// GLU tile order (8 gate rows, 8 up rows, ...), in place via the scratch copies.
+// Reorder rows [gate 0..I) [up 0..I) of a compressed-tensors int4 (bits 4) or int8 (bits 8) matrix
+// (+ scales) into the GLU tile order (8 gate rows, 8 up rows, ...), in place via the scratch copies.
 void glu_interleave_rows(const int32_t* src_q, const bf16* src_s, int n, int k, int32_t* dst_q,
-                         bf16* dst_s, cudaStream_t st);
+                         bf16* dst_s, cudaStream_t st, int bits = 4);
 // Repack a row-major bf16 matrix [N][K] into the W16 layout.
 void repack_w16(const bf16* src, int n, int k, uint4* dst, cudaStream_t st);
 

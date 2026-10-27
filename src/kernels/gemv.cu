@@ -531,6 +531,30 @@ __global__ void repack_w4_kernel(const int32_t* __restrict__ src, int N, int K,
                (a7 << 28);
 }
 
+// one thread per u32 of the W8 layout (4 of the 16 bytes a lane loads); byte b of a lane's 16:
+// k-step 2c + b/8, a-index ai = b%8 (bit 0: k+1, bit 1: row+8, bit 2: k+8), as in quantize_w8_kernel.
+// The source row is K bytes u = w + 128 (little-endian int32 words, LSB first), so w = u ^ 0x80.
+__global__ void repack_w8_kernel(const uint8_t* __restrict__ src, int N, int K,
+                                 uint32_t* __restrict__ dst) {
+    const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const size_t total = (size_t)N * K / 4;
+    if (idx >= total) return;
+    const int w = idx & 3, lane = (idx >> 2) & 31;
+    const size_t chunk_id = idx >> 7;  // r * (K/32) + c
+    const int chunks = K >> 5;
+    const int r = chunk_id / chunks, c = chunk_id % chunks;
+    const int g = lane >> 2, t = lane & 3;
+    uint32_t out = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int b = w * 4 + i, ai = b & 7;
+        const int row = r * 16 + g + ((ai & 2) ? 8 : 0);
+        const int k = (c * 2 + (b >> 3)) * 16 + ((ai & 4) ? 8 : 0) + 2 * t + (ai & 1);
+        out |= (uint32_t)(src[(size_t)row * K + k] ^ 0x80u) << (8 * i);
+    }
+    dst[idx] = out;
+}
+
 __global__ void repack_scales_kernel(const bf16* __restrict__ src, int N, int K,
                                      bf16* __restrict__ dst) {
     const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -637,7 +661,7 @@ __device__ __forceinline__ uint32_t load_x2_f16(const bf16* p, bool ok) {
 // INT8 GEMV (lm_head): fp16 tensor-core math on exact integer weights, per-group fp32 scaling.
 __global__ void gemv_w8_kernel(const uint4* __restrict__ q, const bf16* __restrict__ s, int K,
                                const bf16* __restrict__ x, int ldx, float* __restrict__ y, int ldy,
-                               int m) {
+                               int m, bool glu) {
     const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nwarps = blockDim.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -675,13 +699,13 @@ __global__ void gemv_w8_kernel(const uint4* __restrict__ q, const bf16* __restri
         acc[2] += c[2] * sg8;
         acc[3] += c[3] * sg8;
     }
-    reduce_store(acc, nwarps, y, ldy, m, r * 16);
+    reduce_store(acc, nwarps, y, ldy, m, r * 16, glu);
 }
 
 // INT8 GEMV for 9..8*NT tokens with fp16-packed activations (xpack layout).
 template <int NT>
 __global__ void gemv_w8p_kernel(const uint4* __restrict__ q, const bf16* __restrict__ s, int K,
-                                const uint4* __restrict__ xp, float* __restrict__ y, int ldy, int m) {
+                                const uint4* __restrict__ xp, float* __restrict__ y, int ldy, int m, bool glu) {
     const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nwarps = blockDim.x >> 5;
     const int g = lane >> 2;
@@ -727,7 +751,7 @@ __global__ void gemv_w8p_kernel(const uint4* __restrict__ q, const bf16* __restr
             acc[nt][2] += c[nt][2] * sg8; acc[nt][3] += c[nt][3] * sg8;
         }
     }
-    reduce_store_nt<NT>(acc, nwarps, y, ldy, m, r * 16, false);
+    reduce_store_nt<NT>(acc, nwarps, y, ldy, m, r * 16, glu);
 }
 
 // INT8 lm_head for 17..32 tokens (one K slice per tile, i.e. pick_warps == 1 as for the 5174-tile vocab
@@ -922,13 +946,13 @@ __global__ void quantize_rtn_kernel(const bf16* __restrict__ src, int N, int K,
     if (lane == 0) s[(size_t)row * groups + gi] = sb;
 }
 
-// one block per destination row
+// one block per destination row; wpr = int32 words per packed row (K/8 for int4, K/4 for int8)
 __global__ void glu_rows_kernel(const int32_t* __restrict__ sq, const bf16* __restrict__ ss, int N,
-                                int K, int32_t* __restrict__ dq, bf16* __restrict__ ds) {
+                                int K, int wpr, int32_t* __restrict__ dq, bf16* __restrict__ ds) {
     const int dr = blockIdx.x, I = N / 2;
     const int tile = dr / 16, j = dr % 16;
     const int sr = j < 8 ? tile * 8 + j : I + tile * 8 + (j - 8);
-    for (int i = threadIdx.x; i < K / 8; i += blockDim.x) dq[(size_t)dr * (K / 8) + i] = sq[(size_t)sr * (K / 8) + i];
+    for (int i = threadIdx.x; i < wpr; i += blockDim.x) dq[(size_t)dr * wpr + i] = sq[(size_t)sr * wpr + i];
     for (int i = threadIdx.x; i < K / 128; i += blockDim.x) ds[(size_t)dr * (K / 128) + i] = ss[(size_t)sr * (K / 128) + i];
 }
 
@@ -1128,40 +1152,50 @@ int pick_warps(int tiles, int units, bool w4) {
 }
 
 void glu_interleave_rows(const int32_t* src_q, const bf16* src_s, int n, int k, int32_t* dst_q,
-                         bf16* dst_s, cudaStream_t st) {
-    CHECK(n % 16 == 0, "glu rows %d", n);
-    glu_rows_kernel<<<n, 256, 0, st>>>(src_q, src_s, n, k, dst_q, dst_s);
+                         bf16* dst_s, cudaStream_t st, int bits) {
+    CHECK(n % 16 == 0 && (bits == 4 || bits == 8), "glu rows %d bits %d", n, bits);
+    glu_rows_kernel<<<n, 256, 0, st>>>(src_q, src_s, n, k, k * bits / 32, dst_q, dst_s);
 }
 
 void prefetch_l2(const void* p, size_t bytes, cudaStream_t st) {
     prefetch_l2_kernel<<<16, 256, 0, st>>>((const char*)p, bytes);
 }
 
+int g_w8p1_min_rt = 0;  // (bench) run-time override of QE_W8P1_MIN, 0 = the environment / default
+void gemv_w8_set_p1_min(int m) { g_w8p1_min_rt = m; }
 void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
     CHECK(w.n % 16 == 0 && w.k % 128 == 0 && m >= 1 && m <= kMaxBatchRows, "gemv_w8");
     static const bool s_on = env_int("QE_W8S", 1);
     if (m > 32 && !(s_on && pick_warps(w.n / 16, w.k / 128, true) == 1)) {  // two calls (rows independent)
         gemv_w8(w, x, ldx, y, ldy, 32, st);
-        gemv_w8(w, x + (size_t)32 * ldx, ldx, y + (size_t)32 * ldy, ldy, m - 32, st);
+        // (GLU: y is the bf16 activation buffer, ldy in bf16 elements)
+        float* y2 = w.glu ? reinterpret_cast<float*>(reinterpret_cast<bf16*>(y) + (size_t)32 * ldy) : y + (size_t)32 * ldy;
+        gemv_w8(w, x + (size_t)32 * ldx, ldx, y2, ldy, m - 32, st);
         return;
     }
     const int tiles = w.n / 16;
     const int nw = pick_warps(tiles, w.k / 128, true);
-    if (m <= 8) {
-        gemv_w8_kernel<<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x, ldx, y, ldy, m);
-        return;
-    }
+    // QE_W8P1_MIN = M: from M rows on, <= 8 rows also take the packed-activation kernel (one 8-row tile, x
+    // pre-converted to fp16: one 16-byte load per lane per 32 k instead of eight 4-byte loads + conversions);
+    // same arithmetic, so bit-identical. Default 8 (tests/ab_gemv_w8p1.py, in-process A/B: 8 rows 1.11-1.40x on
+    // gate_up / down / dn_in / qkv, o/out equal; 2..6 rows 0.81-0.97x: the pack kernel costs more than it saves)
+    static const int p1_env = env_int("QE_W8P1_MIN", 8);
+    const int p1_min = g_w8p1_min_rt > 0 ? g_w8p1_min_rt : p1_env;
     int dev;
     CUDA_CHECK(cudaGetDevice(&dev));
     uint4* xp = g_xpack[dev];
+    if (m <= 8 && (m < p1_min || !xp)) {  // (no workspace: kernel tests without gemv_workspace_init)
+        gemv_w8_kernel<<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x, ldx, y, ldy, m, w.glu);
+        return;
+    }
     CHECK(xp && w.k <= kXpackMaxK, "gemv workspace (k=%d)", w.k);
-    const int ntiles = m <= 16 ? 2 : (m + 7) / 8;
+    const int ntiles = m <= 8 ? 1 : m <= 16 ? 2 : (m + 7) / 8;
     const int items = ntiles * (w.k / 32) * 32;
     xpack_kernel<<<(items + 255) / 256, 256, 0, st>>>(x, ldx, w.k, m, ntiles, xp, true);
     // staged-activation kernel for single-slice matrices (the lm_head vocab shard): 9..32 rows
     // (QE_W8S=0 restores gemv_w8p). 8 warps x 1 tile, 3 stages measured best (4/16 warps,
     // 2 tiles per warp and 4 stages within 1-2 %, 16 warps x 2 tiles spills at NT = 4)
-    if (s_on && nw == 1) {
+    if (s_on && nw == 1 && ntiles >= 2 && !w.glu) {
         constexpr int WB = 8;
         const int blocks = (tiles + WB - 1) / WB;
         // 33..64 rows (batched steps with one draft per sequence beyond 16 sequences): same kernel, NT 5..8
@@ -1186,9 +1220,10 @@ void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cuda
         else gemv_w8s_kernel<4, WB, 1, 3><<<blocks, WB * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m, tiles);
         return;
     }
-    if (ntiles == 2) gemv_w8p_kernel<2><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m);
-    else if (ntiles == 3) gemv_w8p_kernel<3><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m);
-    else gemv_w8p_kernel<4><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m);
+    if (ntiles == 1) gemv_w8p_kernel<1><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m, w.glu);
+    else if (ntiles == 2) gemv_w8p_kernel<2><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m, w.glu);
+    else if (ntiles == 3) gemv_w8p_kernel<3><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m, w.glu);
+    else gemv_w8p_kernel<4><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m, w.glu);
 }
 
 void quantize_w8(const bf16* src, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st) {
@@ -1365,6 +1400,16 @@ void repack_w4(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst
     CHECK(n % 16 == 0 && k % 128 == 0, "repack_w4 %d %d", n, k);
     size_t words = (size_t)n * k / 8;
     repack_w4_kernel<<<(words + 255) / 256, 256, 0, st>>>(src_q, n, k,
+                                                         reinterpret_cast<uint32_t*>(dst_q));
+    size_t ns = (size_t)n * (k / 128);
+    repack_scales_kernel<<<(ns + 255) / 256, 256, 0, st>>>(src_s, n, k, dst_s);
+}
+
+void repack_w8(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst_q, bf16* dst_s,
+               cudaStream_t st) {
+    CHECK(n % 16 == 0 && k % 128 == 0, "repack_w8 %d %d", n, k);
+    size_t words = (size_t)n * k / 4;
+    repack_w8_kernel<<<(words + 255) / 256, 256, 0, st>>>(reinterpret_cast<const uint8_t*>(src_q), n, k,
                                                          reinterpret_cast<uint32_t*>(dst_q));
     size_t ns = (size_t)n * (k / 128);
     repack_scales_kernel<<<(ns + 255) / 256, 256, 0, st>>>(src_s, n, k, dst_s);
