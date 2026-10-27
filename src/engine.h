@@ -165,6 +165,11 @@ public:
     // a new sequence of n tokens can start now: a free slot, and the pool holds it next to the
     // running ones (each counted with 16K of room to grow; idle ones can be evicted)
     bool can_admit(int n) const;
+    // make room for a new n-token sequence of value `prio` (the main thread): pause decoding sequences
+    // worth less (lowest prio, the most recently admitted first; never a prompt being prefilled, never
+    // one of the same or a higher prio), only as many as needed and only when that makes it fit (paused
+    // conversations count as out: they resume when room frees). true: the start fits now.
+    bool pause_for(int n, int prio);
     // Eviction value of a slot's conversation (kept with its archive): 0 = finished (a subagent
     // whose last reply had no tool call), 1 = normal, 2 = the main thread: evicted from the GPU
     // last, never dropped from the RAM archive while anything else can go.

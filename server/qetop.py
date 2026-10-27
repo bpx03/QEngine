@@ -26,7 +26,8 @@ EN = {"dekoduje": "decoding", "czeka": "waiting", "działa": "up", "start nr": "
       "W na GPU": "W on GPUs", "stan": "state", "kontekst": "context", "z cache": "cached", "wygen.": "generated",
       "nikt teraz nie pracuje": "nobody is working right now", "pula": "pool", "zarezerwowane": "reserved",
       "w użyciu": "in use", "archiwum": "archive", "dysk": "disk", "wzrosty": "grown", "przesunięcia": "moved",
-      "wysiedlenia": "evicted", "wstrzymane": "paused", "wstrzymania": "preempted", "wznowienia": "resumed", "od startu": "since start", "łącznie": "all time", "czas pracy": "uptime",
+      "wysiedlenia": "evicted", "dla głównego": "for main", "dopuszczone obok": "backfilled",
+      "nie rozpoznano głównego agenta w sesji": "main agent not identified in session", "wstrzymane": "paused", "wstrzymania": "preempted", "wznowienia": "resumed", "od startu": "since start", "łącznie": "all time", "czas pracy": "uptime",
       "zapytania": "requests", "wygenerowane tokeny": "generated tokens", "tokeny promptów": "prompt tokens",
       "trafienia cache": "cache hits", "śr. tok/s przy pracy": "avg tok/s busy", "energia": "energy",
       "tokenów / dżul": "tokens / joule", "rekord tok/s (10 s)": "record tok/s (10 s)",
@@ -80,6 +81,10 @@ def view(s, width=140, note=None):
     head = Text.assemble(("qengine ", "bold"), (f"{s.get('name', '')}  ", "cyan"),
                          (f"{_('działa')} {dur(se['uptime_s'])} · {_('start nr')} {s['runs']}", "grey62"),
                          (f"   {note[0]}", note[1]) if note else ("   l PL/EN · Ctrl+R reset · q", "grey35"))
+    al = (s.get("agents") or {}).get("alarm")
+    if al:  # the scheduler could not tell the main agent thread (server/agents.py): its priority is off
+        head = Group(head, Text(f"⚠ {_('nie rozpoznano głównego agenta w sesji')} {al['session'][:8]}… "
+                                f"({al['requests']}) · QE_MAIN_AGENT_RE", style="bold red"))
     kpi = Table.grid(expand=True, padding=(0, 2))
     for _col in range(7):
         kpi.add_column(justify="center")
@@ -144,13 +149,16 @@ def view(s, width=140, note=None):
                 cells[k] = (str(i) if k == a else ("█" if k < fill else "░"), ("bold " if x["active"] else "") + col)
         for ch, st in cells:
             pool.append(ch, style=st)
-        a, ev = en["archives"], en["events"]
+        a, ev, sc = en["archives"], en["events"], s.get("sched") or {}
         pool = Group(pool, Text(f"{_('pula')} {big(P)} · {_('zarezerwowane')} {big(used)} ({100 * used / P:.0f} %) · {_('w użyciu')} {big(held)}",
                                 style="grey62"),
                      Text(f"{_('archiwum')}: RAM {a['ram']} ({a['ram_bytes'] / 2**30:.1f} GB), {_('dysk')} {a['disk']} "
                           f"({a['disk_bytes'] / 2**30:.1f} GB) · {_('wzrosty')} {ev['grow']}, {_('przesunięcia')} {ev['move']}, "
                           f"{_('wysiedlenia')} {ev['evict']} · {_('wstrzymane')} {en.get('paused', 0)} "
-                          f"({_('wstrzymania')} {ev.get('pause', 0)}, {_('wznowienia')} {ev.get('resume', 0)})", style="grey62"))
+                          f"({_('wstrzymania')} {ev.get('pause', 0)}, {_('wznowienia')} {ev.get('resume', 0)}"
+                          f"{', ' + _('dla głównego') + ' ' + str(sc['main_pauses']) if sc.get('main_pauses') else ''})"
+                          f"{' · ' + _('dopuszczone obok') + ' ' + str(sc['backfills']) if sc.get('backfills') else ''}",
+                          style="grey62"))
 
     g = []
     for x in s["gpus"]:
@@ -178,7 +186,7 @@ def view(s, width=140, note=None):
     st.add_row(_("najdłuższy kontekst"), big(srec["longest_context"]), big(rec["longest_context"]))
 
     lay = Layout()
-    lay.split_column(Layout(Panel(Group(head, kpi), box=box.ROUNDED), size=5),
+    lay.split_column(Layout(Panel(Group(head, kpi), box=box.ROUNDED), size=6 if al else 5),
                      Layout(Panel(chart, title=_("przepustowość (3 min)"), box=box.ROUNDED), size=4),
                      Layout(name="mid"), Layout(name="bot", size=15))
     lay["mid"].split_row(Layout(Panel(t, title=_("agenci i kolejka"), box=box.ROUNDED), ratio=5),

@@ -26,6 +26,8 @@ enum QeWdSite : unsigned {
     kWdKvDecode,        // kv position split: decode softmax-stat exchange flag
     kWdKvPrefill,       // kv position split: prefill softmax-stat exchange flag
     kWdPkp,             // attn_pkp_kernel work-queue dependency (same GPU)
+    kWdQsaX,            // Flash-Next QSA exchanges (q / partials / indexer keys) and the n-gram stage handoff
+    kWdRowAg,           // Flash-Next prefill row all-gather (HC-SP) flags / acks
     kWdSites
 };
 

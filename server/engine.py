@@ -32,6 +32,7 @@ SIGS = {
     "qe_num_slots": (c_int, [c_void_p]),
     "qe_pool_tokens": (c_i64, [c_void_p]),
     "qe_can_admit": (c_int, [c_void_p, c_int]),
+    "qe_pause_for": (c_int, [c_void_p, c_int, c_int]),
     "qe_set_limit": (None, [c_void_p, c_int, c_int]),
     "qe_warmup": (c_double, [c_void_p, c_int]),
     "qe_reset": (None, [c_void_p]),
@@ -87,7 +88,7 @@ GROUPS = {
     "grammar": ("qe_mask_buffer", "qe_spec_io", "qe_constrain", "qe_constrained", "qe_vocab"),
     "vision": ("qe_start_mm", "qe_start_begin"),
 }
-SINGLE = ("qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_can_admit", "qe_set_limit", "qe_warmup",
+SINGLE = ("qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
           "qe_reset", "qe_set_lookahead")
 
 
@@ -274,6 +275,13 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             return bool(self.lib.qe_can_admit(self.h, int(n)))
         return len(self._active) < len(self.slots) and n <= self.max_t
 
+    def pause_for(self, n, prio):
+        """Pause decoding sequences of lower prio (lowest first, never a prefill) until a new sequence of n
+        tokens fits; True: it fits now (nothing is paused when it cannot be made to fit)."""
+        if "qe_pause_for" not in self.fns:
+            return False
+        return bool(self.lib.qe_pause_for(self.h, int(n), int(prio)))
+
     def set_limit(self, slot, tokens):
         """The reply of the slot may emit at most `tokens` more tokens (max_tokens): its steps
         verify only the drafts that fit, so the slot ends exactly at the returned reply."""
@@ -353,7 +361,7 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         a = (ctypes.c_double * 6)()
         if "qe_archive_info" in self.fns:
             L.qe_archive_info(h, a)
-        c = (ctypes.c_longlong * 6)()  # Flash-Next writes the first 3 (no pause / resume)
+        c = (ctypes.c_longlong * 6)()  # grow, move, evict, pause, resume, paused now
         if "qe_pool_counters" in self.fns:
             L.qe_pool_counters(h, c)
         return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots,

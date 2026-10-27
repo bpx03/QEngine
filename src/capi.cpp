@@ -201,6 +201,7 @@ int qe_slot_capacity(void* e, int i) { return ((Engine*)e)->slot_capacity(i); }
 int qe_max_context(void* e) { return ((Engine*)e)->max_context(); }
 long long qe_pool_tokens(void* e) { return (long long)((Engine*)e)->pool_tokens(); }
 int qe_can_admit(void* e, int n) { return ((Engine*)e)->can_admit(n); }
+int qe_pause_for(void* e, int n, int prio) { return ((Engine*)e)->pause_for(n, prio) ? 1 : 0; }
 void qe_set_prio(void* e, int slot, int prio) { ((Engine*)e)->set_prio(slot, prio); }
 void qe_set_limit(void* e, int slot, int tokens) { ((Engine*)e)->set_limit(slot, tokens); }
 void qe_watch_stops(void* e, int slot, int on) { ((Engine*)e)->watch_stops(slot, on != 0); }

@@ -588,6 +588,7 @@ private:
     int pfbn_base_ = PFM;
     std::vector<std::pair<char*, size_t>> bt_regs_;
     bool bt_want_ = false, bt_taken_ = false;
+    void bt_clear_y(int n);  // big batch: its borrowed rows of the y accumulator zeroed (rows [pfbn_base_, n))
     int* pfinv_ = nullptr;         // slot of every (row, k) of the batch's routing
     bool mtpb_ = false, mtpb_last_ = false;  // prefill_batch with the MTP layer
     float* dnqk_ = nullptr;  // chunked DeltaNet inputs: normalized q / k [PFM][2][nk][128], decay / beta [PFM][2][nv]
@@ -767,6 +768,13 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
   private:
     unsigned *nf_h_ = nullptr, *nf_d_ = nullptr, nf_seen_ = 0;  // non-finite guard counter (host-mapped)
     int *hd_ = nullptr, *hn_d_ = nullptr, *lk_ = nullptr;
+    // uniform lookup result (rc2 decode hang): every rank's lk_ gathered, rank 0's installed everywhere
+    static constexpr int kLkWords = 1 + 31;  // count + up to 31 drafts (lk_lmax_ <= MAXP - 1 = 16)
+    float* lkall_ = nullptr;
+    unsigned* lkdiff_ = nullptr;  // host-mapped: lookups where a rank's own result differed from rank 0's
+public:
+    unsigned lk_disagreements() const { return lkdiff_ ? *(volatile unsigned*)lkdiff_ : 0u; }
+private:
     unsigned long long* lkbest_ = nullptr;
     // global answer corpus for the lookup (FLASH_CORPUS tokens, default 0 = off): device copy on every card
     int *cd_ = nullptr, *cn_d_ = nullptr;

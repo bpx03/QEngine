@@ -5,6 +5,7 @@
 
 #include "../kernels/gemv_h16.cuh"
 #include "flash.h"
+#include "../kernels/watchdog.cuh"  // QE_WD_POLL in the exchange waits (a stranded rank traps instead of hanging)
 
 #ifndef FLASH_HCU_H16
 #define FLASH_HCU_H16 1  // prefill HC up: fp16-accumulate MMA per 64-k group (0: fp32 accumulate)
@@ -1399,8 +1400,9 @@ __global__ void k_row_ag_pull(RowAg a, int rank, int ngpu, unsigned amask) {
     if (!ag_pull(a.pm, rank, peer)) return;
     const unsigned s = *a.seq + 1;
     if (threadIdx.x == 0)
-        for (unsigned long long it = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + peer) - s) < 0; it++) {
+        for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + peer) - s) < 0; it++) {
             __nanosleep(20);
+            QE_WD_POLL(ws_, kWdRowAg, peer, s, qe_ld_acquire_sys(a.flags[rank] + peer));
             if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG pull wait for %d: seq %u\n", rank, peer, s);
         }
     __syncthreads();
@@ -1434,13 +1436,15 @@ __global__ void k_row_ag_fin(RowAg a, int rank, int ngpu) {
     for (int g = 0; g < ngpu; g++) {
         if (g == rank) continue;
         if (!ag_pull(a.pm, rank, g))  // g pushed its rows: its flag lands after them
-            for (unsigned long long it = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + g) - s) < 0; it++) {
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + g) - s) < 0; it++) {
                 __nanosleep(20);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(a.flags[rank] + g));
                 if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG wait for %d: seq %u\n", rank, g, s);
             }
         if (ag_pull(a.pm, g, rank))  // g reads this card's rows: wait until it is done
-            for (unsigned long long it = 0; (int)(qe_ld_acquire_sys(a.acks[rank] + g) - s) < 0; it++) {
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.acks[rank] + g) - s) < 0; it++) {
                 __nanosleep(20);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(a.acks[rank] + g));
                 if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG ack wait for %d: seq %u\n", rank, g, s);
             }
     }
@@ -1493,8 +1497,9 @@ __global__ void k_row_ag_wait(RowAg a, int rank, int ngpu) {
     const unsigned s = *a.seq + 1;
     for (int g = 0; g < ngpu; g++)
         if (g != rank)
-            for (unsigned long long it = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + g) - s) < 0; it++) {
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + g) - s) < 0; it++) {
                 __nanosleep(20);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(a.flags[rank] + g));
                 if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG wait for %d: seq %u, seen %u\n", rank, g, s, qe_ld_acquire_sys(a.flags[rank] + g));
             }
     __threadfence_system();
@@ -1511,8 +1516,9 @@ __global__ void k_rag_ackwait(const unsigned* __restrict__ mine, const unsigned*
     const unsigned s = *seq;
     for (int g = 0; g < ngpu; g++)
         if (g != rank)
-            for (unsigned long long it = 0; (int)(qe_ld_acquire_sys(mine + g) - s) < 0; it++) {
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(mine + g) - s) < 0; it++) {
                 __nanosleep(64);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(mine + g));
                 if (it == (1ull << 26)) printf("[flash] stall: rank %d row-AG ack wait for %d: seq %u, seen %u\n", rank, g, s, qe_ld_acquire_sys(mine + g));
             }
 }
@@ -1553,8 +1559,9 @@ __global__ void k_xs_wait(const unsigned* __restrict__ mine, const unsigned* seq
     const unsigned s = *seq + 1;
     for (int g = 0; g < ngpu; g++)
         if (g != rank)
-            for (unsigned long long it = 0; (int)(qe_ld_acquire_sys(mine + g) - s) < 0; it++) {
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(mine + g) - s) < 0; it++) {
                 __nanosleep(64);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(mine + g));
                 if (it == (1ull << 26)) printf("[flash] stall: rank %d staged exchange wait for %d: seq %u, seen %u\n", rank, g, s, qe_ld_acquire_sys(mine + g));
             }
     __threadfence_system();
@@ -1588,7 +1595,7 @@ __global__ void k_qsa_comb2(const float* __restrict__ part, int m, const float* 
         const unsigned s = *xc.seq + 1;
         for (int g = 0; g < p.ngpu; g++)
             if (g != p.rank)
-                while ((int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, g, s, qe_ld_acquire_sys(xc.flags[p.rank] + g)); }
         s_s = s;
     }
     __syncthreads();
@@ -1859,7 +1866,7 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
         const unsigned s = *xc.seq + 1;
         for (int g = 0; g < p.ngpu; g++)
             if (g != p.rank)
-                while ((int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, g, s, qe_ld_acquire_sys(xc.flags[p.rank] + g)); }
         s_s = s;
         s_cnt = 0;
     }
@@ -1964,7 +1971,7 @@ __global__ void k_qsa_comb16(const float* __restrict__ part, int m, const float*
         const unsigned s = *xc.seq + 1;
         for (int g = 0; g < p.ngpu; g++)
             if (g != p.rank)
-                while ((int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, g, s, qe_ld_acquire_sys(xc.flags[p.rank] + g)); }
         s_s = s;
     }
     __syncthreads();
@@ -2020,7 +2027,7 @@ __global__ void k_qsa_attn_b(const float* __restrict__ qb, const uint8_t* __rest
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
         if (owner != p.rank)
-            while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0) __nanosleep(20);
+            for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, owner, s, qe_ld_acquire_sys(xq.flags[p.rank] + owner)); }
         s_s = s;
     }
     __syncthreads();
@@ -2100,7 +2107,7 @@ __global__ void __launch_bounds__(256) k_qsa_attn_rows(const float* __restrict__
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
         if (owner != p.rank)
-            while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0) __nanosleep(20);
+            for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, owner, s, qe_ld_acquire_sys(xq.flags[p.rank] + owner)); }
         s_s = s;
     }
     __syncthreads();
@@ -2187,7 +2194,7 @@ __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ q
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
         if (owner != p.rank)
-            while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0) __nanosleep(20);
+            for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, owner, s, qe_ld_acquire_sys(xq.flags[p.rank] + owner)); }
         s_s = s;
     }
     __syncthreads();
@@ -2371,7 +2378,7 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
         for (int hh = blockIdx.x * 2; hh < blockIdx.x * 2 + 2; hh++) {
             const int ow = hh / QPC(p);
             if (ow != p.rank)
-                while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow)); }
         }
         s_s = s;
     }
@@ -2628,10 +2635,10 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
         const unsigned s = *xq.seq + 1;
         for (int hh = kvh * HPG; hh < kvh * HPG + HPG; hh += QPC(p)) {
             const int ow = hh / QPC(p);
-            if (ow != p.rank) while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0) __nanosleep(20);
+            if (ow != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow)); }
         }
         const int ow2 = (kvh * HPG + HPG - 1) / QPC(p);
-        if (ow2 != p.rank) while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow2) - s) < 0) __nanosleep(20);
+        if (ow2 != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow2) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow2, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow2)); }
         s_s = s;
     }
     __syncthreads();
@@ -4099,7 +4106,7 @@ __global__ void k_ngram_handoff(NgramDev ng, int n) {
     ng.flags[2] = n;
     __threadfence_system();
     qe_st_release_sys(ng.flags, s);
-    while ((int)(qe_ld_acquire_sys(ng.flags + 1) - s) < 0) __nanosleep(64);
+    for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(ng.flags + 1) - s) < 0;) { __nanosleep(64); QE_WD_POLL(ws_, kWdQsaX, 1, s, qe_ld_acquire_sys(ng.flags + 1)); }
 }
 __global__ void k_accept(const int* __restrict__ vtok, const int* __restrict__ otok, int k, int* __restrict__ posd,
                          int* __restrict__ mposd, int* __restrict__ acc, int* __restrict__ hist2, int* __restrict__ em) {

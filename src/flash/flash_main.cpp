@@ -572,8 +572,12 @@ int main(int argc, char** argv) {
     const bool pfb = pfp && !(getenv("FLASH_PFB") && atoi(getenv("FLASH_PFB")) == 0);
     if (pfb) {  // batched prefill: n <= pf_batch() rows per call (MoE half over the whole batch), then the MTP fill
         const int B = W[0]->pf_batch();
+        std::vector<int> cuts;  // FLASH_RUN_CUTS=p,q,...: a batch also ends at these positions (the server's checkpoints)
+        if (const char* c = getenv("FLASH_RUN_CUTS")) for (auto& x : split(c, ',')) if (!x.empty()) cuts.push_back(std::stoi(x));
         for (int i = 0, m = 0; i < np; i += m) {
             m = np - i <= B ? np - i : B - PFM;  // nominal batch B - PFM; a tail of <= PFM rows joins the last one
+            for (int c : cuts) if (c > i && c < i + m) { m = c - i; break; }
+            if (getenv("FLASH_RUN_CUTS") && getenv("FLASH_PFT")) printf("  batch [%d, %d)\n", i, i + m);
             std::vector<int> ch(prompt.begin() + i, prompt.begin() + i + m);
             std::vector<bf16> rows((size_t)m * H);
             const double tg0 = secs();

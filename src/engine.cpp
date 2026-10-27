@@ -933,9 +933,51 @@ void Engine::archive_info(double* out) const {
     }
 }
 
-bool Engine::can_admit(int n) const {
-    // headroom counted per sequence (its growth before it has to move); QE_ADMIT_HEADROOM overrides
+// headroom counted per sequence at admission (its growth before it has to move); QE_ADMIT_HEADROOM overrides
+static size_t admit_headroom() {
     static const size_t ah = getenv("QE_ADMIT_HEADROOM") ? atoll(getenv("QE_ADMIT_HEADROOM")) : 8192;  // 16384 admitted only 22 of 32 sequences on 2 GPUs
+    return ah;
+}
+
+bool Engine::pause_for(int n, int prio) {
+    const size_t ah = admit_headroom();
+    if (n > max_ctx_) return false;
+    bool slot = false;
+    size_t used = 0;
+    struct V { int j; size_t u; };
+    std::vector<V> vs;
+    for (size_t i = 0; i < seqs_.size(); i++) {
+        const Seq& q = seqs_[i];
+        if (!q.active) slot = true;
+        else if (pf_of(i)) used += units_of(q);
+        else if (!q.paused) {
+            const size_t u = units(std::min<size_t>((size_t)q.pos - q.split + ah, max_ctx_));
+            used += u;
+            if (q.prio < prio && q.max_t > 0 && q.pos > q.split) vs.push_back({(int)i, u});
+        }
+    }
+    for (auto& p : pres_) used += units(p.n);
+    const size_t need = units(std::min<size_t>((size_t)n + ah, max_ctx_));
+    if (!slot) return false;  // every slot is taken: pausing frees no slot
+    if (used + need <= pool_tokens_) return true;
+    std::stable_sort(vs.begin(), vs.end(), [&](const V& a, const V& b) {
+        const Seq &x = seqs_[a.j], &y = seqs_[b.j];
+        return x.prio != y.prio ? x.prio < y.prio : x.admit > y.admit;
+    });
+    size_t k = 0, left = used;
+    while (k < vs.size() && left + need > pool_tokens_) left -= vs[k++].u;
+    if (left + need > pool_tokens_) return false;  // pausing all of them would not make it fit: pause none
+    for (size_t i = 0; i < k; i++) {
+        if (pool_log_)
+            printf("pool: pausing slot %d (prio %d) for a %d-token start of prio %d\n", vs[i].j, seqs_[vs[i].j].prio, n, prio),
+                fflush(stdout);
+        if (!pause_slot(vs[i].j)) return false;
+    }
+    return true;
+}
+
+bool Engine::can_admit(int n) const {
+    const size_t ah = admit_headroom();
     bool slot = false;
     size_t used = 0;
     for (size_t i = 0; i < seqs_.size(); i++) {

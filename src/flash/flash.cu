@@ -3769,6 +3769,17 @@ void Worker::trunk_batch(int n, unsigned selmask) {
     else head(1, otok_);
 }
 
+// y (the all-reduced mixer / MoE sums before the residual update) is an accumulator: allreduce_add adds into it and its
+// consumer (k_hc_write, the fused HC read) clears the rows it used, so it must be zero wherever a collective adds into
+// it. Rows past pfbn_base_ are expert cache slots between big batches (bt_regs_), i.e. arbitrary bytes when a big batch
+// takes them: those rows of y are cleared at the start of every big batch (inside its graph). Without this, a chunk whose
+// all-reduce takes the generic path (allreduce_add into y + k_hc_write: a last chunk of < 3 x ngpu rows, or FLASH_AROV=0)
+// added the sums to expert weights: NaN / garbage residual rows from that layer on (1.3-rc2 server garble: batches end at
+// the checkpoints, e.g. [20986, 24576) = 3590 rows, last chunk 6 rows; flash_run never cut there).
+void Worker::bt_clear_y(int n) {
+    if (n > pfbn_base_) CUDA_CHECK(cudaMemsetAsync(y_ + (size_t)pfbn_base_ * H, 0, (size_t)(n - pfbn_base_) * H * 4, st_));
+}
+
 void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_rows, int* out, const int* mtp_toks, bool last,
                            int* draft) {
     CUDA_CHECK(cudaSetDevice(dev_));
@@ -3805,6 +3816,7 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
         CUDA_CHECK(cudaMemcpyAsync(toks_, pfh_tok_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
         CUDA_CHECK(cudaMemcpyAsync(pler_, pfh_ple_, (size_t)n * H * 2, cudaMemcpyHostToDevice, st_));
         if (mtpb_) CUDA_CHECK(cudaMemcpyAsync(mtok_, pfh_mt_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+        bt_clear_y(n);
         comm_begin_unit(ctr_, st_);
         trunk_batch(n, sel);
         CUDA_CHECK(cudaMemcpyAsync(pfh_out_, otok_, 4, cudaMemcpyDeviceToHost, st_));
@@ -3851,6 +3863,7 @@ void Worker::prefill_batch_mtp(const int* mtp_toks, int pos, int n, int* draft) 
     run_cached(pbgraphs_, key, [&] {
         CUDA_CHECK(cudaMemcpyAsync(cposd_, cposh_, (size_t)2 * nch * 4, cudaMemcpyHostToDevice, st_));
         CUDA_CHECK(cudaMemcpyAsync(mtok_, pfh_mt_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+        bt_clear_y(n);
         comm_begin_unit(ctr_, st_);
         ll_idx_ = 0;
         int* const mpos0 = mposd_;
@@ -4003,6 +4016,17 @@ void Worker::set_history(const int* ids, int n, int kfull) {
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
+// rank 0's lookup result (count + drafts) into lk_ on every rank; counts the calls where a rank's own result differed
+__global__ void k_lk_agree(const float* __restrict__ all, int n, int ngpu, int* __restrict__ lk, unsigned* __restrict__ diff) {
+    const int i = threadIdx.x;
+    bool d = false;
+    if (i < n) {
+        const unsigned v0 = __float_as_uint(all[i]);
+        for (int g = 1; g < ngpu; g++) d |= __float_as_uint(all[(size_t)g * n + i]) != v0;
+        lk[i] = (int)v0;
+    }
+    if (__any_sync(0xffffffffu, d) && i == 0) atomicAdd(diff, 1u);
+}
 void Worker::lk_scan_emit() {
     k_lk_scan<<<(max_ctx_ + 255) / 256, 256, 0, st_>>>(hd_, hn_d_, lkbest_);
     // FLASH_CORPUS_MIN: shortest corpus match used (default 12)
@@ -4010,6 +4034,21 @@ void Worker::lk_scan_emit() {
     if (cd_) k_lk_scan_c<<<std::min(1024, (ccap_ + 255) / 256), 256, 0, st_>>>(cd_, cn_d_, hd_, hn_d_, lkbestc_);
     k_lk_emit<<<1, 32, 0, st_>>>(hd_, hn_d_, lkbest_, lk_mmin_, lk_llo_, lk_hi_, lk_lmax_, lk_, em_ + MAXM + 2, lkrg_, lkrp_,
                                  cd_, lkbestc_, cmin);
+    // one lookup result on every rank (qfn decode hang, rc2): the step graph branches on lk_[0] on each device (k_lk_cond:
+    // the MTP draft chain, whose collectives every rank must enter) and k_vtok_lk builds the next verify rows from
+    // lk_[1..]; a rank whose lookup differed (e.g. a corpus update landing between ranks) skipped the chain while the
+    // others spun on its exchanges. All ranks take rank 0's lk_ (FLASH_LK_UNIFORM=0: off). The em_ copy only rank 0's
+    // host reads.
+    static const bool uni = !getenv("FLASH_LK_UNIFORM") || atoi(getenv("FLASH_LK_UNIFORM"));
+    if (uni && p_.ngpu > 1) {
+        if (!lkall_) {
+            lkall_ = (float*)dalloc((size_t)p_.ngpu * kLkWords * 4);
+            CUDA_CHECK(cudaHostAlloc((void**)&lkdiff_, 4, cudaHostAllocMapped));
+            *lkdiff_ = 0;
+        }
+        allgather_small(reinterpret_cast<const float*>(lk_), kLkWords, lkall_, comm_, p_.rank, ctr_, st_);
+        k_lk_agree<<<1, 32, 0, st_>>>(lkall_, kLkWords, p_.ngpu, lk_, lkdiff_);
+    }
 }
 
 // ring of answers: an answer that does not fit the rest of the buffer starts again at 0 (the oldest are overwritten;
@@ -4019,12 +4058,18 @@ void Worker::corpus_add(const int* ids, int n) {
     CUDA_CHECK(cudaSetDevice(dev_));
     if (n > ccap_ - 1) ids += n - (ccap_ - 1), n = ccap_ - 1;
     if (cpos_ + n + 1 > ccap_) cpos_ = 0;
+    // on the work stream (qfn decode hang, rc2): a plain cudaMemcpy ran unordered with a step graph in flight (the
+    // lookahead keeps one queued), which reads the corpus in k_lk_scan_c; the ranks saw the answer at different moments
+    // and took different branches of the device-side lookup conditional. Pageable sources: the async copy returns once
+    // they are staged; the step after it sees the corpus on every rank.
     std::vector<int> v(ids, ids + n);
     v.push_back(-1);
-    CUDA_CHECK(cudaMemcpy(cd_ + cpos_, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(cd_ + cpos_, v.data(), v.size() * 4, cudaMemcpyHostToDevice, st_));
     cpos_ += n + 1;
     cfill_ = std::max(cfill_, cpos_);
-    CUDA_CHECK(cudaMemcpy(cn_d_, &cfill_, 4, cudaMemcpyHostToDevice));
+    const int fill = cfill_;
+    CUDA_CHECK(cudaMemcpyAsync(cn_d_, &fill, 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));  // (the size word's host source is a local)
 }
 
 void Worker::spec_init(int last_tok, const int* drafts, int k, int pos, int commit, int h1, int h0) {

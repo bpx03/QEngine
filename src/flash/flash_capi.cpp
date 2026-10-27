@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -229,6 +230,11 @@ struct Slot {
     bool active = false;      // a reply is being generated (qe_start* .. qe_release)
     bool dirty = false;       // a step launched ahead was dropped (see FE::drain)
     bool synced = false;      // the conversation's archive matches the device
+    // preemption: a paused slot stays active (taken, generating) without a KV region: its rows [0, hist) are in its
+    // conversation's archive segments (held: a resident conversation is never evicted), its recurrent state, pending
+    // rows, speculative state and lookup history stay in the slot's device storage (outside the pool)
+    bool paused = false;
+    unsigned long long admit = 0, pause_t = 0;  // admission / pause order
     bool lk_stale = false;    // its lookup history on the devices is behind (batched steps ran)
     int bhist = -1;           // tokens of its batched-lookup history on the devices (-1: none / stale)
     int remain = -1;          // tokens the reply may still emit (qe_set_limit; -1: no limit)
@@ -357,14 +363,16 @@ struct FE {
     int next_id = 1, ckpt_every = 8192, ckpt_min = 512, ckpt_keep = 6, end_cut = 4096;
     unsigned long long tick = 0;
     const Conv* hold = nullptr;   // the conversation a start is restoring from (never evicted meanwhile)
-    long long n_evict = 0, n_restore = 0, n_sync = 0, n_move = 0, n_grow = 0, n_slot_evict = 0;
+    long long n_evict = 0, n_restore = 0, n_sync = 0, n_move = 0, n_grow = 0, n_slot_evict = 0, n_pause = 0, n_resume = 0;
+    unsigned long long admit_tick = 0, pause_tick = 0;
     bool log = false;             // FLASH_SLOT_LOG=1: archive / restore / pool events on stderr
     // prompt being prefilled (qe_start_begin .. qe_start_finish)
     struct Pf {
         bool on = false;
         int slot = 0;
         std::vector<int> ids;
-        int n = 0, i = 0, hint = 0, nxt = 0, reused = 0;
+        int n = 0, i = 0, hint = 0, nxt = 0, reused = 0, copied = 0;
+        bool from_archive = false;  // (qe_last_* after its finish: another start may have run in between)
         std::vector<int> cks;     // checkpoint positions still ahead (ascending)
         std::vector<int> drafts;
         double t_begin = 0, ms_sync = 0, ms_restore = 0, ms_pool = 0;
@@ -493,6 +501,38 @@ struct FE {
         };
         if (q.cap && free_above()) {
             n_grow++;
+        } else if (q.cap) {
+            // s holds rows: packing the others from the bottom (compact) would copy them over s's region before s
+            // moves (KV of the growing sequence overwritten). Either a gap anywhere (s's own space counts) takes s, or
+            // the others move away around s: those below it down, s down after them, those above it up to the top
+            while (true) {
+                const int at = find_gap(need, s);
+                if (at >= 0) {
+                    if (at != q.base) {
+                        int top = at + need;  // the target rows leave the expert cache before the copy
+                        for (auto& o : sl) if (o.cap) top = std::max(top, o.base + o.cap);
+                        job = [&](int r) { W[r]->set_kv_top(top); W[r]->kv_claim(0); };
+                        run();
+                        move_region(s, at);
+                    }
+                    break;
+                }
+                int others = 0;
+                for (int i = 0; i < (int)sl.size(); i++)
+                    if (i != s && sl[i].cap) others += sl[i].cap;
+                if (others + need <= np) {
+                    make_room_around(s, need);
+                    n_grow++;
+                    break;
+                }
+                int v = -1;  // evict the least valuable idle slot
+                for (int i = 0; i < (int)sl.size(); i++) {
+                    if (i == s || !sl[i].cap || sl[i].active || std::find(protect.begin(), protect.end(), i) != protect.end()) continue;
+                    if (v < 0 || prio_of(i) < prio_of(v) || (prio_of(i) == prio_of(v) && sl[i].used < sl[v].used)) v = i;
+                }
+                if (v < 0) return false;
+                evict_slot(v);
+            }
         } else {
             int at = find_gap(need, s);
             if (at < 0) {
@@ -525,6 +565,32 @@ struct FE {
         if (log) fprintf(stderr, "[qflash] pool: slot %d region [%d, %d) periods for %d tokens (%.1f ms)\n", s, q.base, q.base + q.cap, tokens,
                          now_ms() - t0);
         return true;
+    }
+    // regions of the other slots out of the way of s growing to `need` periods in place (every move is safe for
+    // overlapping regions: down in ascending, up in descending order; kv_move orders its chunks by direction)
+    void make_room_around(int s, int need) {
+        Slot& q = sl[s];
+        job = [&](int r) { W[r]->set_kv_top(np); W[r]->kv_claim(0); };  // the whole pool leaves the expert cache first
+        run();
+        std::vector<int> lo, hi;
+        for (int i = 0; i < (int)sl.size(); i++)
+            if (i != s && sl[i].cap) (sl[i].base < q.base ? lo : hi).push_back(i);
+        std::sort(lo.begin(), lo.end(), [&](int a, int b) { return sl[a].base < sl[b].base; });
+        std::sort(hi.begin(), hi.end(), [&](int a, int b) { return sl[a].base > sl[b].base; });
+        int at = 0;
+        for (int i : lo) {
+            if (sl[i].base > at) move_region(i, at);
+            at = sl[i].base + sl[i].cap;
+        }
+        if (q.base > at) move_region(s, at);
+        int top = np;
+        for (int j : hi) {
+            const int t = top - sl[j].cap;
+            CHECK(t >= sl[j].base, "flash pool: region %d [%d, +%d) cannot move up to %d", j, sl[j].base, sl[j].cap, t);
+            if (t > sl[j].base) move_region(j, t);
+            top = t;
+        }
+        CHECK(q.base + need <= top, "flash pool: no room around slot %d (%d + %d > %d)", s, q.base, need, top);
     }
     void rebind() {
         const int b = sl[cs].base;
@@ -575,6 +641,29 @@ struct FE {
         };
         run();
     }
+    // H2D of archived KV segment g (positions [a, z), region base b) limited to the positions < upto: the device pieces
+    // of [a, min(z, upto)) are prefixes of those of [a, z) (same rows from r0, fewer rows / index blocks)
+    void xfer_part(const HBlob& g, int b, int a, int z, int upto) {
+        const int z2 = std::min(z, upto);
+        if (z2 <= a) return;
+        job = [&](int r) {
+            CUDA_CHECK(cudaSetDevice(W[r]->device()));
+            std::vector<Worker::Piece> full, part;
+            W[r]->kv_pieces_at(b, a, z, full);
+            W[r]->kv_pieces_at(b, a, z2, part);
+            CHECK(part.size() == full.size() || part.empty(), "flash archive: segment pieces %zu vs %zu", part.size(), full.size());
+            size_t off = 0;
+            const cudaStream_t s = W[r]->stream();
+            for (size_t i = 0; i < part.size(); i++) {
+                CHECK(part[i].p == full[i].p && part[i].n <= full[i].n, "flash archive: segment piece %zu", i);
+                CUDA_CHECK(cudaMemcpyAsync(part[i].p, g.p[r] + off, part[i].n, cudaMemcpyHostToDevice, s));
+                off += full[i].n;
+            }
+            CHECK(off == g.n[r] || part.empty(), "flash archive: blob size mismatch (%zu vs %zu)", off, g.n[r]);
+            CUDA_CHECK(cudaStreamSynchronize(s));
+        };
+        run();
+    }
     std::vector<size_t> sizes_of(const std::function<void(int, std::vector<Worker::Piece>&)>& pieces) {
         std::vector<size_t> v(ng);
         for (int r = 0; r < ng; r++) {
@@ -595,10 +684,35 @@ struct FE {
                     victim = it;
             }
             if (victim == convs.end()) return false;
-            if (log) fprintf(stderr, "[qflash] archive: evict conversation %d (%zu tokens, prio %d)\n", victim->id, victim->toks.size(), victim->prio);
+            // the main thread (prio 2) gives back its newest part first and keeps a prefix it resumes from (its next
+            // turn prefills only the tail instead of the whole context); the others go whole
+            if (victim->prio >= 2 && trim_tail(*victim)) continue;
+            // always logged when it costs a long re-prefill later (a lost main thread showed up only as a slow turn)
+            if (log || victim->prio >= 2 || victim->toks.size() >= 16384)
+                fprintf(stderr, "[qflash] archive: evict conversation %d (%zu tokens, prio %d) for %.1f MB (%.2f of %.2f GB used)\n",
+                        victim->id, victim->toks.size(), victim->prio, need / 1e6, hpool.used() / 1e9, budget / 1e9);
             convs.erase(victim);
             n_evict++;
         }
+        return true;
+    }
+    // drop an archived conversation's newest part: its end state, else the KV segments from its highest checkpoint
+    // below the last segment on (and the states past them). False: nothing left to drop but the whole conversation.
+    bool trim_tail(Conv& c) {
+        if (c.end) {
+            c.end = nullptr;
+            return true;
+        }
+        if (c.segs.empty()) return false;
+        int P = -1;
+        for (auto& x : c.ck)
+            if (x->pos > 0 && x->pos <= c.segs.back()->t0) P = std::max(P, x->pos);
+        if (P < 0) return false;
+        while (!c.segs.empty() && c.segs.back()->t0 >= P) c.segs.pop_back();
+        c.kv_n = c.segs.empty() ? 0 : std::min(c.kv_n, c.segs.back()->t1);
+        c.ck.erase(std::remove_if(c.ck.begin(), c.ck.end(), [&](auto& x) { return x->pos > c.kv_n; }), c.ck.end());
+        fprintf(stderr, "[qflash] archive: conversation %d (%zu tokens, prio %d) trimmed to its checkpoint at %d (%.2f of %.2f GB used)\n",
+                c.id, c.toks.size(), c.prio, P, hpool.used() / 1e9, budget / 1e9);
         return true;
     }
     template <class B>
@@ -672,6 +786,7 @@ struct FE {
         auto better = [&](int L, int rank) { return L > b.L || (L == b.L && L > 0 && rank > brank); };
         for (auto& c : convs) {
             if (c.steer != sk) continue;  // steered KV never serves an unsteered request, nor the reverse
+            if (c.slot >= 0 && sl[c.slot].paused) continue;  // no rows on the device; its archive belongs to the slot
             const bool res = c.slot >= 0;
             // a generating slot: its checkpoints (rows below them do not change), not its live end
             const bool busy = res && sl[c.slot].active && !any_slot;
@@ -712,6 +827,90 @@ struct FE {
             if (drop < 0) drop = 0;
             v.erase(v.begin() + drop);
         }
+    }
+    // ---- preemption: active sequences that do not all fit the pool
+    bool prefilling(int s) const {
+        for (auto& x : pfs)
+            if (x.slot == s) return true;
+        return false;
+    }
+    // region periods a running slot needs for its next step (+ the reserve: its floor)
+    int floor_of(const Slot& q) const { return std::min(np, periods_for((int)q.hist.size() + MAXP + 2 + reserve)); }
+    // slot v leaves the pool: its KV rows -> its conversation's archive (synced up to its tokens), region freed
+    bool pause_slot(int v) {
+        Slot& q = sl[v];
+        if (q.paused || !q.active || !q.conv || !q.cap || q.pending < 0 || prefilling(v) || !budget) return false;
+        if (v == cs) drain();
+        const int hn = q.hist.size();
+        if (!sync(v, hn, false) || q.conv->kv_n < hn) {
+            if (log) fprintf(stderr, "[qflash] pool: slot %d (%d tokens) cannot be paused: no archive room\n", v, hn);
+            return false;
+        }
+        if (log) fprintf(stderr, "[qflash] pool: slot %d paused at %d tokens (prio %d), region [%d, %d) freed\n", v, hn, prio_of(v), q.base,
+                         q.base + q.cap);
+        q.cap = 0;
+        q.paused = true;
+        q.pause_t = ++pause_tick;
+        q.bhist = -1;
+        n_pause++;
+        update_top();
+        rebind();
+        return true;
+    }
+    // a paused slot comes back (same rows, same state): only when the room left keeps every running sequence's floor
+    bool unpause_slot(int v, const std::vector<int>& protect) {
+        Slot& q = sl[v];
+        if (!q.paused) return true;
+        const int hn = q.hist.size();
+        int held = 0, deficit = 0;
+        for (int j = 0; j < (int)sl.size(); j++) {
+            const Slot& x = sl[j];
+            if (!x.active || x.paused) continue;
+            held += x.cap;
+            if (!prefilling(j)) deficit += std::max(0, floor_of(x) - x.cap);
+        }
+        if (held + deficit + floor_of(q) > np) return false;
+        std::vector<int> pr = protect;
+        pr.push_back(v);
+        if (!ensure_region(v, hn + MAXP + 2, pr)) return false;
+        const int b = q.base;
+        Conv* c = q.conv;
+        job = [&](int r) { W[r]->kv_claim(hn); };
+        run();
+        for (auto& g : c->segs) xfer_part(*g, b, g->t0, g->t1, hn);
+        q.paused = false;
+        n_resume++;
+        if (log) fprintf(stderr, "[qflash] pool: slot %d resumed at %d tokens in [%d, %d)\n", v, hn, q.base, q.base + q.cap);
+        return true;
+    }
+    // room for slot s's next step (tokens positions); when the active sequences do not all fit, the one worth least
+    // pauses (lowest prio, the most recently admitted among equals; never a prompt being prefilled). False: s has no
+    // room (paused itself: q.paused, else it is alone and does not fit the pool)
+    bool room_or_pause(int s, int tokens, const std::vector<int>& protect) {
+        if (ensure_region(s, tokens, protect)) return true;
+        while (true) {
+            int v = -1, others = 0;
+            for (int j = 0; j < (int)sl.size(); j++) {
+                const Slot& x = sl[j];
+                if (!x.active || x.paused || !x.cap || x.pending < 0 || prefilling(j)) continue;
+                if (j != s) others++;
+                if (v < 0 || prio_of(j) < prio_of(v) || (prio_of(j) == prio_of(v) && x.admit > sl[v].admit)) v = j;
+            }
+            if (others == 0 || v < 0 || !pause_slot(v)) return false;
+            if (v == s) return false;
+            if (ensure_region(s, tokens, protect)) return true;
+        }
+    }
+    // paused slots of `slots` back in queue order (prio, then pause time), strictly head-of-line
+    void resume_paused(const int* slots, int n) {
+        std::vector<int> pz;
+        for (int i = 0; i < n; i++)
+            if (sl.at(slots[i]).paused) pz.push_back(slots[i]);
+        std::stable_sort(pz.begin(), pz.end(), [&](int a, int b) {
+            return prio_of(a) != prio_of(b) ? prio_of(a) > prio_of(b) : sl[a].pause_t < sl[b].pause_t;
+        });
+        for (int v : pz)
+            if (!unpause_slot(v, std::vector<int>(slots, slots + n))) break;
     }
     int free_slot() const {
         for (int i = 0; i < (int)sl.size(); i++)
@@ -1139,18 +1338,16 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         pf.ms_pool = FE::now_ms() - t0;
         L = s.L;
         e->bind(y);
-        int tmax = L;
         std::vector<Seg*> use;
         for (auto& g : s.c->segs)
-            if (g->t0 < L) { use.push_back(g.get()); tmax = std::max(tmax, g->t1); }
-        tmax = std::min(tmax, e->sl[y].cap * e->period);
-        e->job = [&](int r) { e->W[r]->kv_claim(tmax); };
+            if (g->t0 < L) use.push_back(g.get());
+        e->job = [&](int r) { e->W[r]->kv_claim(L); };
         e->run();
         const int b = e->sl[y].base;
-        for (Seg* g : use) {
-            const int a = g->t0, z = g->t1;
-            e->xfer(*g, [&](int r, std::vector<Worker::Piece>& ps) { e->W[r]->kv_pieces_at(b, a, z, ps); }, false);
-        }
+        // only the positions < L: a segment can reach far past them (a conversation archived at 138K, a 25K prompt
+        // resuming at its system-end checkpoint) and the new region is sized for this prompt only; the whole segment
+        // wrote past the region's end into the next slot's KV / live expert-cache slots (or past the pool)
+        for (Seg* g : use) e->xfer_part(*g, b, g->t0, g->t1, L);
         const bool pend = s.st->pend;
         e->xfer(*s.st, [&](int r, std::vector<Worker::Piece>& ps) { e->W[r]->state_pieces_of(y, pend, ps); }, false);
         for (int r = 0; r < e->ng; r++) e->W[r]->set_slot_prev_m(y, pend ? s.st->prev_m : 0);
@@ -1197,6 +1394,8 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     }
     e->last_reused = L;
     pf.reused = L;
+    pf.copied = e->last_copied;
+    pf.from_archive = e->last_from_archive;
     pf.on = true;
     pf.slot = y;
     q.rb_pos = -1;
@@ -1210,6 +1409,8 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     e->job = [&](int r) { e->W[r]->set_constrained(y, false); e->W[r]->set_steer_slot(y, sv, smd, slo, shi, ssc); };
     e->run();
     q.active = true;  // taken (not evicted by another start) until released
+    q.paused = false;
+    q.admit = ++e->admit_tick;
     pf.ids.assign(ids, ids + n);
     pf.n = n;
     pf.i = L;
@@ -1363,12 +1564,14 @@ int qe_start_finish_slot(void* p, int slot) {
     static const bool pft = getenv("FLASH_PFT") || (getenv("FLASH_SLOT_LOG") && atoi(getenv("FLASH_SLOT_LOG")));
     if (pft)
         fprintf(stderr, "[qflash] start: %d tokens (reused %d, %s) in %.1f ms (pool %.1f, restore %.1f), slot %d [%d, %d), conversation %d, %zu known, %.2f GB host\n",
-                n, e->last_reused, e->last_from_archive ? "archive" : e->last_copied ? "checkpoint" : e->last_reused ? "live" : "none",
+                n, pf.reused, pf.from_archive ? "archive" : pf.copied ? "checkpoint" : pf.reused ? "live" : "none",
                 FE::now_ms() - pf.t_begin, pf.ms_pool, pf.ms_restore, e->cs, q.base, q.base + q.cap, q.conv->id, e->convs.size(),
                 e->hpool.used() / 1e9);
     const int nxt = pf.nxt;
-    e->last_pf_slot = pf.slot;  // qe_last_slot / qe_last_reused after a finish: that prompt's
+    e->last_pf_slot = pf.slot;  // qe_last_slot / qe_last_reused / source after a finish: that prompt's
     e->last_reused = pf.reused;
+    e->last_copied = pf.copied;
+    e->last_from_archive = pf.from_archive;
     for (auto it = e->pfs.begin(); it != e->pfs.end(); ++it)
         if (&*it == pp) { e->pfs.erase(it); break; }
     return nxt;
@@ -1384,23 +1587,25 @@ int qe_start3(void* p, const int* ids, int n, int k, unsigned long long affinity
 }
 
 // the next step's shape: lookup drafts (found on the device by the last step) or an MTP step; false: no room
-static bool next_step(FE* e, int& ks, bool& lk) {
+static bool next_step(FE* e, int& ks, bool& lk, bool ahead = false) {
     lk = e->k > 0 && e->lk_next > 0;
     ks = lk ? e->lk_next : e->k;  // after a lookup step the chain ran on the device when needed
     const int hn = e->S().hist.size();
     if (lk && hn + ks + 2 > e->ctx) { lk = false; ks = e->k; }
     if (hn + ks + 2 > e->ctx) return false;
-    // the step's rows must lie in the slot's region (grows / moves / evicts idle slots; nothing is in flight here)
-    return e->ensure_region(e->cs, hn + ks + 2, {e->cs});
+    // the step's rows must lie in the slot's region (grows / moves / evicts idle slots; nothing is in flight here);
+    // a step launched ahead never pauses another sequence
+    return ahead ? e->ensure_region(e->cs, hn + ks + 2, {e->cs}) : e->room_or_pause(e->cs, hn + ks + 2, {e->cs});
 }
 
 int qe_spec_step(void* p, int* out) {
     FE* e = (FE*)p;
     Slot& q = e->S();
     if (q.pending < 0) return 0;
+    if (q.paused && !e->unpause_slot(e->cs, {e->cs})) return 0;  // stepped alone: resumes as soon as its region fits
     q.synced = false;
     if (e->k == 0) {
-        if ((int)q.hist.size() + 2 > qe_max_context(p) || !e->ensure_region(e->cs, (int)q.hist.size() + 2, {e->cs})) return 0;
+        if ((int)q.hist.size() + 2 > qe_max_context(p) || !e->room_or_pause(e->cs, (int)q.hist.size() + 2, {e->cs})) return 0;
         e->job = [&](int r) { e->W[r]->ws_ensure(); };
         e->run();
         const int pos = q.hist.size();
@@ -1416,7 +1621,7 @@ int qe_spec_step(void* p, int* out) {
         const unsigned* mhb = e->mh(e->cs);
         const int kv = std::max(0, std::min({io[16], e->k, 15}));
         const int hn = q.hist.size(), kk = std::max(kv, e->k);
-        if (hn + kk + 2 > e->ctx || !e->ensure_region(e->cs, hn + kk + 2, {e->cs})) return 0;
+        if (hn + kk + 2 > e->ctx || !e->room_or_pause(e->cs, hn + kk + 2, {e->cs})) return 0;
         e->job = [&](int r) {
             e->W[r]->sv_load();
             e->W[r]->upload_mask(mhb, kv + 1);
@@ -1501,7 +1706,7 @@ int qe_spec_step(void* p, int* out) {
     if (la_env && e->lookahead && !e->no_ahead && !eos && q.remain != 0) {
         int ks2;
         bool lk2;
-        if (next_step(e, ks2, lk2)) {
+        if (next_step(e, ks2, lk2, true)) {
             e->job = [&](int r) { e->W[r]->spec_launch(ks2, lk2); };
             e->run();
             e->inflight = true;
@@ -1533,17 +1738,25 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
             cnt[i] = qe_spec_step(p, out + i * 64);
             if (cnt[i] == 0) { out[i * 64] = EOS; cnt[i] = 1; }
         }
+    e->resume_paused(slots, n);
     for (int i = 0; i < n; i++) {
         Slot& q = e->sl.at(slots[i]);
         if (q.con) continue;
         cnt[i] = 0;
-        if (q.pending < 0) continue;
+        if (q.pending < 0 || q.paused) continue;
         const int hn = q.hist.size();
-        if (hn + kb + 2 > e->ctx || !e->ensure_region(slots[i], hn + kb + 2, std::vector<int>(slots, slots + n))) {
-            out[i * 64] = EOS;  // no room: the sequence ends
+        if (hn + kb + 2 > e->ctx || !e->room_or_pause(slots[i], hn + kb + 2, std::vector<int>(slots, slots + n))) {
+            if (q.paused) continue;  // paused for a sequence worth more: no tokens until it resumes
+            // the room is held by prompts being prefilled (never paused): wait for them (no tokens yet)
+            if (!e->pfs.empty() && hn + kb + 2 <= e->ctx && e->periods_for(hn + kb + 2 + e->reserve) <= e->np) continue;
+            out[i * 64] = EOS;  // no room even alone (longer than the pool / the context): the sequence ends
             cnt[i] = 1;
             continue;
         }
+    }
+    for (int i = 0; i < n; i++) {  // (a later slot may have paused an earlier one)
+        Slot& q = e->sl.at(slots[i]);
+        if (q.con || q.pending < 0 || q.paused || cnt[i]) continue;
         run.push_back(slots[i]);
         lims.push_back(q.remain > 0 ? std::min(kb, q.remain - 1) : kb);
         idx.push_back(i);
@@ -1633,6 +1846,15 @@ void qe_release(void* p, int slot) {
     Slot& q = e->sl.at(e->batch_api ? slot : e->cs);
     const int sid = e->batch_api ? slot : e->cs;
     e->pfs.remove_if([&](const FE::Pf& x) { return x.slot == sid; });  // a prompt abandoned in flight
+    if (q.paused) {  // released while paused (finished / cancelled): its rows are archived already, its end state now;
+        // the conversation stays archive-only (a next turn resumes it from there)
+        q.paused = false;
+        q.active = false;
+        e->evict_slot(sid);
+        e->update_top();
+        e->rebind();
+        return;
+    }
     q.active = false;
     q.remain = -1;
     q.want_drafts = false;
@@ -1722,6 +1944,33 @@ int qe_trim(void* p, int slot, int pos) {
     e->prev_lk = false;
     return 1;
 }
+// debug: the full-vocabulary logits of the last head row (after a plain-decoding start,
+// k = 0: the prompt's last position) in token order (rows outside the head: -inf); returns the vocabulary size
+int qe_debug_logits(void* p, float* out) {
+    FE* e = (FE*)p;
+    e->drain();
+    for (int t = 0; t < VOCAB; t++) out[t] = -INFINITY;
+    for (int r = 0; r < e->ng; r++) {
+        const int nv = e->W[r]->vslice();
+        std::vector<float> l(nv);
+        std::vector<int> m(nv);
+        e->W[r]->copy_logits(l.data(), 1);
+        e->W[r]->copy_lmap(m.data());
+        for (int i = 0; i < nv; i++)
+            if (m[i] >= 0 && m[i] < VOCAB) out[m[i]] = l[i];
+    }
+    return VOCAB;
+}
+// debug: slot s (idle) leaves the GPUs: its conversation goes to the host archive as on a pool eviction
+int qe_debug_evict(void* p, int s) {
+    FE* e = (FE*)p;
+    e->drain();
+    if (s < 0 || s >= (int)e->sl.size() || e->sl[s].active || !e->pfs.empty()) return -1;
+    e->evict_slot(s);
+    e->update_top();
+    e->rebind();
+    return 0;
+}
 // debug: rank r's pooled indexer keys (first nb blocks per QSA layer) -> path
 void qe_debug_ikb(void* p, int r, const char* path, int nb) {
     FE* e = (FE*)p;
@@ -1784,10 +2033,42 @@ int qe_can_admit(void* p, int n) {
     if ((int)e->pfs.size() >= e->max_pf || n > e->ctx) return 0;
     int act = 0, used = 0;
     for (auto& q : e->sl)
-        if (q.active) { act++; used += q.cap; }
+        if (q.active) { act++; used += q.paused ? e->floor_of(q) : q.cap; }
     if (!e->batch_api) return act == 0;
     // a slot that is not generating, and room next to the generating ones (idle ones can be evicted)
     return act < (int)e->sl.size() && used + e->periods_for(n + e->reserve) <= e->np;
+}
+// room for a new n-token sequence of value `prio` (the main thread): pause decoding sequences worth less (lowest prio,
+// the most recently admitted first; never a prompt being prefilled, never one of the same or a higher prio), only as
+// many as needed and only when that makes it fit (paused ones count as out: they resume when room frees). 1: fits now
+int qe_pause_for(void* p, int n, int prio) {
+    FE* e = (FE*)p;
+    if (!e->batch_api || !e->budget || (int)e->pfs.size() >= e->max_pf || n > e->ctx) return 0;
+    int act = 0, used = 0;
+    std::vector<int> vs;
+    for (int i = 0; i < (int)e->sl.size(); i++) {
+        const Slot& q = e->sl[i];
+        if (!q.active) continue;
+        act++;
+        if (q.paused) continue;
+        used += q.cap;
+        if (q.conv && q.cap && q.pending >= 0 && !e->prefilling(i) && e->prio_of(i) < prio) vs.push_back(i);
+    }
+    if (act >= (int)e->sl.size()) return 0;  // every slot is taken: pausing frees no slot
+    const int need = e->periods_for(n + e->reserve);
+    if (used + need <= e->np) return 1;
+    std::stable_sort(vs.begin(), vs.end(), [&](int a, int b) {
+        return e->prio_of(a) != e->prio_of(b) ? e->prio_of(a) < e->prio_of(b) : e->sl[a].admit > e->sl[b].admit;
+    });
+    size_t k = 0;
+    int left = used;
+    while (k < vs.size() && left + need > e->np) left -= e->sl[vs[k++]].cap;
+    if (left + need > e->np) return 0;  // pausing all of them would not make it fit: pause none
+    for (size_t i = 0; i < k; i++) {
+        fprintf(stderr, "[qflash] pool: pausing slot %d (prio %d) for a %d-token start of prio %d\n", vs[i], e->prio_of(vs[i]), n, prio);
+        if (!e->pause_slot(vs[i])) return 0;
+    }
+    return 1;
 }
 
 // ---- cache tier: prompt-cache bookkeeping
@@ -1854,6 +2135,7 @@ void qe_slot_info(void* p, int i, long long* out) {
     out[3] = q.active;
     out[4] = (long long)q.used;
     out[5] = q.conv ? q.conv->prio : 1;
+    out[6] = q.paused;
 }
 void qe_archive_info(void* p, double* out) {
     FE* e = (FE*)p;
@@ -1869,6 +2151,11 @@ void qe_pool_counters(void* p, long long* out) {
     out[0] = e->n_grow;
     out[1] = e->n_move;
     out[2] = e->n_slot_evict;
+    out[3] = e->n_pause;
+    out[4] = e->n_resume;
+    long long np2 = 0;
+    for (auto& q : e->sl) np2 += q.paused;
+    out[5] = np2;
 }
 
 }  // extern "C"

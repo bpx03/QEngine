@@ -40,6 +40,8 @@ int qe_vocab(void* e);                       // logits width (248320); else conf
 int qe_num_slots(void* e);                   // default 1; > 1 requires tiers 2 + 3
 long long qe_pool_tokens(void* e);           // KV pool size in tokens (monitoring); default max_context
 int qe_can_admit(void* e, int n);            // a new n-token sequence fits now; default: a free slot and n <= max_context
+int qe_pause_for(void* e, int n, int prio);  // pause decoding sequences of lower prio (lowest first, never a prefill) until a
+                                             // new n-token sequence fits; 1: it fits now (nothing paused if it cannot)
 void qe_set_limit(void* e, int slot, int tokens);  // reply ends after `tokens` more tokens: verify only drafts that fit
 double qe_warmup(void* e, int modes);        // pre-build graphs (bit0 greedy, bit1 sampling); seconds
 void qe_reset(void* e);                      // forget all cached prefixes

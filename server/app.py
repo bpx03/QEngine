@@ -24,6 +24,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from agents import Tracker
 from engine import Engine
 import engine_stats
 from steering import DEFAULT as STEER_DEFAULT, resolve_steering
@@ -283,6 +284,91 @@ class Ids(list):
     mm = None
     label = ""
     img = (0, 0)
+    agent = None  # agents.Info: main-thread detection of the request (prio, tracker feedback)
+
+
+class Admission:
+    """Which queued request the scheduler starts next (engine thread; called under gen.cv)."""
+
+    def __init__(self, gen):
+        self.g, self.e, a = gen, gen.engine, gen.args
+        self.aging, self.pre_min, self.pre_max = a.prefill_aging, a.preempt_min, a.preempt_max
+        self.main_bonus = getattr(a, "main_bonus", 0)
+        self.backfill_wait = getattr(a, "backfill_wait", 0)
+        self.k = a.mtp_k
+        self.last_note = 0.0
+
+    def note(self, msg):  # scheduler notes that would repeat every loop: at most one per second
+        if time.time() - self.last_note > 1.0:
+            self.last_note = time.time()
+            print(msg, flush=True)
+
+    def estimate(self, now):
+        # prefill cost of the queued requests: prompt tokens minus what the caches hold
+        # (engine probe, no side effects; refreshed at most twice a second)
+        e = self.e
+        for j in self.g.queue:
+            if j.est is None or now - j.t_est > 0.5:
+                e.set_steering(*j.p.get("steering_sel", STEER_DEFAULT))  # (cached states are keyed by it)
+                j.est = len(j.ids) - e.probe_cached(j.ids)
+                j.t_est = now
+
+    def pick_next(self, now, prefills):
+        """The queued requests that may be prefilled next, best first (empty: keep waiting): the
+        least left to compute, aged so that nothing starves (every second of waiting is worth
+        `aging` tokens), the main agent thread ahead by `main_bonus` tokens (it waits for nobody
+        else; a subagent overtakes it only after waiting main_bonus / aging seconds). While a long
+        prompt is in progress only a request with at most preempt_max tokens left may cut in (and
+        one at a time), or a main-thread request of any size on a long prompt that is not main."""
+        q = self.g.queue
+        if not q:
+            return []
+        self.estimate(now)
+        order = sorted(range(len(q)), key=lambda i: q[i].est - (now - q[i].t_enq) * self.aging
+                       - (self.main_bonus if q[i].prio >= 2 else 0))
+        if not prefills:
+            return order
+        if len(prefills) >= 2 or self.pre_max <= 0:
+            return []
+        long_ = prefills[-1]
+        pos = max(0, self.e.prefill_pos(long_.slot))
+        if len(long_.ids) - pos < self.pre_min:
+            return []
+        # fairness: the long prompt advances at least preempt_min tokens between cut-ins
+        if long_.cut_at is not None and pos - long_.cut_at < self.pre_min:
+            return []
+        return [i for i in order if not getattr(q[i].ids, "mm", None) and
+                (q[i].est <= self.pre_max or (q[i].prio >= 2 and long_.prio < 2))]
+
+    def admit_next(self, now, prefills):
+        """Index of the queued request to start now, or None. The best candidate that fits the pool
+        goes; one that does not fit lets the next ones that fit start before it (backfill) until it
+        has waited backfill_wait seconds: then only a request of a higher prio may still pass it.
+        A main-thread request that does not fit pauses decoding sequences worth less (never a
+        prefill, never another main thread) when that makes it fit."""
+        g, e = self.g, self.e
+        blocked = None
+        for i in self.pick_next(now, prefills):
+            j = g.queue[i]
+            if blocked is not None and now - blocked.t_enq > self.backfill_wait and j.prio <= blocked.prio:
+                continue  # starvation guard: nothing of the same or a lower class passes it any more
+            need = len(j.ids) + self.k + 2
+            if e.can_admit(need):
+                if blocked is not None:
+                    g.sched["backfills"] += 1
+                    self.note(f"[sched] backfill: {need} tokens start while {len(blocked.ids)} tokens "
+                              f"(waiting {now - blocked.t_enq:.1f} s) do not fit")
+                return i
+            if j.prio >= 2 and e.pause_for(need, j.prio):
+                g.sched["main_pauses"] += 1
+                g.cur_slot = -1  # a paused slot may have been the current single sequence
+                print(f"[sched] main thread ({need} tokens): paused lower-prio sequences to admit it", flush=True)
+                return i
+            if blocked is None:
+                blocked = j
+        if blocked is not None:
+            self.note(f"[sched] no room for {len(blocked.ids) + self.k + 2} tokens next to the running sequences")
+        return None
 
 
 class Generator:
@@ -337,6 +423,11 @@ class Generator:
         from metrics import Metrics
         stats = os.path.expanduser(args.stats_file)
         self.metrics = Metrics(stats, args.served_name)
+        # main agent thread detection (server/agents.py) and the scheduler's counters, both in /api/stats
+        self.agents = Tracker(override=getattr(args, "main_agent_re", None))
+        self.sched = {"main_pauses": 0, "main_cutins": 0, "backfills": 0}
+        snap = self.metrics.snapshot
+        self.metrics.snapshot = lambda: dict(snap(), agents=self.agents.stats(), sched=dict(self.sched))
         if args.metrics_port:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if os.environ.get("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
@@ -351,10 +442,19 @@ class Generator:
         self.dirty = False  # slots changed since the last persist
         threading.Thread(target=self._loop, daemon=True).start()
 
-    def prompt(self, messages, tools, kw):
+    def prompt(self, messages, tools, kw, meta=None, track=False):
         """Returns (ids, affinity): affinity = hash of the system prompt, so the main agent and
         each kind of subagent keep returning to their own sequence slot. ids.hint = position of
-        the first user turn (end of the system part)."""
+        the first user turn (end of the system part). track: a generation request (not a token
+        count): the main-thread tracker sees it (meta: the request's metadata, its session id)."""
+        info = None
+        if track:
+            sys0 = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
+            aff0 = int.from_bytes(hashlib.blake2b(sys0.encode(), digest_size=8).digest(), "little")
+            try:
+                info = self.agents.observe(messages, tools, meta, aff0)
+            except Exception as ex:  # monitoring / priority only: never fail a request for it
+                print(f"agents: {ex!r}", flush=True)
         images = []
         for m in messages:  # image parts in prompt order -> placeholders (+ their sources)
             c = m.get("content")
@@ -373,7 +473,7 @@ class Generator:
         messages = self.clean_history(messages)
         text = self.tmpl.render(messages, tools, **kw)
         sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
-        label = agent_label(sys_txt, messages)
+        label = "main agent" if info is not None and info.main else agent_label(sys_txt, messages)
         affinity = int.from_bytes(hashlib.blake2b(sys_txt.encode(), digest_size=8).digest(), "little")
         if os.environ.get("QE_DUMP_PROMPTS"):
             d = os.environ["QE_DUMP_PROMPTS"]
@@ -381,7 +481,7 @@ class Generator:
             with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
                 f.write(text)
         ids = self.encode(text)
-        ids.label = label
+        ids.label, ids.agent = label, info
         if images:
             from vision import load_image_bytes
             t0 = time.time()
@@ -389,7 +489,7 @@ class Generator:
                 exp, emb, rope3, delta = self.vision.expand(list(ids), [load_image_bytes(s) for s in images])
             hint = ids.hint
             ids = Ids(exp)
-            ids.hint, ids.mm, ids.label = hint, (emb, rope3, delta), label
+            ids.hint, ids.mm, ids.label, ids.agent = hint, (emb, rope3, delta), label, info
             ids.img = (len(images), emb.shape[0])
             print(f"{len(images)} image(s): {emb.shape[0]} tokens, encoded in {time.time() - t0:.2f}s", flush=True)
         return ids, affinity
@@ -539,47 +639,10 @@ class Generator:
         # completion between its chunks (see pick_next)
         prefills = []
         decode_until = 0.0  # while another prompt is prefilled, decode steps run until this time
-        aging = self.args.prefill_aging
         bg_done = True  # idle archiving has nothing left (reset whenever a request finishes)
         pre_min, pre_max = self.args.preempt_min, self.args.preempt_max
 
-        def estimate(now):
-            # prefill cost of the queued requests: prompt tokens minus what the caches hold
-            # (engine probe, no side effects; refreshed at most twice a second)
-            for j in self.queue:
-                if j.est is None or now - j.t_est > 0.5:
-                    e.set_steering(*j.p.get("steering_sel", STEER_DEFAULT))  # (cached states are keyed by it)
-                    j.est = len(j.ids) - e.probe_cached(j.ids)
-                    j.t_est = now
-
-        def pick_next(now):
-            """The queued request to prefill next (None: keep waiting): the one with the least
-            left to compute, aged so that nothing starves (every second of waiting is worth
-            `aging` tokens); while a long prompt is in progress only a request with at most
-            preempt_max tokens left may cut in (and one at a time)."""
-            if not self.queue:
-                return None
-            estimate(now)
-            order = sorted(range(len(self.queue)),
-                           key=lambda i: self.queue[i].est - (now - self.queue[i].t_enq) * aging)
-            if not prefills:
-                return order[0]
-            if len(prefills) >= 2 or pre_max <= 0:
-                return None
-            long_ = prefills[-1]
-            pos = max(0, e.prefill_pos(long_.slot))
-            if len(long_.ids) - pos < pre_min:
-                return None
-            # fairness: the long prompt advances at least preempt_min tokens between cut-ins
-            if long_.cut_at is not None and pos - long_.cut_at < pre_min:
-                return None
-            for i in order:
-                j = self.queue[i]
-                if j.est <= pre_max and not getattr(j.ids, "mm", None):
-                    long_.cut_at = pos
-                    print(f"[sched] {j.est} tokens to prefill cut in on {len(long_.ids)} at {pos}", flush=True)
-                    return i
-            return None
+        adm = Admission(self)
 
         trace = open(os.environ["QE_SCHED_TRACE"], "w", buffering=1) if os.environ.get("QE_SCHED_TRACE") else None
         prof_last = 0.0  # QE_STEP_PROF: return time of the last single step (0: none to chain from)
@@ -634,13 +697,16 @@ class Generator:
                 # admit the next request (shortest remaining prefill first, aged) while a
                 # sequence slot is free and the pool has room for it
                 admit = None
-                i = pick_next(time.time())
+                i = adm.admit_next(time.time(), prefills)
                 if i is not None:
-                    need = len(self.queue[i].ids) + self.args.mtp_k + 2
-                    if e.can_admit(need):
-                        admit = self.queue.pop(i)
-                    elif prefills:
-                        print(f"[sched] no room for {need} tokens next to the running sequences", flush=True)
+                    admit = self.queue.pop(i)
+                    if prefills:  # a cut-in on the long prompt in progress
+                        long_ = prefills[-1]
+                        long_.cut_at = max(0, e.prefill_pos(long_.slot))
+                        if admit.prio >= 2 and long_.prio < 2 and admit.est > pre_max:
+                            self.sched["main_cutins"] += 1
+                        print(f"[sched] {admit.est} tokens to prefill cut in on {len(long_.ids)} at "
+                              f"{long_.cut_at}{' (main thread)' if admit.prio >= 2 else ''}", flush=True)
             if admit is not None:
                 self.dirty = True
                 prof_last = 0.0  # QE_STEP_PROF: no gap across a prefill
@@ -772,10 +838,12 @@ class Job:
         self.finished = False
         self.t_enq, self.est, self.t_est = time.time(), None, 0.0  # scheduler: prefill-cost estimate
         self.cut_at = None  # prefill position at the last cut-in by a short request (fairness)
-        # eviction value of the conversation (engine prio): the main Claude Code agent is kept
-        # (it returns after its subagents); a subagent that ended its turn without a tool call
-        # is finished and goes first
-        self.prio = 2 if getattr(ids, "label", "") == "main agent" else 1
+        # eviction value of the conversation (engine prio) and its scheduling class: the main agent
+        # thread (server/agents.py) is kept (it returns after its subagents) and goes first; a
+        # subagent that ended its turn without a tool call is finished and goes first on eviction
+        info = getattr(ids, "agent", None)
+        self.prio = 2 if (gen.agents.is_main_now(info) if info is not None
+                          else getattr(ids, "label", "") == "main agent") else 1
         self.prof, self.prof_detok, self.prof_emit = [], 0.0, 0.0  # QE_STEP_PROF
 
     def begin_start(self):
@@ -824,6 +892,14 @@ class Job:
             e.watch_stops(self.slot)
         self.copied = e.last_copied()
         self.src = "archive" if e.last_from_archive() else ("other slot" if self.copied else "")
+        n = len(self.ids)
+        conv = getattr(getattr(self.ids, "agent", None), "conv", None)
+        later = conv is not None and conv.turns >= 2  # a later turn of a known conversation (not a cold start)
+        if n >= 16384 and 2 * self.reused < n and (self.src == "archive" or (self.prio >= 2 and later)):
+            # a long prompt that came back mostly uncached: a restore that found only an early checkpoint, or
+            # the main thread's context lost from the archive (an eviction it should have survived)
+            diag("CACHE_PARTIAL", f"slot {self.slot} prompt {n} cached {self.reused} ({100 * self.reused // n} %, "
+                 f"src {self.src or 'none'}, {'main thread' if self.prio >= 2 else 'prio %d' % self.prio})")
         g.cur_slot = self.slot
         self.t1 = time.time()
         g.metrics.prefill_done(self)
@@ -873,6 +949,14 @@ class Job:
             self.grammar_s += time.perf_counter() - tg
         for i, t in enumerate(pending):
             if t in g.eos and not self.p.get("ignore_eos"):
+                self.finish, stop_now = "stop", True
+                pending = pending[:i]
+                break
+            if t == g.im_start and not self.p.get("ignore_eos"):
+                # <|im_start|> is never valid inside a reply: the model skipped <|im_end|> and began a
+                # turn of its own (seen at 130K+ contexts). End the turn here: the client gets the reply
+                # so far, cleanly closed, instead of a hallucinated user / tool turn.
+                print(f"stopping at a generated <|im_start|> after {self.n + i} tokens", flush=True)
                 self.finish, stop_now = "stop", True
                 pending = pending[:i]
                 break
@@ -956,6 +1040,9 @@ class Job:
         if not self.done.is_set():
             if self.prio == 1 and self.finish == "stop" and "<tool_call>" not in self.text_all:
                 self.gen.engine.set_prio(self.slot, 0)  # a subagent that is done (no tool to run)
+            if getattr(self, "det", None) is not None:  # its final reply is recognised in a parent's history
+                self.gen.agents.finished(getattr(self.ids, "agent", None), self.text_all,
+                                         "<tool_call>" in self.text_all)
             ds = engine_stats.delta(getattr(self, "ds0", None), self.gen.dstats.read(self.slot))
             trimmed = None
             if getattr(self, "keep", None) is not None:
@@ -1296,7 +1383,7 @@ def build_app(gen: Generator, args):
         except ValueError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "steering"}}, status_code=400)
-        ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw)
+        ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True)
         stop = body.get("stop")
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "min_p": body.get("min_p"), "seed": body.get("seed"),
@@ -1411,7 +1498,7 @@ def build_app(gen: Generator, args):
                                 status_code=400)
         msgs = anthropic_to_messages(body)
         prev = dict(msgs[-1]) if msgs else None  # before prompt() rewrites image parts
-        ids, aff = gen.prompt(msgs, tools, kw)
+        ids, aff = gen.prompt(msgs, tools, kw, body.get("metadata"), track=True)
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
                   "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer}
@@ -1611,6 +1698,16 @@ def parse_args(argv=None):
     ap.add_argument("--preempt-min", type=int, default=8192,
                     help="only a prefill with at least this many tokens left is cut in on, and "
                          "at most once per this many tokens of its progress")
+    ap.add_argument("--main-bonus", type=float, default=200000,
+                    help="queue order: the main agent thread counts as this many tokens less prefill work "
+                         "(it goes first; a subagent passes it only after waiting main-bonus / prefill-aging "
+                         "seconds; 0 = no precedence)")
+    ap.add_argument("--backfill-wait", type=float, default=30,
+                    help="a queued request that does not fit the KV pool lets smaller ones that fit start "
+                         "first until it has waited this many seconds (0 = strict order: it blocks the queue)")
+    ap.add_argument("--main-agent-re", default=None,
+                    help="regex for the main agent thread, searched in the system prompt and the tool names "
+                         "(overrides the automatic detection; env QE_MAIN_AGENT_RE)")
     ap.add_argument("--loop-guard-tokens", type=int, default=600,
                     help="end a reply whose last N+ tokens are one short fragment repeated (0 = off)")
     ap.add_argument("--metrics-port", type=int, default=9393,

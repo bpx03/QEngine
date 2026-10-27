@@ -8,7 +8,7 @@ with tensor parallelism 3 over PCIe.
 in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
 in our quick tests.
 
-> **Qwen3.8-Flash-Next release candidate.** QEngine 1.3 rc2 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s:
+> **Qwen3.8-Flash-Next release candidate.** QEngine 1.3 rc3 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s:
 > see [Qwen3.8-Flash-Next (release candidate)](#qwen38-flash-next-release-candidate) and the ready-to-run model on
 > [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine); the `latest` Docker image runs both models.
 
@@ -110,6 +110,19 @@ GPUs. On a single-node machine nothing changes.
   (`--disk-cache`).
 - **Scheduling**: shortest-prefill-first queue with aging, short requests can preempt long prefills
   between chunks, prefill chunks interleaved with running decodes.
+  - The **main agent thread** of an agent session goes first: in the prefill queue (`--main-bonus`, a subagent
+    passes it only after waiting `main-bonus / prefill-aging` seconds, 50 s by default), on a long subagent
+    prefill in progress, and in the KV eviction order. When running subagents fill the pool, the main thread is
+    admitted at once by pausing the lowest-priority decoding sequences (never a prompt being prefilled, never
+    another main thread); they resume where they stopped.
+  - The main thread is recognised by behaviour, not by its prompt text: requests are grouped by the client's
+    session id (Claude Code `metadata.user_id`), conversations by their message history, and the main thread is
+    the one that receives the other conversations' results. Before that, a Claude Code-like system prompt with an
+    agent-spawning tool (`Agent`, `Task`) marks it. `--main-agent-re` (or `QE_MAIN_AGENT_RE`) forces it by a regex
+    on the system prompt or the tool names. A session where no main thread could be identified is flagged in
+    `qetop` and `/api/stats`.
+  - A request that does not fit the KV pool no longer blocks the queue: smaller ones that fit start first, until
+    it has waited `--backfill-wait` seconds (default 30; 0 = strict order).
 - **KV pool under pressure** (27B):
   - A conversation's region grows by at least `QE_POOL_MIN_HEAD` tokens (default 2048, or 1/16 of its size if
     larger), so a nearly full pool does not re-place regions on every step.
@@ -124,6 +137,8 @@ GPUs. On a single-node machine nothing changes.
   - A reply ends early only when a single conversation is larger than the pool.
 - **Structured output**: `response_format` with `json_object` / `json_schema` through llguidance
   grammars, enforced in the engine together with speculative decoding.
+- **Turn end**: a generated `<|im_start|>` ends the reply like the end-of-turn token (both models; not with
+  `ignore_eos`), so a reply never continues into a turn the model made up.
 - **Tool calls** (OpenAI `tools` and Anthropic `tool_use` / `tool_result`) and thinking on/off with
   reasoning-effort levels (chat template in `server/templates/`).
 - **Vision** (`--vision 1`): images in Anthropic and OpenAI messages; the ViT encoder runs in PyTorch on
@@ -374,7 +389,11 @@ with top-10 + a shared expert, 4-stream hyper-connections, a per-layer n-gram em
 - MTP drafts (k = 3) plus lookup drafts from the conversation history, steps launched ahead, CUDA graphs;
 - 16 sequence slots by default (the maximum) with batched decoding (grouped expert GEMMs from 9 rows), up to two prompts
   prefilled in flight, prompt-prefix reuse, checkpoints and a host-RAM archive of conversations;
-- stop sequences and structured output (JSON schema) natively, like the 27B engine.
+- stop sequences and structured output (JSON schema) natively, like the 27B engine;
+- the KV pool under pressure works like the 27B one: when the running conversations do not fit, the one with the
+  lowest priority (then the most recently admitted) is paused, its KV goes to the RAM archive and its stream pauses
+  without an end token; it resumes exactly where it stopped as soon as the others keep their headroom. A reply ends
+  early only when a single conversation is larger than the pool.
 
 ### Hardware and host memory
 
@@ -391,7 +410,9 @@ with top-10 + a shared expert, 4-stream hyper-connections, a per-layer n-gram em
 - **Host RAM**: by default the n-gram embedding table is pinned in host memory, 51.8 GB in its INT8 form (102.4 GB as
   BF16); together with the host-resident expert groups and the embeddings that is **about 64 GB with the archive
   off** (`FLASH_KV_ARCHIVE_GB=0`). The conversation archive (default `FLASH_KV_ARCHIVE_GB=48`) adds up to its size, so
-  plan for **about 110 GB** with the defaults, or about 80 GB with `FLASH_KV_ARCHIVE_GB=16`.
+  plan for **about 110 GB** with the defaults, or about 80 GB with `FLASH_KV_ARCHIVE_GB=16`. The archive is pinned
+  host memory: set `FLASH_KV_ARCHIVE_GB` to what is free after about 64 GB for the engine itself (a tmpfs `/tmp`
+  also takes RAM).
 - **Low-RAM machines: disk mode** (`FLASH_NGRAM_PIN=0`, INT8 table only). The table is not pinned: it stays in the
   file mapping, and each step a host thread copies the rows it needs (from the page cache, or from disk on a miss)
   into a small pinned buffer. It needs the NVIDIA open kernel modules (the startup check asks for pageable-memory
@@ -473,7 +494,7 @@ build/flash_run --model models/Qwen3.8-Flash-Next-QE-INT4 --ids @prompt.ids --ge
 |---|---|---|
 | `FLASH_EC_MARGIN_MB` | 256 | VRAM per card left free next to the expert cache; a list sets it per card (`256,2048,256` for a desktop GPU1) |
 | `FLASH_NGRAM` | auto | `int8` when `ngram_int8.safetensors` exists, else `bf16`; set either to force it |
-| `FLASH_KV_ARCHIVE_GB` | 48 | host-RAM archive of conversations (0 = off) |
+| `FLASH_KV_ARCHIVE_GB` | 48 | host-RAM archive of conversations (0 = off). When it is full, finished and normal conversations go first (least recently used); the main agent thread gives back its newest part first and keeps a prefix it resumes from |
 | `FLASH_NGRAM_PIN` | 1 | 0: disk mode, the n-gram table read through the file mapping instead of pinned (see above) |
 | `FLASH_MAX_SEQS` | 16 | sequence slots (1..16); lower it to free VRAM for the expert cache on a single-user setup |
 | `FLASH_MAX_PREFILLS` | 2 | prompts prefilled in flight (a short prompt can run between the chunks of a long one) |
@@ -493,6 +514,7 @@ build/flash_run --model models/Qwen3.8-Flash-Next-QE-INT4 --ids @prompt.ids --ge
 | `FLASH_MOE_SLOT` | 1 | prefill expert down projection into a per-(token, expert) buffer summed in a fixed order instead of floating-point atomics (0 = atomics) |
 | `FLASH_CKPT_MIN` | 512 | a conversation gets a checkpoint where it diverges from a cached one at least this many tokens in (prefix reuse across conversations) |
 | `FLASH_LOOKUP` | 1 | lookup drafts from the history (0 = off) |
+| `FLASH_LK_UNIFORM` | 1 | every card takes the lookup result of the first card, so all cards run the same draft step (0 = off) |
 | `FLASH_DETERMINISTIC` | 0 | 1: fixed-order reductions in prefill (reproducible runs) |
 | `FLASH_GUARD` | 1 | non-finite values reaching the output head stop the process with a message (2: log only, 0: off) |
 
@@ -626,7 +648,7 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Performance in the container matches bare metal (single-user decode, same GPUs).
 
-**Flash-Next (release candidate)** runs in the image `ghcr.io/bpx03/qengine:1.3-rc2` (text only; `latest` is the
+**Flash-Next (release candidate)** runs in the image `ghcr.io/bpx03/qengine:1.3-rc3` (text only; `latest` is the
 image of the 1.3 preview 1 release). Point `QE_MODEL` at the Flash-Next model directory and pass the `FLASH_*`
 variables with `-e`:
 
@@ -635,7 +657,7 @@ docker run -d --name qengine-flash --gpus all --ipc=host --ulimit memlock=-1 \
   -p 8080:8080 -p 127.0.0.1:9393:9393 \
   -v /path/to/models:/app/models:ro -v qengine-cache:/root/.cache/qengine \
   -e QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4 \
-  ghcr.io/bpx03/qengine:1.3-rc2
+  ghcr.io/bpx03/qengine:1.3-rc3
 ```
 
 Add `-e FLASH_NGRAM_PIN=0` for disk mode on a low-RAM host (see [Hardware and host memory](#hardware-and-host-memory)).

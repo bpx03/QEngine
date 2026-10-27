@@ -703,10 +703,10 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
         const unsigned s = *xq.seq + 1;
         for (int hh = kvh * HPG; hh < kvh * HPG + HPG; hh += QPC(p)) {
             const int ow = hh / QPC(p);
-            if (ow != p.rank) while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0) __nanosleep(20);
+            if (ow != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow)); }
         }
         const int ow2 = (kvh * HPG + HPG - 1) / QPC(p);
-        if (ow2 != p.rank) while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow2) - s) < 0) __nanosleep(20);
+        if (ow2 != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow2) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow2, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow2)); }
         s_s = s;
     }
     __syncthreads();
