@@ -192,6 +192,36 @@ inline void matmul(const W16& w, const bf16* x, int ldx, float* y, int ldy, int 
     if (m <= kMaxBatchRows) gemv_w16(w, x, ldx, y, ldy, m, st);
     else gemm_w16(w, x, ldx, y, ldy, m, st);
 }
+// One of the six per-layer matrices: INT4 (W4) or INT8 (W8, loaded from an 8-bit checkpoint). An INT8
+// layer runs the bf16-input W8 GEMV up to kMaxBatchRows rows (decode) and the W8A8 GEMM above that
+// (prefill; QE_W8_GEMM=0: the GEMV in kMaxBatchRows-row pieces); both have the GLU epilogue; no H16 / early path.
+struct QW {
+    W4 q4;
+    W8 q8;
+    bool is8 = false;
+    int n() const { return is8 ? q8.n : q4.n; }
+    int k() const { return is8 ? q8.k : q4.k; }
+    bool glu() const { return is8 ? q8.glu : q4.glu; }
+};
+inline void matmul(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
+    static const bool gemm = env_int("QE_W8_GEMM", 1) != 0;
+    if (gemm && m > kMaxBatchRows) {
+        gemm_w8(w, x, ldx, y, ldy, m, st);
+        return;
+    }
+    for (int r = 0; r < m; r += kMaxBatchRows) {  // (GLU: y is the bf16 activation buffer, ldy in bf16 elements)
+        float* yr = w.glu ? reinterpret_cast<float*>(reinterpret_cast<bf16*>(y) + (size_t)r * ldy) : y + (size_t)r * ldy;
+        gemv_w8(w, x + (size_t)r * ldx, ldx, yr, ldy, std::min(kMaxBatchRows, m - r), st);
+    }
+}
+inline void matmul(const QW& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
+    if (w.is8) matmul(w.q8, x, ldx, y, ldy, m, st);
+    else matmul(w.q4, x, ldx, y, ldy, m, st);
+}
+inline void prefetch_l2(const QW& w, size_t cap, cudaStream_t st) {
+    if (w.is8) prefetch_l2(w.q8.q, std::min(cap, w8_qbytes(w.q8.n, w.q8.k)), st);
+    else prefetch_l2(w.q4, cap, st);
+}
 inline void matmul(const Lin& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
     CHECK(!w.is8 || m <= kMaxBatchRows, "W8 layers are decode-only");
     if (w.is8) gemv_w8(w.q8, x, ldx, y, ldy, m, st);

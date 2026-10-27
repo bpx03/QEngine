@@ -124,6 +124,38 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     print_plan(cfg_, plan_);
     const std::vector<std::string> weight_files = safetensors_files(model_dir);
     for (const std::string& f : weight_files) st_.open(f);
+    // mixed precision: QE_W4_FROM=<INT4 checkpoint dir> supplies the layer matrices of the QE_W4_LAYERS classes
+    // (comma list of qkv, o, attn = qkv + o, in, out, dn = in + out, mlp = gate_up + down; default mlp); the
+    // rest come from model_dir (e.g. INT8). Same tensor names in both checkpoints; the norms an AWQ checkpoint
+    // folded its smoothing into come along (Worker::load).
+    if (const char* w4dir = env_str("QE_W4_FROM")) {
+        const std::string spec = env_str("QE_W4_LAYERS") ? env_str("QE_W4_LAYERS") : "mlp";
+        std::stringstream ss(spec);
+        for (std::string t; std::getline(ss, t, ',');) {
+            if (t == "qkv") w4_mask_ |= Worker::W4C_QKV;
+            else if (t == "o") w4_mask_ |= Worker::W4C_O;
+            else if (t == "attn") w4_mask_ |= Worker::W4C_QKV | Worker::W4C_O;
+            else if (t == "in") w4_mask_ |= Worker::W4C_IN;
+            else if (t == "out") w4_mask_ |= Worker::W4C_OUT;
+            else if (t == "dn") w4_mask_ |= Worker::W4C_IN | Worker::W4C_OUT;
+            else if (t == "gate_up") w4_mask_ |= Worker::W4C_GU;
+            else if (t == "down") w4_mask_ |= Worker::W4C_DOWN;
+            else if (t == "mlp") w4_mask_ |= Worker::W4C_GU | Worker::W4C_DOWN;
+            else CHECK(false, "QE_W4_LAYERS: unknown class %s", t.c_str());
+        }
+        // AWQ couples up_proj and down_proj (up carries down's smoothing): gate_up and down only together
+        CHECK(!(w4_mask_ & Worker::W4C_GU) == !(w4_mask_ & Worker::W4C_DOWN),
+              "QE_W4_LAYERS: gate_up and down must come from the same checkpoint (AWQ smoothing up -> down): use mlp");
+        w4_st_.reset(new SafeTensors);
+        std::string key = std::string("|w4:") + w4dir + ":" + spec;
+        for (const std::string& f : safetensors_files(w4dir)) {
+            w4_st_->open(f);
+            struct stat stt;
+            if (stat(f.c_str(), &stt) == 0) key += ":" + std::to_string(stt.st_size) + ":" + std::to_string(stt.st_mtime);
+        }
+        w4_key_ = key;
+        fprintf(stderr, "mixed precision: %s layers from %s\n", spec.c_str(), w4dir);
+    }
     // QE_MTP_FILE: another MTP head (e.g. a fine-tuned one), same tensor names
     const std::string mtp_file = env_str("QE_MTP_FILE") ? env_str("QE_MTP_FILE") : model_dir + "/model_mtp.safetensors";
     if (FILE* f = fopen(mtp_file.c_str(), "rb")) {
@@ -142,6 +174,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             struct stat stt;
             if (stat(f.c_str(), &stt) == 0) fp << "|" << f.substr(f.rfind('/') + 1) << ":" << stt.st_size << ":" << stt.st_mtime;
         }
+        fp << w4_key_;
         gemm_tune_set_model(fp.str());
     }
     if (env_set("QE_MTP_ADAPT")) adapt_ = env_int("QE_MTP_ADAPT", adapt_);
@@ -215,10 +248,19 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             for (size_t r = 0; r < devices.size(); r++)
                 workers_[r]->draft_ids.assign(rank.begin() + r * per, rank.begin() + (r + 1) * per);
             printf("MTP draft vocabulary: %d most frequent tokens\n", nd);
+        } else if (!f && nd > 0 && mtp_st_) {
+            // the full-vocabulary draft head is ~4x the bytes per draft (INT8 setups: ~0.3 ms of each ~0.7 ms draft)
+            fprintf(stderr, "MTP draft vocabulary: no %s/token_rank.bin, drafting over the full vocabulary "
+                            "(slower; copy it from the INT4 checkpoint, it depends only on the tokenizer)\n",
+                    model_dir.c_str());
         }
         if (f) fclose(f);
     }
     pool_.reset(new GpuPool(devices));
+    for (auto& w : workers_) {
+        w->w4_st = w4_st_.get();
+        w->w4_mask = w4_mask_;
+    }
     pool_->run([&](int r) { workers_[r]->load(st_, mtp_st_.get(), embed_); });
     // the stats exchange of a position-split head: each card writes into its peer's rows / flags
     for (size_t r = 0; r < workers_.size(); r++)
@@ -1889,6 +1931,7 @@ void Engine::disk_init() {
         struct stat stt;
         if (stat(f.c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;
     }
+    fp << w4_key_;  // mixed precision: other weights
     fp << "|g" << workers_.size() << "|" << (env_str("QE_SPLIT") ? env_str("QE_SPLIT") : "");
     if (kvs_.on()) fp << "|kvsplit" << kvs_.period << "," << kvs_.a01 << "," << kvs_.a12;
     for (auto& w : workers_) fp << "|" << w->archive_bytes(0, 1) << "," << w->archive_bytes(0, 2) << "," << w->snapshot_bytes();

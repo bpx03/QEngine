@@ -495,7 +495,7 @@ void Worker::tune_gemm() {
             matmul(dn->dn.out, act_, dsh_.nv * 128, partial_, H, t, stream);
         }
         const Layer& L = layers_[0];
-        if (L.gate_up.glu) matmul(L.gate_up, xn_, H, reinterpret_cast<float*>(act_), I, t, stream);
+        if (L.gate_up.glu()) matmul(L.gate_up, xn_, H, reinterpret_cast<float*>(act_), I, t, stream);
         else matmul(L.gate_up, xn_, H, proj_, proj_ld_, t, stream);
         matmul(L.down, act_, I, partial_, H, t, stream);
         if (has_mtp) {
@@ -697,10 +697,23 @@ Worker::~Worker() {
         if (s) cudaStreamDestroy(s);
 }
 
+// K of a compressed-tensors packed matrix stored at `bits` per value; checked against weight_shape
+// when the checkpoint has it (an INT8 checkpoint on the INT4 loader, or the reverse, stops here)
+static int packed_k(const SafeTensors& st, const std::string& name, int bits) {
+    const int K = st.get(name + ".weight_packed").shape[1] * (32 / bits);
+    if (st.has(name + ".weight_shape")) {
+        const TensorInfo& ws = st.get(name + ".weight_shape");
+        CHECK(ws.dtype == "I64" && ws.nbytes == 16, "%s.weight_shape dtype %s", name.c_str(), ws.dtype.c_str());
+        const long long k = ((const long long*)ws.data)[1];
+        CHECK(k == K, "%s: weight_shape K=%lld but %d-bit packing gives K=%d (wrong bit width for this checkpoint)",
+              name.c_str(), k, bits, K);
+    }
+    return K;
+}
+
 W4 Worker::load_w4(const SafeTensors& st, const std::vector<RowSpec>& rows, int c0, int c1,
                    bool glu) {
-    const TensorInfo& t0 = st.get(rows[0].name + ".weight_packed");
-    const int K = t0.shape[1] * 8;
+    const int K = packed_k(st, rows[0].name, 4);
     if (c0 < 0) { c0 = 0; c1 = K; }
     const int kl = c1 - c0;
     int n = 0;
@@ -748,6 +761,88 @@ W4 Worker::load_w4(const SafeTensors& st, const std::vector<RowSpec>& rows, int 
     CUDA_CHECK(cudaStreamSynchronize(stream));
     w.q = dq;
     w.s = ds;
+    return w;
+}
+
+// INT8 analogue of load_w4: compressed-tensors int32 [N][K/4] (rows of K bytes u = w + 128) plus bf16
+// scales [N][K/128], rows from several tensors stacked, columns [c0, c1) taken, repacked into W8.
+W8 Worker::load_w8(const SafeTensors& st, const std::vector<RowSpec>& rows, int c0, int c1,
+                   bool glu) {
+    const int K = packed_k(st, rows[0].name, 8);
+    if (c0 < 0) { c0 = 0; c1 = K; }
+    const int kl = c1 - c0;
+    int n = 0;
+    for (auto& r : rows) n += r.r1 - r.r0;
+    CHECK(n % 16 == 0 && kl % 128 == 0 && c0 % 128 == 0, "w8 %s n=%d k=%d", rows[0].name.c_str(),
+          n, kl);
+    int32_t* tq = (int32_t*)g_scratch_q.get((size_t)n * kl);
+    bf16* ts = (bf16*)g_scratch_s.get((size_t)n * (kl / 128) * 2);
+    int off = 0;
+    for (auto& r : rows) {
+        const TensorInfo& q = st.get(r.name + ".weight_packed");
+        const TensorInfo& s = st.get(r.name + ".weight_scale");
+        CHECK(q.dtype == "I32" && s.dtype == "BF16" && q.shape[1] * 4 == K, "w8 %s: %s [%lld, %lld], scale %s",
+              r.name.c_str(), q.dtype.c_str(), q.shape[0], q.shape[1], s.dtype.c_str());
+        const int h = r.r1 - r.r0;
+        // (stream-ordered before the repack, see load_w4)
+        CUDA_CHECK(cudaMemcpy2DAsync((char*)tq + (size_t)off * kl, kl, q.data + (size_t)r.r0 * K + c0, K, kl, h,
+                                     cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(ts + (size_t)off * (kl / 128), kl / 128 * 2,
+                                     s.data + ((size_t)r.r0 * (K / 128) + c0 / 128) * 2, K / 128 * 2,
+                                     kl / 128 * 2, h, cudaMemcpyHostToDevice, stream));
+        off += h;
+    }
+    W8 w;
+    w.n = n;
+    w.k = kl;
+    w.glu = glu;
+    uint4* dq = (uint4*)dalloc(w8_qbytes(n, kl), true);
+    bf16* ds = (bf16*)dalloc(w4_sbytes(n, kl), true);
+    if (glu) {  // interleave gate/up rows per 16-row tile, via a temporary copy
+        int32_t* gq;
+        bf16* gs;
+        CUDA_CHECK(cudaMalloc(&gq, (size_t)n * kl));
+        CUDA_CHECK(cudaMalloc(&gs, (size_t)n * (kl / 128) * 2));
+        glu_interleave_rows(tq, ts, n, kl, gq, gs, stream, 8);
+        repack_w8(gq, gs, n, kl, dq, ds, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaFree(gq));
+        CUDA_CHECK(cudaFree(gs));
+    } else {
+        repack_w8(tq, ts, n, kl, dq, ds, stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    w.q = dq;
+    w.s = ds;
+    return w;
+}
+
+QW Worker::load_qw(const SafeTensors& st_main, const std::vector<RowSpec>& rows, int c0, int c1, bool glu, int cls) {
+    const bool mixed = w4_st && (w4_mask & cls);
+    const SafeTensors& st = mixed ? *w4_st : st_main;
+    // next to INT8 layers an INT4 gate_up skips its GLU layout and runs gate_up + silu_mul like the INT8 ones
+    // (the GLU decode paths of INT4 assume the H16 / early-GEMV inputs, which INT8 setups do not produce)
+    if (mixed) glu = false;
+    QW w;
+    const std::string& name = rows[0].name;
+    int bits = 4;  // checkpoints without weight_shape: INT4 (the original format)
+    if (st.has(name + ".weight_shape")) {
+        const TensorInfo& ws = st.get(name + ".weight_shape");
+        const long long k = ws.dtype == "I64" && ws.nbytes == 16 ? ((const long long*)ws.data)[1] : 0;
+        const long long cols = st.get(name + ".weight_packed").shape[1];
+        CHECK(k > 0 && (k == cols * 8 || k == cols * 4), "%s: weight_shape K=%lld vs %lld packed columns", name.c_str(),
+              k, cols);
+        bits = k == cols * 4 ? 8 : 4;
+    }
+    if (bits == 8) {
+        // QE_W8_GLU (default 1): gate_up in the GLU row order, its GEMV / GEMM write silu(gate) * up directly
+        static const bool w8_glu = env_int("QE_W8_GLU", 1) != 0;
+        w.is8 = true;
+        w.q8 = load_w8(st, rows, c0, c1, glu && w8_glu);
+        w8_any_ = true;
+    } else {
+        w.q4 = load_w4(st, rows, c0, c1, glu);
+    }
     return w;
 }
 
@@ -935,16 +1030,20 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         Layer& L = layers_[i];
         const std::string pre = lp(i);
         L.full = c_.is_full[i];
-        L.in_norm = load_bf16(st, pre + "input_layernorm.weight", -1, -1);
-        L.post_norm = load_bf16(st, pre + "post_attention_layernorm.weight", -1, -1);
+        // mixed precision from an AWQ checkpoint (RedHat INT4: smoothing folded into input_layernorm -> q/k/v or
+        // in_proj_qkv/z/a/b, post_attention_layernorm -> gate/up, up -> down): a smoothed matrix needs the norm
+        // (and in_proj_a/b) it was balanced against; o_proj / out_proj are not smoothed
+        const bool mix_in = w4_st && (w4_mask & (L.full ? W4C_QKV : W4C_IN)), mix_mlp = w4_st && (w4_mask & W4C_GU);
+        L.in_norm = load_bf16(mix_in ? *w4_st : st, pre + "input_layernorm.weight", -1, -1);
+        L.post_norm = load_bf16(mix_mlp ? *w4_st : st, pre + "post_attention_layernorm.weight", -1, -1);
         if (L.full) {
             const std::string a = pre + "self_attn.";
-            L.fa.qkv = load_w4(st,
+            L.fa.qkv = load_qw(st,
                                {{a + "q_proj", p_.q_heads.b * 512, p_.q_heads.e * 512},
                                 {a + "k_proj", p_.kv_heads.b * 256, p_.kv_heads.e * 256},
                                 {a + "v_proj", p_.kv_heads.b * 256, p_.kv_heads.e * 256}},
-                               -1, -1);
-            L.fa.o = load_w4(st, {{a + "o_proj", 0, H}}, p_.o_heads.b * 256, p_.o_heads.e * 256);
+                               -1, -1, false, W4C_QKV);
+            L.fa.o = load_qw(st, {{a + "o_proj", 0, H}}, p_.o_heads.b * 256, p_.o_heads.e * 256, false, W4C_O);
             L.fa.q_norm = load_bf16(st, a + "q_norm.weight", -1, -1);
             L.fa.k_norm = load_bf16(st, a + "k_norm.weight", -1, -1);
             if (st.has(a + "k_scale") && st.has(a + "v_scale")) {
@@ -966,23 +1065,23 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
             const std::string a = pre + "linear_attn.";
             const int kb = p_.k_heads.b * 128, ke = p_.k_heads.e * 128;
             const int vb = p_.v_heads.b * 128, ve = p_.v_heads.e * 128;
-            L.dn.in = load_w4(st,
+            L.dn.in = load_qw(st,
                               {{a + "in_proj_qkv", kb, ke},
                                {a + "in_proj_qkv", kd + kb, kd + ke},
                                {a + "in_proj_qkv", 2 * kd + vb, 2 * kd + ve},
                                {a + "in_proj_z", vb, ve}},
-                              -1, -1);
-            L.dn.ab = load_w16(st,
+                              -1, -1, false, W4C_IN);
+            L.dn.ab = load_w16(mix_in ? *w4_st : st,
                                {{a + "in_proj_b.weight", p_.v_heads.b, p_.v_heads.e},
                                 {a + "in_proj_a.weight", p_.v_heads.b, p_.v_heads.e}},
                                8);
-            if (gemv_h16_on()) {  // fp16 copy read from the XH activations by the decode step
+            if (gemv_h16_on() && !w8_any_) {  // fp16 copy read from the XH activations by the decode step
                 L.dn.abh = L.dn.ab;
                 L.dn.abh.w = (uint4*)dalloc(w16_bytes(L.dn.ab.n, L.dn.ab.k), true);
                 w16_to_h(L.dn.ab, (uint4*)L.dn.abh.w, stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
-            L.dn.out = load_w4(st, {{a + "out_proj", 0, H}}, vb, ve);
+            L.dn.out = load_qw(st, {{a + "out_proj", 0, H}}, vb, ve, false, W4C_OUT);
             // conv weight [10240][1][4] -> local channels in the same q|k|v order
             {
                 const TensorInfo& t = st.get(a + "conv1d.weight");
@@ -1004,11 +1103,15 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
             // lazy state writes of single-row steps (dn_lazy_of): state written every T-th step
             dsh_.lazy_t = env_int("QE_DN_LAZY", 3);
         }
-        L.gate_up = load_w4(st,
+        L.gate_up = load_qw(st,
                             {{pre + "mlp.gate_proj", p_.inter.b, p_.inter.e},
                              {pre + "mlp.up_proj", p_.inter.b, p_.inter.e}},
-                            -1, -1, glu_);
-        L.down = load_w4(st, {{pre + "mlp.down_proj", 0, H}}, p_.inter.b, p_.inter.e);
+                            -1, -1, glu_, W4C_GU);
+        L.down = load_qw(st, {{pre + "mlp.down_proj", 0, H}}, p_.inter.b, p_.inter.e, false, W4C_DOWN);
+    }
+    if (w8_any_) {  // INT8 layers: no H16 / early / GLU-epilogue paths yet (see QW); W4A8 off for the INT4 matrices too
+        gemm_i8_disable();
+        if (rank == 0) fprintf(stderr, "INT8 layer weights: W8 GEMV for decode, W8A8 GEMM for prefill, H16 / early GEMV / W4A8 off\n");
     }
     final_norm_ = load_bf16(st, "model.language_model.norm.weight", -1, -1);
     if (mtp_st) {
@@ -1170,7 +1273,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     }
     xn_ = (bf16*)dalloc((size_t)M * H * 2, false);
     act_ = (bf16*)dalloc((size_t)M * act_w * 2, false);
-    h16_ = gemv_h16_on();
+    h16_ = gemv_h16_on() && !w8_any_;
     if (h16_) {
         xh_act_ld_ = act_w;
         xh_xn_ = (__half*)dalloc((size_t)kMaxBatchRows * H * 2, false);
@@ -1461,8 +1564,8 @@ void Worker::forward(int m, bool logits, bool spec) {
             dn_out(dno_, proj_ + dn_ch_, proj_ld_, L.dn.norm_w, dsh_.nv, eps, m, act_, st, xha);
             mm4(L.dn.out, act_, vw, partial_, H, m, st, xha, vw);
         }
-        if (L.gate_up.glu && allreduce_early(m, L.post_norm, L.gate_up, reinterpret_cast<float*>(act_), I, xha, I, true, 1)) {
-        } else if (allreduce_pf(resid_, m, L.post_norm, xn_, &L.gate_up), L.gate_up.glu) {
+        if (L.gate_up.glu() && allreduce_early(m, L.post_norm, L.gate_up, reinterpret_cast<float*>(act_), I, xha, I, true, 1)) {
+        } else if (allreduce_pf(resid_, m, L.post_norm, xn_, &L.gate_up), L.gate_up.glu()) {
             // fused silu(gate) * up epilogue -> bf16 act_ (+ XH copy)
             mm4(L.gate_up, xn_, H, reinterpret_cast<float*>(act_), I, m, st, xhx, H, xha, I);
         } else {
@@ -1471,7 +1574,7 @@ void Worker::forward(int m, bool logits, bool spec) {
         }
         mm4(L.down, act_, I, partial_, H, m, st, xha, I);
         const bf16* next_norm = i + 1 < c_.layers ? layers_[i + 1].in_norm : final_norm_;
-        const W4* nxt = nullptr;
+        const QW* nxt = nullptr;
         if (i + 1 < c_.layers) nxt = layers_[i + 1].full ? &layers_[i + 1].fa.qkv : &layers_[i + 1].dn.in;
         // the layer output: its steering (fused into the all-reduce; the early-GEMV all-reduce has no hook)
         const SteerArg sa = steer_arg(i, cur_slot_);
@@ -1506,7 +1609,7 @@ void Worker::forward(int m, bool logits, bool spec) {
 // the bf16 copy of a fused norm output is needed unless the H16 kernels consume the XH copy instead:
 // `next` is the W4 matrix fed by this norm (the DeltaNet `ab` projection reads XH too); the final norm
 // (next == null) feeds lm_head in bf16
-bf16* Worker::xn_bf16(bf16* xn, int m, const W4* next) {
+bf16* Worker::xn_bf16(bf16* xn, int m, const QW* next) {
     if (!h16_ || m > rows_cap_ || xn != xn_ || !next || dec_gemm_rows(m)) return xn;
     return nullptr;
 }
@@ -1521,10 +1624,12 @@ static int early_gemv_mask() {
     return v;
 }
 
-bool Worker::allreduce_early(int m, const bf16* norm, const W4& w, float* y, int ldy, __half* yh, int ldyh,
+bool Worker::allreduce_early(int m, const bf16* norm, const QW& qw, float* y, int ldy, __half* yh, int ldyh,
                              bool join, int site) {
     static const int ll16 = env_int("QE_LL16", 1);
     static const int ranks = env_int("QE_EARLY_RANKS", 7);  // GPUs using it
+    if (qw.is8 || w8_any_) return false;  // INT8 setups: no early W8 GEMV, no H16 XH inputs for an INT4 one
+    const W4& w = qw.q4;
     if (!(early_gemv_mask() & site) || !((ranks >> rank) & 1) || !h16_ || ngpu_ < 2 || m > 8 || !use_ll_ || ll16 <= 0 || m < ll16 || !xh_xn_)
         return false;
     static const int depth = env_int("QE_EARLY_DEPTH", -1);
@@ -1576,7 +1681,7 @@ void Worker::early_join() {
     if (early_join_ev_) CUDA_CHECK(cudaStreamWaitEvent(stream, early_join_ev_, 0));
 }
 
-void Worker::allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const W4* next, const SteerArg* sa) {
+void Worker::allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const QW* next, const SteerArg* sa) {
     const int ll = next_ll(m);
     if (!next || pf_bytes_ == 0 || m > rows_cap_) {
         allreduce_add(resid, partial_, m, c_.hidden, comm_, rank, ctr_, stream, norm, c_.eps,
@@ -1690,7 +1795,7 @@ void Worker::forward_batch(const std::vector<int>& slots, const std::vector<int>
             mm4(L.dn.out, act_, vw, partial_, H, M, st, xh_act_, vw);
         }
         allreduce_pf(resid_, M, L.post_norm, xn_, &L.gate_up);
-        if (L.gate_up.glu) {
+        if (L.gate_up.glu()) {
             mm4(L.gate_up, xn_, H, reinterpret_cast<float*>(act_), I, M, st, xh_xn_, H, xh_act_, I);
         } else {
             mm4(L.gate_up, xn_, H, proj_, ld, M, st, xh_xn_, H);
@@ -1698,7 +1803,7 @@ void Worker::forward_batch(const std::vector<int>& slots, const std::vector<int>
         }
         mm4(L.down, act_, I, partial_, H, M, st, xh_act_, I);
         const bf16* next_norm = li + 1 < c_.layers ? layers_[li + 1].in_norm : final_norm_;
-        const W4* nxt = nullptr;
+        const QW* nxt = nullptr;
         if (li + 1 < c_.layers)
             nxt = layers_[li + 1].full ? &layers_[li + 1].fa.qkv : &layers_[li + 1].dn.in;
         SteerArg sa = steer_arg(li, 0);  // the layer output; each row its sequence's slot (fixed by the graph key)
@@ -1779,9 +1884,14 @@ void Worker::dec_gemm_warm(int) {
     const int H = c_.hidden, I = p_.inter.size();
     int t = kMaxBatchRows;
     cudaStream_t st = stream;
-    auto run = [&](const W4& w, const bf16* x) {
+    auto run4 = [&](const W4& w, const bf16* x) {
         if (w.glu) gemm_w4(w, x, w.k, reinterpret_cast<float*>(act_), w.n / 2, t, st);
         else gemm_w4(w, x, w.k, w.k == H ? proj_ : partial_, w.k == H ? proj_ld_ : H, t, st);
+    };
+    auto run = [&](const QW& w, const bf16* x) {  // INT8: the W8A8 GEMM of the matrices mm4 sends there
+        if (!w.is8) run4(w.q4, x);
+        else if (dec_gemm8(w.q8) && w.q8.glu) gemm_w8(w.q8, x, w.q8.k, reinterpret_cast<float*>(act_), w.q8.n / 2, t, st);
+        else if (dec_gemm8(w.q8)) gemm_w8(w.q8, x, w.q8.k, w.q8.k == H ? proj_ : partial_, w.q8.k == H ? proj_ld_ : H, t, st);
     };
     // buffer sizes of a whole prefill chunk (no growth later), then the decode row counts (tuner buckets,
     // stream-K plans of 33..64 rows)
@@ -1797,11 +1907,11 @@ void Worker::dec_gemm_warm(int) {
     for (auto& L : layers_)
         if (L.full) { run(L.fa.qkv, xn_); run(L.fa.o, act_); break; }
     if (mtp_.fc.is4) {
-        run(mtp_.fc.q, mtp_in_);
-        run(mtp_.qkv.q, xn_);
-        run(mtp_.o.q, act_);
-        run(mtp_.gate_up.q, xn_);
-        run(mtp_.down.q, act_);
+        run4(mtp_.fc.q, mtp_in_);
+        run4(mtp_.qkv.q, xn_);
+        run4(mtp_.o.q, act_);
+        run4(mtp_.gate_up.q, xn_);
+        run4(mtp_.down.q, act_);
     }
     }
     CUDA_CHECK(cudaStreamSynchronize(st));
@@ -2098,6 +2208,11 @@ void Worker::matmul_part(const W4& w, const bf16* x, int ldx, int m, size_t row0
                          : partial_ + row0 * c_.hidden, c_.hidden, m, stream);
     if (pb) gemm_set_out_bf16(false);
 }
+void Worker::matmul_part(const QW& w, const bf16* x, int ldx, int m, size_t row0, bool pb) {
+    if (!w.is8) return matmul_part(w.q4, x, ldx, m, row0, pb);
+    CHECK(!pb, "bf16 partial rows with an INT8 layer");  // forward_prefill keeps pb off when w8_any_
+    matmul(w.q8, x, ldx, partial_ + row0 * c_.hidden, c_.hidden, m, stream);
+}
 
 // QE_DBG_SKIP (timing experiments only, the results are wrong): bit 1 = deferred AR tail (one row
 // kept, it zeroes the GEMM counter), 2 = DeltaNet between in_proj and out_proj, 4 = MTP pass of
@@ -2192,7 +2307,7 @@ void Worker::forward_prefill(int m, bool logits) {
     bool defer_ok[2];
     for (int b = 0; b < 2; b++) defer_ok[b] = allreduce_deferrable(comm_, mbs[b], H, r0s[b]);
     bool pb[2];  // partial rows of b in bf16 (GEMM output mode, see part_bf16_on)
-    for (int b = 0; b < 2; b++) pb[b] = part_bf16_on(defer_ok[b]);
+    for (int b = 0; b < 2; b++) pb[b] = part_bf16_on(defer_ok[b]) && !w8_any_;  // (the W8 GEMV writes fp32)
     // owner-finished all-reduce (QE_AR_OWNFIN, comm.cuh OwnFin): the owners of the rows add, norm and
     // quantize them and send the int8 (and, for the DeltaNet ab projection / final norm, bf16) rows
     // to every GPU: no finishing kernel over all rows on this stream; the residual stays valid on
@@ -2338,7 +2453,7 @@ void Worker::forward_prefill(int m, bool logits) {
             xbf_cur_ = xbf_[b];  // bf16 input rows of the ab projection (owner-finished AR), else xn_
             mixer_rows(i, r0s[b], mbs[b], poss[b], b == 0 ? 0 : m0, pb[b]);
             xbf_cur_ = nullptr;
-            reduce(b, L.post_norm, L.gate_up.glu, true);  // MLP input: W4A8 gate_up only
+            reduce(b, L.post_norm, L.gate_up.glu(), true);  // MLP input: W4A8 gate_up only
         }
         const bf16* next_norm = i + 1 < c_.layers ? layers_[i + 1].in_norm : final_norm_;
         for (int b = 0; b < 2; b++) {
@@ -2346,7 +2461,7 @@ void Worker::forward_prefill(int m, bool logits) {
             const size_t ox = (size_t)r0s[b] * H;
             float* proj = proj_ + (size_t)r0s[b] * proj_ld_;
             bf16* act = act_ + (size_t)r0s[b] * I;
-            if (L.gate_up.glu) {
+            if (L.gate_up.glu()) {
                 matmul(L.gate_up, xn_ + ox, H, reinterpret_cast<float*>(act), I, mbs[b], st);
             } else {
                 matmul(L.gate_up, xn_ + ox, H, proj, proj_ld_, mbs[b], st);

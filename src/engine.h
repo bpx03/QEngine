@@ -546,6 +546,9 @@ private:
     std::vector<CardPlan> plan_;
     SafeTensors st_;
     std::unique_ptr<SafeTensors> mtp_st_;
+    std::unique_ptr<SafeTensors> w4_st_;  // QE_W4_FROM: INT4 source of the QE_W4_LAYERS classes (mixed precision)
+    int w4_mask_ = 0;
+    std::string w4_key_;  // fingerprint part of the mixed-precision setup (empty: none)
     int k_ = 0;        // max drafts per step (0 = plain decoding)
     SampleParams samp_{1.f, 1.f, kTopK, 0.f, 0, 0};
     bool samp_on_ = false;
