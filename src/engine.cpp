@@ -1066,6 +1066,10 @@ double Engine::warmup(int modes) {
     pool_->run([&](int r) { workers_[r]->tune_gemm(); });  // prefill GEMM configurations
     if (!has_mtp()) return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const int keep = cur_;
+    // the decode attention row split is part of the graph key, and launch_step turns it on while a sequence is
+    // below the ~38-split length (every short conversation): warm those graphs (they were warmed with it off,
+    // and the first steps of the first reply captured them again, ~25 ms each)
+    for (auto& w : workers_) w->attn_rs_ = true;
     for (int sl = 0; sl < 1; sl++) {  // the first slot (where the first conversation lands)
         use_slot(sl);
         for (int smp = 0; smp < 2; smp++) {

@@ -1178,6 +1178,9 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         xh_tmp_ = (__half*)dalloc((size_t)kMaxBatchRows * std::max({H, act_w, 2 * H}) * 2, false);
     }
     qbuf_ = (bf16*)dalloc((size_t)M * ash_.nq * 256 * 2, false);
+    // the remaining loads are synchronous cudaMemcpy from pageable memory, whose DMA may still be in flight on
+    // return: settle them all before any kernel on `stream` reads the weights
+    CUDA_CHECK(cudaDeviceSynchronize());
     plan_bytes();  // kv_fp8_ / has_mtp are known now
     alloc_xchg();
     logits_ = (float*)dalloc((size_t)kMaxBatchRows * p_.vocab.size() * 4, false);
