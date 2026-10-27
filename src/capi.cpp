@@ -107,6 +107,14 @@ void qe_gemm_w16(const void* wp, int n, int k, const bf16* x, float* y, int t) {
 void qe_quantize_w8(const bf16* w, int n, int k, void* dq, void* ds) {
     quantize_w8(w, n, k, (uint4*)dq, (bf16*)ds, 0);
 }
+void qe_gemm_w8_set_kernel(int v) { gemm_w8_set_kernel(v); }
+// W8A8 GEMM: G = activation group, ci = tile candidate (< 0: gemm_w8's default choice); glu: bf16 GLU output
+void qe_gemm_w8a8(const void* q, const void* s, int n, int k, const bf16* x, float* y, int t, int G, int ci, int glu) {
+    W8 w{(const uint4*)q, (const bf16*)s, n, k, glu != 0};
+    const int ldc = glu ? n / 2 : n;
+    if (ci < 0) gemm_w8(w, x, k, y, ldc, t, 0);
+    else gemm_w8_cfg(w, x, k, y, ldc, t, 0, G, ci);
+}
 void qe_gemv_w8_set_p1_min(int m) { gemv_w8_set_p1_min(m); }
 void qe_gemv_w8_glu(const void* q, const void* s, int n, int k, const bf16* x, void* act, int m) {  // act: bf16 [m][n / 2]
     gemv_workspace_init();

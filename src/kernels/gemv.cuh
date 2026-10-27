@@ -124,6 +124,11 @@ void gemm_w16(const W16& w, const bf16* x, int ldx, float* c, int ldc, int t, cu
 // var (0: gemm_i8_kernel, 1: gemm_i8t_kernel).
 void gemm_w4_i8(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st,
                 int G, int ci, int var);
+// W8A8 prefill GEMM (int8 activations per token and G-group, default 32, W8 weights): c[t][n] fp32 (GLU: bf16
+// activations [t][n / 2]); gemm_w8_cfg picks the activation group G (32 / 64 / 128) and tile ci (0..2)
+void gemm_w8(const W8& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st);
+void gemm_w8_cfg(const W8& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st, int G, int ci);
+void gemm_w8_set_kernel(int v);  // (bench) 1 = gemm_w8v_kernel (tiles ci 0..3), 0 = the first gemm_w8a8_kernel (0..2)
 // A producer of x (t rows, k = hidden) may quantize it for the W4A8 GEMM that consumes it next
 // (glu_next: the MLP gate_up, else the mixer qkv / in_proj): returns the int8 and scale
 // buffers to fill (layouts of x_to_i8_kernel, group *G) and registers them for the next
@@ -131,6 +136,8 @@ void gemm_w4_i8(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, c
 bool gemm_i8_prequant(const bf16* x, int t, int k, int row0, bool glu_next, int8_t** xq, float** xsc, int* G,
                       int** ctr = nullptr);  // ctr: the producer zeroes the GEMM's stream-K counter (no memset)
 int gemm_i8_prequant_group(int k, bool glu_next);
+// W4A8 off for every class (as QE_PREFILL_INT8=0): INT8 layers need bf16 inputs, no int8 prequant
+void gemm_i8_disable();
 void gemm_i8_prequant_ext(const bf16* x, int t, int k, int G, int8_t* xq, float* xsc);
 int* gemm_i8_sk_ctr();
 // dn_out writes the int8 input of the next W4A8 out_proj (k = 2048) itself (QE_DNO_I8=0: off)
