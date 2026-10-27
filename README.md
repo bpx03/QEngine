@@ -227,6 +227,43 @@ without `token_rank.bin` the drafts use the full vocabulary, and without `model_
 uses the checkpoint's original MTP head (`QE_MTP_FILE` selects another head file). Both make it slower
 than the published numbers (fewer accepted drafts per step, more expensive drafting).
 
+### INT8 weights
+
+The engine also runs 8-bit checkpoints (compressed-tensors `pack-quantized`, symmetric, group 128), e.g.
+`lued/Qwen3.8-27B-INT8-W8A16-MTP` (sharded; detected per tensor from `weight_shape`):
+
+```bash
+hf download lued/Qwen3.8-27B-INT8-W8A16-MTP --local-dir models/Qwen3.8-27B-INT8
+cp models/Qwen3.8-27B-INT4/token_rank.bin models/Qwen3.8-27B-INT8/   # tokenizer-only; without it every MTP draft reads a 4x larger draft head
+# fp8 KV cache scales (the checkpoint has none; without them the KV cache falls back to bf16 = half the pool):
+python3 tools/kv_scales.py calibrate --model models/Qwen3.8-27B-INT8 --corpus <text dirs/files>
+server/run.sh 8080 --model models/Qwen3.8-27B-INT8
+```
+
+INT8 layers decode on a W8A16 GEMV (fp32 accumulation; 1–2 rows at ~95 % of DRAM bandwidth, bit-identical
+across row counts up to 64, `tests/test_w8_rows.py`) and prefill on a W8A8 GEMM (`gemm_w8v_kernel`, int8 tensor cores, activations
+quantized per token and 32-k group, autotuned); batched decode passes of ≥ 33 rows take the GEMM as INT4 does.
+`tools/kv_scales.py` writes `<model>/kv_scales.safetensors` (loaded automatically; `QE_KV_SCALES=<file>|off`);
+`extract` copies another checkpoint's scales. Switches: `QE_W8A8_G` (activation group, 32 default),
+`QE_W8_GEMM=0` (GEMV prefill), `QE_W8_GLU=0`, `QE_W8A8_KERNEL=0` (the first, untuned W8A8 kernel). Mixed precision:
+`QE_W4_FROM=models/Qwen3.8-27B-INT4 QE_W4_LAYERS=mlp` takes the MLP from the INT4 checkpoint (it is AWQ: a
+class comes with the norms its smoothing was folded into; gate_up only together with down).
+
+Measured on 2× RTX 3090 (240 W, no P2P, TP=2, 8 slots), quality on 32 × 1,024 scored positions vs BF16 (HF):
+
+| | INT8 | INT4 (RedHat) | vLLM FP8 (club-3090 dual-ultramax) |
+|---|---:|---:|---:|
+| KLD vs BF16 / top-1 | **0.0033 / 98.9 %** | 0.060 / 94.0 % | 0.0073 / 98.5 % |
+| weights per GPU | 13.5 GB | 7.2 GB | — |
+| KV pool, 8 slots | 311K tokens | 671K | ~285K (1 slot) |
+| decode code / prose, 4 + 4 long answers stopped at EOS (`tools/decode_probe.py`) | 215 / 107 tok/s | 296 / 166 | 172 / 85 (DFlash2) |
+| prefill 10K / 90K TTFT | 4.9 s / 48 s | 4.8 s / 45 s | 6.6 s / 69 s |
+| serving, 1K in / 512 out, c = 1 / 4 / 8 / 16 | 107 / 229 / 318 / 376 tok/s | 150 / 295 / 368 / 423 | ~67 (1 slot) |
+
+Known limit: INT8 runs without the H16 kernels, and that path (upstream too, `QE_GEMV_H16=0`) does not keep
+batch == alone when lookup drafts are on (`tests/test_pool.py` fails; `QE_LOOKUP=0` passes): a greedy request
+can flip a near-tie token depending on what it is batched with.
+
 ## Run
 
 The defaults are the best measured configuration; most setups change only these:
