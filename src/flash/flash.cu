@@ -19,6 +19,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+// CUDA module loading EAGER, set when the library / flash_run is loaded (before the first CUDA call). With lazy loading
+// the first launch of a kernel loads its module, and in the eager first batch of a graph key that load can wait while
+// the device spins on a peer's flags whose card waits for this one: FLASH_COMM=ce + pfsel deadlocked 2 of 2 runs at the
+// base, 0 of 8 with EAGER (qfn_ce_eager_2026-10-27). A value set by the user is kept (CUDA_MODULE_LOADING=LAZY: off).
+__attribute__((constructor)) static void qe_eager_modules() { setenv("CUDA_MODULE_LOADING", "EAGER", 0); }
+
 namespace flash {
 
 char* pin_host_file(const std::string& path, size_t off, size_t n, const void* src, int threads, const std::vector<int>& numa) {
@@ -1021,6 +1027,19 @@ void Worker::alloc_state() {
         detpart_ = (unsigned long long*)dalloc((size_t)pfbn_ * std::max(H, HC * HCD_ROWS + HC) * 8);  // MoE partial / HC down sums
     }
     if (getenv("FLASH_DBGHASH") && atoi(getenv("FLASH_DBGHASH"))) dbgh_ = (unsigned long long*)dalloc((size_t)(LAYERS + 1) * DBGK * 8);
+    if (getenv("FLASH_DBG_XQCHK") && atoi(getenv("FLASH_DBG_XQCHK"))) {
+        xqsnap_ = dalloc((size_t)pfbn_ * H * 2 + (size_t)pfbn_ * (TOPK + 1) * 8);
+        if (getenv("FLASH_DBG_GU2X") && atoi(getenv("FLASH_DBG_GU2X"))) actsnap_ = dalloc((size_t)pfbn_ * (TOPK + 1) * NGRP * GRP * 2);
+        CUDA_CHECK(cudaHostAlloc((void**)&xqrec_, 8 * 4 + 200 * 24, cudaHostAllocMapped));
+        memset(xqrec_, 0, 8 * 4 + 200 * 24);
+    }
+    if (getenv("FLASH_DBGHASH") && atoi(getenv("FLASH_DBGHASH")) == 2) {
+        rowh_n_ = pfbn_;
+        rowh_ = (unsigned long long*)dalloc((size_t)LAYERS * rowh_n_ * 4 * 8);
+        CUDA_CHECK(cudaMemset(rowh_, 0, (size_t)LAYERS * rowh_n_ * 4 * 8));
+        rowl1_ = (double*)dalloc((size_t)LAYERS * rowh_n_ * 8);
+        CUDA_CHECK(cudaMemset(rowl1_, 0, (size_t)LAYERS * rowh_n_ * 8));
+    }
     {  // sequence-parallel HC prefill: row all-gather protocol (2 channels) and the HC scratch of one chunk's own rows
         agflags_ = (unsigned*)dalloc(4 * 4 * 4);  // [2 channels][4 senders] flags, then [2 channels][4 readers] acks (pull)
         agseq_ = (unsigned*)dalloc(2 * 4);
@@ -1080,18 +1099,32 @@ void Worker::alloc_state() {
         *nf_h_ = 0;
         CUDA_CHECK(cudaHostGetDevicePointer((void**)&nf_d_, nf_h_, 0));
     }
-    xrecv_ = (float*)dalloc((size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
+    // the QSA exchanges' receive slots and flags are written by the peers' kernels: device memory reached over P2P,
+    // or, without peer access (no P2P driver, QE_P2P=0), pinned host memory every card maps (zero-copy). Before
+    // rc3-fixes such a box wrote into the peers' device memory and crashed in the first prefill (Xid 31).
+    auto palloc = [&](size_t bytes) -> void* {
+        if (comm_.p2p || p_.ngpu < 2) return dalloc(bytes);
+        void* h = nullptr;
+        CUDA_CHECK(cudaHostAlloc(&h, bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+        memset(h, 0, bytes);
+        void* d = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&d, h, 0));
+        return d;
+    };
+    if (!comm_.p2p && p_.ngpu > 1 && p_.rank == 0)
+        fprintf(stderr, "[flash] no peer access: attention exchanges through pinned host memory (slower than P2P)\n");
+    xrecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
     xscnt_ = (unsigned*)dalloc(4 * 4);
     xqscnt_ = (unsigned*)dalloc(4 * 4);
-    xflags_ = (unsigned*)dalloc(4 * 4);
+    xflags_ = (unsigned*)palloc(4 * 4);
     xseq_ = (unsigned*)dalloc(4);
     xdone_ = (unsigned*)dalloc(4);
-    xqrecv_ = (float*)dalloc((size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4);
-    xqflags_ = (unsigned*)dalloc(4 * 4);
+    xqrecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4);
+    xqflags_ = (unsigned*)palloc(4 * 4);
     xqseq_ = (unsigned*)dalloc(4);
     xqdone_ = (unsigned*)dalloc(4);
-    xirecv_ = (float*)dalloc((size_t)XSLOT * p_.ngpu * XROWS * IDX_TOPB * 4);
-    xiflags_ = (unsigned*)dalloc(4 * 4);
+    xirecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * IDX_TOPB * 4);
+    xiflags_ = (unsigned*)palloc(4 * 4);
     xiseq_ = (unsigned*)dalloc(4);
     xidone_ = (unsigned*)dalloc(4);
     alloc_staging();  // staged prefill transfers (FLASH_COMM ce / host)
@@ -1576,6 +1609,74 @@ const Worker::EcStats& Worker::ec_stats() {
 
 // FLASH_JOBCHK: the job builders write every job routing produces, the MoE kernels run `bound` blocks: report a count
 // above the launched grid (those jobs would be skipped) or above the job buffer
+__global__ void k_nancnt(const float* p, size_t n, unsigned* out) {  // debug: non-finite floats
+    unsigned c = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) c += !isfinite(p[i]);
+    if (c) atomicAdd(out, c);
+}
+__global__ void k_nancnt16(const __half* p, size_t n, unsigned* out) {
+    unsigned c = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) c += !isfinite(__half2float(p[i]));
+    if (c) atomicAdd(out, c);
+}
+// debug (FLASH_QPF_NAN): non-finite own q rows / received q rows (slot of the exchange just consumed) / attention out
+__global__ void k_qnan(const float* qb, const float* recv, const unsigned* seq, int ngpu, int rank, int mr, int qp, bool q16,
+                       const float* ax, unsigned* rec) {
+    const unsigned s = *seq;  // bumped by the attention: this exchange's number
+    unsigned c0 = 0, c1 = 0, c2 = 0;
+    const size_t st = (size_t)gridDim.x * blockDim.x, i0 = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    for (size_t i = i0; i < (size_t)mr * (NQ + 4) * HD; i += st) c0 += !isfinite(qb[i]);
+    for (int g = 0; g < ngpu; g++) {
+        if (g == rank) continue;
+        const float* r = recv + ((size_t)(s & 1) * ngpu + g) * XROWS * qp;
+        if (q16) { const __half* h = reinterpret_cast<const __half*>(r); for (size_t i = i0; i < (size_t)mr * qp; i += st) c1 += !isfinite(__half2float(h[i])); }
+        else for (size_t i = i0; i < (size_t)mr * qp; i += st) c1 += !isfinite(r[i]);
+    }
+    for (size_t i = i0; i < (size_t)mr * NQ * (HD + 2); i += st) c2 += !isfinite(ax[i]);
+    if (c0) atomicAdd(rec, c0);
+    if (c1) atomicAdd(rec + 1, c1);
+    if (c2) atomicAdd(rec + 2, c2);
+    if (blockIdx.x == 0 && threadIdx.x == 0) rec[3] = s;
+}
+// debug (FLASH_DBGHASH=2): per row hash of `words` 32-bit words per row, out[r * 4 + k] += hash
+__global__ void k_row_hash(const unsigned* p, int words, int m, unsigned long long* out, int k) {
+    const int r = blockIdx.x;
+    if (r >= m) return;
+    unsigned long long h = 0ull;
+    for (int i = threadIdx.x; i < words; i += blockDim.x)
+        h += (unsigned long long)(p[(size_t)r * words + i] + 0x9e3779b9u) * (2654435761ull * (i + 1) | 1ull);
+    for (int o = 16; o > 0; o >>= 1) h += __shfl_xor_sync(0xffffffffu, h, o);
+    if ((threadIdx.x & 31) == 0) atomicAdd(out + (size_t)r * 4 + k, h);
+}
+__global__ void k_row_l1(const float* p, int n, int m, double* out) {
+    const int r = blockIdx.x;
+    if (r >= m) return;
+    __shared__ double red[8];
+    double a = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) a += fabs((double)p[(size_t)r * n + i]);
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = a;
+    __syncthreads();
+    if (threadIdx.x == 0) { double t = 0.0; for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += red[w]; atomicAdd(out + r, t); }
+}
+// debug (FLASH_DBG_XQCHK): rows of a and b that differ -> rec [n][5] {layer, kind, row, first word, a word}, rec[0] count
+__global__ void k_cmp_rows(const unsigned* a, const unsigned* b, int rows, int words, unsigned* rec, int li, int kind) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    __shared__ int first;
+    if (threadIdx.x == 0) first = 1 << 30;
+    __syncthreads();
+    for (int i = threadIdx.x; i < words; i += blockDim.x)
+        if (a[(size_t)r * words + i] != b[(size_t)r * words + i]) atomicMin(&first, i);
+    __syncthreads();
+    if (threadIdx.x == 0 && first < (1 << 30)) {
+        const unsigned k = atomicAdd(rec, 1u);
+        if (k < 200) {
+            unsigned* e = rec + 8 + k * 6;
+            e[0] = li; e[1] = kind; e[2] = r; e[3] = first; e[4] = a[(size_t)r * words + first]; e[5] = b[(size_t)r * words + first];
+        }
+    }
+}
 __global__ void k_jobtrap(const int* njobs, int bound) {
     if (*njobs > bound) { printf("[flash] FATAL: prefill MoE job list %d > grid %d (expert work would be skipped)\n", *njobs, bound); __trap(); }
 }
@@ -2231,7 +2332,12 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // (not with copy-engine exchanges: FLASH_COMM=ce + k_qsa_pfsel faults / NaN in batches > 2560 rows,
                 // cause open; the kernel's output equals k_qsa_dec's there when run as a shadow)
                 static const bool qpf_ce = getenv("FLASH_QPF_CE") && atoi(getenv("FLASH_QPF_CE"));  // debug: pfsel with CE
-                if (pfsel && pf_ && sel_on_ && mr > MAXM && std::min(pfs, attn_split_) >= 1 && (qpf_ce || !(xstage_ && comm_.xfer == kXferCE))) {
+                // copy-engine exchanges: the q flags waited for by k_qpf_qwait before the kernel (no spinning pfsel blocks);
+                // FLASH_QPF_CE=0: k_qsa_dec there as before
+                // (opt-in until validated: CE + pfsel still deadlocks intermittently in the eager first batch, qfn_prefill_r4)
+                static const bool qpf_ce_on = getenv("FLASH_QPF_CE") && atoi(getenv("FLASH_QPF_CE"));
+                const bool ce_x = xstage_ && comm_.xfer == kXferCE;
+                if (pfsel && pf_ && sel_on_ && mr > MAXM && std::min(pfs, attn_split_) >= 1 && (!ce_x || qpf_ce_on || qpf_ce)) {
                     const int S = std::min(pfs, attn_split_);
                     for (int z = 1; z < S; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
                     const size_t smem = qpf_smem(lbmax);
@@ -2254,16 +2360,27 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     // default: one item per block until the rc2 test round validates it)
                     static const bool qps = getenv("FLASH_QPF_PERSIST") && atoi(getenv("FLASH_QPF_PERSIST"));
                     const int ngrp = (mr + QP_R - 1) / QP_R;
+                    const int qdbg = ce_x && qpf_dbg == 0 ? 5 : qpf_dbg;
+                    if (qdbg == 5) k_qpf_qwait<<<1, 32, 0, st_>>>(xq, p_);
                     if (qps && qpu_.ctr) {
                         qu.ctr = qpu_.ctr;
                         qu.S = S;
                         if (!nsm_) CUDA_CHECK(cudaDeviceGetAttribute(&nsm_, cudaDevAttrMultiProcessorCount, dev_));
                         kf<<<std::min(nsm_, NKV * ngrp * S), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, isel_,
-                                                                                insel_, lbmax, mr, rbcur_, q16, qpf_dbg, qu, ngrp);
+                                                                                insel_, lbmax, mr, rbcur_, q16, qdbg, qu, ngrp);
                     } else
                     kf<<<dim3(NKV, ngrp, S), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d,
-                                                                                p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, qpf_dbg, qu, 0);
+                                                                                p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, qdbg, qu, 0);
                     if (S > 1) k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S);
+                    static const bool qnan = getenv("FLASH_QPF_NAN") && atoi(getenv("FLASH_QPF_NAN"));  // debug: first NaN (device-side)
+                    if (qnan) {
+                        if (!qnan_rec_) { CUDA_CHECK(cudaHostAlloc((void**)&qnan_rec_, 4096 * 16, cudaHostAllocMapped)); memset(qnan_rec_, 0, 4096 * 16); }
+                        if (qnan_n_ < 4096) {
+                            qnan_meta_.push_back({li, cposh_[2 * (int)(posd_ - cposd_) / 2]});
+                            k_qnan<<<64, 256, 0, st_>>>(qb, xqpr_[p_.rank], xqseq_, p_.ngpu, p_.rank, mr, qper(p_), q16, attn_x_, qnan_rec_ + 4 * qnan_n_);
+                            qnan_n_++;
+                        }
+                    }
                 } else {
                 const int S = mr > MAXM ? spf : dec_split_;
                 for (int z = 1; z < S; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
@@ -2313,7 +2430,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         if (dh) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(attn_x_), (size_t)mr * NQ * (HD + 2), dh + 9);
         const float* prow = proj_ + (size_t)t0 * ld;
         bf16* abr = ab_ + (size_t)t0 * ql * HD;
-        if (p2p && comm_.p2p) {
+        if (p2p) {  // (without peer access the receive slots are pinned host memory, palloc)
             Xchg xc;
             for (int g = 0; g < p_.ngpu; g++) { xc.recv[g] = xpr_[g]; xc.flags[g] = xpf_[g]; }
             xc.seq = xseq_;
@@ -2378,6 +2495,13 @@ void Worker::moe(Layer& L, int m) {
         static const bool slot_on = !getenv("FLASH_MOE_SLOT") || atoi(getenv("FLASH_MOE_SLOT"));
         const size_t srows = (size_t)moe_slot_rows_ + (bt_taken_ ? moe_slot_rows2_ : 0);
         const bool slot = slot_on && !detpart_ && moe_slots_ && (size_t)m * (TOPK + 1) <= srows;
+        static const int msync = getenv("FLASH_DBG_MOESYNC") ? atoi(getenv("FLASH_DBG_MOESYNC")) : 0;  // debug (eager only)
+        if (msync) {  // bits: 1 expert-cache copy stream, 2 staging-ring copy stream, 4 comm stream, 8 st_ itself
+            CUDA_CHECK(cudaStreamSynchronize(st_));
+            if ((msync & 1) && ec_cs_) CUDA_CHECK(cudaStreamSynchronize(ec_cs_));
+            if ((msync & 2) && dst_) CUDA_CHECK(cudaStreamSynchronize(dst_));
+            if (msync & 4) CUDA_CHECK(cudaStreamSynchronize(cst_));
+        }
         k_jobs_pf<<<1, NE, 0, st_>>>(m, L.gmap, L.groups, pfs_use_ && &L != &mtp_ ? stab(L) : ctab(L), L.ndev, gsel_, gw_, gsh_,
                                      pfjobs_, pftl_, pfwl_, njobs_, slot ? pfinv_ : nullptr);
         KCHK("k_jobs_pf");
@@ -2396,10 +2520,33 @@ void Worker::moe(Layer& L, int m) {
             int8_t* const xq = reinterpret_cast<int8_t*>(xh_);
             float2* const xqs = reinterpret_cast<float2*>(xq + H);
             k_xh_to_q<64><<<m, 160, 0, st_>>>(xh_, xq, xqs);
-            // FLASH_MOE_QW=1: half-group blocks (128 registers, 2 blocks / SM, room next to the comm stream's blocks)
-            static const int qw = getenv("FLASH_MOE_QW") ? atoi(getenv("FLASH_MOE_QW")) : 2;
+            // half-group blocks (WT = 1: 128 registers, 2 blocks / SM) by default. The whole-group variant (FLASH_MOE_QW=2,
+            // 248 registers, 1 block / SM) gives different activations for a few tokens now and then when it runs next
+            // to the engine's other streams (det 16K in-process repeats: 4/10 differ on 3 GPUs, 6/6 on 2; the same
+            // launch twice on unchanged inputs differed). Standalone it is deterministic and racecheck / synccheck /
+            // memcheck are clean; L2-only scale loads (gu_q_job) fixed 3 GPUs but not 2 (3/8 differ, some runs abort).
+            // WT = 1: 10/10 and 8/8 identical, 16K 3 GPUs 2750.6 vs 2751.3 ms (rc3_fixes_2026-10-27).
+            static const int qw = getenv("FLASH_MOE_QW") ? atoi(getenv("FLASH_MOE_QW")) : 1;
+            static const bool xqchk = getenv("FLASH_DBG_XQCHK") && atoi(getenv("FLASH_DBG_XQCHK"));  // debug: inputs changed?
+            const int li_dbg = (int)(&L - L_.data());
+            if (xqchk && xqsnap_) {
+                CUDA_CHECK(cudaMemcpyAsync(xqsnap_, xh_, (size_t)m * H * 2, cudaMemcpyDeviceToDevice, st_));
+                CUDA_CHECK(cudaMemcpyAsync((char*)xqsnap_ + (size_t)pfbn_ * H * 2, pftl_, (size_t)m * (TOPK + 1) * 4, cudaMemcpyDeviceToDevice, st_));
+            }
             if (qw == 1) k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
             else k_moe_gu_q<64><<<mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+            static const bool gu2x = getenv("FLASH_DBG_GU2X") && atoi(getenv("FLASH_DBG_GU2X"));  // debug: gate_up twice
+            if (gu2x && actsnap_) {
+                const size_t rows = pfact_bytes_ / (GRP * 2);
+                CUDA_CHECK(cudaMemcpyAsync(actsnap_, pfact_, pfact_bytes_, cudaMemcpyDeviceToDevice, st_));
+                if (qw == 1) k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+                else k_moe_gu_q<64><<<mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+                k_cmp_rows<<<(unsigned)rows, 64, 0, st_>>>(reinterpret_cast<const unsigned*>(pfact_), reinterpret_cast<const unsigned*>(actsnap_), (int)rows, GRP / 2, xqrec_, li_dbg, 2);
+            }
+            if (xqchk && xqsnap_) {
+                k_cmp_rows<<<m, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), reinterpret_cast<const unsigned*>(xqsnap_), m, H / 2, xqrec_, li_dbg, 0);
+                k_cmp_rows<<<1, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(pftl_), reinterpret_cast<const unsigned*>((char*)xqsnap_ + (size_t)pfbn_ * H * 2), 1, m * (TOPK + 1), xqrec_, li_dbg, 1);
+            }
         } else if (gu2) k_moe_gu_pf2<<<std::min(mj, 1024), 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xh_, pfact_);
         else k_moe_gu_pf<<<dim3(2 * GRP / 16, mj), 128, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xh_, pfact_);
         KCHK("k_moe_gu_pf");
@@ -2587,7 +2734,7 @@ void Worker::head_sample(int m, int* dst) {  // full lm_head, local top-64 -> ga
     topk_local(logits_, nv, m, 0, cand_, st_);
     k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_);
     allgather_small(cand_, m * kTopK * 2, cand_all_, comm_, p_.rank, ctr_, st_);
-    sample_rows(cand_all_, p_.ngpu, m, sp_, dst, st_);
+    sample_rows(cand_all_, p_.ngpu, m, sp_, dst, st_, vchain_ && m > 1);
 }
 
 // the bound slot's parameters; each slot keeps its own (batched steps sample every row with its slot's, see head_sample_b)
@@ -2602,6 +2749,7 @@ void Worker::set_sampling(float temperature, float top_p, int top_k, float min_p
     h.min_p = min_p;
     h.seed = seed;
     h.counter = 0;
+    h.pen = pen_of(cur_slot_);  // penalty off until set_penalty
     CUDA_CHECK(cudaMemcpy(sp_, &h, sizeof(h), cudaMemcpyHostToDevice));
     if (spslot_) {
         CUDA_CHECK(cudaMemcpy(spslot_ + cur_slot_, &h, sizeof(h), cudaMemcpyHostToDevice));
@@ -2609,6 +2757,34 @@ void Worker::set_sampling(float temperature, float top_p, int top_k, float min_p
         const int on = sampling_;
         CUDA_CHECK(cudaMemcpy(sson_d_ + cur_slot_, &on, 4, cudaMemcpyHostToDevice));
     }
+}
+
+void Worker::set_penalty(float presence, float frequency, const int* seed, int n) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    const float pf[2] = {presence, frequency};
+    if (presence != 0.f || frequency != 0.f) {
+        n = std::max(0, std::min(n, kPenSeedMax));
+        if (n > 0) CUDA_CHECK(cudaMemcpy(pseed_d_, seed, (size_t)n * 4, cudaMemcpyHostToDevice));
+        pen_reset(pen_of(cur_slot_), VOCAB, pseed_d_, n, st_);
+    }
+    CUDA_CHECK(cudaMemcpyAsync((char*)sp_ + offsetof(SampleParams, presence), pf, 8, cudaMemcpyHostToDevice, st_));
+    if (spslot_)
+        CUDA_CHECK(cudaMemcpyAsync((char*)(spslot_ + cur_slot_) + offsetof(SampleParams, presence), pf, 8,
+                                   cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+
+void Worker::pen_host(const int* toks, int n, int pos) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    for (int i = 0; i < n; i += 16) pen_commit_host(sp_, toks + i, std::min(16, n - i), pos + i, st_);
+}
+
+void Worker::set_no_lookup(int slot, bool off) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    const int v = off ? 1 : 0;
+    CUDA_CHECK(cudaMemcpyAsync(nolk_d_ + slot, &v, 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
 void Worker::head_sample_b(int m, int* dst) {  // as head_sample, every row with its slot's parameters (greedy rows: argmax)
@@ -2888,6 +3064,11 @@ void Worker::set_agpeer(int g, const Worker* w) {
 // (this card's NUMA node: its own D2H copies stay local)
 void Worker::alloc_staging() {
     if (comm_.xfer == kXferP2P || p_.ngpu < 2) return;
+    if (p_.rank == 0) {
+        const char* ml = getenv("CUDA_MODULE_LOADING");
+        fprintf(stderr, "[flash] staged transfers: CUDA module loading %s%s\n", ml ? ml : "(driver default)",
+                ml && strcmp(ml, "EAGER") ? " (not EAGER: the first-launch deadlock guard is off)" : "");
+    }
     xout_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
     xoutc_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
     xdummy_ = (unsigned*)dalloc(4 * 4);
@@ -3090,7 +3271,8 @@ bool Worker::hcsp_ok(int n) const {
     static const bool on = !getenv("FLASH_HCSP") || atoi(getenv("FLASH_HCSP"));
     static const bool ov = (!getenv("FLASH_AROV") || atoi(getenv("FLASH_AROV"))) && !g_kchk;
     static const bool fused = !getenv("FLASH_ARHC") || atoi(getenv("FLASH_ARHC"));
-    if (!on || !ov || !fused || p_.ngpu < 2 || dbgh_ || !agpf_[0] || n <= PFM) return false;
+    static const bool dbg_sp = getenv("FLASH_DBGHASH") && atoi(getenv("FLASH_DBGHASH")) == 2;  // hashes on the sp path too
+    if (!on || !ov || !fused || p_.ngpu < 2 || (dbgh_ && !dbg_sp) || !agpf_[0] || n <= PFM) return false;
     for (int g = 0; g < p_.ngpu; g++) if (!agpf_[g] || !agdst_[0][g]) return false;
     for (int off = 0; off < n; off += PFM)
         if (!allreduce_hc_ok(comm_, std::min(PFM, n - off), H)) return false;
@@ -3324,6 +3506,20 @@ int Worker::pf_units(int n, int* ub, int* cb) const {
     return nu;
 }
 
+// eager batch with staged transfers (FLASH_COMM=ce / host; the first use of a graph key runs eagerly): keep the work
+// enqueued ahead of the device to one mixer chunk / MoE part. Every exchange issues peer copies from the host; with the
+// device queue full a cudaMemcpyAsync blocks the issuing thread while the device spins on a peer's flags whose host is
+// blocked the same way (a cross-card deadlock: gdb showed a worker thread inside cudaMemcpyAsync in row_ag; qfn_prefill_r4).
+// The sync waits only for work whose peer half every card has already issued (all cards enqueue the same sequence).
+// Captured graphs (every later batch of the key) are unaffected.
+void Worker::eager_stage_sync() {
+    static const bool on = getenv("FLASH_CE_EAGER_SYNC") && atoi(getenv("FLASH_CE_EAGER_SYNC"));  // opt-in until validated
+    if (!on || !xstage_) return;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(st_, &cs));
+    if (cs == cudaStreamCaptureStatusNone) { CUDA_CHECK(cudaStreamSynchronize(st_)); CUDA_CHECK(cudaStreamSynchronize(cst_)); }
+}
+
 void Worker::trunk_batch_sp(int n, unsigned selmask) {
     static const bool units_on = !getenv("FLASH_PFU") || atoi(getenv("FLASH_PFU"));  // 0: per-chunk collectives (before r2)
     if (!units_on) { trunk_batch_sp1(n, selmask); return; }
@@ -3418,6 +3614,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         }
         if (L.full) qsa(L, li, 0, mc);
         else gdn(L, li, 0, mc);
+        eager_stage_sync();
     };
     auto last_row_R = [&](cudaStream_t s, int ch) {  // the last row's residual (owned by one rank of the last unit)
         const int u = nu - 1;
@@ -3473,16 +3670,27 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         for (int p = 0; p < np; p++) {  // MoE parts: units [pb[p], pb[p + 1])
             const int u0 = pb[p], u1 = pb[p + 1], off = ub[u0], mc = ub[u1] - off;
             for (int u = u0; u < u1; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));
+            static const int dbg_ser = getenv("FLASH_DBG_MOESER") ? atoi(getenv("FLASH_DBG_MOESER")) : 0;  // debug
+            if (dbg_ser && p > 0) for (int u = pb[p - 1]; u < u0; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));
             reset_rows();
             at_rows(off);
             if (!spm) hc_read(L.hcm, mc, true);
             if (p == 0 && pfs_use_) CUDA_CHECK(cudaStreamWaitEvent(st_, pfs_cp_[li & 1], 0));
+            if (dbgh_) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), (size_t)mc * H / 2, dbgh_ + li * DBGK + 3);
+            if (rowh_) k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 0);
             moe(L, mc);
+            if (rowh_) {
+                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 1);
+                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), H, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 2);
+                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(gsel_), TOPK, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 3);
+                k_row_l1<<<mc, 256, 0, st_>>>(part_, H, mc, rowl1_ + (size_t)li * rowh_n_ + off);
+            }
             CUDA_CHECK(cudaEventRecord(evp_[u0], st_));
             for (int u = u0; u < u1; u++) {
                 if (li == 0) ar_unit(u, evp_[u0], false, nullptr, li);  // layer 1's mixer input (PLE) needs every row's residual
                 else ar_unit(u, evp_[u0], true, li + 1 < LAYERS ? &L_[li + 1].hca : nullptr, li);
             }
+            eager_stage_sync();
         }
         reset_rows();
         if (pfs_use_ && li + 2 < LAYERS) {
@@ -3490,6 +3698,12 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             CUDA_CHECK(cudaStreamWaitEvent(dst_, pfs_used_[li & 1], 0));
             pfs_copy(li + 2);
         }
+        // eager batch with staged transfers (FLASH_COMM=ce / host; the first use of a graph key runs eagerly): bound the
+        // work enqueued ahead of the device to one layer. Every exchange issues peer copies from the host; with the device
+        // queue full a cudaMemcpyAsync blocks the issuing thread while the device spins on a peer's flags whose host is
+        // blocked the same way (cross-card deadlock, gdb: a worker thread inside cudaMemcpyAsync in row_ag; qfn_prefill_r4).
+        // The sync waits only for work whose peer half every card has already issued. Graph replays are unaffected.
+        eager_stage_sync();
     }
     for (int u = 0; u < nu; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));  // join
     ypend_ = false;
@@ -3828,6 +4042,15 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
     if (pft_host)
         fprintf(stderr, "[pft] rank %d pos %d n %d: tick %.2f ms, prep %.2f, launch %.2f, sync %.2f\n", p_.rank, pos, n, (th1 - th0) * 1e3,
                 (th2 - th1) * 1e3, (th3 - th2) * 1e3, (now_s() - th3) * 1e3);
+    if (qnan_rec_) {
+        for (int k = 0; k < qnan_n_; k++)
+            if (qnan_rec_[4 * k] || qnan_rec_[4 * k + 1] || qnan_rec_[4 * k + 2]) {
+                fprintf(stderr, "[qpf_nan] rank %d first non-finite at check %d (layer %d chunk pos %d, exchange %u): own q %u, received q %u, attention out %u\n",
+                        p_.rank, k, qnan_meta_[k].first, qnan_meta_[k].second, qnan_rec_[4 * k + 3], qnan_rec_[4 * k], qnan_rec_[4 * k + 1], qnan_rec_[4 * k + 2]);
+                break;
+            }
+        fprintf(stderr, "[qpf_nan] rank %d: %d checks\n", p_.rank, qnan_n_);
+    }
     static const bool ecv = getenv("FLASH_EC_VERIFY") && atoi(getenv("FLASH_EC_VERIFY"));
     if (ecv) { char w[48]; snprintf(w, sizeof(w), "after prefill batch pos %d", pos); ec_verify(w); }
     if (selst_) {
@@ -3928,9 +4151,12 @@ void Worker::spec_body(int k, bool lookup, int kd) {
     } else
     k_ngram<<<m, 256, 0, st_>>>(vtok_, hist2_, ngp_, pler_);
     KCHK("k_ngram");
+    vchain_ = true;  // verify rows (penalty: row i continues the sampled rows < i)
     trunk(m, vtok_);
+    vchain_ = false;
     k_accept<<<1, 32, 0, st_>>>(vtok_, otok_, k, posd_, mposd_, acc_, hist2_, em_);  // otok_: argmax or sampled rows
     KCHK("k_accept");
+    if (sampling_) pen_commit(sp_, em_, posd_, st_);  // the emitted tokens end at the new position
     mtp_core(m, false, otok_, motok_, acc_);
     k_draft0<<<1, 32, 0, st_>>>(motok_, acc_, dr_);
     // lookup steps: no MTP draft chain (the fill's draft is enough for a k=1 step); constrained: kd drafts

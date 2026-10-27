@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agents import Tracker
+import loop_guard
 from engine import Engine
 import engine_stats
 from steering import DEFAULT as STEER_DEFAULT, resolve_steering
@@ -385,6 +386,14 @@ class Generator:
         self.gen_turns = collections.OrderedDict()  # see remember_turn
         self.im_start = self.tok.token_to_id("<|im_start|>")
         self.im_end_nl = self.tok.encode("<|im_end|>\n", add_special_tokens=False).ids
+        # loop guard (server/loop_guard.py): the repeated reply's tokens seed the penalty, without special tokens
+        # (ids from <|endoftext|> on) and whitespace-only pieces
+        self.asst_ids = self.tok.encode("assistant\n", add_special_tokens=False).ids
+        self.im_end = self.tok.token_to_id("<|im_end|>")
+        self.special_min = self.tok.token_to_id("<|endoftext|>") or 1 << 30
+        wsch = set("ĠĊĉčĀ \t\n")  # byte-level BPE spellings of whitespace
+        self.ws_ids = {i for t, i in self.tok.get_vocab().items() if i < self.special_min and t and set(t) <= wsch}
+        self.guards = {"triggers": 0, "recent": []}  # /api/stats loop_guard
         self.seg_lock = threading.Lock()
         # end of turn: generation_config.json eos_token_id ([<|im_end|>, <|endoftext|>] for both
         # models) plus those two tokens by name
@@ -427,7 +436,8 @@ class Generator:
         self.agents = Tracker(override=getattr(args, "main_agent_re", None))
         self.sched = {"main_pauses": 0, "main_cutins": 0, "backfills": 0}
         snap = self.metrics.snapshot
-        self.metrics.snapshot = lambda: dict(snap(), agents=self.agents.stats(), sched=dict(self.sched))
+        self.metrics.snapshot = lambda: dict(snap(), agents=self.agents.stats(), sched=dict(self.sched),
+                                             loop_guard=self.guard_stats())
         if args.metrics_port:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if os.environ.get("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
@@ -442,7 +452,7 @@ class Generator:
         self.dirty = False  # slots changed since the last persist
         threading.Thread(target=self._loop, daemon=True).start()
 
-    def prompt(self, messages, tools, kw, meta=None, track=False):
+    def prompt(self, messages, tools, kw, meta=None, track=False, guard_on=True):
         """Returns (ids, affinity): affinity = hash of the system prompt, so the main agent and
         each kind of subagent keep returning to their own sequence slot. ids.hint = position of
         the first user turn (end of the system part). track: a generation request (not a token
@@ -470,6 +480,9 @@ class Generator:
                 else:
                     parts.append({"type": "text", "text": "[image omitted: this server runs without vision]"})
             m["content"] = parts
+        guard = self.loop_check(messages, info) if track and guard_on else None
+        if guard and self.args.loop_guard_note:  # the repeated call's result tells the model it is looping
+            messages, guard["note"] = loop_guard.add_note(messages, guard["turns"])
         messages = self.clean_history(messages)
         text = self.tmpl.render(messages, tools, **kw)
         sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
@@ -481,7 +494,7 @@ class Generator:
             with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
                 f.write(text)
         ids = self.encode(text)
-        ids.label, ids.agent = label, info
+        ids.label, ids.agent, ids.guard = label, info, guard
         if images:
             from vision import load_image_bytes
             t0 = time.time()
@@ -489,10 +502,47 @@ class Generator:
                 exp, emb, rope3, delta = self.vision.expand(list(ids), [load_image_bytes(s) for s in images])
             hint = ids.hint
             ids = Ids(exp)
-            ids.hint, ids.mm, ids.label, ids.agent = hint, (emb, rope3, delta), label, info
+            ids.hint, ids.mm, ids.label, ids.agent, ids.guard = hint, (emb, rope3, delta), label, info, guard
             ids.img = (len(images), emb.shape[0])
             print(f"{len(images)} image(s): {emb.shape[0]} tokens, encoded in {time.time() - t0:.2f}s", flush=True)
         return ids, affinity
+
+    def loop_check(self, messages, info):
+        """Cross-turn loop guard (server/loop_guard.py): None, or the guard of this request's turn."""
+        a = self.args
+        if getattr(a, "loop_guard_turns", 0) <= 0:
+            return None
+        try:
+            k = loop_guard.streak(messages)
+        except Exception as ex:  # a guard must never fail a request
+            print(f"loop guard: {ex!r}", flush=True)
+            return None
+        if k < a.loop_guard_turns:
+            return None
+        pres = a.loop_guard_penalty if k < 2 * a.loop_guard_turns else max(a.loop_guard_penalty, 2.0)
+        conv = getattr(getattr(info, "conv", None), "id", None)
+        sess = getattr(getattr(info, "session", None), "key", "") or ""
+        return {"turns": k, "presence": pres, "conv": conv, "session": sess[2:10],
+                "main": bool(getattr(info, "main", False))}
+
+    def guard_note(self, guard):
+        """A guarded turn starts: warning line, diag log, /api/stats (qetop)."""
+        ev = {"t": time.time(), "turns": guard["turns"], "conversation": guard["conv"], "session": guard["session"],
+              "main": guard["main"], "presence": guard["presence"]}
+        with self.seg_lock:
+            self.guards["triggers"] += 1
+            self.guards["recent"] = (self.guards["recent"] + [ev])[-8:]
+        print(f"WARNING loop guard: conversation {guard['conv']} (session {guard['session'] or '-'}) repeated the "
+              f"same turn {guard['turns']} times: next turn with presence penalty {guard['presence']:.2f} on the "
+              f"repeated reply ({guard.get('seed', 0)} tokens), lookup drafts off"
+              f"{', note appended to the tool result' if guard.get('note') else ''}", flush=True)
+        diag("LOOP_GUARD", f"conversation {guard['conv']} session {guard['session']} turns {guard['turns']} "
+             f"presence {guard['presence']:.2f} note {int(bool(guard.get('note')))}")
+
+    def guard_stats(self):
+        with self.seg_lock:
+            return {"turns": getattr(self.args, "loop_guard_turns", 0), "triggers": self.guards["triggers"],
+                    "recent": list(self.guards["recent"])}
 
     def clean_history(self, messages):
         """Model-specific history fixes before the template (--merge-system, --drop-empty-turns)."""
@@ -835,6 +885,7 @@ class Job:
         self.glk = None  # TokenLookup of a constrained reply (grammar.py)
         self.done = threading.Event()
         self.error, self.stats, self.slot = None, None, -1
+        self.penalty, self.guarded = None, 0  # (presence, frequency) in force; loop guard: repeated turns before
         self.finished = False
         self.t_enq, self.est, self.t_est = time.time(), None, 0.0  # scheduler: prefill-cost estimate
         self.cut_at = None  # prefill position at the last cut-in by a short request (fairness)
@@ -863,8 +914,28 @@ class Job:
                                   getattr(self.ids, "mm", None))
         # after start_begin: the engine applies sampling parameters to its current slot, which
         # is this request's only now (before, they landed on whichever sequence was current)
-        e.set_sampling(temp, p.get("top_p") or d["top_p"], p.get("top_k") or d["top_k"],
-                       p.get("min_p") or d["min_p"], p.get("seed") or int(time.time() * 1e6))
+        # presence / frequency penalty: the request's, else the server default for sampled requests (greedy ones
+        # stay greedy: deterministic checks); the loop guard raises presence and seeds it with the repeated reply
+        pres, freq = p.get("presence_penalty"), p.get("frequency_penalty")
+        explicit = pres is not None or freq is not None
+        pres = float(pres if pres is not None else (getattr(g.args, "presence_penalty", 0.0) if temp > 0 else 0.0))
+        freq = float(freq if freq is not None else (getattr(g.args, "frequency_penalty", 0.0) if temp > 0 else 0.0))
+        guard = getattr(self.ids, "guard", None)
+        seed = []
+        if guard is not None:
+            pres = max(pres, guard["presence"])
+            seed = loop_guard.last_reply_tokens(self.ids, g.im_start, g.asst_ids, g.im_end, g.special_min, g.ws_ids)
+        top_p, top_k, min_p = p.get("top_p") or d["top_p"], p.get("top_k") or d["top_k"], p.get("min_p") or d["min_p"]
+        if temp <= 0 and (pres or freq) and (explicit or guard is not None):
+            temp, top_p, top_k, min_p = 1.0, 1.0, 1, 0.0  # greedy with a penalty: the penalised argmax
+        e.set_sampling(temp, top_p, top_k, min_p, p.get("seed") or int(time.time() * 1e6))
+        self.penalty = (pres, freq) if temp > 0 and (pres or freq) else None
+        if self.penalty and not e.set_penalty(pres, freq, seed):
+            self.penalty = None
+        if guard is not None:
+            e.set_no_lookup(self.slot, True)
+            self.guarded = guard["turns"]
+            g.guard_note(dict(guard, seed=len(seed)))
         e.set_prio(self.slot, self.prio)
         self.grammar = self.p.get("grammar")
         self.grammar_s = 0.0
@@ -1063,6 +1134,10 @@ class Job:
                 self.stats["drafts"] = ds  # [steps, MTP drafted, accepted, lookup drafted, accepted]
             if trimmed is not None:
                 self.stats["stop_trim"] = trimmed
+            if self.penalty:
+                self.stats["penalty"] = self.penalty
+            if self.guarded:
+                self.stats["loop_guard"] = self.guarded
             if self.grammar is not None:
                 self.stats["grammar_s"] = self.grammar_s
                 self.stats["grammar_steps"] = self.gsteps
@@ -1383,14 +1458,18 @@ def build_app(gen: Generator, args):
         except ValueError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "steering"}}, status_code=400)
-        ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True)
+        ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True,
+                              guard_on=body.get("loop_guard") is not False)
+        if body.get("loop_guard") is False:  # per request off-switch of the cross-turn loop guard
+            ids.guard = None
         stop = body.get("stop")
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "min_p": body.get("min_p"), "seed": body.get("seed"),
                   "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens"),
                   "stop": [stop] if isinstance(stop, str) else stop,
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
-                  "grammar": grammar, "steering_sel": steer}
+                  "grammar": grammar, "steering_sel": steer,
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(kw.get("enable_thinking", True))
 
@@ -1498,10 +1577,13 @@ def build_app(gen: Generator, args):
                                 status_code=400)
         msgs = anthropic_to_messages(body)
         prev = dict(msgs[-1]) if msgs else None  # before prompt() rewrites image parts
-        ids, aff = gen.prompt(msgs, tools, kw, body.get("metadata"), track=True)
+        ids, aff = gen.prompt(msgs, tools, kw, body.get("metadata"), track=True, guard_on=body.get("loop_guard") is not False)
+        if body.get("loop_guard") is False:  # per request off-switch of the cross-turn loop guard
+            ids.guard = None
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
-                  "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer}
+                  "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer,
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         mid = "msg_" + uuid.uuid4().hex[:24]
         parser = Parser(kw.get("enable_thinking", True))
         stop_map = {"stop": "end_turn", "length": "max_tokens"}
@@ -1710,6 +1792,21 @@ def parse_args(argv=None):
                          "(overrides the automatic detection; env QE_MAIN_AGENT_RE)")
     ap.add_argument("--loop-guard-tokens", type=int, default=600,
                     help="end a reply whose last N+ tokens are one short fragment repeated (0 = off)")
+    ap.add_argument("--presence-penalty", type=float, default=float(os.environ.get("QE_PRESENCE_PENALTY", "0")),
+                    help="presence penalty of sampled requests that send none (Claude Code's Anthropic API never "
+                         "does); env QE_PRESENCE_PENALTY")
+    ap.add_argument("--frequency-penalty", type=float, default=float(os.environ.get("QE_FREQUENCY_PENALTY", "0")),
+                    help="frequency penalty of sampled requests that send none; env QE_FREQUENCY_PENALTY")
+    ap.add_argument("--loop-guard-turns", type=int, default=int(os.environ.get("QE_LOOP_GUARD_TURNS", "3")),
+                    help="cross-turn loop guard: after N consecutive identical (reply, result) turns of a "
+                         "conversation the next turn runs with --loop-guard-penalty on the repeated reply's tokens "
+                         "and no lookup drafts (0 = off); env QE_LOOP_GUARD_TURNS")
+    ap.add_argument("--loop-guard-penalty", type=float,
+                    default=float(os.environ.get("QE_LOOP_GUARD_PENALTY", "1.5")),
+                    help="presence penalty of a guarded turn (2.0 from 2N repeated turns); env QE_LOOP_GUARD_PENALTY")
+    ap.add_argument("--loop-guard-note", type=int, default=int(os.environ.get("QE_LOOP_GUARD_NOTE", "1")),
+                    help="guarded turn: append a server note to the latest tool result (the same call returned the "
+                         "same result N times, change the approach); 0 = off; env QE_LOOP_GUARD_NOTE")
     ap.add_argument("--metrics-port", type=int, default=9393,
                     help="live monitoring (dashboard, qetop, /metrics) on this port; 0 = off")
     ap.add_argument("--metrics-host", default="127.0.0.1")

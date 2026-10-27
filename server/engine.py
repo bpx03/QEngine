@@ -73,6 +73,8 @@ SIGS = {
     "qe_set_steering_ex": (c_int, [c_void_p, c_int, c_float, c_int, c_int, c_int]),
     "qe_steer_info": (c_char_p, [c_void_p]),
     "qe_capture": (c_int, [c_void_p, P_int, c_int, c_int, ctypes.POINTER(c_float)]),
+    "qe_set_penalty": (None, [c_void_p, c_float, c_float, P_int, c_int]),
+    "qe_set_no_lookup": (None, [c_void_p, c_int, c_int]),
 }
 REQUIRED = ("qe_create", "qe_destroy", "qe_max_context", "qe_set_sampling", "qe_start3", "qe_spec_step",
             "qe_last_reused", "qe_last_slot", "qe_release")
@@ -151,6 +153,21 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
     def set_sampling(self, temperature, top_p=1.0, top_k=40, min_p=0.0, seed=0):
         self.lib.qe_set_sampling(self.h, float(temperature), float(top_p), int(top_k),
                                  float(min_p), int(seed))
+
+    def set_penalty(self, presence=0.0, frequency=0.0, seed=()):
+        """Presence / frequency penalty of the current slot (after set_sampling, which turns it off; sampled
+        requests only). seed: token ids that count as already generated (each once). False: not supported."""
+        if "qe_set_penalty" not in self.fns:
+            return False
+        seed = list(seed)[-8192:]
+        arr = (ctypes.c_int * max(1, len(seed)))(*seed)
+        self.lib.qe_set_penalty(self.h, float(presence), float(frequency), arr, len(seed))
+        return True
+
+    def set_no_lookup(self, slot, off=True):
+        """No lookup drafts for the slot's reply (until its next start)."""
+        if "qe_set_no_lookup" in self.fns:
+            self.lib.qe_set_no_lookup(self.h, int(slot), int(bool(off)))
 
     def start(self, ids, k=3, affinity=0, hint=0, mm=None):
         """Prefill (reusing cached prefixes) in the best sequence slot; affinity is a 64-bit

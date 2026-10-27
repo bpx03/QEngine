@@ -242,6 +242,8 @@ struct Slot {
     int rb_pos = -1, rb_rows = 0;
     bool want_drafts = false;
     bool con = false;         // grammar-constrained (qe_constrain); its host buffers live in FE (mask_host / spec_io)
+    bool pen = false;         // presence / frequency penalty on (qe_set_penalty): host-known tokens go to its counts
+    bool nolk = false;        // lookup drafts off for this reply (qe_set_no_lookup: the server's loop guard)
     unsigned long long used = 0;
     // draft statistics since the slot was created (qe_draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
     long long ds[5] = {0, 0, 0, 0, 0};
@@ -1219,6 +1221,25 @@ void qe_set_sampling(void* p, float temperature, float top_p, int top_k, float m
     // the bound slot's parameters (the server calls this right after start_begin, which binds the request's slot);
     // every slot keeps its own (per-slot sampling in batched steps, reloaded when a slot is bound)
     for (int r = 0; r < e->ng; r++) e->W[r]->set_sampling(temperature, top_p, top_k, min_p, seed);
+    if (e->cs >= 0) e->S().pen = false;
+}
+
+// presence / frequency penalty of the bound slot (call after qe_set_sampling, which turns it off): the counts
+// restart with the distinct seed tokens (the server's loop guard: the repeated reply), then follow the reply
+void qe_set_penalty(void* p, float presence, float frequency, const int* seed, int n) {
+    FE* e = (FE*)p;
+    e->drain();
+    for (int r = 0; r < e->ng; r++) e->W[r]->set_penalty(presence, frequency, seed, n);
+    if (e->cs >= 0) e->S().pen = presence != 0.f || frequency != 0.f;
+}
+
+// lookup drafts off / on for the slot's reply (reset by the next start of the slot)
+void qe_set_no_lookup(void* p, int slot, int off) {
+    FE* e = (FE*)p;
+    e->drain();
+    if (slot < 0 || slot >= (int)e->sl.size()) return;
+    e->sl[slot].nolk = off != 0;
+    for (int r = 0; r < e->ng; r++) e->W[r]->set_no_lookup(slot, off != 0);
 }
 
 // a slot for a new sequence of n tokens (free, or the least valuable idle one evicted to the archive), with its region
@@ -1402,6 +1423,11 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     q.want_drafts = false;
     // a new request starts unconstrained, also on the devices (evict_slot / qe_reset clear only the host flag)
     q.con = false;
+    q.pen = false;  // set_sampling (next) turns the penalty off; qe_set_penalty after it
+    if (q.nolk) {
+        q.nolk = false;
+        for (int r = 0; r < e->ng; r++) e->W[r]->set_no_lookup(y, false);
+    }
     // the slot's steering flag follows its conversation's key (device flag at a fixed address: no graph changes)
     int sv, smd, slo, shi;  // the slot's steering follows its conversation's key
     float ssc;
@@ -1551,6 +1577,11 @@ int qe_start_finish_slot(void* p, int slot) {
     spec_start(e, pf.nxt, pf.drafts, pf.ids.data(), n);
     Slot& q = e->S();
     q.pending = pf.nxt;
+    if (q.pen) {  // the first token (sampled at the prompt end) sits at position n
+        const int t = pf.nxt;
+        e->job = [&](int r) { e->W[r]->pen_host(&t, 1, n); };
+        e->run();
+    }
     q.active = true;
     q.remain = -1;
     if (q.con) {  // the drafts made at the prompt end, for the caller to check
@@ -1588,7 +1619,7 @@ int qe_start3(void* p, const int* ids, int n, int k, unsigned long long affinity
 
 // the next step's shape: lookup drafts (found on the device by the last step) or an MTP step; false: no room
 static bool next_step(FE* e, int& ks, bool& lk, bool ahead = false) {
-    lk = e->k > 0 && e->lk_next > 0;
+    lk = e->k > 0 && e->lk_next > 0 && !e->S().nolk;
     ks = lk ? e->lk_next : e->k;  // after a lookup step the chain ran on the device when needed
     const int hn = e->S().hist.size();
     if (lk && hn + ks + 2 > e->ctx) { lk = false; ks = e->k; }
@@ -1610,6 +1641,10 @@ int qe_spec_step(void* p, int* out) {
         e->run();
         const int pos = q.hist.size();
         const int t = e->forward({q.pending}, pos);
+        if (q.pen) {
+            e->job = [&](int r) { e->W[r]->pen_host(&t, 1, pos + 1); };
+            e->run();
+        }
         q.pending = t;
         out[0] = t;
         q.count_step(false, 0, 1);

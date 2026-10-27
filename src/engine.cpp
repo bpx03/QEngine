@@ -1987,6 +1987,16 @@ void Engine::set_sampling(float temperature, float top_p, int top_k, float min_p
     samp_ = p;
     samp_on_ = on;
     for (auto& w : workers_) w->set_sampling(p, on);
+    seqs_[cur_].pen = false;
+}
+
+void Engine::set_penalty(float presence, float frequency, const int* seed, int n) {
+    pool_->run([&](int r) { workers_[r]->set_penalty(presence, frequency, seed, n); });
+    seqs_[cur_].pen = presence != 0.f || frequency != 0.f;
+}
+
+void Engine::set_no_lookup(int slot, bool off) {
+    if (slot >= 0 && slot < (int)seqs_.size()) seqs_[slot].no_lookup = off;
 }
 
 void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
@@ -2217,6 +2227,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     const auto t2 = now();
     for (auto& w : workers_) w->set_sampling(samp_, samp_on_);
     Seq& q = seqs_[slot];
+    q.pen = q.no_lookup = false;  // per reply (set_penalty / set_no_lookup after this start)
     if (q.sk != sk) {  // another key: the old content is archived (above) and not reused
         q.pos = 0;
         q.seq.clear();
@@ -2581,6 +2592,7 @@ int Engine::start_finish_slot(int slot) {
     CUDA_CHECK(cudaSetDevice(workers_[0]->device));
     CUDA_CHECK(cudaMemcpy(&tok, workers_[0]->out_tok_ + last_m - 1, 4, cudaMemcpyDeviceToHost));
     q.last_tok = q.pending = tok;
+    if (q.pen) pool_->run([&](int r) { workers_[r]->pen_host(&tok, 1, n); });  // the first token sits at n
     q.k_avail = pf.kstart;
     lk_slot_ = -1;
     lkb_inval(pf.slot);
@@ -2828,7 +2840,7 @@ void Engine::launch_batch(int buf, bool ahead) {
         bool cand[kMaxBatch] = {};
         for (int i = 0; i < n; i++) {
             const Seq& q = seqs_[bslots_[i]];
-            if (!lkb_mode_[bslots_[i]] || q.constrained || q.want_drafts) continue;
+            if (!lkb_mode_[bslots_[i]] || q.constrained || q.want_drafts || q.no_lookup) continue;
             cand[i] = true;
             nlk++;
             base_lk += kvs[i] + 1;
@@ -3138,6 +3150,10 @@ int Engine::spec_step(int* out) {
     if (k_ == 0) {  // plain decoding
         q.seq.push_back(q.pending);
         out[0] = q.last_tok = q.pending = decode(q.last_tok);
+        if (q.pen) {
+            const int t = out[0], at = q.pos;  // decode advanced pos to the new token's
+            pool_->run([&](int r) { workers_[r]->pen_host(&t, 1, at); });
+        }
         q.count_step(false, 0, 1);
         return 1;
     }
@@ -3154,7 +3170,7 @@ int Engine::spec_step(int* out) {
     CHECK(q.pos + k_ + 1 <= q.max_t, "context full");
     // lookup drafts (QE_LOOKUP): the device history must be this sequence's; a lookup step is launched once the
     // previous step's result is known (no step queued ahead while the text is being copied)
-    const bool lk_ok = lk_on_ && !q.constrained && !q.want_drafts;
+    const bool lk_ok = lk_on_ && !q.constrained && !q.want_drafts && !q.no_lookup;
     if (lk_ok && !inflight_ && lk_slot_ != cur_) {
         std::vector<int> h(q.seq);
         h.push_back(q.pending);

@@ -281,6 +281,13 @@ public:
     void start_ngram_stage(const HostTables* ht);
     // temperature <= 0: greedy; else sampled verification rows / first token (same seed on every card)
     void set_sampling(float temperature, float top_p, int top_k, float min_p, unsigned long long seed);
+    // presence / frequency penalty of the bound slot (after set_sampling, which turns it off); its counts restart
+    // with the distinct seed tokens. pen_host: host-known tokens of the bound slot at positions pos.. (first token,
+    // steps without drafts)
+    void set_penalty(float presence, float frequency, const int* seed, int n);
+    void pen_host(const int* toks, int n, int pos);
+    // per slot: lookup drafts off (device flag read by the batched lookup pick; the single path asks the host)
+    void set_no_lookup(int slot, bool off);
     void set_prev_m(int n) { prev_m_ = n; }
     void set_cold(const std::vector<std::vector<int>>& c) { cold_ = c; }
     // per-token routing probability [48][512] (router trace): cold groups seed the expert cache hottest first
@@ -418,6 +425,12 @@ private:
     std::vector<char> sson_;          // per slot: sampling on (temperature > 0)
     int* sson_d_ = nullptr;           // the same flags on the device (batched sampling)
     bool bsamp_ = false;              // the batched step being built samples (some slot has temperature > 0)
+    PenState* pen_ = nullptr;         // per slot penalty counts (pen_state_bytes(VOCAB) each)
+    PenState* pen_of(int s) const { return (PenState*)((char*)pen_ + (size_t)s * pen_state_bytes(VOCAB)); }
+    int* nolk_d_ = nullptr;           // per slot: 1 = no lookup drafts (batched steps)
+    static constexpr int kPenSeedMax = 8192;
+    int* pseed_d_ = nullptr;          // set_penalty's seed tokens (device, kPenSeedMax)
+    bool vchain_ = false;             // trunk rows are verify rows of one sequence (penalty: rows see earlier rows)
     void head_sample_b(int m, int* dst);
     std::vector<unsigned long long> guse_;  // per slot: last use of its graph set (LRU bound FLASH_SLOT_GRAPHS)
     unsigned long long gtick_ = 0;
@@ -617,6 +630,10 @@ private:
     QpUnion qpu_;
     int nsm_ = 0;
     int maxlg_ = 0;  // most local groups of one expert on this card (prefill job bound)
+    void eager_stage_sync();  // staged transfers in an eager batch: bound the enqueued work (see flash.cu)
+    unsigned* qnan_rec_ = nullptr;  // FLASH_QPF_NAN: [checks][own q, received q, attention out, exchange] (host-mapped)
+    int qnan_n_ = 0;
+    std::vector<std::pair<int, int>> qnan_meta_;  // (layer, chunk position) per check
     unsigned* jobchk_ = nullptr;  // FLASH_JOBCHK: host-mapped [overflows, max njobs per tag 1..2, bound of that call per tag]
 public:
     void jobchk_report() const {
@@ -757,6 +774,38 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
   public:
     static constexpr int DBGK = 12;          // FLASH_DBGHASH kinds per layer (flash_main prints the names)
     unsigned long long* dbgh_ = nullptr;     // FLASH_DBGHASH: per layer hashes of the prefill intermediates
+    unsigned long long* rowh_ = nullptr;     // FLASH_DBGHASH=2: per (layer, row) hashes [LAYERS][pfbn_][4] (debug)
+    double* rowl1_ = nullptr;
+    void* xqsnap_ = nullptr;
+    void* actsnap_ = nullptr;     // FLASH_DBG_GU2X: the first gate_up's output (debug)      // FLASH_DBG_XQCHK: copy of the MoE gate_up inputs (debug)
+    unsigned* xqrec_ = nullptr;   // FLASH_DBG_XQCHK: host-mapped records of changed rows
+    void dbg_xqrep(int rep) {
+        if (!xqrec_) return;
+        CUDA_CHECK(cudaSetDevice(dev_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        const unsigned n = xqrec_[0];
+        if (n) printf("xqchk rep %d rank %d: %u changed rows during gate_up\n", rep, p_.rank, n);
+        for (unsigned k = 0; k < n && k < 12; k++) {
+            const unsigned* e = xqrec_ + 8 + k * 6;
+            printf("  layer %u %s row %u word %u: now %08x was %08x\n", e[0], e[1] == 2 ? "act (gate_up run 2 vs 1)" : e[1] ? "tl" : "xh/xq", e[2], e[3], e[4], e[5]);
+        }
+        xqrec_[0] = 0;
+    }                // FLASH_DBGHASH=2: per (layer, row) L1 norm of the MoE partial (debug)
+    void dbg_rowl1(std::vector<double>& out) {
+        out.assign((size_t)LAYERS * rowh_n_, 0.0);
+        if (!rowl1_) return;
+        CUDA_CHECK(cudaMemcpy(out.data(), rowl1_, out.size() * 8, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemset(rowl1_, 0, out.size() * 8));
+    }
+    int rowh_n_ = 0;
+    void dbg_rowh(std::vector<unsigned long long>& out) {
+        out.assign((size_t)LAYERS * rowh_n_ * 4, 0);
+        if (!rowh_) return;
+        CUDA_CHECK(cudaSetDevice(dev_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        CUDA_CHECK(cudaMemcpy(out.data(), rowh_, out.size() * 8, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemset(rowh_, 0, out.size() * 8));
+    }
     void dbg_hashes(std::vector<unsigned long long>& out) {
         out.assign((size_t)(LAYERS + 1) * DBGK, 0);
         if (!dbgh_) return;

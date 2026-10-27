@@ -120,6 +120,11 @@ public:
     void constrain(int slot, bool on);
     bool constrained(int slot) const { return seqs_.at(slot).constrained; }
     // temperature <= 0 selects greedy decoding
+    // presence / frequency penalty of the current slot (after set_sampling, which turns it off): its counts
+    // restart with the distinct seed tokens, then follow the reply. set_no_lookup: no lookup drafts for the slot's
+    // reply (reset by its next start)
+    void set_penalty(float presence, float frequency, const int* seed, int n);
+    void set_no_lookup(int slot, bool off);
     void set_sampling(float temperature, float top_p, int top_k, float min_p,
                       unsigned long long seed);
     // Debug: run n <= 8 tokens from position 0 and dump residuals [layers][n][hidden].
@@ -285,6 +290,8 @@ private:
         // ahead while a stop may start in the step in flight (set_no_ahead), and the undo of the
         // last step so the reply can end where its stop starts (trim)
         bool want_drafts = false, no_ahead = false;
+        bool pen = false;           // presence / frequency penalty on (set_penalty): host-known tokens to its counts
+        bool no_lookup = false;     // lookup drafts off for this reply (set_no_lookup: the server's loop guard)
         std::vector<int> drafts;
         int rb_pos = 0, rb_rows = 0;   // last step: position before it, rows it committed
         long long rb_epoch = -1;       // launch epoch after it (-1: a step of the slot queued after it)

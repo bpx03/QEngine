@@ -95,7 +95,7 @@ template <int G, int NTT, int WT>  // WT: 16-row tiles per warp (2: the whole gr
 __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __restrict__ tl, const float* __restrict__ wl,
                                          const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
                                          __half* __restrict__ act, int8_t (*xs)[GQ_TT][GQ_KS],
-                                         float2 (*ss)[GQ_KS / G][GQ_TT]) {
+                                         float2 (*ss)[GQ_TT][GQ_KS / G]) {
     constexpr int KS = GQ_KS, NKS = H / KS, NST = GQ_NST, SUB = KS / G, chunks = H >> 6, groups = H >> 7;
     const int m = pj.n;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
@@ -113,11 +113,17 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
                 asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(xrow + ks * KS + p * 16));
             }
         }
+        // the token's scales: L2 only (.cg / ld.cg), never L1. They live in the XH rows k_xh_to_q quantized in place
+        // just before; an L1 line of the old fp16 row (an SM that read those rows earlier, e.g. k_xh_to_x on the comm
+        // stream) returned stale scales through cp.async.ca: a few tokens' activations garbage now and then
+        // (rc3_fixes_2026-10-27: 4-6 / 10 det 16K repeats differ, gate_up run twice on the same inputs differed)
         if ((int)threadIdx.x < 8 * NTT) {
+            if constexpr (SUB == 2) {
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(&ss[b][threadIdx.x][0]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(srow + ks * SUB));
+            } else {
 #pragma unroll
-            for (int s = 0; s < SUB; s++) {
-                const unsigned dst = (unsigned)__cvta_generic_to_shared(&ss[b][s][threadIdx.x]);
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(dst), "l"(srow + ks * SUB + s));
+                for (int s = 0; s < SUB; s++) ss[b][threadIdx.x][s] = __ldcg(srow + ks * SUB + s);
             }
         }
         asm volatile("cp.async.commit_group;");
@@ -192,7 +198,7 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
             const int sg = G == 64 ? c : 0;
 #pragma unroll
             for (int j = 0; j < NTT; j++) {
-                const float2 x0 = ss[b][sg][8 * j + 2 * t4], x1 = ss[b][sg][8 * j + 2 * t4 + 1];
+                const float2 x0 = ss[b][8 * j + 2 * t4][sg], x1 = ss[b][8 * j + 2 * t4 + 1][sg];
 #pragma unroll
                 for (int a = 0; a < WT; a++) {
                     const float f0 = __fmaf_rn(__uint_as_float(ci[a][j][0]), x0.x, x0.y);
@@ -228,7 +234,7 @@ __global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q(const PfJob* 
                                                      __half* __restrict__ act) {
     static_assert(G == 64 || G == 128, "G");
     __shared__ __align__(16) int8_t xs[GQ_NST][GQ_TT][GQ_KS];
-    __shared__ __align__(16) float2 ss[GQ_NST][GQ_KS / G][GQ_TT];
+    __shared__ __align__(16) float2 ss[GQ_NST][GQ_TT][GQ_KS / G];
     const int nj = *njobs;
     for (int jb = (int)blockIdx.x; jb < nj * (3 - WT); jb += gridDim.x) {
         const int job = nj - 1 - jb / (3 - WT), rh = jb % (3 - WT);
@@ -576,6 +582,17 @@ constexpr int QP_UMAX = QP_R * IDX_TOPB;
 __host__ __device__ constexpr size_t qpf_kv_bytes() { return (size_t)2 * 2 * QP_KT * QD_SROW * 2; }  // 2 buffers x (K, V)
 constexpr int QP_NST = 4;  // fp8 staging ring (cp.async) depth
 __host__ __device__ constexpr size_t qpf_raw_bytes() { return (size_t)QP_NST * (2 * QP_KT * HD + 3 * QP_KT * 4); }
+// CE path (FLASH_COMM=ce): the peers' q flags of the exchange about to be consumed, waited for by one thread here instead
+// of in every k_qsa_pfsel block. A pfsel block takes a whole SM; blocks spinning on flags while holding every SM
+// deadlocked against the copy-engine exchanges and their wait kernels (hang / watchdog trap, qfn_prefill_r4).
+__global__ void k_qpf_qwait(Xchg xq, Plan p) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *xq.seq + 1;
+    for (int g = 0; g < p.ngpu; g++)
+        if (g != p.rank)
+            for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + g) - s) < 0;) { __nanosleep(32); QE_WD_POLL(ws_, kWdQsaX, g, s, qe_ld_acquire_sys(xq.flags[p.rank] + g)); }
+    __threadfence_system();
+}
 __host__ __device__ inline size_t qpf_smem(int lbmax) {
     return qpf_kv_bytes() + qpf_raw_bytes() + (size_t)2 * 3 * QP_KT * 4 + (size_t)QP_UMAX * 4 + QP_UMAX + (size_t)((lbmax + 31) / 32) * 4;
 }
@@ -699,6 +716,7 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
         }
     }
     if (threadIdx.x == 0 && dbg == 3) s_s = *xq.seq;  // shadow run after k_qsa_dec consumed the exchange (debug)
+    else if (threadIdx.x == 0 && dbg == 5) s_s = *xq.seq + 1;  // the flags were waited for by k_qpf_qwait (CE path): no spin here
     else if (threadIdx.x == 0) {  // the peers' q rows of this kv head's heads
         const unsigned s = *xq.seq + 1;
         for (int hh = kvh * HPG; hh < kvh * HPG + HPG; hh += QPC(p)) {

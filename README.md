@@ -8,7 +8,7 @@ with tensor parallelism 3 over PCIe.
 in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
 in our quick tests.
 
-> **Qwen3.8-Flash-Next release candidate.** QEngine 1.3 rc3 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s:
+> **Qwen3.8-Flash-Next release candidate.** QEngine 1.3 rc4 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s:
 > see [Qwen3.8-Flash-Next (release candidate)](#qwen38-flash-next-release-candidate) and the ready-to-run model on
 > [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine); the `latest` Docker image runs both models.
 
@@ -46,7 +46,10 @@ patched open NVIDIA kernel driver (the community P2P patch for GeForce cards:
 https://github.com/tinygrad/open-gpu-kernel-modules, with Resizable BAR enabled). With the stock GeForce
 driver, P2P is not available; the engine detects this and falls back to a slower path through host
 memory (the same as `QE_P2P=0`): all-reduces go through pinned host memory, the position-split KV
-layout is disabled (smaller KV pool) and decode and prefill are slower than the published numbers.
+layout is disabled (smaller KV pool) and decode and prefill are slower than the published numbers. For
+Flash-Next the attention exchanges between the cards also go through pinned host memory then (1.3-rc3 and
+earlier crashed in the first prefill without P2P); measured with `QE_P2P=0` on 3 GPUs, a 16K prompt takes 6.0 s
+instead of 2.8 s and decode runs at about 210 tok/s.
 
 **Interconnect probe (multi-socket / SYS topologies).** At startup both engines measure every GPU pair for a few
 milliseconds: stores from SMs into the peer's memory, loads by the receiving card's SMs from the sender's memory,
@@ -135,6 +138,19 @@ GPUs. On a single-node machine nothing changes.
     headroom. They continue exactly where they stopped: drafts and lookup history are kept. This works for any
     number of conversations.
   - A reply ends early only when a single conversation is larger than the pool.
+- **Repetition control** (both models):
+  - `presence_penalty` / `frequency_penalty` request fields (OpenAI and Anthropic API), applied in the GPU
+    sampler (also to speculative drafts). Default 0; `--presence-penalty` / `--frequency-penalty` (or
+    `QE_PRESENCE_PENALTY` / `QE_FREQUENCY_PENALTY`) set it for sampled requests that send none.
+  - **Cross-turn loop guard**: when an agent repeats the same reply with the same result `--loop-guard-turns` times
+    in a row (default 3; 0 = off), the next turn gets a short server note appended to the latest tool result (the
+    same call returned the same result N times, change the approach; `--loop-guard-note 0` or
+    `QE_LOOP_GUARD_NOTE=0` turns the note off), a presence penalty on the repeated reply (`--loop-guard-penalty`,
+    1.5; 2.0 from twice the turn count) and no lookup drafts. A repeated "ok", a call that gets new output and a
+    turn the user typed never trigger it. `"loop_guard": false` in a request turns it off for that request.
+    Triggers show up as a warning in the log, in `/api/stats` and in `qetop`.
+  - Within one reply, a reply whose last `--loop-guard-tokens` tokens (default 600) are one short fragment repeated
+    is ended.
 - **Structured output**: `response_format` with `json_object` / `json_schema` through llguidance
   grammars, enforced in the engine together with speculative decoding.
 - **Turn end**: a generated `<|im_start|>` ends the reply like the end-of-turn token (both models; not with
@@ -501,6 +517,7 @@ build/flash_run --model models/Qwen3.8-Flash-Next-QE-INT4 --ids @prompt.ids --ge
 | `FLASH_PFB` | 2048 | rows of the prefill batch whose buffers are always allocated; the server sends 2048-token chunks (`--prefill-chunk`) while other requests decode |
 | `FLASH_PFB_BIG` | 4096 | larger prefill batches (2048-row expert parts); the extra rows' buffers (~0.2 GB per card) serve as expert-cache slots outside such batches and are taken back only while one runs (0 = off). The server uses them for a prompt with no other request decoding or waiting (`--prefill-chunk-idle`, 4096 for Flash-Next) |
 | `FLASH_MOE_Q` | 1 | prefill expert gate/up with INT8 activations (per 64 values, quantized at runtime; the INT4 weights are unchanged) on INT8 tensor cores (0 = fp16) |
+| `FLASH_MOE_QW` | 1 | INT8 gate/up kernel variant: half-group blocks (2 per SM). `2` = whole-group blocks, which in 1.3-rc3 gave wrong activations for a few tokens now and then on our machine (not reproduced outside the engine, under investigation); same speed |
 | `FLASH_MOE_DQ` | 1 | the same for the expert down projection (0 = fp16) |
 | `FLASH_ROWS_Q` | 1 | prefill attention q/k/v and output projections, router and MTP input with INT8 activations on the INT8 weights (0 = previous kernel) |
 | `FLASH_ATTN_PFSEL` | 1 | prefill attention with block selection (long prompts): 8 rows share one pass over the union of their selected blocks (0 = per-row kernel; `FLASH_COMM=ce` always uses the per-row kernel) |
@@ -516,6 +533,7 @@ build/flash_run --model models/Qwen3.8-Flash-Next-QE-INT4 --ids @prompt.ids --ge
 | `FLASH_LOOKUP` | 1 | lookup drafts from the history (0 = off) |
 | `FLASH_LK_UNIFORM` | 1 | every card takes the lookup result of the first card, so all cards run the same draft step (0 = off) |
 | `FLASH_DETERMINISTIC` | 0 | 1: fixed-order reductions in prefill (reproducible runs) |
+| `CUDA_MODULE_LOADING` | EAGER | set by the engine at load unless already set: every kernel module is loaded at startup (lazy loading could deadlock the first prefill on the copy-engine path, `FLASH_COMM=ce`, and made the first prefill slower); `LAZY` = the CUDA default |
 | `FLASH_GUARD` | 1 | non-finite values reaching the output head stop the process with a message (2: log only, 0: off) |
 
 ### Numbers (release candidate, October 24–26, 2026)
@@ -648,7 +666,7 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Performance in the container matches bare metal (single-user decode, same GPUs).
 
-**Flash-Next (release candidate)** runs in the image `ghcr.io/bpx03/qengine:1.3-rc3` (text only; `latest` is the
+**Flash-Next (release candidate)** runs in the image `ghcr.io/bpx03/qengine:1.3-rc4` (text only; `latest` is the
 image of the 1.3 preview 1 release). Point `QE_MODEL` at the Flash-Next model directory and pass the `FLASH_*`
 variables with `-e`:
 
@@ -657,7 +675,7 @@ docker run -d --name qengine-flash --gpus all --ipc=host --ulimit memlock=-1 \
   -p 8080:8080 -p 127.0.0.1:9393:9393 \
   -v /path/to/models:/app/models:ro -v qengine-cache:/root/.cache/qengine \
   -e QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4 \
-  ghcr.io/bpx03/qengine:1.3-rc3
+  ghcr.io/bpx03/qengine:1.3-rc4
 ```
 
 Add `-e FLASH_NGRAM_PIN=0` for disk mode on a low-RAM host (see [Hardware and host memory](#hardware-and-host-memory)).

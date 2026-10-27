@@ -379,14 +379,14 @@ __global__ void k_lk_scan_b(const int* __restrict__ hdb, const int* __restrict__
 }
 __global__ void k_lk_pick_b(const int* __restrict__ hdb, const int* __restrict__ hnb, size_t hstride, const int* __restrict__ segs,
                             int nseg, int k, int mmin, unsigned long long* __restrict__ best, int* __restrict__ svt,
-                            int* __restrict__ cnt) {
+                            int* __restrict__ cnt, const int* __restrict__ nolk) {
     const int s = threadIdx.x;
     if (s >= nseg) return;
     const unsigned long long b = best[s];
     best[s] = 0ull;
     const int len = (int)(b >> 32), j = (int)(b & 0xffffffffu), slot = segs[s];
     const int n = hnb[slot];
-    if (len < mmin) return;
+    if (len < mmin || (nolk && nolk[slot])) return;  // nolk: the slot's lookup drafts are off (loop guard)
     const int* hd = hdb + (size_t)slot * hstride;
     const int L = min(k, n - 1 - j);
     int* v = svt + slot * (MAXM + 1);
@@ -608,6 +608,7 @@ void Worker::batch_body(int nseg, int k) {
     KCHK("batch meta");
     trunk_b(m, bvt_, nseg, rps);
     k_accept_b<<<1, 32, 0, st_>>>(bvt_, otok_, k, nseg, bseg_d_, bseg_d_ + MAXM, svp_, svh_, bacc_, bem_);
+    if (bsamp_) pen_commit_b(spslot_, bseg_d_, nseg, bem_, MAXM + 2, svp_, st_);
     if (has_mtp_) {
         mtp_core_b(m, false, otok_, motok_, rpos_, rbase_, rslot_, rps);
         k_draft0_b<<<1, 32, 0, st_>>>(motok_, bacc_, bdr_, nseg);
@@ -621,7 +622,7 @@ void Worker::batch_body(int nseg, int k) {
         const size_t hs = (size_t)max_ctx_ + 64;
         k_hist_add_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, bem_);
         k_lk_scan_b<<<dim3((unsigned)((hs + 255) / 256), nseg), 256, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, lkbb_);
-        k_lk_pick_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, k, blk_min_, lkbb_, svt_, blkcnt_);
+        k_lk_pick_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, k, blk_min_, lkbb_, svt_, blkcnt_, nolk_d_);
         KCHK("batch lookup");
     }
     KCHK("batch step");

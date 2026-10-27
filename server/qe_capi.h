@@ -20,6 +20,13 @@ int qe_max_context(void* e);  // max prompt + reply tokens of one sequence
 // starts (or set between start_begin and its first chunk) must apply to its first token and to
 // every later step of that slot.
 void qe_set_sampling(void* e, float temperature, float top_p, int top_k, float min_p, unsigned long long seed);
+// Optional (both engines): presence / frequency penalty of the current sequence, called right after
+// qe_set_sampling (which turns it off). Sampled rows only (temperature > 0): logit -= frequency * c +
+// presence * (c > 0), c = occurrences of the token in the reply so far (+ the earlier verify rows of the
+// step); the counts restart here with the n distinct seed tokens (each counts once; the server's loop
+// guard passes the repeated reply). qe_set_no_lookup: no lookup drafts for the slot's reply (until its next start).
+void qe_set_penalty(void* e, float presence, float frequency, const int* seed, int n);
+void qe_set_no_lookup(void* e, int slot, int off);
 // Prefill the prompt ids[0, n) and return the FIRST generated token (< 0: no room). The server
 // re-sends the whole conversation every turn: reuse the longest cached prefix (at least the live
 // sequence of the slot: previous prompt + the reply generated in it). k: max MTP drafts per step

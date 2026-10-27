@@ -233,6 +233,10 @@ void qe_set_sampling(void* e, float temperature, float top_p, int top_k, float m
                      unsigned long long seed) {
     ((Engine*)e)->set_sampling(temperature, top_p, top_k, min_p, seed);
 }
+void qe_set_penalty(void* e, float presence, float frequency, const int* seed, int n) {
+    ((Engine*)e)->set_penalty(presence, frequency, seed, n);
+}
+void qe_set_no_lookup(void* e, int slot, int off) { ((Engine*)e)->set_no_lookup(slot, off != 0); }
 unsigned* qe_mask_buffer(void* e, int slot) { return ((Engine*)e)->mask_buffer(slot); }
 int* qe_spec_io(void* e, int slot) { return ((Engine*)e)->spec_io(slot); }
 void qe_constrain(void* e, int slot, int on) { ((Engine*)e)->constrain(slot, on != 0); }

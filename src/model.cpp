@@ -122,7 +122,11 @@ void Worker::add_slot() {
         ss.eos0 = c_.eos;
         ss.eos1 = c_.eos2;
         sl.sp = (SampleParams*)dalloc(sizeof(SampleParams), false);
+        sl.pen = (PenState*)dalloc(pen_state_bytes(c_.vocab), false);
+        pen_reset(sl.pen, c_.vocab, nullptr, 0, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
         SampleParams d{1.f, 1.f, kTopK, 0.f, 0, 0};
+        d.pen = sl.pen;
         CUDA_CHECK(cudaMemcpy(sl.sp, &d, sizeof(d), cudaMemcpyHostToDevice));
         const size_t mw = mask_words() * (kMaxSpecK + 1);
         sl.mask = (unsigned*)dalloc(mw * 4, false);
@@ -1270,8 +1274,32 @@ void Worker::snapshot_restore(const void* src) {
 void Worker::set_sampling(const SampleParams& p, bool on) {
     CUDA_CHECK(cudaSetDevice(device));
     SeqSlot& sl = slots_.at(cur_slot_);
-    CUDA_CHECK(cudaMemcpy(sl.sp, &p, sizeof(p), cudaMemcpyHostToDevice));
+    SampleParams h = p;
+    h.presence = h.frequency = 0.f;
+    h.pen = sl.pen;
+    CUDA_CHECK(cudaMemcpy(sl.sp, &h, sizeof(h), cudaMemcpyHostToDevice));
     sl.sampling = sampling = on;
+}
+
+void Worker::set_penalty(float presence, float frequency, const int* seed, int n) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    SeqSlot& sl = slots_.at(cur_slot_);
+    if (presence != 0.f || frequency != 0.f) {
+        if (!pseed_d_) pseed_d_ = (int*)dalloc((size_t)kPenSeedMax * 4, false);
+        n = std::max(0, std::min(n, kPenSeedMax));
+        if (n > 0) CUDA_CHECK(cudaMemcpy(pseed_d_, seed, (size_t)n * 4, cudaMemcpyHostToDevice));
+        pen_reset(sl.pen, c_.vocab, pseed_d_, n, stream);
+    }
+    const float pf[2] = {presence, frequency};
+    CUDA_CHECK(cudaMemcpyAsync((char*)sl.sp + offsetof(SampleParams, presence), pf, 8, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void Worker::pen_host(const int* toks, int n, int pos) {
+    CUDA_CHECK(cudaSetDevice(device));
+    const SampleParams* p = slots_.at(cur_slot_).sp;
+    for (int i = 0; i < n; i += 16) pen_commit_host(p, toks + i, std::min(16, n - i), pos + i, stream);
 }
 
 void Worker::set_constrained(int i, bool on) {

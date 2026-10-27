@@ -692,11 +692,49 @@ int main(int argc, char** argv) {
                    fl < 0 ? "IDENTICAL" : "differs", fl, fk >= 0 ? kind[fk] : "-", nd, (LAYERS + 1) * Worker::DBGK, nxt);
         }
     }
+    for (int r = 0; r < ng; r++) W[r]->dbg_xqrep(rep);
+    if (W[0]->rowh_) {  // FLASH_DBGHASH=2: per (layer, row) hashes vs the first repetition: first differing per kind
+        static std::vector<std::vector<unsigned long long>> r0(ng);
+        static std::vector<std::vector<double>> l0(ng);
+        static const char* kn[4] = {"xh before MoE", "xq after MoE (in place)", "MoE partial", "routing"};
+        for (int r = 0; r < ng; r++) {
+            std::vector<unsigned long long> h;
+            W[r]->dbg_rowh(h);
+            std::vector<double> l1;
+            W[r]->dbg_rowl1(l1);
+            if (rep == 0) { r0[r] = h; l0[r] = l1; continue; }
+            const int RN = W[r]->rowh_n_;
+            for (int l = 0, done = 0; l < LAYERS && !done; l++)  // MoE partial L1 of the first differing rows
+                for (int row = 0; row < RN; row++)
+                    if (h[((size_t)l * RN + row) * 4 + 2] != r0[r][((size_t)l * RN + row) * 4 + 2]) {
+                        for (int q = std::max(0, row - 2); q < std::min(RN, row + 10); q++)
+                            printf("rowl1 rep %d rank %d layer %d row %d: %.6f vs %.6f (rel %.2e)%s\n", rep, r, l, q, l1[(size_t)l * RN + q],
+                                   l0[r][(size_t)l * RN + q], fabs(l1[(size_t)l * RN + q] - l0[r][(size_t)l * RN + q]) / (l0[r][(size_t)l * RN + q] + 1e-30),
+                                   h[((size_t)l * RN + q) * 4 + 2] != r0[r][((size_t)l * RN + q) * 4 + 2] ? " *" : "");
+                        done = 1;
+                        break;
+                    }
+            for (int k = 0; k < 4; k++) {
+                int fl = -1, fr = -1, nd = 0, nl = 0, lastl = -1;
+                for (int l = 0; l < LAYERS; l++)
+                    for (int row = 0; row < RN; row++)
+                        if (h[((size_t)l * RN + row) * 4 + k] != r0[r][((size_t)l * RN + row) * 4 + k]) {
+                            if (fl < 0) { fl = l; fr = row; }
+                            if (l == fl) { nd++; if (lastl < 0) lastl = row; nl = row; }
+                        }
+                if (fl >= 0) printf("rowh rep %d rank %d %s: first layer %d, rows %d..%d (%d rows differ there)\n", rep, r, kn[k], fl, fr, nl, nd);
+            }
+        }
+    }
     if (nrep > 1 && getenv("FLASH_LOGITS_NEXT")) {  // check every repetition (graph replays)
-        step2({nxt}, np, true, false, 0);
-        FILE* f = fopen((std::string(getenv("FLASH_LOGITS_NEXT")) + "." + std::to_string(rep)).c_str(), "wb");
-        fwrite(logits.data(), 4, nv0, f);
-        fclose(f);
+        // FLASH_LOGITS_NEXT_K=k: the same forward k times after this prefill (decode determinism on a fixed state)
+        const int kn = getenv("FLASH_LOGITS_NEXT_K") ? std::max(1, atoi(getenv("FLASH_LOGITS_NEXT_K"))) : 1;
+        for (int q = 0; q < kn; q++) {
+            step2({nxt}, np, true, false, 0);
+            FILE* f = fopen((std::string(getenv("FLASH_LOGITS_NEXT")) + "." + std::to_string(rep) + (kn > 1 ? "." + std::to_string(q) : "")).c_str(), "wb");
+            fwrite(logits.data(), 4, nv0, f);
+            fclose(f);
+        }
     }
     }
     if (W[0]->dump_) {

@@ -95,8 +95,17 @@ void Worker::alloc_slots() {
     sson_d_ = (int*)dalloc((size_t)ns * 4);
     con_slot_.assign(ns, 0);
     mask_d_ = (unsigned*)dalloc((size_t)MASK_ROWS * MASK_WORDS * 4);
+    pen_ = (PenState*)dalloc((size_t)ns * pen_state_bytes(VOCAB));
+    nolk_d_ = (int*)dalloc((size_t)ns * 4);
+    pseed_d_ = (int*)dalloc((size_t)kPenSeedMax * 4);
+    CUDA_CHECK(cudaMemset(nolk_d_, 0, (size_t)ns * 4));
     {
         std::vector<SampleParams> d(ns, SampleParams{1.f, 1.f, kTopK, 0.f, 0, 0});
+        for (int s = 0; s < ns; s++) {
+            d[s].pen = pen_of(s);
+            pen_reset(pen_of(s), VOCAB, nullptr, 0, st_);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(st_));
         CUDA_CHECK(cudaMemcpy(spslot_, d.data(), d.size() * sizeof(SampleParams), cudaMemcpyHostToDevice));
     }
     for (auto& q : slots_)

@@ -206,7 +206,8 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                 mn.host = std::min(mn.host, b.host);
             }
         // co-run tax: a local compute proxy timed alone and next to each transport's traffic (QE_COMM_CORUN=0: off)
-        if (env_int("QE_COMM_CORUN", 1)) {
+        // (not with CUDA_LAUNCH_BLOCKING=1: the spinning side-stream kernel would block the host launch forever)
+        if (env_int("QE_COMM_CORUN", 1) && !env_int("CUDA_LAUNCH_BLOCKING", 0)) {
             const size_t n16 = bytes / 16;
             const int reps = std::max(1, env_int("QE_COMM_CORUN_REPS", 8));
             std::vector<cudaStream_t> stB(ng);

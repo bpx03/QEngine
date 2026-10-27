@@ -77,6 +77,7 @@ struct SeqSlot {
     int* rdelta = nullptr;        // RoPE position shift of text after images (device)
     SpecState spec;               // this sequence's tokens / drafts / positions (device)
     SampleParams* sp = nullptr;   // sampling parameters (device)
+    PenState* pen = nullptr;      // presence / frequency penalty counts (device; sp->pen when a penalty is on)
     bool sampling = false;
     // grammar-constrained decoding (response_format): allowed-token bitmasks over the whole
     // vocabulary, one per verification row ([kMaxSpecK + 1][words], device, fixed address so
@@ -261,7 +262,13 @@ public:
     std::vector<int> draft_ids;
     // Sampling of the current slot: params live on the device; `sampling` selects greedy vs
     // sampled graphs.
-    void set_sampling(const SampleParams& p, bool on);
+    void set_sampling(const SampleParams& p, bool on);  // penalty off (set_penalty after it)
+    // presence / frequency penalty of the current slot: counts restart with the distinct seed tokens; pen_host:
+    // host-known tokens of the current slot at positions pos.. (first token, steps without drafts)
+    void set_penalty(float presence, float frequency, const int* seed, int n);
+    void pen_host(const int* toks, int n, int pos);
+    static constexpr int kPenSeedMax = 8192;
+    int* pseed_d_ = nullptr;
     bool sampling = false;
     // Grammar-constrained decoding of slot i: its logits are masked with its device bitmask
     // (words: (vocab + 31) / 32 uint32) before the token choice. upload_mask copies a host mask

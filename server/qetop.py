@@ -27,7 +27,9 @@ EN = {"dekoduje": "decoding", "czeka": "waiting", "działa": "up", "start nr": "
       "nikt teraz nie pracuje": "nobody is working right now", "pula": "pool", "zarezerwowane": "reserved",
       "w użyciu": "in use", "archiwum": "archive", "dysk": "disk", "wzrosty": "grown", "przesunięcia": "moved",
       "wysiedlenia": "evicted", "dla głównego": "for main", "dopuszczone obok": "backfilled",
-      "nie rozpoznano głównego agenta w sesji": "main agent not identified in session", "wstrzymane": "paused", "wstrzymania": "preempted", "wznowienia": "resumed", "od startu": "since start", "łącznie": "all time", "czas pracy": "uptime",
+      "nie rozpoznano głównego agenta w sesji": "main agent not identified in session",
+      "pętla między turami": "cross-turn loop", "rozmowa": "conversation", "ta sama tura": "same turn",
+      "bez lookup": "no lookup", "razem": "total", "wstrzymane": "paused", "wstrzymania": "preempted", "wznowienia": "resumed", "od startu": "since start", "łącznie": "all time", "czas pracy": "uptime",
       "zapytania": "requests", "wygenerowane tokeny": "generated tokens", "tokeny promptów": "prompt tokens",
       "trafienia cache": "cache hits", "śr. tok/s przy pracy": "avg tok/s busy", "energia": "energy",
       "tokenów / dżul": "tokens / joule", "rekord tok/s (10 s)": "record tok/s (10 s)",
@@ -85,6 +87,12 @@ def view(s, width=140, note=None):
     if al:  # the scheduler could not tell the main agent thread (server/agents.py): its priority is off
         head = Group(head, Text(f"⚠ {_('nie rozpoznano głównego agenta w sesji')} {al['session'][:8]}… "
                                 f"({al['requests']}) · QE_MAIN_AGENT_RE", style="bold red"))
+    lg = (s.get("loop_guard") or {}).get("recent") or []
+    if lg and time.time() - lg[-1]["t"] < 600:  # a conversation repeated the same turn (server/loop_guard.py)
+        g = lg[-1]
+        head = Group(head, Text(f"⚠ {_('pętla między turami')}: {_('rozmowa')} {g['conversation']} "
+                                f"({g['turns']}× {_('ta sama tura')}) · presence {g['presence']:.1f}, "
+                                f"{_('bez lookup')} · {_('razem')} {s['loop_guard']['triggers']}", style="bold yellow"))
     kpi = Table.grid(expand=True, padding=(0, 2))
     for _col in range(7):
         kpi.add_column(justify="center")
