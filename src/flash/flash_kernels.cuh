@@ -5,6 +5,7 @@
 
 #include "../kernels/gemv_h16.cuh"
 #include "flash.h"
+#include "../kernels/watchdog.cuh"  // QE_WD_POLL in the exchange waits (a stranded rank traps instead of hanging)
 
 #ifndef FLASH_HCU_H16
 #define FLASH_HCU_H16 1  // prefill HC up: fp16-accumulate MMA per 64-k group (0: fp32 accumulate)
@@ -136,6 +137,86 @@ __global__ void k_hc_write(float* __restrict__ R, const float* __restrict__ inj,
     }
 }
 
+// Activation steering (QE_STEER / QE_STEER_DIR) at a layer output, the point llama.cpp names "l_last" (the residual
+// after the FFN hyper-connection combine), on each of the HC streams. Loaded vectors share one buffer
+// w[vec][mode][layer][H] (strength folded in: add alpha v, project sqrt(alpha) unit v); every row picks
+// {vector, mode, lo, hi} and the scale of its slot (sl[slot * 4], vector < 0: off) - per slot in batched steps (rslot),
+// the bound slot's copy (index 0) otherwise. These live at fixed addresses: changing them changes no graph.
+// add: R_i += scale w; project: R_i -= scale (R_i . w) w. dw[vec][mode][layer][stream][HCD_ROWS]: the next HC read's
+// fused down weights applied to w (computed by the decode down kernel itself at load), the correction of the fused path.
+// the row's w index (vector * 2 + mode, or -1) with its scale and mode
+__device__ __forceinline__ int steer_row(const SteerArg& a, int t, float& sc, int& mode) {
+    if (a.li < 0) return -1;
+    const int slot = a.rslot ? a.rslot[t] : 0;
+    const int* q = a.sl + slot * 4;
+    const int v = q[0];
+    if (v < 0 || a.li < q[2] || a.li > q[3]) return -1;
+    sc = a.sc[slot];
+    mode = q[1];
+    return v * 2 + mode;
+}
+// Separate steering kernel (layer 0 / 47 outputs, prefill, unfused HC paths): one block per row; an unsteered row
+// exits before touching memory. y != nullptr: the layer's residual update is still pending (R += inj * y): applied
+// here first (the same fma as k_hc_write) and y cleared for the row (the next HC read then adds inj * 0, exact).
+constexpr int STEER_T = 512, STEER_PT = H / STEER_T;
+static_assert(H % STEER_T == 0, "steer: H / 512");
+__global__ void __launch_bounds__(STEER_T) k_steer(float* __restrict__ R, const float* __restrict__ inj, float* __restrict__ y,
+                                                   SteerArg a) {
+    const int t = blockIdx.x, tid = threadIdx.x;
+    float sc = 0.f;
+    int mode = 0;
+    const int vi = steer_row(a, t, sc, mode);
+    if (vi < 0) return;
+    const float* w = a.w + ((size_t)vi * LAYERS + a.li) * H;
+    float* rr = R + (size_t)t * RW;
+    float io[HC];
+#pragma unroll
+    for (int i = 0; i < HC; i++) io[i] = y ? inj[t * HC + i] : 0.f;
+    float v[HC][STEER_PT], wv[STEER_PT];
+#pragma unroll
+    for (int j = 0; j < STEER_PT; j++) {
+        const int d = tid + j * STEER_T;
+        wv[j] = w[d];
+        float yv = 0.f;
+        if (y) { yv = y[(size_t)t * H + d]; y[(size_t)t * H + d] = 0.f; }
+#pragma unroll
+        for (int i = 0; i < HC; i++) {
+            float x = rr[i * H + d];
+            if (y) x += io[i] * yv;
+            v[i][j] = x;
+        }
+    }
+    float c[HC];
+    if (mode == 1) {  // project
+        __shared__ float red[STEER_T / 32][HC];
+        __shared__ float dot[HC];
+#pragma unroll
+        for (int i = 0; i < HC; i++) {
+            float q = 0.f;
+#pragma unroll
+            for (int j = 0; j < STEER_PT; j++) q += v[i][j] * wv[j];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+            if ((tid & 31) == 0) red[tid >> 5][i] = q;
+        }
+        __syncthreads();
+        if (tid < HC) {
+            float s2 = 0.f;
+            for (int k = 0; k < STEER_T / 32; k++) s2 += red[k][tid];
+            dot[tid] = s2;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < HC; i++) c[i] = -sc * dot[i];
+    } else {
+#pragma unroll
+        for (int i = 0; i < HC; i++) c[i] = sc;
+    }
+#pragma unroll
+    for (int j = 0; j < STEER_PT; j++)
+#pragma unroll
+        for (int i = 0; i < HC; i++) rr[i * H + tid + j * STEER_T] = v[i][j] + c[i] * wv[j];
+}
 // ------------------------------------------------------------------ fused hyper-connection read
 // int8 pair -> fp16x2 (exact integers), as gemv.cu
 __device__ __forceinline__ uint32_t s8x2_f16(uint32_t t) {
@@ -436,16 +517,71 @@ __global__ void __launch_bounds__(32 * HCDX_TW) k_hcd_x(const uint4* __restrict_
 // inj (as k_hc_mid_pf). grid m, 512 threads.
 __global__ void __launch_bounds__(512) k_hc_mid_dec(const float* __restrict__ P, float* __restrict__ R,
                                                     __half* __restrict__ hh, float* __restrict__ rinv, float* __restrict__ inj,
-                                                    const float* __restrict__ y = nullptr, const float* __restrict__ injo = nullptr) {
+                                                    const float* __restrict__ y = nullptr, const float* __restrict__ injo = nullptr,
+                                                    SteerArg sa = SteerArg()) {
     // y != nullptr: R += inj_old * y here (k_hcd_s used the same values); inj is overwritten only after the barrier
     const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     __shared__ float red[16][HC];
     __shared__ float ri[HC];
+    __shared__ float sdot[HC];
     float q2[HC] = {0.f, 0.f, 0.f, 0.f};
     float* rr = R + (size_t)t * RW;
     float io[HC];
 #pragma unroll
     for (int i = 0; i < HC; i++) io[i] = y ? injo[t * HC + i] : 0.f;
+    // steering of the previous layer's output fused in (SteerArg): R' = R + c_i w per stream, the down sums of the
+    // unsteered R (k_hcd_s) corrected by c_i dw_i (linear in R); c_i = scale (add) or -scale (R_i . w) (project)
+    float ssc = 0.f;
+    int mode = 0;
+    const int svi = steer_row(sa, t, ssc, mode);
+    float cst[HC] = {0.f, 0.f, 0.f, 0.f};
+    if (svi >= 0) {
+        const float* w = sa.w + ((size_t)svi * LAYERS + sa.li) * H;
+        float v[HC][H / 512], wv[H / 512];
+#pragma unroll
+        for (int j = 0; j < H / 512; j++) {
+            const int d = tid + j * 512;
+            wv[j] = w[d];
+            const float yv = y ? y[(size_t)t * H + d] : 0.f;
+#pragma unroll
+            for (int i = 0; i < HC; i++) {
+                float x = rr[i * H + d];
+                if (y) x += io[i] * yv;
+                v[i][j] = x;
+            }
+        }
+        if (mode == 1) {
+#pragma unroll
+            for (int i = 0; i < HC; i++) {
+                float q = 0.f;
+#pragma unroll
+                for (int j = 0; j < H / 512; j++) q += v[i][j] * wv[j];
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+                if (lane == 0) red[warp][i] = q;
+            }
+            __syncthreads();
+            if (tid < HC) {
+                float a = 0.f;
+                for (int w2 = 0; w2 < 16; w2++) a += red[w2][tid];
+                sdot[tid] = a;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < HC; i++) cst[i] = -ssc * sdot[i];
+        } else {
+#pragma unroll
+            for (int i = 0; i < HC; i++) cst[i] = ssc;
+        }
+#pragma unroll
+        for (int j = 0; j < H / 512; j++)
+#pragma unroll
+            for (int i = 0; i < HC; i++) {
+                const float x = v[i][j] + cst[i] * wv[j];
+                rr[i * H + tid + j * 512] = x;
+                q2[i] += x * x;
+            }
+    } else
     for (int d = tid; d < H; d += 512) {
         const float yv = y ? y[(size_t)t * H + d] : 0.f;
 #pragma unroll
@@ -477,12 +613,37 @@ __global__ void __launch_bounds__(512) k_hc_mid_dec(const float* __restrict__ P,
             float u = 0.f;
 #pragma unroll
             for (int gq = 0; gq < HCD_NP; gq++) u += pb[(size_t)gq * HCD_ROWS];
+            if (svi >= 0) u += cst[i] * sa.dw[(((size_t)svi * LAYERS + sa.li) * HC + i) * HCD_ROWS + tid];
             z += u * ri[i];
         }
         if (tid < LOWRANK) hh[(size_t)t * LOWRANK + tid] = __float2half_rn(silu(z / HC));
         else if (inj) inj[t * HC + tid - LOWRANK] = 2.f * sigm(z / HC);
     }
 }
+// activation capture (make_vector, qe_capture): acc[d] += sum over rows t >= skip of the layer-output residual's
+// stream mean (R + inj * y when the update is pending)
+__global__ void k_capture(const float* __restrict__ R, const float* __restrict__ inj, const float* __restrict__ y, int m, int skip,
+                          float* __restrict__ acc) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= H) return;
+    float s = 0.f;
+    for (int t = skip; t < m; t++) {
+        const float yv = y ? y[(size_t)t * H + d] : 0.f;
+#pragma unroll
+        for (int i = 0; i < HC; i++) s += R[(size_t)t * RW + i * H + d] + (y ? inj[t * HC + i] * yv : 0.f);
+    }
+    acc[d] += s * (1.f / HC);
+}
+// dw of one (vector, layer): sum of the down kernel's group partials of row s, stream s (the order of k_hc_mid_dec)
+__global__ void k_steer_dw(const float* __restrict__ P, float* __restrict__ dw) {
+    const int s = blockIdx.x, r = threadIdx.x;
+    if (r >= HCD_ROWS) return;
+    const float* pb = P + ((size_t)s * HC + s) * HCD_NP * HCD_ROWS + r;
+    float u = 0.f;
+    for (int gq = 0; gq < HCD_NP; gq++) u += pb[(size_t)gq * HCD_ROWS];
+    dw[s * HCD_ROWS + r] = u;
+}
+
 // Up part + mix. Prologue (every block): z_j = sum_i u[t][i][j] * rinv_i, h = silu(z / 4) (fp16, smem); block 0
 // writes inj = 2 sigmoid(z[320 + i] / 4). U rows are permuted so a 16-row tile = 4 hidden dims x 4 streams
 // (row dd * 4 + i of tile T <-> U row i * 2560 + 4T + dd), INT8 with g64 scales; one warp per tile, K = 320.
@@ -1167,7 +1328,16 @@ struct Xchg {
     unsigned* scnt;       // local per-peer arrival counters of the sending blocks
 };
 constexpr int XROWS = PFM;  // rows of the exchange buffers (a whole prefill chunk)
-constexpr int XPER = 8 * (HD + 2);
+// slots of the QSA exchange receive ring (q / partials / indexer); the slot index is s & (XSLOT - 1). 2 slots are
+// enough: the consumer accepts flag >= s, and the per-layer all-reduce keeps the cards within one exchange of each
+// other. (prefill-r4 tried 4 slots and a consumer -> sender credit handshake while hunting the 2-GPU garbage: no
+// effect, the cause was a load-time copy race; bench/patches/qfn_r4_garbage_hunt_full.patch)
+constexpr int XSLOT = 2;
+// per-row floats of a receive slot: the QSA q heads of one card (3 cards: 8, 2 cards: 12) x (HD + 2) partial records;
+// the q exchange uses qper (x HD). Allocations: the plan's value (3 cards: the former constant 8 x (HD + 2))
+__host__ __device__ __forceinline__ int QPC(const Plan& p) { return NQ / p.ngpu; }
+__host__ __device__ __forceinline__ int xper(const Plan& p) { return QPC(p) * (HD + 2); }
+__host__ __device__ __forceinline__ int qper(const Plan& p) { return QPC(p) * HD; }
 // grid (peers, blocks per peer): the last block of a peer raises its flag
 __device__ __forceinline__ void xsend_done(Xchg& xc, int peer, unsigned s, const Plan& p) {
     __syncthreads();
@@ -1189,7 +1359,98 @@ struct RowAg {
     unsigned* flags[4];   // [rank] flag words [ngpu senders]
     unsigned* seq;        // local counter
     unsigned* scnt;       // local per-peer block counters
+    unsigned* acks[4];    // pull mode: [rank] ack words [ngpu readers] (a reader is done with the owner's rows)
+    int rr[8];            // pull mode: rows [rr[2g], rr[2g + 1]) of rank g
+    unsigned pm;          // Comm::pullm (bit 4 i + j: rank i reads rank j's rows)
 };
+// Pull variant of k_row_ag (prefill-r4): SM stores into the peers' memory stall this card's memory system for the
+// kernels next to them (tools/mb/mb_gdn.cu), loads of the same bytes from the peer barely. Per directed pair (a.pm bit
+// 4 i + j: rank i reads rank j's rows, Comm::pullm): k_row_ag_mix stores this card's rows into the pushed peers' arrays
+// (+ their flag after the rows) and raises the "rows ready" flag of the pulling peers; k_row_ag_pull (block x = peer
+// slot) waits for a pulled peer's flag, copies its rows into the local arrays (P2P loads) and acks in the peer's
+// memory; k_row_ag_fin waits for the pushed peers' rows and for the acks of the peers that read this card's rows (the
+// MoE quantizes them in place next), then advances the sequence.
+__device__ __forceinline__ bool ag_pull(unsigned pm, int reader, int owner) { return (pm >> (4 * reader + owner)) & 1u; }
+__global__ void k_row_ag_mix(RowAg a, int r0, int r1, int rank, int ngpu, unsigned amask) {
+    const int peer = blockIdx.x >= (unsigned)rank ? blockIdx.x + 1 : blockIdx.x;
+    const unsigned s = *a.seq + 1;
+    if (ag_pull(a.pm, peer, rank)) {
+        if (blockIdx.y == 0 && threadIdx.x == 0) { __threadfence_system(); qe_st_release_sys(a.flags[peer] + rank, s); }
+        return;
+    }
+    for (int k = 0; k < 3; k++) {
+        if (!((amask >> k) & 1) || r1 <= r0) continue;
+        const size_t n16 = (size_t)(r1 - r0) * a.rowb[k] / 16;
+        const uint4* src = reinterpret_cast<const uint4*>(a.dst[k][rank] + (size_t)r0 * a.rowb[k]);
+        uint4* dst = reinterpret_cast<uint4*>(a.dst[k][peer] + (size_t)r0 * a.rowb[k]);
+        for (size_t i = (size_t)blockIdx.y * blockDim.x + threadIdx.x; i < n16; i += (size_t)gridDim.y * blockDim.x) dst[i] = src[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        if (atomicAdd(a.scnt + peer, 1u) == gridDim.y - 1) {
+            a.scnt[peer] = 0u;
+            __threadfence_system();
+            qe_st_release_sys(a.flags[peer] + rank, s);
+        }
+    }
+}
+__global__ void k_row_ag_pull(RowAg a, int rank, int ngpu, unsigned amask) {
+    const int peer = blockIdx.x >= (unsigned)rank ? blockIdx.x + 1 : blockIdx.x;
+    if (!ag_pull(a.pm, rank, peer)) return;
+    const unsigned s = *a.seq + 1;
+    if (threadIdx.x == 0)
+        for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + peer) - s) < 0; it++) {
+            __nanosleep(20);
+            QE_WD_POLL(ws_, kWdRowAg, peer, s, qe_ld_acquire_sys(a.flags[rank] + peer));
+            if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG pull wait for %d: seq %u\n", rank, peer, s);
+        }
+    __syncthreads();
+    const int r0 = a.rr[2 * peer], r1 = a.rr[2 * peer + 1];
+    for (int k = 0; k < 3; k++) {
+        if (!((amask >> k) & 1) || r1 <= r0) continue;
+        const size_t n16 = (size_t)(r1 - r0) * a.rowb[k] / 16;
+        const uint4* src = reinterpret_cast<const uint4*>(a.dst[k][peer] + (size_t)r0 * a.rowb[k]);
+        uint4* dst = reinterpret_cast<uint4*>(a.dst[k][rank] + (size_t)r0 * a.rowb[k]);
+        size_t i = (size_t)blockIdx.y * blockDim.x + threadIdx.x;
+        const size_t st = (size_t)gridDim.y * blockDim.x;
+        for (; i + st < n16; i += 2 * st) {  // two loads in flight per thread
+            const uint4 v0 = __ldcv(src + i), v1 = __ldcv(src + i + st);
+            dst[i] = v0;
+            dst[i + st] = v1;
+        }
+        if (i < n16) dst[i] = __ldcv(src + i);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        if (atomicAdd(a.scnt + 4 + peer, 1u) == gridDim.y - 1) {
+            a.scnt[4 + peer] = 0u;
+            qe_st_release_sys(a.acks[peer] + rank, s);
+        }
+    }
+}
+__global__ void k_row_ag_fin(RowAg a, int rank, int ngpu) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *a.seq + 1;
+    for (int g = 0; g < ngpu; g++) {
+        if (g == rank) continue;
+        if (!ag_pull(a.pm, rank, g))  // g pushed its rows: its flag lands after them
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + g) - s) < 0; it++) {
+                __nanosleep(20);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(a.flags[rank] + g));
+                if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG wait for %d: seq %u\n", rank, g, s);
+            }
+        if (ag_pull(a.pm, g, rank))  // g reads this card's rows: wait until it is done
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.acks[rank] + g) - s) < 0; it++) {
+                __nanosleep(20);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(a.acks[rank] + g));
+                if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG ack wait for %d: seq %u\n", rank, g, s);
+            }
+    }
+    __threadfence_system();
+    *a.seq = s;
+}
 __global__ void k_row_ag(RowAg a, int r0, int r1, int rank, int ngpu, unsigned amask) {
     const int peer = blockIdx.x >= (unsigned)rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *a.seq + 1;
@@ -1236,17 +1497,92 @@ __global__ void k_row_ag_wait(RowAg a, int rank, int ngpu) {
     const unsigned s = *a.seq + 1;
     for (int g = 0; g < ngpu; g++)
         if (g != rank)
-            while ((int)(qe_ld_acquire_sys(a.flags[rank] + g) - s) < 0) __nanosleep(20);
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(a.flags[rank] + g) - s) < 0; it++) {
+                __nanosleep(20);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(a.flags[rank] + g));
+                if (it == (1ull << 27)) printf("[flash] stall: rank %d row-AG wait for %d: seq %u, seen %u\n", rank, g, s, qe_ld_acquire_sys(a.flags[rank] + g));
+            }
     __threadfence_system();
     *a.seq = s;
+}
+// ---- staged prefill transfers (comm_select_path: FLASH_COMM=ce / host, or auto on slow SM stores)
+// host-staged row all-gather: the sender waits until every peer has copied its previous rows out of its pinned staging
+// rows (ack words, raised after the peer's H2D), so the staging rows can be reused
+struct AckP {
+    unsigned* w[4];  // [rank] the ack words [4 senders] of every card for this channel
+};
+__global__ void k_rag_ackwait(const unsigned* __restrict__ mine, const unsigned* seq, int rank, int ngpu) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *seq;
+    for (int g = 0; g < ngpu; g++)
+        if (g != rank)
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(mine + g) - s) < 0; it++) {
+                __nanosleep(64);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(mine + g));
+                if (it == (1ull << 26)) printf("[flash] stall: rank %d row-AG ack wait for %d: seq %u, seen %u\n", rank, g, s, qe_ld_acquire_sys(mine + g));
+            }
+}
+__global__ void k_rag_ack(AckP a, const unsigned* seq, int rank, int ngpu) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *seq;
+    __threadfence_system();
+    for (int g = 0; g < ngpu; g++)
+        if (g != rank) qe_st_release_sys(a.w[g] + rank, s);
+}
+// staged QSA exchange: the send kernel wrote into the local outbox, the copies follow; raise the receivers' flags with
+// the exchange's sequence number (flags: [rank] the flag words [4 senders] of every card)
+struct FlagP {
+    unsigned* f[4];
+};
+__global__ void k_xs_flag(FlagP p, const unsigned* seq, int rank, int ngpu) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *seq + 1;
+    __threadfence_system();
+    for (int g = 0; g < ngpu; g++)
+        if (g != rank) qe_st_release_sys(p.f[g] + rank, s);
+}
+// host-staged exchange: the peers' rows are in the receive slot (H2D before this kernel): raise this card's own flag
+// words of every sender, which the consumer kernel waits for
+// copy-engine staged transfers: the transfer's flag value (*seq + 1) into a local word, which the stream's copies then
+// write into the peers' flag words after the rows
+__global__ void k_seq_word(unsigned* w, const unsigned* seq) { *w = *seq + 1; }
+__global__ void k_xs_local(unsigned* mine, const unsigned* seq, int rank, int ngpu) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *seq + 1;
+    __threadfence();
+    for (int g = 0; g < ngpu; g++)
+        if (g != rank) qe_st_release_sys(mine + g, s);
+}
+// wait for the peers' flags of the exchange (host words), without advancing the counter (the consumer kernel does)
+__global__ void k_xs_wait(const unsigned* __restrict__ mine, const unsigned* seq, int rank, int ngpu) {
+    if (threadIdx.x != 0) return;
+    const unsigned s = *seq + 1;
+    for (int g = 0; g < ngpu; g++)
+        if (g != rank)
+            for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(mine + g) - s) < 0; it++) {
+                __nanosleep(64);
+                QE_WD_POLL(ws_, kWdRowAg, g, s, qe_ld_acquire_sys(mine + g));
+                if (it == (1ull << 26)) printf("[flash] stall: rank %d staged exchange wait for %d: seq %u, seen %u\n", rank, g, s, qe_ld_acquire_sys(mine + g));
+            }
+    __threadfence_system();
+}
+// receive slots of the QSA exchanges by an even counter at the start of a prefill batch: the host then knows the slot
+// parity of every staged exchange of the batch (its copies are addressed on the host, also in a replayed graph)
+// staged batches: align the exchange counters to a multiple of XSLOT, so exchange k of the batch (host counter k = 1,
+// 2, ...) uses slot k & (XSLOT - 1), the slot the consumers read (s & (XSLOT - 1), s = seq + 1); was parity (2 slots)
+__global__ void k_xpar_align(unsigned* a, unsigned* b) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *a += (XSLOT - *a % XSLOT) % XSLOT;
+        *b += (XSLOT - *b % XSLOT) % XSLOT;
+    }
 }
 __global__ void k_xsend(const float* __restrict__ part, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    float* dst = xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * XPER;
-    const int h0 = peer * 8;
-    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * XPER / 2; idx += gridDim.y * blockDim.x) {
-        const int t = idx / (XPER / 2), r = idx % (XPER / 2);
+    float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * xper(p);
+    const int h0 = peer * QPC(p);
+    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * xper(p) / 2; idx += gridDim.y * blockDim.x) {
+        const int t = idx / (xper(p) / 2), r = idx % (xper(p) / 2);
         reinterpret_cast<float2*>(dst)[idx] = reinterpret_cast<const float2*>(part + ((size_t)t * NQ + h0) * (HD + 2))[r];
     }
     xsend_done(xc, peer, s, p);
@@ -1259,21 +1595,21 @@ __global__ void k_qsa_comb2(const float* __restrict__ part, int m, const float* 
         const unsigned s = *xc.seq + 1;
         for (int g = 0; g < p.ngpu; g++)
             if (g != p.rank)
-                while ((int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, g, s, qe_ld_acquire_sys(xc.flags[p.rank] + g)); }
         s_s = s;
     }
     __syncthreads();
     const unsigned s = s_s;
     const int hl = blockIdx.x, t = blockIdx.y, d = threadIdx.x, h = p.q0 + hl;
-    const float* rb = xc.recv[p.rank] + (size_t)(s & 1) * p.ngpu * XROWS * XPER;
+    const float* rb = xc.recv[p.rank] + (size_t)(s & (XSLOT - 1)) * p.ngpu * XROWS * xper(p);
     float M = -INFINITY;
     for (int g = 0; g < p.ngpu; g++) {
-        const float* o = g == p.rank ? part + ((size_t)t * NQ + h) * (HD + 2) : rb + ((size_t)g * XROWS + t) * XPER + hl * (HD + 2);
+        const float* o = g == p.rank ? part + ((size_t)t * NQ + h) * (HD + 2) : rb + ((size_t)g * XROWS + t) * xper(p) + hl * (HD + 2);
         M = fmaxf(M, __ldcg(o + HD));
     }
     float a = 0.f, L = 0.f;
     for (int g = 0; g < p.ngpu; g++) {
-        const float* o = g == p.rank ? part + ((size_t)t * NQ + h) * (HD + 2) : rb + ((size_t)g * XROWS + t) * XPER + hl * (HD + 2);
+        const float* o = g == p.rank ? part + ((size_t)t * NQ + h) * (HD + 2) : rb + ((size_t)g * XROWS + t) * xper(p) + hl * (HD + 2);
         const float mg = __ldcg(o + HD);
         if (mg == -INFINITY) continue;
         const float c = __expf(mg - M);
@@ -1399,6 +1735,36 @@ __global__ void __launch_bounds__(256) k_idx_score_t(const bf16* __restrict__ ik
     }
 }
 // k-th largest key (1-based) of n keys in smem via 4 passes of 8-bit radix (block-wide); returns the key
+// the same over keys in global memory written by this block (k_idx_local<true>): coherent (L2) loads
+__device__ unsigned radix_kth_g(const unsigned* keys, int n, int k, unsigned* hist) {
+    unsigned prefix = 0u, mask = 0u;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const unsigned kk = __ldcg(keys + i);
+            if ((kk & mask) == prefix) atomicAdd(&hist[(kk >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        __shared__ unsigned s_digit, s_rem;
+        if (threadIdx.x == 0) {
+            unsigned acc = 0u;
+            int d = 255;
+            for (; d > 0; d--) {
+                if (acc + hist[d] >= (unsigned)k) break;
+                acc += hist[d];
+            }
+            s_digit = d;
+            s_rem = k - acc;
+        }
+        __syncthreads();
+        prefix |= s_digit << shift;
+        mask |= 255u << shift;
+        k = s_rem;
+        __syncthreads();
+    }
+    return prefix;
+}
 __device__ unsigned radix_kth(const unsigned* __restrict__ keys, int n, int k, unsigned* hist) {
     unsigned prefix = 0u, mask = 0u;
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -1429,13 +1795,17 @@ __device__ unsigned radix_kth(const unsigned* __restrict__ keys, int n, int k, u
     return prefix;
 }
 // local top-IDX_TOPB scores of row t -> send buffer (as keys; fewer blocks: all of them, pad 0 = -inf).
-// One block per row, dynamic smem lbmax keys.
-__global__ void k_idx_local(const float* __restrict__ scores, const int* __restrict__ pos0, Plan p, int lbmax,
+// One block per row, dynamic smem lbmax keys; GK (the keys of a card's whole context do not fit shared memory: 2 cards
+// own 1/2 of the positions, 262144 -> 32768 blocks = 128 KB): the keys replace the row's scores in place (global
+// memory), k_idx_select then reads them as keys (skeys)
+template <bool GK = false>
+__global__ void k_idx_local(float* __restrict__ scores, const int* __restrict__ pos0, Plan p, int lbmax,
                             unsigned* __restrict__ out, const int* __restrict__ rpos = nullptr) {
-    extern __shared__ unsigned keys[];
+    extern __shared__ unsigned keys_sm[];
     __shared__ unsigned hist[256];
     __shared__ int s_cnt;
     const int t = blockIdx.x;
+    unsigned* keys = GK ? reinterpret_cast<unsigned*>(scores + (size_t)t * lbmax) : keys_sm;
     const int pos = rpos ? rpos[t] : *pos0 + t, nbg = (pos + 1) / IDX_R;
     unsigned* o = out + (size_t)t * IDX_TOPB;
     if (nbg <= IDX_TOPB) {
@@ -1444,10 +1814,22 @@ __global__ void k_idx_local(const float* __restrict__ scores, const int* __restr
     }
     const int nlb = owned_upto(p, IDX_R * nbg - 1) / IDX_R;
     for (int i = threadIdx.x; i < nlb; i += blockDim.x) keys[i] = fkey(scores[(size_t)t * lbmax + i]);
+    if (GK) __threadfence_block();
     if (threadIdx.x == 0) s_cnt = 0;
     __syncthreads();
     if (nlb <= IDX_TOPB) {
-        for (int i = threadIdx.x; i < IDX_TOPB; i += blockDim.x) o[i] = i < nlb ? keys[i] : 0u;
+        for (int i = threadIdx.x; i < IDX_TOPB; i += blockDim.x) o[i] = i < nlb ? (GK ? __ldcg(keys + i) : keys[i]) : 0u;
+        return;
+    }
+    if (GK) {
+        const unsigned kth = radix_kth_g(keys, nlb, IDX_TOPB, hist);
+        for (int i = threadIdx.x; i < nlb; i += blockDim.x) {
+            const unsigned kk = __ldcg(keys + i);
+            if (kk > kth) o[atomicAdd(&s_cnt, 1)] = kk;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < nlb; i += blockDim.x)
+            if (__ldcg(keys + i) == kth) { const int j = atomicAdd(&s_cnt, 1); if (j < IDX_TOPB) o[j] = kth; }
         return;
     }
     const unsigned kth = radix_kth(keys, nlb, IDX_TOPB, hist);
@@ -1462,7 +1844,7 @@ __global__ void k_idx_local(const float* __restrict__ scores, const int* __restr
 __global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    unsigned* dst = reinterpret_cast<unsigned*>(xc.recv[peer]) + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * IDX_TOPB;
+    unsigned* dst = reinterpret_cast<unsigned*>(xc.recv[peer]) + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * IDX_TOPB;
     for (int idx = threadIdx.x; idx < m * IDX_TOPB; idx += blockDim.x) dst[idx] = loc[idx];
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1474,8 +1856,8 @@ __global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Pla
 // (score key >= threshold) into sel[t][0..nsel[t]). One block per row; the last block bumps the exchange.
 __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* __restrict__ loc, const int* __restrict__ pos0,
                              Plan p, int lbmax, Xchg xc, int* __restrict__ sel, int* __restrict__ nsel,
-                             const int* __restrict__ rpos = nullptr) {
-    __shared__ unsigned keys[3 * IDX_TOPB];
+                             const int* __restrict__ rpos = nullptr, bool skeys = false) {
+    __shared__ unsigned keys[3 * IDX_TOPB];  // ngpu <= 3
     __shared__ unsigned hist[256];
     __shared__ unsigned s_s;
     __shared__ int s_cnt;
@@ -1484,14 +1866,14 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
         const unsigned s = *xc.seq + 1;
         for (int g = 0; g < p.ngpu; g++)
             if (g != p.rank)
-                while ((int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, g, s, qe_ld_acquire_sys(xc.flags[p.rank] + g)); }
         s_s = s;
         s_cnt = 0;
     }
     __syncthreads();
     const int pos = rpos ? rpos[t] : *pos0 + t, nbg = (pos + 1) / IDX_R;
     if (nbg > IDX_TOPB) {
-        const unsigned* rb = reinterpret_cast<const unsigned*>(xc.recv[p.rank]) + (size_t)(s_s & 1) * p.ngpu * XROWS * IDX_TOPB;
+        const unsigned* rb = reinterpret_cast<const unsigned*>(xc.recv[p.rank]) + (size_t)(s_s & (XSLOT - 1)) * p.ngpu * XROWS * IDX_TOPB;
         for (int i = threadIdx.x; i < p.ngpu * IDX_TOPB; i += blockDim.x) {
             const int g = i / IDX_TOPB, j = i % IDX_TOPB;
             keys[i] = g == p.rank ? loc[(size_t)t * IDX_TOPB + j] : __ldcg(rb + ((size_t)g * XROWS + t) * IDX_TOPB + j);
@@ -1504,7 +1886,8 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
         const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
         for (int b0 = 0; b0 < nlb; b0 += blockDim.x) {
             const int i = b0 + threadIdx.x;
-            const bool f = i < nlb && fkey(scores[(size_t)t * lbmax + i]) >= thr;
+            const float sv = i < nlb ? scores[(size_t)t * lbmax + i] : 0.f;
+            const bool f = i < nlb && (skeys ? __float_as_uint(sv) : fkey(sv)) >= thr;
             const unsigned bal = __ballot_sync(0xffffffffu, f);
             if (lane == 0) wcnt[wid] = __popc(bal);
             __syncthreads();
@@ -1535,13 +1918,12 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
 
 // QSA variant B: q is computed for the local heads only; every card sends its 8 heads' q rows ([MAXM][8][HD]) to
 // both peers (receive buffer [2 slots][ngpu][MAXM][8][HD]); the attention waits for the peer's flag per block.
-constexpr int QPER = 8 * HD;
 __global__ void k_qxsend(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    float* dst = xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * QPER;
-    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * QPER / 4; idx += gridDim.y * blockDim.x) {
-        const int t = idx / (QPER / 4), r = idx % (QPER / 4);
+    float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * qper(p);
+    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * qper(p) / 4; idx += gridDim.y * blockDim.x) {
+        const int t = idx / (qper(p) / 4), r = idx % (qper(p) / 4);
         reinterpret_cast<float4*>(dst)[idx] = reinterpret_cast<const float4*>(qb + ((size_t)t * (NQ + 4) + p.q0) * HD)[r];
     }
     xsend_done(xc, peer, s, p);
@@ -1552,9 +1934,9 @@ constexpr int XP16 = HD / 2 + 4;  // 128 floats of halves, m, l, pad (16-byte al
 __global__ void k_qxsend16(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
-    __half* dst = reinterpret_cast<__half*>(xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * QPER);
-    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * QPER / 8; idx += gridDim.y * blockDim.x) {
-        const int t = idx / (QPER / 8), r = idx % (QPER / 8);
+    __half* dst = reinterpret_cast<__half*>(xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * qper(p));
+    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * qper(p) / 8; idx += gridDim.y * blockDim.x) {
+        const int t = idx / (qper(p) / 8), r = idx % (qper(p) / 8);
         const float4* src = reinterpret_cast<const float4*>(qb + ((size_t)t * (NQ + 4) + p.q0) * HD) + 2 * r;
         const float4 a = src[0], b = src[1];
         constexpr float k = 1.f / 16.f;
@@ -1562,13 +1944,14 @@ __global__ void k_qxsend16(const float* __restrict__ qb, int m, Xchg xc, Plan p)
     }
     xsend_done(xc, peer, s, p);
 }
-__global__ void k_xsend16(const float* __restrict__ part, int m, Xchg xc, Plan p) {
+// ahead: exchanges of this kind sent but not yet consumed here (pipelined QSA chunks, prefill-r3)
+__global__ void k_xsend16(const float* __restrict__ part, int m, Xchg xc, Plan p, int ahead = 0) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
-    const unsigned s = *xc.seq + 1;
-    float* dst = xc.recv[peer] + ((size_t)(s & 1) * p.ngpu + p.rank) * XROWS * XPER;
-    const int h0 = peer * 8;
-    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * 8 * 32; idx += gridDim.y * blockDim.x) {
-        const int rec = idx >> 5, l8 = idx & 31, t = rec >> 3, hl = rec & 7;
+    const unsigned s = *xc.seq + 1 + ahead;
+    float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * xper(p);
+    const int qpc = QPC(p), h0 = peer * qpc;
+    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * qpc * 32; idx += gridDim.y * blockDim.x) {
+        const int rec = idx >> 5, l8 = idx & 31, t = rec / qpc, hl = rec - t * qpc;
         const float* src = part + ((size_t)t * NQ + h0 + hl) * (HD + 2);
         const float L = src[HD + 1], inv = L > 0.f ? 1.f / L : 0.f;
         const float2* s2 = reinterpret_cast<const float2*>(src) + 4 * l8;  // records of HD + 2 floats: 8-byte aligned
@@ -1588,17 +1971,17 @@ __global__ void k_qsa_comb16(const float* __restrict__ part, int m, const float*
         const unsigned s = *xc.seq + 1;
         for (int g = 0; g < p.ngpu; g++)
             if (g != p.rank)
-                while ((int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xc.flags[p.rank] + g) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, g, s, qe_ld_acquire_sys(xc.flags[p.rank] + g)); }
         s_s = s;
     }
     __syncthreads();
     const unsigned s = s_s;
     const int hl = blockIdx.x, t = blockIdx.y, d = threadIdx.x, h = p.q0 + hl;
-    const float* rb = xc.recv[p.rank] + (size_t)(s & 1) * p.ngpu * XROWS * XPER;
+    const float* rb = xc.recv[p.rank] + (size_t)(s & (XSLOT - 1)) * p.ngpu * XROWS * xper(p);
     const float* own = part + ((size_t)t * NQ + h) * (HD + 2);
     float M = __ldcg(own + HD);
     for (int g = 0; g < p.ngpu; g++)
-        if (g != p.rank) M = fmaxf(M, __ldcg(rb + ((size_t)g * XROWS * XPER) + ((size_t)t * 8 + hl) * XP16 + HD / 2));
+        if (g != p.rank) M = fmaxf(M, __ldcg(rb + ((size_t)g * XROWS * xper(p)) + ((size_t)t * QPC(p) + hl) * XP16 + HD / 2));
     float a = 0.f, L = 0.f;
     {
         const float mg = __ldcg(own + HD);
@@ -1610,7 +1993,7 @@ __global__ void k_qsa_comb16(const float* __restrict__ part, int m, const float*
     }
     for (int g = 0; g < p.ngpu; g++) {
         if (g == p.rank) continue;
-        const float* rec = rb + ((size_t)g * XROWS * XPER) + ((size_t)t * 8 + hl) * XP16;
+        const float* rec = rb + ((size_t)g * XROWS * xper(p)) + ((size_t)t * QPC(p) + hl) * XP16;
         const float mg = __ldcg(rec + HD / 2);
         if (mg == -INFINITY) continue;
         const float w = __expf(mg - M) * __ldcg(rec + HD / 2 + 1);
@@ -1640,16 +2023,16 @@ __global__ void k_qsa_attn_b(const float* __restrict__ qb, const uint8_t* __rest
     __shared__ unsigned s_s;
     if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
     const int h = blockIdx.x, t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int owner = h / 8;
+    const int owner = h / QPC(p);
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
         if (owner != p.rank)
-            while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0) __nanosleep(20);
+            for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, owner, s, qe_ld_acquire_sys(xq.flags[p.rank] + owner)); }
         s_s = s;
     }
     __syncthreads();
     const float* qsrc = owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                        : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * QPER + (h - owner * 8) * HD;
+                                        : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
     qs[threadIdx.x] = __ldcg(qsrc + threadIdx.x) * (1.f / 16.f);
     __syncthreads();
     const int kvh = h / (NQ / NKV);
@@ -1720,17 +2103,17 @@ __global__ void __launch_bounds__(256) k_qsa_attn_rows(const float* __restrict__
     if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
     const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int t = blockIdx.y * 8 + warp;
-    const int owner = h / 8;
+    const int owner = h / QPC(p);
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
         if (owner != p.rank)
-            while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0) __nanosleep(20);
+            for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, owner, s, qe_ld_acquire_sys(xq.flags[p.rank] + owner)); }
         s_s = s;
     }
     __syncthreads();
     if (t < m) {
         const float* qsrc = owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                            : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * QPER + (h - owner * 8) * HD;
+                                            : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
         float q8[8];
 #pragma unroll
         for (int e = 0; e < 8; e++) q8[e] = __ldcg(qsrc + lane * 8 + e) * (1.f / 16.f);
@@ -1807,11 +2190,11 @@ __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ q
     float* kss = reinterpret_cast<float*>(Vs + TA_KEYS * TA_SROW);
     __shared__ unsigned s_s;
     const int h = blockIdx.x, tb = blockIdx.y * TA_ROWS, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int owner = h / 8, kvh = h / (NQ / NKV);
+    const int owner = h / QPC(p), kvh = h / (NQ / NKV);
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
         if (owner != p.rank)
-            while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0) __nanosleep(20);
+            for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + owner) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, owner, s, qe_ld_acquire_sys(xq.flags[p.rank] + owner)); }
         s_s = s;
     }
     __syncthreads();
@@ -1821,7 +2204,7 @@ __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ q
         float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
         if (t < m) {
             const float* qsrc = owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                                : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * QPER + (h - owner * 8) * HD;
+                                                : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
             v = __ldcg(reinterpret_cast<const float4*>(qsrc) + c4);
         }
         __half2* d = reinterpret_cast<__half2*>(Qs + r * TA_SROW + c4 * 4);
@@ -1993,14 +2376,14 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
         for (int hh = blockIdx.x * 2; hh < blockIdx.x * 2 + 2; hh++) {
-            const int ow = hh / 8;
+            const int ow = hh / QPC(p);
             if (ow != p.rank)
-                while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0) __nanosleep(20);
+                for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow)); }
         }
         s_s = s;
     }
     __syncthreads();
-    const int owner = h / 8;
+    const int owner = h / QPC(p);
     const int pos = *pos0;
     const int g = lane >> 2, t4 = lane & 3;
     const int r0 = rg * 16 + g, r1 = r0 + 8;  // rows of this lane within the block
@@ -2011,13 +2394,13 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
             if (tb + t >= m) return nullptr;
             const int tt = tb + t;
             return owner == p.rank ? qb + ((size_t)tt * (NQ + 4) + h) * HD
-                                   : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + tt) * QPER + (h - owner * 8) * HD;
+                                   : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + tt) * qper(p) + (h - owner * QPC(p)) * HD;
         };
         if (Q16 && owner != p.rank) {
             auto qrow16 = [&](int t) -> const __half* {
                 if (tb + t >= m) return nullptr;
-                return reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & 1) * p.ngpu + owner) * XROWS * QPER) +
-                       (size_t)(tb + t) * QPER + (h - owner * 8) * HD;
+                return reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p)) +
+                       (size_t)(tb + t) * qper(p) + (h - owner * QPC(p)) * HD;
             };
             const __half* h0 = qrow16(r0);
             const __half* h1 = qrow16(r1);
@@ -2250,12 +2633,12 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
     constexpr int HPG = NQ / NKV;  // 12 q heads per kv head
     if (threadIdx.x == 0) {
         const unsigned s = *xq.seq + 1;
-        for (int hh = kvh * HPG; hh < kvh * HPG + HPG; hh += 8) {
-            const int ow = hh / 8;
-            if (ow != p.rank) while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0) __nanosleep(20);
+        for (int hh = kvh * HPG; hh < kvh * HPG + HPG; hh += QPC(p)) {
+            const int ow = hh / QPC(p);
+            if (ow != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow)); }
         }
-        const int ow2 = (kvh * HPG + HPG - 1) / 8;
-        if (ow2 != p.rank) while ((int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow2) - s) < 0) __nanosleep(20);
+        const int ow2 = (kvh * HPG + HPG - 1) / QPC(p);
+        if (ow2 != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow2) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow2, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow2)); }
         s_s = s;
     }
     __syncthreads();
@@ -2263,15 +2646,15 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
     uint32_t qa[HD / 16][4];
     {
         auto qrow = [&](int h) -> const float* {
-            const int owner = h / 8;
+            const int owner = h / QPC(p);
             return owner == p.rank ? qb + ((size_t)t * (NQ + 4) + h) * HD
-                                   : xq.recv[p.rank] + (((size_t)(s_s & 1) * p.ngpu + owner) * XROWS + t) * QPER + (h - owner * 8) * HD;
+                                   : xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
         };
         auto qrow16 = [&](int h) -> const __half* {  // fp16 rows of a peer (nullptr: own head, fp32)
-            const int owner = h / 8;
+            const int owner = h / QPC(p);
             return owner == p.rank || !q16 ? nullptr
-                 : reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & 1) * p.ngpu + owner) * XROWS * QPER) +
-                       (size_t)t * QPER + (h - owner * 8) * HD;
+                 : reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p)) +
+                       (size_t)t * qper(p) + (h - owner * QPC(p)) * HD;
         };
         const int h0 = kvh * HPG + g, h1 = kvh * HPG + g + 8;
         const float* q0 = qrow(h0);
@@ -3723,7 +4106,7 @@ __global__ void k_ngram_handoff(NgramDev ng, int n) {
     ng.flags[2] = n;
     __threadfence_system();
     qe_st_release_sys(ng.flags, s);
-    while ((int)(qe_ld_acquire_sys(ng.flags + 1) - s) < 0) __nanosleep(64);
+    for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(ng.flags + 1) - s) < 0;) { __nanosleep(64); QE_WD_POLL(ws_, kWdQsaX, 1, s, qe_ld_acquire_sys(ng.flags + 1)); }
 }
 __global__ void k_accept(const int* __restrict__ vtok, const int* __restrict__ otok, int k, int* __restrict__ posd,
                          int* __restrict__ mposd, int* __restrict__ acc, int* __restrict__ hist2, int* __restrict__ em) {
@@ -3857,10 +4240,17 @@ __global__ void k_lk_emit(const int* __restrict__ hd, const int* __restrict__ hn
     out[31] = s;  // raw match length (statistics / policy tuning)
     for (int i = 0; i < L; i++) { lk[1 + i] = hd[j + 1 + i]; out[1 + i] = hd[j + 1 + i]; }
 }
-// guard: count non-finite values of the lm_head input (n values) into a host-mapped counter
-__global__ void k_nonfinite(const bf16* __restrict__ x, int n, unsigned* __restrict__ cnt) {
+// guard: count non-finite values of the lm_head input (m rows of h values) into a host-mapped counter (blocks that saw
+// one) and flag the rows (host-mapped, row index clamped to rows - 1): which sequence of a batch to fail
+__global__ void k_nonfinite(const bf16* __restrict__ x, int m, int h, unsigned* __restrict__ cnt, unsigned* __restrict__ rows,
+                            int nrows) {
     int bad = 0;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) bad |= !isfinite(__bfloat162float(x[i]));
+    const int n = m * h;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        if (!isfinite(__bfloat162float(x[i]))) {
+            bad = 1;
+            if (rows) rows[min(i / h, nrows - 1)] = 1u;
+        }
     if (__syncthreads_or(bad) && threadIdx.x == 0) atomicAdd(cnt, 1u);
 }
 // MTP draft chain after a lookup step only when the next step is an MTP step (no lookup drafts)
@@ -4425,8 +4815,8 @@ __global__ void __launch_bounds__(512) k_jobs_pf(int C, const int* __restrict__ 
                                                  ColdTab ct, int ndev, const int* __restrict__ gsel,
                                                  const float* __restrict__ gw, const float* __restrict__ gsh,
                                                  PfJob* __restrict__ jobs, int* __restrict__ tl, float* __restrict__ wl,
-                                                 int* __restrict__ njobs) {
-    __shared__ int cnt[NE + 1], off[NE + 1], fill[NE + 1], jbase[NE + 1], abase[NE + 1];
+                                                 int* __restrict__ njobs, int* __restrict__ inv = nullptr) {
+    __shared__ int cnt[NE + 1], off[NE + 1], fill[NE + 1], jbase[NE + 1], abase[NE + 1], nloc[NE];
     __shared__ int wtot[16], wtot2[16], wtot3[16];
     const int e = threadIdx.x, warp = e >> 5, lane = e & 31;
     cnt[e] = 0;
@@ -4439,6 +4829,7 @@ __global__ void __launch_bounds__(512) k_jobs_pf(int C, const int* __restrict__ 
     int gm[NGRP];
 #pragma unroll
     for (int g = 0; g < NGRP; g++) { gm[g] = gmap[e * NGRP + g]; ng += (gm[g] >= 0 && cnt[e] > 0); }
+    nloc[e] = ng;
     // exclusive scans: token-list offsets (count) and job indices (local groups)
     const int ar = ng * cnt[e];  // activation rows of the expert's local groups
     const int nq = (cnt[e] + PF_SHJ - 1) / PF_SHJ;  // row chunks of the expert (jobs = chunks x local groups)
@@ -4465,6 +4856,9 @@ __global__ void __launch_bounds__(512) k_jobs_pf(int C, const int* __restrict__ 
         const int slot = off[ex] + atomicAdd(&fill[ex], 1);
         tl[slot] = i / TOPK;
         wl[slot] = gw[i];
+        // slot of (row, k) for the slot-buffer down's sums (k_moe_sum); -1: the expert has no group on this card (no
+        // job writes the slot, it holds another expert's output from an earlier batch)
+        if (inv) inv[i] = nloc[ex] > 0 ? slot : -1;
     }
     for (int i = e; i < C; i += 512) { tl[ta + i] = i; wl[ta + i] = gsh[i]; }
     __syncthreads();
@@ -4785,6 +5179,126 @@ __global__ void __launch_bounds__(128) k_moe_dn_pf(const PfJob* __restrict__ job
             }
         }
     }
+}
+// down of a prefill job into the slot buffer (FLASH_MOE_SLOT): the expert output of every (row, expert) slot of the
+// token lists is stored (fp16, x 1/16) instead of added to the row's partial by fp32 atomics (the atomics bound the
+// kernel: ~28K per row); k_moe_sum adds a row's 11 slots in a fixed order. Same tiles and arithmetic as k_moe_dn_pf.
+constexpr float kSlotScale = 16.f;
+struct SlotBuf {  // slot rows [0, n1) in a, the rest in b (the big-batch extension)
+    __half* a; int n1; __half* b;
+    __device__ __forceinline__ __half* row(int s) const { return s < n1 ? a + (size_t)s * H : b + (size_t)(s - n1) * H; }
+};
+template <int TT>
+__global__ void __launch_bounds__(128) k_moe_dn_slot(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
+                                                     const __half* __restrict__ act, SlotBuf slots) {
+    constexpr int NT = 4;
+    const int job = blockIdx.y;
+    if (job >= *njobs) return;
+    const int ngj = jobs[job].ng;
+    if (ngj == 0) return;
+    const int pn = jobs[job].n, poff = jobs[job].off;
+    const int rb = (blockIdx.x * 4 + (threadIdx.x >> 5)) * TT;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    for (int t0 = 0; t0 < pn; t0 += 8 * NT) {
+        const int m = min(8 * NT, pn - t0);
+        float acc[TT][NT][4];
+#pragma unroll
+        for (int tt = 0; tt < TT; tt++)
+#pragma unroll
+            for (int j = 0; j < NT; j++) acc[tt][j][0] = acc[tt][j][1] = acc[tt][j][2] = acc[tt][j][3] = 0.f;
+        for (int k = 0; k < ngj; k++) {
+            const PfJob pj = jobs[job + k];
+            uint4 b0[2][NT], b1[2][NT];
+#pragma unroll
+            for (int c = 0; c < 2; c++)
+#pragma unroll
+                for (int j = 0; j < NT; j++) {
+                    const int li = 8 * j + g < m ? 8 * j + g : 0;
+                    const uint4* xr = reinterpret_cast<const uint4*>(act + (size_t)(pj.aoff + t0 + li) * GRP + t4 * 16);
+                    b0[c][j] = xr[c * 8];
+                    b1[c][j] = xr[c * 8 + 1];
+                }
+#pragma unroll
+            for (int tt = 0; tt < TT; tt++) {
+                const int r = rb + tt;
+                const uint4* qp = pj.w.dq + (size_t)r * 2 * 32 + lane;
+                const uint4 w0 = __ldg(qp), w1 = __ldg(qp + 32);
+                const float sg = __half2float(pj.w.ds[r * 16 + g]) * kXhScale, sg8 = __half2float(pj.w.ds[r * 16 + g + 8]) * kXhScale;
+#pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    const uint4 wc = c ? w1 : w0;
+                    uint32_t hacc[NT][2];
+#pragma unroll
+                    for (int j = 0; j < NT; j++) hacc[j][0] = hacc[j][1] = 0u;
+                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        uint32_t a[4];
+                        xh_dequant(words[q], a);
+#pragma unroll
+                        for (int j = 0; j < NT; j++) {
+                            if (8 * j >= m) break;
+                            const uint4& bb = (q >> 1) ? b1[c][j] : b0[c][j];
+                            xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NT; j++) xh_flush(acc[tt][j], hacc[j], sg, sg8);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NT; j++) {
+            const int n0 = 8 * j + 2 * t4;
+#pragma unroll
+            for (int tt = 0; tt < TT; tt++) {
+                const int row0 = (rb + tt) * 16;
+                if (n0 < m) {
+                    __half* o = slots.row(poff + t0 + n0) + row0 + g;
+                    o[0] = __float2half_rn(acc[tt][j][0] * (1.f / kSlotScale));
+                    o[8] = __float2half_rn(acc[tt][j][2] * (1.f / kSlotScale));
+                }
+                if (n0 + 1 < m) {
+                    __half* o = slots.row(poff + t0 + n0 + 1) + row0 + g;
+                    o[0] = __float2half_rn(acc[tt][j][1] * (1.f / kSlotScale));
+                    o[8] = __float2half_rn(acc[tt][j][3] * (1.f / kSlotScale));
+                }
+            }
+        }
+    }
+}
+// part[t] = shared slot + the row's TOPK routed slots (k order): every element written, no memset
+__global__ void __launch_bounds__(320) k_moe_sum(SlotBuf slots, const int* __restrict__ inv, int shoff,
+                                                 const int* __restrict__ gmap, float* __restrict__ part) {
+    const int t = blockIdx.x, i = threadIdx.x;  // 8 columns per thread (H = 2560 = 320 x 8)
+    __shared__ int sl[TOPK + 1];
+    if (i < TOPK) sl[i] = inv[t * TOPK + i];  // -1: no group of that expert on this card
+    if (i == TOPK) {  // the shared expert's slot, if this card holds a group of it
+        bool any = false;
+        for (int g = 0; g < NGRP; g++) any |= gmap[NE * NGRP + g] >= 0;
+        sl[TOPK] = any ? shoff + t : -1;
+    }
+    __syncthreads();
+    float a[8];
+#pragma unroll
+    for (int q = 0; q < 8; q++) a[q] = 0.f;
+    if (sl[TOPK] >= 0) {
+        const uint4 v = reinterpret_cast<const uint4*>(slots.row(sl[TOPK]))[i];
+        const __half2* h = reinterpret_cast<const __half2*>(&v);
+#pragma unroll
+        for (int q = 0; q < 4; q++) { const float2 f = __half22float2(h[q]); a[2 * q] = f.x; a[2 * q + 1] = f.y; }
+    }
+#pragma unroll
+    for (int k = 0; k < TOPK; k++) {
+        if (sl[k] < 0) continue;
+        const uint4 v = reinterpret_cast<const uint4*>(slots.row(sl[k]))[i];
+        const __half2* h = reinterpret_cast<const __half2*>(&v);
+#pragma unroll
+        for (int q = 0; q < 4; q++) { const float2 f = __half22float2(h[q]); a[2 * q] += f.x; a[2 * q + 1] += f.y; }
+    }
+    float4* o = reinterpret_cast<float4*>(part + (size_t)t * H) + 2 * i;
+    o[0] = make_float4(a[0] * kSlotScale, a[1] * kSlotScale, a[2] * kSlotScale, a[3] * kSlotScale);
+    o[1] = make_float4(a[4] * kSlotScale, a[5] * kSlotScale, a[6] * kSlotScale, a[7] * kSlotScale);
 }
 __global__ void k_spin(unsigned ns) {  // debug: delay a stream (race stress tests)
     const unsigned long long t0 = clock64();

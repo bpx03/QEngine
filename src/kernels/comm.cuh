@@ -1,5 +1,6 @@
 #pragma once
 #include "../common.h"
+#include "steer.cuh"
 
 // Cross-GPU reduction without P2P: every GPU writes its partial into pinned, host-mapped
 // memory and raises a per-GPU flag; peers poll the flag over PCIe and read the data.
@@ -50,8 +51,26 @@ struct Comm {
     unsigned* cfl[4] = {nullptr, nullptr, nullptr, nullptr};
     int dev[4] = {0, 0, 0, 0};  // CUDA device of each rank
     uint2* pstage[4] = {nullptr, nullptr, nullptr, nullptr};
+    // prefill transfer path (comm_select_path: startup probe, FLASH_COMM / QE_COMM): kXferP2P SM loads / stores between the peers
+    // memory, kXferCE copy-engine peer copies, kXferHost copies staged through pinned host memory (D2H, flag, H2D)
+    int xfer = 0;
+    // P2P prefill collectives (xfer == kXferP2P), per directed pair: bit 4 i + j set = rank i READS rank j's rows from
+    // j's memory (SM loads, "pull"), else j stores them into i's memory ("push"). Pull keeps the sender's memory system
+    // free (SM stores over PCIe stall every kernel next to them); comm_select_path sets it from the probe.
+    unsigned pullm = 0;
+    // staged transfers (xfer != kXferP2P): flag words [2 kinds][ngpu senders] of each receiving rank (device memory of the
+    // receiver for CE, host-mapped pinned memory for host staging), a device counter per rank, and for host staging
+    // each rank's pinned send rows: [rs_rows][h] bf16 partials (hrs) and sums (hag), on the rank's NUMA node
+    unsigned* xfl[4] = {nullptr, nullptr, nullptr, nullptr};
+    unsigned* xcnt[4] = {nullptr, nullptr, nullptr, nullptr};
+    // CE: a device word per rank holding the call's sequence number, copied by the copy engine into the peers' flag
+    // words after the rows (same stream: the flag lands after the data it covers)
+    unsigned* xsw[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint2* hrs[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint2* hag[4] = {nullptr, nullptr, nullptr, nullptr};
 };
 constexpr int kCeSlots = 16;
+constexpr int kXferP2P = 0, kXferCE = 1, kXferHost = 2;
 
 // Owner-finished deferred prefill all-reduce: the owner of a row (reduce-scatter) also adds the
 // sum to ITS residual rows, applies the norm and writes the normed row - int8 for the W4A8 GEMM
@@ -85,6 +104,8 @@ void comm_free_p2p(Comm& c, const int* devices);
 void comm_begin_unit(const CommCounters& ctr, cudaStream_t st);
 
 // resid[m][h] += sum_g partial_g  (fixed summation order -> bitwise identical on all GPUs).
+// sa (optional, steer.cuh): the activation steering of the rows' layer output, applied after the sum and before the
+// fused norm (not with defer / of: allreduce_finish takes it then).
 // If norm_w is given, also writes xn = bf16(rmsnorm(resid) * (1 + norm_w)) (fused next norm).
 // ll_idx >= 0 (and m <= kMaxBatchRows) selects the LL protocol: ll_idx is the collective's
 // index within the current launch unit (identical on every GPU).
@@ -98,7 +119,7 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
                    const CommCounters& ctr, cudaStream_t st, const bf16* norm_w = nullptr,
                    float eps = 0.f, bf16* xn = nullptr, int ll_idx = -1, bool overlapped = false,
                    __half* xh = nullptr, bool defer = false, int rs_off = 0, bool part_bf16 = false,
-                   const OwnFin* of = nullptr);
+                   const OwnFin* of = nullptr, const SteerArg* sa = nullptr);
 bool allreduce_ownfin_ok(const Comm& c, int h);
 bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, int h, const Comm& c, int rank,
                       const CommCounters& ctr, cudaStream_t st, int blocks, bool own_rows = false);
@@ -145,9 +166,27 @@ bool allreduce_deferrable(const Comm& c, int m, int h, int rs_off);
 // gemm.cu's x_to_i8_kernel); needs h % 2048 == 0
 void allreduce_finish(float* resid, int m, int h, const Comm& c, int rank, const bf16* norm_w, float eps,
                       bf16* xn, int rs_off, cudaStream_t st, int8_t* xq = nullptr, float* xsc = nullptr,
-                      int G = 0, int* ctr = nullptr, bool wxn = true);  // ctr: zeroed by the kernel (stream-K counter)
+                      int G = 0, int* ctr = nullptr, bool wxn = true,  // ctr: zeroed by the kernel (stream-K counter)
+                      const SteerArg* sa = nullptr);  // sa: layer-output steering before the norm (steer.cuh)
 // (wxn = false with xq: the bf16 xn rows are not written, only the int8 copy for the next GEMM)
 
 // out[g][0..n) = src of GPU g, n <= 4096 floats
 void allgather_small(const float* src, int n, float* out, const Comm& c, int rank,
                      const CommCounters& ctr, cudaStream_t st);
+
+// ---------------------------------------------------------------- topology, startup probe, transfer path
+#include <vector>
+// NUMA node of a GPU (sysfs of its PCI device; -1: unknown / no NUMA)
+int gpu_numa_node(int device);
+// NUMA nodes of the machine (1 on a single-node machine)
+int numa_nodes();
+// memory policy of [p, p + n) (page aligned, before the first touch): one node preferred, several interleaved; no-op on
+// a single-node machine or with an empty list
+void numa_place(void* p, size_t n, const std::vector<int>& nodes);
+// Probes every GPU pair (SM stores into peer memory, copy-engine peer copies, copies staged through pinned host memory;
+// a few ms each), reads the topology (P2P performance rank, NUMA nodes), logs them and picks the prefill transfer path:
+// env (FLASH_COMM / QE_COMM) = auto | p2p | ce | host. staged: the engine has the CE / host-staged prefill collectives
+// (else the choice is reported only: kXferCE keeps the engine's default, kXferHost turns peer access off). Allocates the
+// staged path's flags and buffers. Returns c.xfer.
+int comm_select_path(Comm& c, const int* devices, const char* env, bool staged);
+const char* comm_path_name(int xfer);

@@ -44,7 +44,9 @@ const char* site_name(unsigned s) {
                                       "early GEMV ready tag (gemv_w4h_early, same GPU)",
                                       "kv-split decode softmax stats flag",
                                       "kv-split prefill softmax stats flag",
-                                      "attn_pkp work queue (same GPU)"};
+                                      "attn_pkp work queue (same GPU)",
+                                      "Flash-Next QSA exchange flags (q / partials / indexer, n-gram stage)",
+                                      "Flash-Next row all-gather flags / acks"};
     return s < kWdSites ? n[s] : "?";
 }
 
@@ -131,10 +133,9 @@ const auto g_load_time = std::chrono::steady_clock::now();
         fflush(stdout);
         _exit(75);
     }
-    if (getenv("QE_FATAL_EXIT") && atoi(getenv("QE_FATAL_EXIT"))) {  // no core dump
-        fflush(stderr);
-        _exit(70);
-    }
+    fflush(stderr);
+    fflush(stdout);  // the server's persistent log (server/logtee.py) gets the last lines before the process ends
+    if (getenv("QE_FATAL_EXIT") && atoi(getenv("QE_FATAL_EXIT"))) _exit(70);  // no core dump
     abort();
 }
 }  // namespace

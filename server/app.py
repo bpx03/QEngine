@@ -24,7 +24,11 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from engine import Engine
+from agents import Tracker
+import loop_guard
+from engine import Engine, SequenceFault
+import engine_stats
+from steering import DEFAULT as STEER_DEFAULT, resolve_steering
 from grammar import GrammarError, Grammars, TokenLookup, schema_of
 from model_profile import Profile, drop_empty_turns, merge_leading_system
 
@@ -281,6 +285,91 @@ class Ids(list):
     mm = None
     label = ""
     img = (0, 0)
+    agent = None  # agents.Info: main-thread detection of the request (prio, tracker feedback)
+
+
+class Admission:
+    """Which queued request the scheduler starts next (engine thread; called under gen.cv)."""
+
+    def __init__(self, gen):
+        self.g, self.e, a = gen, gen.engine, gen.args
+        self.aging, self.pre_min, self.pre_max = a.prefill_aging, a.preempt_min, a.preempt_max
+        self.main_bonus = getattr(a, "main_bonus", 0)
+        self.backfill_wait = getattr(a, "backfill_wait", 0)
+        self.k = a.mtp_k
+        self.last_note = 0.0
+
+    def note(self, msg):  # scheduler notes that would repeat every loop: at most one per second
+        if time.time() - self.last_note > 1.0:
+            self.last_note = time.time()
+            print(msg, flush=True)
+
+    def estimate(self, now):
+        # prefill cost of the queued requests: prompt tokens minus what the caches hold
+        # (engine probe, no side effects; refreshed at most twice a second)
+        e = self.e
+        for j in self.g.queue:
+            if j.est is None or now - j.t_est > 0.5:
+                e.set_steering(*j.p.get("steering_sel", STEER_DEFAULT))  # (cached states are keyed by it)
+                j.est = len(j.ids) - e.probe_cached(j.ids)
+                j.t_est = now
+
+    def pick_next(self, now, prefills):
+        """The queued requests that may be prefilled next, best first (empty: keep waiting): the
+        least left to compute, aged so that nothing starves (every second of waiting is worth
+        `aging` tokens), the main agent thread ahead by `main_bonus` tokens (it waits for nobody
+        else; a subagent overtakes it only after waiting main_bonus / aging seconds). While a long
+        prompt is in progress only a request with at most preempt_max tokens left may cut in (and
+        one at a time), or a main-thread request of any size on a long prompt that is not main."""
+        q = self.g.queue
+        if not q:
+            return []
+        self.estimate(now)
+        order = sorted(range(len(q)), key=lambda i: q[i].est - (now - q[i].t_enq) * self.aging
+                       - (self.main_bonus if q[i].prio >= 2 else 0))
+        if not prefills:
+            return order
+        if len(prefills) >= 2 or self.pre_max <= 0:
+            return []
+        long_ = prefills[-1]
+        pos = max(0, self.e.prefill_pos(long_.slot))
+        if len(long_.ids) - pos < self.pre_min:
+            return []
+        # fairness: the long prompt advances at least preempt_min tokens between cut-ins
+        if long_.cut_at is not None and pos - long_.cut_at < self.pre_min:
+            return []
+        return [i for i in order if not getattr(q[i].ids, "mm", None) and
+                (q[i].est <= self.pre_max or (q[i].prio >= 2 and long_.prio < 2))]
+
+    def admit_next(self, now, prefills):
+        """Index of the queued request to start now, or None. The best candidate that fits the pool
+        goes; one that does not fit lets the next ones that fit start before it (backfill) until it
+        has waited backfill_wait seconds: then only a request of a higher prio may still pass it.
+        A main-thread request that does not fit pauses decoding sequences worth less (never a
+        prefill, never another main thread) when that makes it fit."""
+        g, e = self.g, self.e
+        blocked = None
+        for i in self.pick_next(now, prefills):
+            j = g.queue[i]
+            if blocked is not None and now - blocked.t_enq > self.backfill_wait and j.prio <= blocked.prio:
+                continue  # starvation guard: nothing of the same or a lower class passes it any more
+            need = len(j.ids) + self.k + 2
+            if e.can_admit(need):
+                if blocked is not None:
+                    g.sched["backfills"] += 1
+                    self.note(f"[sched] backfill: {need} tokens start while {len(blocked.ids)} tokens "
+                              f"(waiting {now - blocked.t_enq:.1f} s) do not fit")
+                return i
+            if j.prio >= 2 and e.pause_for(need, j.prio):
+                g.sched["main_pauses"] += 1
+                g.cur_slot = -1  # a paused slot may have been the current single sequence
+                print(f"[sched] main thread ({need} tokens): paused lower-prio sequences to admit it", flush=True)
+                return i
+            if blocked is None:
+                blocked = j
+        if blocked is not None:
+            self.note(f"[sched] no room for {len(blocked.ids) + self.k + 2} tokens next to the running sequences")
+        return None
 
 
 class Generator:
@@ -297,6 +386,14 @@ class Generator:
         self.gen_turns = collections.OrderedDict()  # see remember_turn
         self.im_start = self.tok.token_to_id("<|im_start|>")
         self.im_end_nl = self.tok.encode("<|im_end|>\n", add_special_tokens=False).ids
+        # loop guard (server/loop_guard.py): the repeated reply's tokens seed the penalty, without special tokens
+        # (ids from <|endoftext|> on) and whitespace-only pieces
+        self.asst_ids = self.tok.encode("assistant\n", add_special_tokens=False).ids
+        self.im_end = self.tok.token_to_id("<|im_end|>")
+        self.special_min = self.tok.token_to_id("<|endoftext|>") or 1 << 30
+        wsch = set("ĠĊĉčĀ \t\n")  # byte-level BPE spellings of whitespace
+        self.ws_ids = {i for t, i in self.tok.get_vocab().items() if i < self.special_min and t and set(t) <= wsch}
+        self.guards = {"triggers": 0, "recent": []}  # /api/stats loop_guard
         self.seg_lock = threading.Lock()
         # end of turn: generation_config.json eos_token_id ([<|im_end|>, <|endoftext|>] for both
         # models) plus those two tokens by name
@@ -320,6 +417,7 @@ class Generator:
         self.engine = Engine(args.model, args.devices, args.max_ctx, getattr(args, "split", "") or "",
                              lib_path=getattr(args, "engine_lib", None) or None,
                              vocab=prof.vocab_size)
+        self.dstats = engine_stats.DraftStats(self.engine)  # per-slot draft counters (qe_draft_stats)
         if not self.engine.has("stops"):  # no undo of the steps past a stop sequence
             global STOP_ROLLBACK
             STOP_ROLLBACK = 0
@@ -334,6 +432,12 @@ class Generator:
         from metrics import Metrics
         stats = os.path.expanduser(args.stats_file)
         self.metrics = Metrics(stats, args.served_name)
+        # main agent thread detection (server/agents.py) and the scheduler's counters, both in /api/stats
+        self.agents = Tracker(override=getattr(args, "main_agent_re", None))
+        self.sched = {"main_pauses": 0, "main_cutins": 0, "backfills": 0}
+        snap = self.metrics.snapshot
+        self.metrics.snapshot = lambda: dict(snap(), agents=self.agents.stats(), sched=dict(self.sched),
+                                             loop_guard=self.guard_stats())
         if args.metrics_port:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if os.environ.get("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
@@ -344,14 +448,24 @@ class Generator:
         self.cv = threading.Condition()
         self.queue = []
         self.ctrl = []  # (fn, done event) run by the scheduler thread when nothing is generating
+        self.n_faults = 0  # engine NaN guard faults seen (faults())
         self.cur_slot = -1
         self.dirty = False  # slots changed since the last persist
         threading.Thread(target=self._loop, daemon=True).start()
 
-    def prompt(self, messages, tools, kw):
+    def prompt(self, messages, tools, kw, meta=None, track=False, guard_on=True):
         """Returns (ids, affinity): affinity = hash of the system prompt, so the main agent and
         each kind of subagent keep returning to their own sequence slot. ids.hint = position of
-        the first user turn (end of the system part)."""
+        the first user turn (end of the system part). track: a generation request (not a token
+        count): the main-thread tracker sees it (meta: the request's metadata, its session id)."""
+        info = None
+        if track:
+            sys0 = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
+            aff0 = int.from_bytes(hashlib.blake2b(sys0.encode(), digest_size=8).digest(), "little")
+            try:
+                info = self.agents.observe(messages, tools, meta, aff0)
+            except Exception as ex:  # monitoring / priority only: never fail a request for it
+                print(f"agents: {ex!r}", flush=True)
         images = []
         for m in messages:  # image parts in prompt order -> placeholders (+ their sources)
             c = m.get("content")
@@ -367,10 +481,13 @@ class Generator:
                 else:
                     parts.append({"type": "text", "text": "[image omitted: this server runs without vision]"})
             m["content"] = parts
+        guard = self.loop_check(messages, info) if track and guard_on else None
+        if guard and self.args.loop_guard_note:  # the repeated call's result tells the model it is looping
+            messages, guard["note"] = loop_guard.add_note(messages, guard["turns"])
         messages = self.clean_history(messages)
         text = self.tmpl.render(messages, tools, **kw)
         sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
-        label = agent_label(sys_txt, messages)
+        label = "main agent" if info is not None and info.main else agent_label(sys_txt, messages)
         affinity = int.from_bytes(hashlib.blake2b(sys_txt.encode(), digest_size=8).digest(), "little")
         if os.environ.get("QE_DUMP_PROMPTS"):
             d = os.environ["QE_DUMP_PROMPTS"]
@@ -378,7 +495,7 @@ class Generator:
             with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
                 f.write(text)
         ids = self.encode(text)
-        ids.label = label
+        ids.label, ids.agent, ids.guard = label, info, guard
         if images:
             from vision import load_image_bytes
             t0 = time.time()
@@ -386,10 +503,47 @@ class Generator:
                 exp, emb, rope3, delta = self.vision.expand(list(ids), [load_image_bytes(s) for s in images])
             hint = ids.hint
             ids = Ids(exp)
-            ids.hint, ids.mm, ids.label = hint, (emb, rope3, delta), label
+            ids.hint, ids.mm, ids.label, ids.agent, ids.guard = hint, (emb, rope3, delta), label, info, guard
             ids.img = (len(images), emb.shape[0])
             print(f"{len(images)} image(s): {emb.shape[0]} tokens, encoded in {time.time() - t0:.2f}s", flush=True)
         return ids, affinity
+
+    def loop_check(self, messages, info):
+        """Cross-turn loop guard (server/loop_guard.py): None, or the guard of this request's turn."""
+        a = self.args
+        if getattr(a, "loop_guard_turns", 0) <= 0:
+            return None
+        try:
+            k = loop_guard.streak(messages)
+        except Exception as ex:  # a guard must never fail a request
+            print(f"loop guard: {ex!r}", flush=True)
+            return None
+        if k < a.loop_guard_turns:
+            return None
+        pres = a.loop_guard_penalty if k < 2 * a.loop_guard_turns else max(a.loop_guard_penalty, 2.0)
+        conv = getattr(getattr(info, "conv", None), "id", None)
+        sess = getattr(getattr(info, "session", None), "key", "") or ""
+        return {"turns": k, "presence": pres, "conv": conv, "session": sess[2:10],
+                "main": bool(getattr(info, "main", False))}
+
+    def guard_note(self, guard):
+        """A guarded turn starts: warning line, diag log, /api/stats (qetop)."""
+        ev = {"t": time.time(), "turns": guard["turns"], "conversation": guard["conv"], "session": guard["session"],
+              "main": guard["main"], "presence": guard["presence"]}
+        with self.seg_lock:
+            self.guards["triggers"] += 1
+            self.guards["recent"] = (self.guards["recent"] + [ev])[-8:]
+        print(f"WARNING loop guard: conversation {guard['conv']} (session {guard['session'] or '-'}) repeated the "
+              f"same turn {guard['turns']} times: next turn with presence penalty {guard['presence']:.2f} on the "
+              f"repeated reply ({guard.get('seed', 0)} tokens), lookup drafts off"
+              f"{', note appended to the tool result' if guard.get('note') else ''}", flush=True)
+        diag("LOOP_GUARD", f"conversation {guard['conv']} session {guard['session']} turns {guard['turns']} "
+             f"presence {guard['presence']:.2f} note {int(bool(guard.get('note')))}")
+
+    def guard_stats(self):
+        with self.seg_lock:
+            return {"turns": getattr(self.args, "loop_guard_turns", 0), "triggers": self.guards["triggers"],
+                    "recent": list(self.guards["recent"])}
 
     def clean_history(self, messages):
         """Model-specific history fixes before the template (--merge-system, --drop-empty-turns)."""
@@ -501,6 +655,12 @@ class Generator:
                 return i
         return 0
 
+    def too_long(self, ids):
+        """The error message when the prompt does not fit the largest context slot (checked before a stream starts:
+        Anthropic clients compact the conversation on a 400 'prompt is too long'), else None."""
+        cap = max(self.engine.slots) - self.args.mtp_k - 2
+        return f"prompt is too long: {len(ids)} tokens > {cap} maximum" if len(ids) > cap else None
+
     def run(self, ids, p, on_text, cancelled, affinity=0):
         """Blocking generation; calls on_text(str) for new text. Returns stats dict."""
         if len(ids) + self.args.mtp_k + 2 > max(self.engine.slots):
@@ -518,6 +678,23 @@ class Generator:
         return job.stats
 
     # ------------------------------------------------------------ scheduler (engine thread)
+    def faults(self, jobs):
+        """The engine's NaN guard failed sequences (non-finite values): those requests end with an error, the
+        others go on. True when one of `jobs` failed."""
+        n = self.engine.fault_count()
+        if n == self.n_faults:
+            return False
+        self.n_faults = n
+        hit = False
+        for j in jobs:
+            msg = None if j.finished else self.engine.slot_fault(j.slot)
+            if msg:
+                print(f"engine fault: request on slot {j.slot} ({len(j.ids)} prompt tokens, {getattr(j, 'n', 0)} "
+                      f"generated) failed: {msg}", flush=True)
+                j.fail(SequenceFault(msg))
+                hit = True
+        return hit
+
     def run_on_engine(self, fn):
         """Run fn() on the scheduler thread between requests and wait for it."""
         ev = threading.Event()
@@ -536,46 +713,10 @@ class Generator:
         # completion between its chunks (see pick_next)
         prefills = []
         decode_until = 0.0  # while another prompt is prefilled, decode steps run until this time
-        aging = self.args.prefill_aging
         bg_done = True  # idle archiving has nothing left (reset whenever a request finishes)
         pre_min, pre_max = self.args.preempt_min, self.args.preempt_max
 
-        def estimate(now):
-            # prefill cost of the queued requests: prompt tokens minus what the caches hold
-            # (engine probe, no side effects; refreshed at most twice a second)
-            for j in self.queue:
-                if j.est is None or now - j.t_est > 0.5:
-                    j.est = len(j.ids) - e.probe_cached(j.ids)
-                    j.t_est = now
-
-        def pick_next(now):
-            """The queued request to prefill next (None: keep waiting): the one with the least
-            left to compute, aged so that nothing starves (every second of waiting is worth
-            `aging` tokens); while a long prompt is in progress only a request with at most
-            preempt_max tokens left may cut in (and one at a time)."""
-            if not self.queue:
-                return None
-            estimate(now)
-            order = sorted(range(len(self.queue)),
-                           key=lambda i: self.queue[i].est - (now - self.queue[i].t_enq) * aging)
-            if not prefills:
-                return order[0]
-            if len(prefills) >= 2 or pre_max <= 0:
-                return None
-            long_ = prefills[-1]
-            pos = max(0, e.prefill_pos(long_.slot))
-            if len(long_.ids) - pos < pre_min:
-                return None
-            # fairness: the long prompt advances at least preempt_min tokens between cut-ins
-            if long_.cut_at is not None and pos - long_.cut_at < pre_min:
-                return None
-            for i in order:
-                j = self.queue[i]
-                if j.est <= pre_max and not getattr(j.ids, "mm", None):
-                    long_.cut_at = pos
-                    print(f"[sched] {j.est} tokens to prefill cut in on {len(long_.ids)} at {pos}", flush=True)
-                    return i
-            return None
+        adm = Admission(self)
 
         trace = open(os.environ["QE_SCHED_TRACE"], "w", buffering=1) if os.environ.get("QE_SCHED_TRACE") else None
         prof_last = 0.0  # QE_STEP_PROF: return time of the last single step (0: none to chain from)
@@ -583,7 +724,14 @@ class Generator:
         def tr(kind, t0, n=0, toks=0):  # scheduler trace (QE_SCHED_TRACE=file): one JSON line per event
             if trace:
                 trace.write(json.dumps([kind, round(t0, 6), round(time.time() - t0, 6), n, toks]) + "\n")
+        last_mg = 0.0
         while True:
+            if time.time() - last_mg > 1.0:  # host memory pressure: the archive gives memory back (engine)
+                last_mg = time.time()
+                try:
+                    e.mem_guard()
+                except Exception:
+                    pass
             if not active or time.time() - last_snap > 0.5:  # monitoring: KV pool / archives
                 try:
                     self.metrics.engine_snapshot(e.pool_info())
@@ -610,8 +758,16 @@ class Generator:
                             if not self.queue and not self.ctrl:
                                 self.ctrl.append((e.persist, None))
                                 self.dirty = False
-                    else:
-                        self.cv.wait()
+                    elif not self.cv.wait(1.0) and time.time() - last_mg > 1.0:
+                        # idle: the host memory check still runs (another process may grow meanwhile)
+                        last_mg = time.time()
+                        self.cv.release()
+                        try:
+                            e.mem_guard()
+                        except Exception:
+                            pass
+                        finally:
+                            self.cv.acquire()
                 if not active and not prefills:
                     ctrl, self.ctrl = self.ctrl, []
             for fn, ev in ctrl:
@@ -630,13 +786,16 @@ class Generator:
                 # admit the next request (shortest remaining prefill first, aged) while a
                 # sequence slot is free and the pool has room for it
                 admit = None
-                i = pick_next(time.time())
+                i = adm.admit_next(time.time(), prefills)
                 if i is not None:
-                    need = len(self.queue[i].ids) + self.args.mtp_k + 2
-                    if e.can_admit(need):
-                        admit = self.queue.pop(i)
-                    elif prefills:
-                        print(f"[sched] no room for {need} tokens next to the running sequences", flush=True)
+                    admit = self.queue.pop(i)
+                    if prefills:  # a cut-in on the long prompt in progress
+                        long_ = prefills[-1]
+                        long_.cut_at = max(0, e.prefill_pos(long_.slot))
+                        if admit.prio >= 2 and long_.prio < 2 and admit.est > pre_max:
+                            self.sched["main_cutins"] += 1
+                        print(f"[sched] {admit.est} tokens to prefill cut in on {len(long_.ids)} at "
+                              f"{long_.cut_at}{' (main thread)' if admit.prio >= 2 else ''}", flush=True)
             if admit is not None:
                 self.dirty = True
                 prof_last = 0.0  # QE_STEP_PROF: no gap across a prefill
@@ -660,6 +819,11 @@ class Generator:
                 # chunks the queue is checked, so a short request can cut in even when nothing
                 # decodes; the decoders' share of the time only applies while they run
                 budget = self.args.prefill_chunk if self.args.prefill_chunk > 0 else 1 << 30
+                # adaptive chunk: no other slot decoding or waiting -> the larger idle chunk (Flash-Next: its
+                # 4096-row batch); decided per chunk, so a request that arrives meanwhile gets 2048 again
+                idle = self.args.prefill_chunk_idle
+                if idle > budget and not busy and len(prefills) == 1 and not self.queue:
+                    budget = idle
                 share = self.args.prefill_share if busy and self.args.prefill_chunk > 0 else 0.0
                 try:
                     if busy and time.time() < decode_until:  # the decoders' share of the GPU time
@@ -709,6 +873,8 @@ class Generator:
                     self.metrics.step(active, [len(toks)], time.time() - ts)
                     if STEP_PROF:
                         p2 = _pc()
+                    if self.faults(active) or j.finished:
+                        continue
                     j.feed(toks)
                     if STEP_PROF:
                         p3 = _pc()
@@ -723,8 +889,10 @@ class Generator:
                     tr("batch", ts, len(active), sum(len(r) for r in res))
                     self.metrics.step(active, [len(r) for r in res], time.time() - ts)
                     tf = time.time()
+                    self.faults(active)
                     for j, toks in zip(active, res):
-                        j.feed(toks)
+                        if not j.finished:
+                            j.feed(toks)
                     tr("feed", tf, len(active))
             except Exception as ex:
                 for j in active:
@@ -760,13 +928,16 @@ class Job:
         self.glk = None  # TokenLookup of a constrained reply (grammar.py)
         self.done = threading.Event()
         self.error, self.stats, self.slot = None, None, -1
+        self.penalty, self.guarded = None, 0  # (presence, frequency) in force; loop guard: repeated turns before
         self.finished = False
         self.t_enq, self.est, self.t_est = time.time(), None, 0.0  # scheduler: prefill-cost estimate
         self.cut_at = None  # prefill position at the last cut-in by a short request (fairness)
-        # eviction value of the conversation (engine prio): the main Claude Code agent is kept
-        # (it returns after its subagents); a subagent that ended its turn without a tool call
-        # is finished and goes first
-        self.prio = 2 if getattr(ids, "label", "") == "main agent" else 1
+        # eviction value of the conversation (engine prio) and its scheduling class: the main agent
+        # thread (server/agents.py) is kept (it returns after its subagents) and goes first; a
+        # subagent that ended its turn without a tool call is finished and goes first on eviction
+        info = getattr(ids, "agent", None)
+        self.prio = 2 if (gen.agents.is_main_now(info) if info is not None
+                          else getattr(ids, "label", "") == "main agent") else 1
         self.prof, self.prof_detok, self.prof_emit = [], 0.0, 0.0  # QE_STEP_PROF
 
     def begin_start(self):
@@ -781,12 +952,33 @@ class Job:
         self.stops = [s for s in (p.get("stop") or []) if s]
         self.t0 = time.time()
         g.metrics.prefill_start(self)
+        e.set_steering(*p.get("steering_sel", STEER_DEFAULT))  # this request's steering (keys the cached prefixes)
         self.slot = e.start_begin(self.ids, g.args.mtp_k, self.affinity, g.system_end(self.ids),
                                   getattr(self.ids, "mm", None))
         # after start_begin: the engine applies sampling parameters to its current slot, which
         # is this request's only now (before, they landed on whichever sequence was current)
-        e.set_sampling(temp, p.get("top_p") or d["top_p"], p.get("top_k") or d["top_k"],
-                       p.get("min_p") or d["min_p"], p.get("seed") or int(time.time() * 1e6))
+        # presence / frequency penalty: the request's, else the server default for sampled requests (greedy ones
+        # stay greedy: deterministic checks); the loop guard raises presence and seeds it with the repeated reply
+        pres, freq = p.get("presence_penalty"), p.get("frequency_penalty")
+        explicit = pres is not None or freq is not None
+        pres = float(pres if pres is not None else (getattr(g.args, "presence_penalty", 0.0) if temp > 0 else 0.0))
+        freq = float(freq if freq is not None else (getattr(g.args, "frequency_penalty", 0.0) if temp > 0 else 0.0))
+        guard = getattr(self.ids, "guard", None)
+        seed = []
+        if guard is not None:
+            pres = max(pres, guard["presence"])
+            seed = loop_guard.last_reply_tokens(self.ids, g.im_start, g.asst_ids, g.im_end, g.special_min, g.ws_ids)
+        top_p, top_k, min_p = p.get("top_p") or d["top_p"], p.get("top_k") or d["top_k"], p.get("min_p") or d["min_p"]
+        if temp <= 0 and (pres or freq) and (explicit or guard is not None):
+            temp, top_p, top_k, min_p = 1.0, 1.0, 1, 0.0  # greedy with a penalty: the penalised argmax
+        e.set_sampling(temp, top_p, top_k, min_p, p.get("seed") or int(time.time() * 1e6))
+        self.penalty = (pres, freq) if temp > 0 and (pres or freq) else None
+        if self.penalty and not e.set_penalty(pres, freq, seed):
+            self.penalty = None
+        if guard is not None:
+            e.set_no_lookup(self.slot, True)
+            self.guarded = guard["turns"]
+            g.guard_note(dict(guard, seed=len(seed)))
         e.set_prio(self.slot, self.prio)
         self.grammar = self.p.get("grammar")
         self.grammar_s = 0.0
@@ -800,6 +992,7 @@ class Job:
         """The prompt is prefilled: first token, then this job decodes with the others."""
         g, e = self.gen, self.gen.engine
         first, self.reused, self.slot = e.start_finish(self.slot)
+        self.ds0 = g.dstats.read(self.slot)  # draft counters of the slot (engine_stats: the per-request stats line)
         # max_tokens in the engine: an MTP step accepting drafts past it would leave tokens in the
         # slot that the reply does not have, and the next turn would miss the live end (resume
         # from the prompt-end checkpoint and recompute the whole reply)
@@ -813,6 +1006,14 @@ class Job:
             e.watch_stops(self.slot)
         self.copied = e.last_copied()
         self.src = "archive" if e.last_from_archive() else ("other slot" if self.copied else "")
+        n = len(self.ids)
+        conv = getattr(getattr(self.ids, "agent", None), "conv", None)
+        later = conv is not None and conv.turns >= 2  # a later turn of a known conversation (not a cold start)
+        if n >= 16384 and 2 * self.reused < n and (self.src == "archive" or (self.prio >= 2 and later)):
+            # a long prompt that came back mostly uncached: a restore that found only an early checkpoint, or
+            # the main thread's context lost from the archive (an eviction it should have survived)
+            diag("CACHE_PARTIAL", f"slot {self.slot} prompt {n} cached {self.reused} ({100 * self.reused // n} %, "
+                 f"src {self.src or 'none'}, {'main thread' if self.prio >= 2 else 'prio %d' % self.prio})")
         g.cur_slot = self.slot
         self.t1 = time.time()
         g.metrics.prefill_done(self)
@@ -862,6 +1063,14 @@ class Job:
             self.grammar_s += time.perf_counter() - tg
         for i, t in enumerate(pending):
             if t in g.eos and not self.p.get("ignore_eos"):
+                self.finish, stop_now = "stop", True
+                pending = pending[:i]
+                break
+            if t == g.im_start and not self.p.get("ignore_eos"):
+                # <|im_start|> is never valid inside a reply: the model skipped <|im_end|> and began a
+                # turn of its own (seen at 130K+ contexts). End the turn here: the client gets the reply
+                # so far, cleanly closed, instead of a hallucinated user / tool turn.
+                print(f"stopping at a generated <|im_start|> after {self.n + i} tokens", flush=True)
                 self.finish, stop_now = "stop", True
                 pending = pending[:i]
                 break
@@ -945,6 +1154,10 @@ class Job:
         if not self.done.is_set():
             if self.prio == 1 and self.finish == "stop" and "<tool_call>" not in self.text_all:
                 self.gen.engine.set_prio(self.slot, 0)  # a subagent that is done (no tool to run)
+            if getattr(self, "det", None) is not None:  # its final reply is recognised in a parent's history
+                self.gen.agents.finished(getattr(self.ids, "agent", None), self.text_all,
+                                         "<tool_call>" in self.text_all)
+            ds = engine_stats.delta(getattr(self, "ds0", None), self.gen.dstats.read(self.slot))
             trimmed = None
             if getattr(self, "keep", None) is not None:
                 trimmed = self.gen.engine.trim(self.slot, len(self.ids) + self.keep)
@@ -960,8 +1173,14 @@ class Job:
                           "cache_src": self.src,
                           "completion_tokens": self.n, "finish": self.finish, "slot": self.slot,
                           "prefill_s": self.t1 - self.t0, "decode_s": t2 - self.t1}
+            if ds is not None:
+                self.stats["drafts"] = ds  # [steps, MTP drafted, accepted, lookup drafted, accepted]
             if trimmed is not None:
                 self.stats["stop_trim"] = trimmed
+            if self.penalty:
+                self.stats["penalty"] = self.penalty
+            if self.guarded:
+                self.stats["loop_guard"] = self.guarded
             if self.grammar is not None:
                 self.stats["grammar_s"] = self.grammar_s
                 self.stats["grammar_steps"] = self.gsteps
@@ -1041,6 +1260,15 @@ def stream_bridge(gen, ids, params, affinity=0):
     return agen()
 
 
+async def fault_events(it):
+    """stream_bridge items, with an engine fault (SequenceFault) as the last item instead of an exception."""
+    try:
+        async for item in it:
+            yield item
+    except SequenceFault as ex:
+        yield ex
+
+
 def log_stats(kind, st):
     tps = st["completion_tokens"] / max(st["decode_s"], 1e-6)
     pps = (st["prompt_tokens"] - st["cached_tokens"]) / max(st["prefill_s"], 1e-6)
@@ -1052,6 +1280,7 @@ def log_stats(kind, st):
           f"{pps:.0f} tok/s) | gen {st['completion_tokens']} @ {tps:.1f} tok/s | {st['finish']}{gr}"
           f"{' | stop trim ' + ('ok' if st['stop_trim'] else 'missed') if 'stop_trim' in st else ''}",
           flush=True)
+    engine_stats.log(st, st.get("drafts"))  # [stats] lines for benchmark log parsers (QE_STATS_LOG=0: off)
 
 
 # ----------------------------------------------------------------------------- request mapping
@@ -1251,6 +1480,11 @@ def anthropic_tools(tools):
 def build_app(gen: Generator, args):
     app = FastAPI()
     model_name = args.served_name
+    gen.steer = gen.engine.steer_info()  # activation steering vectors loaded by the engine (server/steering.py)
+
+    @app.get("/v1/steering")
+    async def steering():
+        return gen.steer
 
     @app.get("/health")
     async def health():
@@ -1271,14 +1505,26 @@ def build_app(gen: Generator, args):
         except GrammarError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "response_format"}}, status_code=400)
-        ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw)
+        try:
+            steer = resolve_steering(gen.steer, body)
+        except ValueError as ex:
+            return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
+                                           "param": "steering"}}, status_code=400)
+        ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True,
+                              guard_on=body.get("loop_guard") is not False)
+        if gen.too_long(ids):
+            return JSONResponse({"error": {"message": gen.too_long(ids), "type": "invalid_request_error",
+                                           "code": "context_length_exceeded"}}, status_code=400)
+        if body.get("loop_guard") is False:  # per request off-switch of the cross-turn loop guard
+            ids.guard = None
         stop = body.get("stop")
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "min_p": body.get("min_p"), "seed": body.get("seed"),
                   "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens"),
                   "stop": [stop] if isinstance(stop, str) else stop,
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
-                  "grammar": grammar}
+                  "grammar": grammar, "steering_sel": steer,
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(kw.get("enable_thinking", True))
 
@@ -1302,7 +1548,12 @@ def build_app(gen: Generator, args):
                     return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
                 started = False
                 sse_s = [0.0, 0]  # QE_STEP_PROF: event-loop time of parser + chunk JSON, chunks
-                async for item in stream_bridge(gen, ids, params, aff):
+                async for item in fault_events(stream_bridge(gen, ids, params, aff)):
+                    if isinstance(item, SequenceFault):  # the engine failed this request: an error event, then the end
+                        yield "data: " + json.dumps({"error": {"message": f"engine error: {item}", "type": "server_error",
+                                                               "code": 500}}) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
                     if not started:  # role chunk with the first token: clients measure TTFT on it
                         started = True
                         yield chunk({"role": "assistant", "content": ""})
@@ -1338,7 +1589,10 @@ def build_app(gen: Generator, args):
 
         parts = {"reasoning": "", "content": ""}
         st = None
-        async for item in stream_bridge(gen, ids, params, aff):
+        async for item in fault_events(stream_bridge(gen, ids, params, aff)):
+            if isinstance(item, SequenceFault):
+                return JSONResponse({"error": {"message": f"engine error: {item}", "type": "server_error"}},
+                                    status_code=500)
             if isinstance(item, dict):
                 st = item
                 for kind, t in parser.feed("", final=True):
@@ -1379,12 +1633,23 @@ def build_app(gen: Generator, args):
         except GrammarError as ex:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
                                 status_code=400)
+        try:
+            steer = resolve_steering(gen.steer, body)
+        except ValueError as ex:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
+                                status_code=400)
         msgs = anthropic_to_messages(body)
         prev = dict(msgs[-1]) if msgs else None  # before prompt() rewrites image parts
-        ids, aff = gen.prompt(msgs, tools, kw)
+        ids, aff = gen.prompt(msgs, tools, kw, body.get("metadata"), track=True, guard_on=body.get("loop_guard") is not False)
+        if gen.too_long(ids):
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": gen.too_long(ids)}},
+                                status_code=400)
+        if body.get("loop_guard") is False:  # per request off-switch of the cross-turn loop guard
+            ids.guard = None
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
-                  "stop": body.get("stop_sequences"), "grammar": grammar}
+                  "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer,
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         mid = "msg_" + uuid.uuid4().hex[:24]
         parser = Parser(kw.get("enable_thinking", True))
         stop_map = {"stop": "end_turn", "length": "max_tokens"}
@@ -1426,7 +1691,11 @@ def build_app(gen: Generator, args):
                                                           "delta": delta}))
                     return out
 
-                async for item in stream_bridge(gen, ids, params, aff):
+                async for item in fault_events(stream_bridge(gen, ids, params, aff)):
+                    if isinstance(item, SequenceFault):  # the engine failed this request: an error event, then the end
+                        yield ev("error", {"type": "error", "error": {"type": "api_error",
+                                                                       "message": f"engine error: {item}"}})
+                        return
                     if isinstance(item, dict):
                         st = item
                         for kind, t in parser.feed("", final=True):
@@ -1460,7 +1729,10 @@ def build_app(gen: Generator, args):
 
         parts = {"reasoning": "", "content": ""}
         st = None
-        async for item in stream_bridge(gen, ids, params, aff):
+        async for item in fault_events(stream_bridge(gen, ids, params, aff)):
+            if isinstance(item, SequenceFault):
+                return JSONResponse({"type": "error", "error": {"type": "api_error",
+                                                                "message": f"engine error: {item}"}}, status_code=500)
             if isinstance(item, dict):
                 st = item
                 for kind, t in parser.feed("", final=True):
@@ -1494,8 +1766,15 @@ def resolve_model_args(args):
         args.served_name = d["served_name"]
     if args.mtp_k is None:
         args.mtp_k = d["mtp_k"]
+    if args.devices is None:
+        vis = [x for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+        args.devices = ",".join(str(i) for i in range(len(vis))) if vis else "0,1,2"
     if args.split is None:
-        args.split = d["split"]
+        # the profile's split is per GPU (Flash-Next: 3 values); another GPU count uses the engine's default
+        sp = d["split"] or ""
+        args.split = sp if len([x for x in sp.split(",") if x]) in (0, len(args.devices.split(","))) else ""
+    if args.prefill_chunk_idle is None:
+        args.prefill_chunk_idle = d.get("prefill_chunk_idle", 0)
     for k in ("drop_empty_turns", "merge_system"):
         v = getattr(args, k)
         setattr(args, k, bool(d[k]) if v is None else bool(v))
@@ -1514,7 +1793,9 @@ def parse_args(argv=None):
     default_tmpl = os.path.join(ROOT, "server/templates/qwen38_syssafe.jinja")
     ap.add_argument("--template", default=default_tmpl if os.path.exists(default_tmpl) else None,
                     help="chat template (default: server/templates/qwen38_syssafe.jinja, else the model's own)")
-    ap.add_argument("--devices", default="0,1,2")
+    ap.add_argument("--devices", default=None,
+                    help="GPU indices within CUDA_VISIBLE_DEVICES (default: every visible GPU, else 0,1,2); "
+                         "Flash-Next runs on 2 or 3")
     ap.add_argument("--max-ctx", type=int, default=262144)
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
@@ -1550,6 +1831,9 @@ def parse_args(argv=None):
     ap.add_argument("--prefill-chunk", type=int, default=2048,
                     help="prompt chunk (tokens) between decode bursts of the running sequences "
                          "(0: a prompt is prefilled at once, the others wait)")
+    ap.add_argument("--prefill-chunk-idle", type=int, default=None,
+                    help="prompt chunk (tokens) while no other sequence decodes or waits (default per "
+                         "model: Flash-Next 4096 = its big prefill batch, 27B 0 = --prefill-chunk)")
     ap.add_argument("--prefill-share", type=float, default=0.5,
                     help="share of the GPU time the running sequences keep while another prompt "
                          "is prefilled (0.5: they decode at ~half their speed, the prefill takes "
@@ -1569,8 +1853,33 @@ def parse_args(argv=None):
     ap.add_argument("--preempt-min", type=int, default=8192,
                     help="only a prefill with at least this many tokens left is cut in on, and "
                          "at most once per this many tokens of its progress")
+    ap.add_argument("--main-bonus", type=float, default=200000,
+                    help="queue order: the main agent thread counts as this many tokens less prefill work "
+                         "(it goes first; a subagent passes it only after waiting main-bonus / prefill-aging "
+                         "seconds; 0 = no precedence)")
+    ap.add_argument("--backfill-wait", type=float, default=30,
+                    help="a queued request that does not fit the KV pool lets smaller ones that fit start "
+                         "first until it has waited this many seconds (0 = strict order: it blocks the queue)")
+    ap.add_argument("--main-agent-re", default=None,
+                    help="regex for the main agent thread, searched in the system prompt and the tool names "
+                         "(overrides the automatic detection; env QE_MAIN_AGENT_RE)")
     ap.add_argument("--loop-guard-tokens", type=int, default=600,
                     help="end a reply whose last N+ tokens are one short fragment repeated (0 = off)")
+    ap.add_argument("--presence-penalty", type=float, default=float(os.environ.get("QE_PRESENCE_PENALTY", "0")),
+                    help="presence penalty of sampled requests that send none (Claude Code's Anthropic API never "
+                         "does); env QE_PRESENCE_PENALTY")
+    ap.add_argument("--frequency-penalty", type=float, default=float(os.environ.get("QE_FREQUENCY_PENALTY", "0")),
+                    help="frequency penalty of sampled requests that send none; env QE_FREQUENCY_PENALTY")
+    ap.add_argument("--loop-guard-turns", type=int, default=int(os.environ.get("QE_LOOP_GUARD_TURNS", "3")),
+                    help="cross-turn loop guard: after N consecutive identical (reply, result) turns of a "
+                         "conversation the next turn runs with --loop-guard-penalty on the repeated reply's tokens "
+                         "and no lookup drafts (0 = off); env QE_LOOP_GUARD_TURNS")
+    ap.add_argument("--loop-guard-penalty", type=float,
+                    default=float(os.environ.get("QE_LOOP_GUARD_PENALTY", "1.5")),
+                    help="presence penalty of a guarded turn (2.0 from 2N repeated turns); env QE_LOOP_GUARD_PENALTY")
+    ap.add_argument("--loop-guard-note", type=int, default=int(os.environ.get("QE_LOOP_GUARD_NOTE", "1")),
+                    help="guarded turn: append a server note to the latest tool result (the same call returned the "
+                         "same result N times, change the approach); 0 = off; env QE_LOOP_GUARD_NOTE")
     ap.add_argument("--metrics-port", type=int, default=9393,
                     help="live monitoring (dashboard, qetop, /metrics) on this port; 0 = off")
     ap.add_argument("--metrics-host", default="127.0.0.1")
@@ -1584,6 +1893,12 @@ def parse_args(argv=None):
     ap.add_argument("--disk-cache-gb", type=float, default=200)
     ap.add_argument("--persist-idle", type=float, default=120,
                     help="seconds idle before live conversations are saved to the disk cache")
+    ap.add_argument("--log-file", default=os.environ.get("QE_LOG_FILE", "auto"),
+                    help="persistent log: the server's whole output (also the engine's) is appended to this file with "
+                         "a timestamp per line and survives crashes and restarts (auto: "
+                         "~/.cache/qengine/logs/<served-name>.log; '' or 0: off); env QE_LOG_FILE")
+    ap.add_argument("--log-mb", type=float, default=float(os.environ.get("QE_LOG_MB", "64")),
+                    help="size of the persistent log before it is rotated (3 old files are kept); env QE_LOG_MB")
     args = ap.parse_args(argv)
     resolve_model_args(args)
     if not args.template:
@@ -1601,8 +1916,34 @@ def parse_args(argv=None):
     return args
 
 
+def start_log(args):
+    """The persistent log (server/logtee.py), before the engine loads; a header with the build and settings."""
+    lf = args.log_file
+    if not lf or lf in ("0", "off", "none"):
+        return
+    import logtee
+    import subprocess
+    import sys
+    path = logtee.default_path(args.served_name or "qengine") if lf == "auto" else os.path.expanduser(lf)
+    try:
+        build = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short=7", "HEAD"], capture_output=True,
+                               text=True, timeout=3).stdout.strip()
+    except Exception:
+        build = ""
+    build = build or os.path.basename(os.path.realpath(ROOT))
+    env = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items())
+                   if k.startswith(("QE_", "FLASH_", "CUDA_VISIBLE", "CUDA_MODULE")))
+    try:
+        logtee.install(path, args.log_mb, 3, f"==== qengine server start: pid {os.getpid()}, build {build} "
+                                             f"({os.path.realpath(ROOT)}), log {path}\n"
+                                             f"argv: {' '.join(sys.argv)}\nenv: {env}")
+    except Exception as ex:  # never keep the server from starting
+        print(f"persistent log off: {ex}", flush=True)
+
+
 def main():
     args = parse_args()
+    start_log(args)
     gen = Generator(args)
     uvicorn.run(build_app(gen, args), host=args.host, port=args.port, log_level="warning")
     gen.metrics.save()

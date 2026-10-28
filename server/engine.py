@@ -7,6 +7,8 @@ otherwise (contract: server/qe_capi.h)."""
 import ctypes
 import os
 
+from steering import SteeringMixin
+
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 c_void_p, c_int, c_char_p, c_float = ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_float
@@ -30,6 +32,7 @@ SIGS = {
     "qe_num_slots": (c_int, [c_void_p]),
     "qe_pool_tokens": (c_i64, [c_void_p]),
     "qe_can_admit": (c_int, [c_void_p, c_int]),
+    "qe_pause_for": (c_int, [c_void_p, c_int, c_int]),
     "qe_set_limit": (None, [c_void_p, c_int, c_int]),
     "qe_warmup": (c_double, [c_void_p, c_int]),
     "qe_reset": (None, [c_void_p]),
@@ -66,7 +69,20 @@ SIGS = {
     "qe_constrained": (c_int, [c_void_p, c_int]),
     "qe_start_mm": (c_int, [c_void_p, P_int, c_int, c_int, c_u64, c_int, c_void_p, c_int, P_int, c_int]),
     "qe_lookup_corpus": (None, [c_void_p, P_int, c_int]),
+    "qe_set_steering": (c_int, [c_void_p, c_int, c_float]),
+    "qe_set_steering_ex": (c_int, [c_void_p, c_int, c_float, c_int, c_int, c_int]),
+    "qe_steer_info": (c_char_p, [c_void_p]),
+    "qe_capture": (c_int, [c_void_p, P_int, c_int, c_int, ctypes.POINTER(c_float)]),
+    "qe_set_penalty": (None, [c_void_p, c_float, c_float, P_int, c_int]),
+    "qe_set_no_lookup": (None, [c_void_p, c_int, c_int]),
+    "qe_mem_guard": (None, [c_void_p]),
+    "qe_fault_count": (c_i64, [c_void_p]),
+    "qe_slot_fault": (c_int, [c_void_p, c_int, c_char_p, c_int]),
 }
+
+
+class SequenceFault(RuntimeError):
+    """The engine's NaN guard failed this request (non-finite values in its forward); the server goes on."""
 REQUIRED = ("qe_create", "qe_destroy", "qe_max_context", "qe_set_sampling", "qe_start3", "qe_spec_step",
             "qe_last_reused", "qe_last_slot", "qe_release")
 # feature -> functions that must all exist for it
@@ -81,7 +97,7 @@ GROUPS = {
     "grammar": ("qe_mask_buffer", "qe_spec_io", "qe_constrain", "qe_constrained", "qe_vocab"),
     "vision": ("qe_start_mm", "qe_start_begin"),
 }
-SINGLE = ("qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_can_admit", "qe_set_limit", "qe_warmup",
+SINGLE = ("qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
           "qe_reset", "qe_set_lookahead")
 
 
@@ -98,7 +114,7 @@ def bind(lib):
     return have
 
 
-class Engine:
+class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/steering.py)
     def __init__(self, model_dir, devices="0,1,2", max_t=262144, split="", lib_path=None, vocab=None):
         self.lib_path = lib_path or os.environ.get("QE_LIB") or os.path.join(_ROOT, "build", "libqengine.so")
         self.lib = ctypes.CDLL(self.lib_path)
@@ -138,10 +154,27 @@ class Engine:
     def missing_optional(self):
         return [g for g, ok in self.caps.items() if not ok] + [f for f in SINGLE if f not in self.fns]
 
+    # activation steering: steer_info / set_steering / capture come from server/steering.py (SteeringMixin)
+
     # ------------------------------------------------------------------ sequences
     def set_sampling(self, temperature, top_p=1.0, top_k=40, min_p=0.0, seed=0):
         self.lib.qe_set_sampling(self.h, float(temperature), float(top_p), int(top_k),
                                  float(min_p), int(seed))
+
+    def set_penalty(self, presence=0.0, frequency=0.0, seed=()):
+        """Presence / frequency penalty of the current slot (after set_sampling, which turns it off; sampled
+        requests only). seed: token ids that count as already generated (each once). False: not supported."""
+        if "qe_set_penalty" not in self.fns:
+            return False
+        seed = list(seed)[-8192:]
+        arr = (ctypes.c_int * max(1, len(seed)))(*seed)
+        self.lib.qe_set_penalty(self.h, float(presence), float(frequency), arr, len(seed))
+        return True
+
+    def set_no_lookup(self, slot, off=True):
+        """No lookup drafts for the slot's reply (until its next start)."""
+        if "qe_set_no_lookup" in self.fns:
+            self.lib.qe_set_no_lookup(self.h, int(slot), int(bool(off)))
 
     def start(self, ids, k=3, affinity=0, hint=0, mm=None):
         """Prefill (reusing cached prefixes) in the best sequence slot; affinity is a 64-bit
@@ -222,6 +255,9 @@ class Engine:
             return p["tok"] if p["tok"] is not None else self.start(*p["args"])
         tok = self.lib.qe_start_finish(self.h) if slot is None else self.lib.qe_start_finish_slot(self.h, int(slot))
         self._mm_keep = None
+        if tok == -2 and "qe_slot_fault" in self.fns:  # the NaN guard failed the prompt
+            s = self.lib.qe_last_slot(self.h)
+            raise SequenceFault(self.slot_fault(s) or "non-finite values in the prefill")
         return tok, self.lib.qe_last_reused(self.h), self.lib.qe_last_slot(self.h)
 
     def num_prefills(self):
@@ -266,6 +302,13 @@ class Engine:
             return bool(self.lib.qe_can_admit(self.h, int(n)))
         return len(self._active) < len(self.slots) and n <= self.max_t
 
+    def pause_for(self, n, prio):
+        """Pause decoding sequences of lower prio (lowest first, never a prefill) until a new sequence of n
+        tokens fits; True: it fits now (nothing is paused when it cannot be made to fit)."""
+        if "qe_pause_for" not in self.fns:
+            return False
+        return bool(self.lib.qe_pause_for(self.h, int(n), int(prio)))
+
     def set_limit(self, slot, tokens):
         """The reply of the slot may emit at most `tokens` more tokens (max_tokens): its steps
         verify only the drafts that fit, so the slot ends exactly at the returned reply."""
@@ -307,6 +350,22 @@ class Engine:
         if "qe_persist" in self.fns:
             self.lib.qe_persist(self.h)
 
+    def fault_count(self):
+        """NaN guard faults so far (each failed one request)."""
+        return self.lib.qe_fault_count(self.h) if "qe_fault_count" in self.fns else 0
+
+    def slot_fault(self, slot):
+        """The slot's NaN guard message (read once), else None."""
+        if "qe_slot_fault" not in self.fns:
+            return None
+        buf = ctypes.create_string_buffer(1024)
+        return buf.value.decode(errors="replace") if self.lib.qe_slot_fault(self.h, int(slot), buf, 1024) else None
+
+    def mem_guard(self):
+        """Host memory pressure check of the archive (gives memory back below MemAvailable - margin)."""
+        if "qe_mem_guard" in self.fns:
+            self.lib.qe_mem_guard(self.h)
+
     def archive_more(self, budget=64 << 20):
         """Archive idle conversations to host memory, about `budget` bytes per GPU per call
         (call when nothing runs); True when nothing is left to archive."""
@@ -333,23 +392,26 @@ class Engine:
         """Monitoring snapshot (call from the engine thread): slots, archives, pool events."""
         L, h = self.lib, self.h
         slots = []
-        b = (ctypes.c_longlong * 6)()
+        b = (ctypes.c_longlong * 7)()
         for i in range(len(self.slots)):
             if "qe_slot_info" in self.fns:
                 L.qe_slot_info(h, i, b)
-                slots.append({"off": b[0], "cap": b[1], "pos": b[2], "active": bool(b[3]), "used": b[4], "prio": b[5]})
+                slots.append({"off": b[0], "cap": b[1], "pos": b[2], "active": bool(b[3]), "used": b[4], "prio": b[5],
+                              "paused": bool(b[6])})
             else:
-                slots.append({"off": 0, "cap": self.max_t, "pos": 0, "active": i in self._active, "used": 0, "prio": 1})
+                slots.append({"off": 0, "cap": self.max_t, "pos": 0, "active": i in self._active, "used": 0, "prio": 1,
+                              "paused": False})
         a = (ctypes.c_double * 6)()
         if "qe_archive_info" in self.fns:
             L.qe_archive_info(h, a)
-        c = (ctypes.c_longlong * 3)()
+        c = (ctypes.c_longlong * 6)()  # grow, move, evict, pause, resume, paused now
         if "qe_pool_counters" in self.fns:
             L.qe_pool_counters(h, c)
         return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots,
                 "archives": {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
                              "pinned_bytes": a[4], "pinned_used": a[5]},
-                "events": {"grow": c[0], "move": c[1], "evict": c[2]}}
+                "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},
+                "paused": c[5]}
 
     # ------------------------------------------------------------------ stop sequences
     def watch_stops(self, slot, on=True):

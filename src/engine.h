@@ -1,4 +1,5 @@
 #pragma once
+#include "host_mem.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "model.h"
+#include "steer.h"
 
 // One persistent host thread per GPU; run() executes a job on all of them concurrently.
 class GpuPool {
@@ -80,6 +82,11 @@ public:
     // ahead would be undone before the next prefill chunk (losing its MTP drafts)
     void set_lookahead(bool on) { lookahead_ = on; }
     int spec_step(int* out);
+    // draft statistics of a slot since its creation: {steps, MTP drafted, MTP accepted, lookup drafted, lookup accepted}
+    void draft_stats(int slot, long long* out) const {
+        const Seq& q = seqs_.at(slot);
+        for (int i = 0; i < 5; i++) out[i] = q.ds[i];
+    }
     // End generation: waits for the step queued ahead and undoes it.
     void finish();
     // Concurrent sequences. start() marks its slot active (other starts avoid it) until
@@ -114,6 +121,11 @@ public:
     void constrain(int slot, bool on);
     bool constrained(int slot) const { return seqs_.at(slot).constrained; }
     // temperature <= 0 selects greedy decoding
+    // presence / frequency penalty of the current slot (after set_sampling, which turns it off): its counts
+    // restart with the distinct seed tokens, then follow the reply. set_no_lookup: no lookup drafts for the slot's
+    // reply (reset by its next start)
+    void set_penalty(float presence, float frequency, const int* seed, int n);
+    void set_no_lookup(int slot, bool off);
     void set_sampling(float temperature, float top_p, int top_k, float min_p,
                       unsigned long long seed);
     // Debug: run n <= 8 tokens from position 0 and dump residuals [layers][n][hidden].
@@ -123,6 +135,18 @@ public:
     void set_dump_hidden(uint16_t* out) { for (auto& w : workers_) w->dump_hidden = out; }
     // Full logits of the last forward ([m][vocab]).
     void logits(float* out, int m);
+    // Activation steering (QE_STEER / QE_STEER_DIR / QE_STEER_DEFAULT, src/steer.h; vectors loaded at construction):
+    // the next start's vector (index in steer_info()'s list, -1 off, -2 the server default with its defaults at scale
+    // 1), scale (multiplies the mode's sidecar scale), mode (-1 the vector's default, 0 add, 1 project) and layers
+    // (lo, hi = -1, -1: the mode's default range; else inside the vector's file layers). Sticky until the next call.
+    // A conversation keeps the key it was computed with: prefix reuse, checkpoints, the archive and shared prefixes
+    // never mix KV of different (vector, mode, layers, scale). Returns 0, or -1 for a bad value (nothing changed).
+    int set_steering(int vec, float scale, int mode, int lo, int hi);
+    const char* steer_info() const { return steer_json_.c_str(); }
+    // Activation capture (steering/make_vector.py): prefill ids[0, n) unsteered from position 0 in a slot (no prefix
+    // reuse) and write out[layers][hidden] = the mean over positions [r0, n) of every layer output's residual (the
+    // point the vectors act on). Returns 0, or -1 (prompts in flight / no room).
+    int capture(const int* ids, int n, int r0, float* out);
 
     const Config& config() const { return cfg_; }
     int pos() const { return seqs_[cur_].pos; }
@@ -147,6 +171,11 @@ public:
     // a new sequence of n tokens can start now: a free slot, and the pool holds it next to the
     // running ones (each counted with 16K of room to grow; idle ones can be evicted)
     bool can_admit(int n) const;
+    // make room for a new n-token sequence of value `prio` (the main thread): pause decoding sequences
+    // worth less (lowest prio, the most recently admitted first; never a prompt being prefilled, never
+    // one of the same or a higher prio), only as many as needed and only when that makes it fit (paused
+    // conversations count as out: they resume when room frees). true: the start fits now.
+    bool pause_for(int n, int prio);
     // Eviction value of a slot's conversation (kept with its archive): 0 = finished (a subagent
     // whose last reply had no tool call), 1 = normal, 2 = the main thread: evicted from the GPU
     // last, never dropped from the RAM archive while anything else can go.
@@ -175,13 +204,27 @@ public:
     int num_pinned() const;
     // monitoring (host-side state; call from the engine's thread): slot i -> {offset, capacity,
     // cached tokens, active, last use}; archives -> {in RAM, RAM bytes, on disk, disk bytes};
-    // pool events -> {regions grown, regions moved, conversations evicted}
+    // pool events -> {regions grown, regions moved, conversations evicted, active ones paused
+    // (preempted), resumed, paused now}
     void slot_info(int i, long long* out) const;
     void archive_info(double* out) const;
-    void pool_counters(long long* out) const { out[0] = n_grow_; out[1] = n_move_; out[2] = n_evict_; }
+    void pool_counters(long long* out) const {
+        out[0] = n_grow_; out[1] = n_move_; out[2] = n_evict_; out[3] = n_pause_; out[4] = n_unpause_;
+        out[5] = (long long)paused_.size();
+    }
 
 private:
     void step(const int* ids, int m, bool want_logits);
+    // steering (set_steering): the loaded vectors, the server default, the next start's selection and its key
+    // (vector | mode | lo | hi | scale bits, -1 off); every cached state carries the key it was computed with (sk)
+    std::vector<qsteer::SteerSpec> steer_;
+    int steer_def_ = -1, steer_vec_ = -1, steer_mode_ = 0, steer_lo_ = 0, steer_hi_ = -1;
+    float steer_scale_ = 1.f;
+    std::string steer_json_ = "{\"default\": null, \"vectors\": []}";
+    long long steer_key() const;
+    static void steer_unkey(long long k, int& vec, int& mode, int& lo, int& hi, float& scale);
+    void steer_slot(int slot);   // the slot's device steering follows its conversation's key (Seq::sk)
+    bool no_reuse_ = false;      // capture(): the next start computes the prompt from position 0
     void reset_slot();  // the current slot starts from position 0
     void plan_slots(int main_cap);
     // KV pool (see plan_slots)
@@ -193,9 +236,10 @@ private:
     size_t units(size_t rows) const { return rows ? rows + slack_ : 0; }
     KvSplit kvs_;
     bool kvs_auto_ = false;  // shares chosen in plan_slots from the free memory after the weights
-    long long n_grow_ = 0, n_move_ = 0, n_evict_ = 0;
+    long long n_grow_ = 0, n_move_ = 0, n_evict_ = 0, n_pause_ = 0, n_unpause_ = 0, n_release_ = 0;
     int max_ctx_ = 0;
     int round_cap(int need) const;
+    int min_cap(int need) const;
     size_t free_after(int s) const;
     void place(int s, size_t off, int cap);
     int held_rows(int s) const;
@@ -203,7 +247,22 @@ private:
     void pack_up_above(int s);
     bool place_in_gap(int s, int want);
     bool try_grow(int s, int want);
-    bool ensure_cap(int s, int need, const std::vector<int>& protect = {});
+    // ensure_cap modes: SQUEEZE as a last resort lets s grow by less than min_cap (active slots
+    // give back their floor too); FLOOR never; FREE takes only free room and idle conversations
+    // (no active slot is trimmed: resuming a paused one must not start a pause / resume cycle)
+    struct KvArchive;
+    enum Room { SQUEEZE, FLOOR, FREE };
+    bool ensure_cap(int s, int need, const std::vector<int>& protect = {}, Room mode = SQUEEZE);
+    // decode steps: ensure_cap, else pause (preempt) active conversations - the lowest prio, the
+    // most recently admitted, the main thread last - until s fits; false: no room (s itself may
+    // be the one paused: Seq::paused)
+    bool room_or_pause(int s, int need);
+    bool pause_slot(int v);
+    bool unpause_slot(int v);
+    // a paused slot: active for its caller (its steps return no tokens), its region freed; the KV
+    // of [0, pos) and the delta-net state at pos wait in a held archive, restored when room frees
+    struct Paused { KvArchive* arch; int pos; std::vector<int> seq; long long seen; unsigned long long at; };
+    std::map<int, Paused> paused_;
     void use_slot(int i);
     int pick_slot(const int* ids, int n, int k, unsigned long long affinity);
     struct KvArchive;  // defined below
@@ -213,6 +272,7 @@ private:
         std::vector<void*> bufs;    // one pinned host buffer per GPU
         unsigned long long used = 0;
         int kind = 0;               // 0 checkpoint (every 8K / divergence), 1 prompt end (own quota: snap_policy.h)
+        long long sk = -1;          // steering key it was computed with (set_steering)
     };
     // Host-side mirror of one sequence slot.
     struct Seq {
@@ -231,15 +291,28 @@ private:
         // ahead while a stop may start in the step in flight (set_no_ahead), and the undo of the
         // last step so the reply can end where its stop starts (trim)
         bool want_drafts = false, no_ahead = false;
+        bool pen = false;           // presence / frequency penalty on (set_penalty): host-known tokens to its counts
+        bool no_lookup = false;     // lookup drafts off for this reply (set_no_lookup: the server's loop guard)
         std::vector<int> drafts;
         int rb_pos = 0, rb_rows = 0;   // last step: position before it, rows it committed
         long long rb_epoch = -1;       // launch epoch after it (-1: a step of the slot queued after it)
         long long launches = 0, rb_launch = -1;  // the slot's own step launches (batched: stash per slot)
         bool rb_batched = false;
         bool full = false;          // no room to grow (step_batch): ends with its end token until released
+        bool paused = false;        // preempted for room (paused_): its steps return no tokens until resumed
+        long long admit = 0;        // admission order (start_begin): the most recent is paused first
         // shared prefix (stage 4): keys [0, split) are read from the prefix region pres_[pre];
         // the own region holds keys [split, max_t) (max_t stays the logical capacity)
         int split = 0, pre = -1;
+        long long sk = -1;          // steering key of its KV / state (set_steering): never served to another key
+        // draft statistics (draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
+        long long ds[5] = {0, 0, 0, 0, 0};
+        void count_step(bool lookup, int drafted, int emitted) {
+            const int acc = emitted > 1 ? emitted - 1 : 0;
+            ds[0]++;
+            ds[lookup ? 3 : 1] += drafted > acc ? drafted : acc;
+            ds[lookup ? 4 : 2] += acc;
+        }
     };
     // Shared prefix regions: the KV rows [0, n) of a pinned prefix once in the pool, read by every
     // slot attached to it (Seq::pre); the delta-net state comes from the pinned archive. Placed
@@ -250,13 +323,14 @@ private:
         int n = 0, refs = 0;
         size_t off = 0;
         unsigned long long used = 0;
+        long long sk = -1;  // steering key of its rows
     };
     std::vector<GpuPrefix> pres_;
     bool share_prefix_ = true;  // QE_SHARE_PREFIX (0: prefixes are copied into every slot as before)
     int rows_of(const Seq& q) const { return q.max_t > 0 ? q.max_t - q.split : 0; }
     size_t units_of(const Seq& q) const { return units(rows_of(q)); }
     void used_intervals(std::vector<std::pair<size_t, size_t>>& out) const;
-    int find_prefix(const int* ids, int n) const;
+    int find_prefix(const int* ids, int n, long long sk) const;
     int materialize_prefix(const KvArchive& a, const std::vector<int>& protect);
     size_t prefix_room(int n, const std::vector<int>& protect);
     bool drop_lru_prefix();
@@ -354,6 +428,8 @@ private:
         void free(char* p, size_t bytes, bool pinned);
         size_t pinned_bytes() const { return pinned_; }
         size_t used_bytes() const { return used_; }
+        size_t pinned_free() const { std::lock_guard<std::mutex> l(mu_); return pinned_ - used_; }
+        size_t release(size_t want);  // memory pressure: whole free slabs back to the host (host_mem.h)
     private:
         struct Slab { char* base; size_t size; std::map<size_t, size_t> free; };  // offset -> length
         std::vector<Slab> slabs_;
@@ -400,6 +476,7 @@ private:
         // > 0: a start() is restoring from it; making room (prefix materialization, ensure_cap
         // evictions archiving other slots) must not drop it before its rows / state are copied
         mutable int hold = 0;
+        long long sk = -1;                  // steering key of its KV / states (set_steering); steered ones stay in RAM
         size_t bytes() const { return total; }
     };
     std::vector<int> devs_;  // CUDA devices of the workers (P2P buffers are per device)
@@ -409,7 +486,7 @@ private:
     size_t archive_budget_ = 0, archive_used_ = 0;
     int archive_min_ = 2048;
     bool pool_log_ = false;  // QE_POOL_LOG=1: pool / archive events on stdout
-    void archive_slot(int slot);
+    void archive_slot(int slot, bool force = false);
     // Incremental archiving of idle conversations (archive_more): the archive under
     // construction and each GPU's next piece; completed by archive_slot() if the slot is
     // needed before it is done.
@@ -421,7 +498,12 @@ private:
     bool bg_prepare(int slot);
     void bg_finish(bool all);
     void drop_archive(std::list<KvArchive>::iterator it);
-    bool ram_make_room(size_t need, int prio);
+    bool ram_make_room(size_t need, int prio, size_t limit = (size_t)-1);
+    size_t ram_budget();  // archive_budget_ capped by the host's memory (host_mem.h)
+    qe_hostmem::CapLog cap_log_;
+public:
+    void mem_guard();  // host memory below MemAvailable - margin: the archive gives memory back
+private:
     void disk_make_room(size_t need);
     void disk_forget(KvArchive& a);
     bool archive_load(KvArchive& a);

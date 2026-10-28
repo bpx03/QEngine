@@ -1,3 +1,4 @@
+#include "gpu_guard.h"
 #include <cstring>
 #include <vector>
 #include <random>
@@ -153,11 +154,20 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     std::vector<double> w;
     std::stringstream ss(devices);
     for (std::string x; std::getline(ss, x, ',');) devs.push_back(std::stoi(x));
+    {  // one QEngine process per GPU (gpu_guard.h)
+        const std::string busy = qe_gpu_guard::acquire(devs);
+        if (!busy.empty()) { fprintf(stderr, "qengine: %s\n", busy.c_str()); return nullptr; }
+    }
     if (split && *split) {
         std::stringstream s2(split);
         for (std::string x; std::getline(s2, x, ',');) w.push_back(std::stod(x));
     }
-    return new Engine(model_dir, devs, max_t, w);
+    try {
+        return new Engine(model_dir, devs, max_t, w);
+    } catch (std::runtime_error& ex) {  // a refused steering vector (QE_STEER / QE_STEER_DIR): no engine
+        fprintf(stderr, "qengine: %s\n", ex.what());
+        return nullptr;
+    }
 }
 void qe_destroy(void* e) { delete (Engine*)e; }
 void qe_reset(void* e) { ((Engine*)e)->reset(); }
@@ -189,6 +199,7 @@ int qe_start_finish_slot(void* e, int slot) { return ((Engine*)e)->start_finish_
 int qe_num_prefills(void* e) { return ((Engine*)e)->num_prefills(); }
 int qe_prefill_pos(void* e, int slot) { return ((Engine*)e)->prefill_pos(slot); }
 int qe_archive_more(void* e, long long budget) { return ((Engine*)e)->archive_more((size_t)budget); }
+void qe_mem_guard(void* e) { ((Engine*)e)->mem_guard(); }
 void qe_set_lookahead(void* e, int on) { ((Engine*)e)->set_lookahead(on != 0); }
 int qe_last_slot(void* e) { return ((Engine*)e)->last_slot(); }
 int qe_num_slots(void* e) { return ((Engine*)e)->num_slots(); }
@@ -196,6 +207,7 @@ int qe_slot_capacity(void* e, int i) { return ((Engine*)e)->slot_capacity(i); }
 int qe_max_context(void* e) { return ((Engine*)e)->max_context(); }
 long long qe_pool_tokens(void* e) { return (long long)((Engine*)e)->pool_tokens(); }
 int qe_can_admit(void* e, int n) { return ((Engine*)e)->can_admit(n); }
+int qe_pause_for(void* e, int n, int prio) { return ((Engine*)e)->pause_for(n, prio) ? 1 : 0; }
 void qe_set_prio(void* e, int slot, int prio) { ((Engine*)e)->set_prio(slot, prio); }
 void qe_set_limit(void* e, int slot, int tokens) { ((Engine*)e)->set_limit(slot, tokens); }
 void qe_watch_stops(void* e, int slot, int on) { ((Engine*)e)->watch_stops(slot, on != 0); }
@@ -208,6 +220,7 @@ void qe_slot_info(void* e, int i, long long* out) { ((Engine*)e)->slot_info(i, o
 void qe_archive_info(void* e, double* out) { ((Engine*)e)->archive_info(out); }
 void qe_pool_counters(void* e, long long* out) { ((Engine*)e)->pool_counters(out); }
 int qe_spec_step(void* e, int* out) { return ((Engine*)e)->spec_step(out); }
+void qe_draft_stats(void* e, int slot, long long* out) { ((Engine*)e)->draft_stats(slot, out); }
 void qe_finish(void* e) { ((Engine*)e)->finish(); }
 double qe_warmup(void* e, int modes) { return ((Engine*)e)->warmup(modes); }
 int qe_last_copied(void* e) { return ((Engine*)e)->last_copied(); }
@@ -226,6 +239,10 @@ void qe_set_sampling(void* e, float temperature, float top_p, int top_k, float m
                      unsigned long long seed) {
     ((Engine*)e)->set_sampling(temperature, top_p, top_k, min_p, seed);
 }
+void qe_set_penalty(void* e, float presence, float frequency, const int* seed, int n) {
+    ((Engine*)e)->set_penalty(presence, frequency, seed, n);
+}
+void qe_set_no_lookup(void* e, int slot, int off) { ((Engine*)e)->set_no_lookup(slot, off != 0); }
 unsigned* qe_mask_buffer(void* e, int slot) { return ((Engine*)e)->mask_buffer(slot); }
 int* qe_spec_io(void* e, int slot) { return ((Engine*)e)->spec_io(slot); }
 void qe_constrain(void* e, int slot, int on) { ((Engine*)e)->constrain(slot, on != 0); }
@@ -233,6 +250,16 @@ int qe_constrained(void* e, int slot) { return ((Engine*)e)->constrained(slot) ?
 int qe_last_reused(void* e) { return ((Engine*)e)->last_reused(); }
 int qe_vocab(void* e) { return ((Engine*)e)->config().vocab; }
 int qe_layers(void* e) { return ((Engine*)e)->config().layers; }
+// activation steering (QE_STEER / QE_STEER_DIR / QE_STEER_DEFAULT, src/steer.h; server/qe_capi.h tier 10): the next
+// start's vector (index in qe_steer_info, -1 off, -2 the server default), scale, mode (-1 / 0 add / 1 project) and
+// layers (-1, -1: the mode's default); sticky. Returns 0, or -1 for a bad value (unchanged).
+int qe_set_steering_ex(void* e, int vec, float scale, int mode, int lo, int hi) {
+    return ((Engine*)e)->set_steering(vec, scale, mode, lo, hi);
+}
+int qe_set_steering(void* e, int vec, float scale) { return ((Engine*)e)->set_steering(vec, scale, -1, -1, -1); }
+const char* qe_steer_info(void* e) { return ((Engine*)e)->steer_info(); }
+// mean layer-output residual over positions [r0, n) of an unsteered prefill from position 0 -> out[layers][hidden]
+int qe_capture(void* e, const int* ids, int n, int r0, float* out) { return ((Engine*)e)->capture(ids, n, r0, out); }
 }
 
 // ---- comm microbenchmark ----

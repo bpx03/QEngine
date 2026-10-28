@@ -75,13 +75,18 @@ __device__ __forceinline__ float uniform(const SampleParams& p, int row, int sal
 
 // Merge the per-GPU sorted lists of one row into the global top-K and turn them into
 // probabilities (temperature, top-k, min-p, top-p). Returns the candidate count.
+// Penalty (pen_active): all kTopK merged candidates get logit -= frequency * c + presence * (c > 0), c = the slot's
+// count + occurrences in ext[0..next) (earlier verify rows), re-sorted, then the top-k of them as without it. A token
+// outside the merged top-kTopK cannot enter (the penalty only lowers logits; 64 >> top_k of the profiles).
 __device__ int row_probs(const float* gathered, int ngpu, int m, int mi, const SampleParams& p,
-                         float* prob, int* tok) {
+                         float* prob, int* tok, const int* ext = nullptr, int next = 0) {
     int head[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const int K = max(1, min(p.top_k, kTopK));
+    const bool pen = pen_active(p);
+    const int want = pen ? kTopK : K;
     float lg[kTopK];
     int n = 0;
-    for (; n < K; n++) {
+    for (; n < want; n++) {
         int best = -1;
         float bv = -FLT_MAX;
         for (int g = 0; g < ngpu; g++) {
@@ -93,6 +98,23 @@ __device__ int row_probs(const float* gathered, int ngpu, int m, int mi, const S
         lg[n] = bv;
         tok[n] = __float_as_int(gathered[(((size_t)best * m + mi) * kTopK + head[best]) * 2 + 1]);
         head[best]++;
+    }
+    if (pen) {
+        const unsigned char* cnt = p.pen->cnt;
+        for (int i = 0; i < n; i++) {
+            int c = cnt[tok[i]];
+            for (int j = 0; j < next; j++) c += ext[j] == tok[i];
+            if (c > 0) lg[i] -= p.frequency * (float)c + p.presence;
+        }
+        for (int i = 1; i < n; i++) {  // stable insertion sort, descending (ties keep the merge order)
+            const float v = lg[i];
+            const int t = tok[i];
+            int j = i - 1;
+            for (; j >= 0 && lg[j] < v; j--) { lg[j + 1] = lg[j]; tok[j + 1] = tok[j]; }
+            lg[j + 1] = v;
+            tok[j + 1] = t;
+        }
+        n = min(n, K);
     }
     const float inv_t = 1.f / fmaxf(p.temperature, 1e-5f);
     float sum = 0.f;
@@ -133,13 +155,13 @@ __device__ int draw(const float* prob, const int* tok, int n, float u, int skip,
 }
 
 __global__ void sample_rows_kernel(const float* gathered, int ngpu, int m, SampleParams* pp,
-                                   int* tokens) {
+                                   int* tokens, int chain) {
     if (threadIdx.x != 0) return;
     const SampleParams p = *pp;
     for (int mi = 0; mi < m; mi++) {
         float prob[kTopK];
         int tok[kTopK];
-        const int n = row_probs(gathered, ngpu, m, mi, p, prob, tok);
+        const int n = row_probs(gathered, ngpu, m, mi, p, prob, tok, tokens, chain ? mi : 0);
         tokens[mi] = draw(prob, tok, n, uniform(p, mi, 0), -1, 0.f);
     }
     pp->counter = p.counter + 1;
@@ -159,16 +181,38 @@ __global__ void sample_rows_slots_kernel(const float* gathered, int ngpu, int m,
         if (!on[s]) {
             SampleParams g = p;
             g.top_k = 1;
+            g.pen = nullptr;
             row_probs(gathered, ngpu, m, mi, g, prob, tok);
             tokens[mi] = tok[0];
             continue;
         }
-        const int n = row_probs(gathered, ngpu, m, mi, p, prob, tok);
+        int ext[kTopK], next = 0;  // penalty: the slot's earlier (verify) rows of this step
+        if (pen_active(p))
+            for (int j = 0; j < mi && next < kTopK; j++)
+                if (rowslot[j] == s) ext[next++] = tokens[j];
+        const int n = row_probs(gathered, ngpu, m, mi, p, prob, tok, ext, next);
         tokens[mi] = draw(prob, tok, n, uniform(p, mi, 0), -1, 0.f);
         touched |= 1ull << (s & 63);
     }
     for (int s = 0; s < 64; s++)
         if ((touched >> s) & 1ull) base[s].counter += 1;
+}
+
+// penalty counts += t[0..n) at positions base.. (a lower base than the last commit: that tail is taken back first)
+__device__ void pen_commit_dev(PenState* q, const int* t, int n, int base) {
+    const int c = q->cpos;
+    if (c >= 0 && base < c)
+        for (int x = c - 1; x >= max(base, c - kPenRing); x--) {
+            unsigned char& v = q->cnt[q->ring[x % kPenRing]];
+            if (v != 0 && v != 255) v--;
+        }
+    for (int i = 0; i < n; i++) {
+        const int tk = t[i];
+        if (tk < 0) continue;
+        if (q->cnt[tk] != 255) q->cnt[tk]++;
+        q->ring[(base + i) % kPenRing] = tk;
+    }
+    q->cpos = base + n;
 }
 
 __device__ void accept_sampled_dev(const float* gathered, int ngpu, int k, SampleParams* pp,
@@ -178,7 +222,8 @@ __device__ void accept_sampled_dev(const float* gathered, int ngpu, int k, Sampl
     for (int j = 0; j <= k; j++) {
         float prob[kTopK];
         int tok[kTopK];
-        const int n = row_probs(gathered, ngpu, m, r0 + j, p, prob, tok);
+        // penalty: row j continues the accepted drafts out[0..j) (== tokens[1..j])
+        const int n = row_probs(gathered, ngpu, m, r0 + j, p, prob, tok, s.out, j);
         if (j == k) {  // every draft accepted: bonus token from the last row
             s.out[j] = draw(prob, tok, n, uniform(p, j, 1), -1, 0.f);
             break;
@@ -206,6 +251,7 @@ __device__ void accept_sampled_dev(const float* gathered, int ngpu, int k, Sampl
     *s.mtp_pos = *s.pos;
     *s.hrow = 0;
     pp->counter = p.counter + 1;
+    if (pen_active(p)) pen_commit_dev(p.pen, s.out, a + 1, *s.pos + 1);  // out[j] sits at pos + 1 + j
 }
 
 __global__ void accept_sampled_kernel(const float* gathered, int ngpu, int k, SampleParams* pp,
@@ -248,7 +294,52 @@ __global__ void mask_logits_kernel(float* __restrict__ logits, int v, int off,
     }
 }
 
+__global__ void pen_commit_kernel(const SampleParams* p, const int* toks, const int* end_pos) {
+    if (threadIdx.x != 0 || !pen_active(*p)) return;
+    const int n = toks[0];
+    pen_commit_dev(p->pen, toks + 1, n, *end_pos - n + 1);
+}
+__global__ void pen_commit_b_kernel(const SampleParams* base, const int* segs, int nseg, const int* toks, int stride,
+                                    const int* svp) {
+    const int s = threadIdx.x;
+    if (s >= nseg) return;
+    const int slot = segs[s];
+    if (!pen_active(base[slot])) return;
+    const int* e = toks + (size_t)s * stride;
+    pen_commit_dev(base[slot].pen, e + 1, e[0], svp[slot * 2] - e[0] + 1);
+}
+struct HostToks {
+    int t[16];
+};
+__global__ void pen_commit_host_kernel(const SampleParams* p, HostToks t, int n, int pos) {
+    if (threadIdx.x != 0 || !pen_active(*p)) return;
+    pen_commit_dev(p->pen, t.t, n, pos);
+}
+__global__ void pen_seed_kernel(PenState* q, const int* seed, int n, int vocab) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        if (seed[i] >= 0 && seed[i] < vocab) q->cnt[seed[i]] = 1;
+}
+
 }  // namespace
+
+void pen_commit(const SampleParams* p, const int* toks, const int* end_pos, cudaStream_t st) {
+    pen_commit_kernel<<<1, 32, 0, st>>>(p, toks, end_pos);
+}
+void pen_commit_b(const SampleParams* base, const int* segs, int nseg, const int* toks, int stride, const int* svp,
+                  cudaStream_t st) {
+    if (nseg > 0) pen_commit_b_kernel<<<1, 64, 0, st>>>(base, segs, nseg, toks, stride, svp);
+}
+void pen_commit_host(const SampleParams* p, const int* toks, int n, int pos, cudaStream_t st) {
+    HostToks t{};
+    n = n < 0 ? 0 : n > 16 ? 16 : n;
+    for (int i = 0; i < n; i++) t.t[i] = toks[i];
+    if (n > 0) pen_commit_host_kernel<<<1, 32, 0, st>>>(p, t, n, pos);
+}
+void pen_reset(PenState* pen, int vocab, const int* seed, int n, cudaStream_t st) {
+    CUDA_CHECK(cudaMemsetAsync(pen, 0xff, sizeof(int), st));  // cpos = -1
+    CUDA_CHECK(cudaMemsetAsync(pen->cnt, 0, (size_t)vocab, st));
+    if (n > 0) pen_seed_kernel<<<(n + 255) / 256, 256, 0, st>>>(pen, seed, n, vocab);
+}
 
 void mask_logits(float* logits, int v, int vocab_off, const unsigned* bits, int r0, int rows,
                  size_t stride, cudaStream_t st) {
@@ -264,8 +355,8 @@ void sample_rows_slots(const float* gathered, int ngpu, int m, SampleParams* bas
     sample_rows_slots_kernel<<<1, 32, 0, st>>>(gathered, ngpu, m, base, rowslot, on, tokens);
 }
 void sample_rows(const float* gathered, int ngpu, int m, SampleParams* p, int* tokens,
-                 cudaStream_t st) {
-    sample_rows_kernel<<<1, 32, 0, st>>>(gathered, ngpu, m, p, tokens);
+                 cudaStream_t st, bool chain) {
+    sample_rows_kernel<<<1, 32, 0, st>>>(gathered, ngpu, m, p, tokens, chain ? 1 : 0);
 }
 
 void spec_accept_batch(const float* gathered, int ngpu, const AcceptBatch& b, cudaStream_t st) {

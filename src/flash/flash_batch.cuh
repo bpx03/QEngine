@@ -379,14 +379,14 @@ __global__ void k_lk_scan_b(const int* __restrict__ hdb, const int* __restrict__
 }
 __global__ void k_lk_pick_b(const int* __restrict__ hdb, const int* __restrict__ hnb, size_t hstride, const int* __restrict__ segs,
                             int nseg, int k, int mmin, unsigned long long* __restrict__ best, int* __restrict__ svt,
-                            int* __restrict__ cnt) {
+                            int* __restrict__ cnt, const int* __restrict__ nolk) {
     const int s = threadIdx.x;
     if (s >= nseg) return;
     const unsigned long long b = best[s];
     best[s] = 0ull;
     const int len = (int)(b >> 32), j = (int)(b & 0xffffffffu), slot = segs[s];
     const int n = hnb[slot];
-    if (len < mmin) return;
+    if (len < mmin || (nolk && nolk[slot])) return;  // nolk: the slot's lookup drafts are off (loop guard)
     const int* hd = hdb + (size_t)slot * hstride;
     const int L = min(k, n - 1 - j);
     int* v = svt + slot * (MAXM + 1);
@@ -459,8 +459,8 @@ void Worker::gdn_b(Layer& L, int li, int m, int rps) {
     } else
     k_dn_rec_b<<<dim3(vl, 16, m / rps), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, tab(TB_S, li), tab(TB_RP, li),
                                                        rslot_, bpn_, stepcs_, o, rps);
-    k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, 2048);
-    gemv_w4h(L.dn_out, ah_, 2048, part_, H, m, st_);
+    k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, vl * DV);
+    gemv_w4h(L.dn_out, ah_, vl * DV, part_, H, m, st_);
     KCHK("gdn_b");
 }
 
@@ -489,9 +489,10 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     xi.seq = xiseq_;
     xi.done = xidone_;
     k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb);
-    k_idx_local<<<m, 1024, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
+    if (idx_gk_) k_idx_local<true><<<m, 1024, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
+    else k_idx_local<<<m, 1024, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
     k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_);
-    k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp);
+    k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp, idx_gk_);
     KCHK("qsa_b select");
     AttnDst d{};
     d.o[0] = attn_x_;
@@ -552,6 +553,7 @@ void Worker::trunk_b(int m, const int* toks, int nseg, int rps) {
         hc_read(L.hcm, m, true);
         moe(L, m);
         hc_write(m);
+        steer_mark(li, rslot_);  // the layer output; per row its slot's vector
         bdump(li, 1, m, rps);
     }
     flush_y(m);
@@ -606,6 +608,7 @@ void Worker::batch_body(int nseg, int k) {
     KCHK("batch meta");
     trunk_b(m, bvt_, nseg, rps);
     k_accept_b<<<1, 32, 0, st_>>>(bvt_, otok_, k, nseg, bseg_d_, bseg_d_ + MAXM, svp_, svh_, bacc_, bem_);
+    if (bsamp_) pen_commit_b(spslot_, bseg_d_, nseg, bem_, MAXM + 2, svp_, st_);
     if (has_mtp_) {
         mtp_core_b(m, false, otok_, motok_, rpos_, rbase_, rslot_, rps);
         k_draft0_b<<<1, 32, 0, st_>>>(motok_, bacc_, bdr_, nseg);
@@ -619,7 +622,7 @@ void Worker::batch_body(int nseg, int k) {
         const size_t hs = (size_t)max_ctx_ + 64;
         k_hist_add_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, bem_);
         k_lk_scan_b<<<dim3((unsigned)((hs + 255) / 256), nseg), 256, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, lkbb_);
-        k_lk_pick_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, k, blk_min_, lkbb_, svt_, blkcnt_);
+        k_lk_pick_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, k, blk_min_, lkbb_, svt_, blkcnt_, nolk_d_);
         KCHK("batch lookup");
     }
     KCHK("batch step");
@@ -644,6 +647,7 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     for (int i = 0; i < nseg; i++) { bseg_h_[i] = slots[i]; bseg_h_[MAXM + i] = lims ? lims[i] : k; }
     ec_tick(0, 0);
     bnseg_ = nseg;
+    brps_ = k + 1;
     bslots_.assign(slots, slots + nseg);
     const bool con0 = con_;  // grammar masks belong to the bound slot's single steps (constrained slots never batch)
     con_ = false;

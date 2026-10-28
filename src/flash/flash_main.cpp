@@ -1,7 +1,8 @@
 #include <sys/mman.h>
 #include <cuda_profiler_api.h>
-// flash_run: load Qwen3.8-Flash-Next (qengine INT4 checkpoint) on 3 GPUs, run a prompt and greedy decode.
+// flash_run: load Qwen3.8-Flash-Next (qengine INT4 checkpoint) on 2 or 3 GPUs, run a prompt and greedy decode.
 //   flash_run [--model DIR] [--dev 0,1,2] [--ctx 262144] [--w 176,160,176] --ids 1,2,3 [--gen 16] [--logits out.bin]
+//   (--w: expert-group weights per GPU, default 176,160,176 on 3 GPUs, equal on 2)
 #include <dirent.h>
 #include <cstdint>
 
@@ -17,7 +18,9 @@
 #include <functional>
 #include <vector>
 
+#include "../gpu_guard.h"
 #include "flash.h"
+#include "flash_steer.h"
 #include "../json.h"
 
 using namespace flash;
@@ -36,11 +39,13 @@ static std::vector<std::string> split(const std::string& s, char c) {
 // 16 n-gram embedding rows (bigram heads 0..7, trigram heads 8..15) of token t of the history h -> out[2560]
 static void ngram_row(const HostTables& ht, const std::vector<int>& h, int t, bf16* out) {
     // shifted tokens within the EOS-delimited segment (previous EOS excluded from the current position)
-    int seg = 0;
-    for (int i = t - 1; i >= 0; i--)
-        if (h[i] == EOS) { seg = i + 1; break; }
+    // shifted token s is used iff no EOS sits in [t - s, t - 1] (the previous EOS ends the segment): only the two
+    // previous positions decide (prefill-r4: the scan back to the last EOS was O(t) per token, O(n^2) per prompt:
+    // 100K prompt 14 -> 60 ms of host time per 4K batch, serial with the GPU)
     long long sh[3];
-    for (int s = 0; s < 3; s++) sh[s] = (t - s >= seg && t - s >= 0) ? h[t - s] : EOS;
+    sh[0] = h[t];
+    sh[1] = (t >= 1 && h[t - 1] != EOS) ? h[t - 1] : EOS;
+    sh[2] = (t >= 2 && h[t - 1] != EOS && h[t - 2] != EOS) ? h[t - 2] : EOS;
     auto mul = [](long long a, long long b) { return (long long)((unsigned long long)a * (unsigned long long)b); };
     long long big = mul(sh[0], ht.mult[0]) ^ mul(sh[1], ht.mult[1]);
     long long tri = big ^ mul(sh[2], ht.mult[2]);
@@ -53,9 +58,23 @@ static void ngram_row(const HostTables& ht, const std::vector<int>& h, int t, bf
     }
 }
 
+// rows t0 .. t0 + m - 1 of the n-gram embedding (PLE input) in parallel: host reads of the n-gram table, serial with
+// the GPU between prefill batches (prefill-r4)
+static void ngram_rows(const HostTables& ht, const std::vector<int>& h, int t0, int m, bf16* out) {
+    const int nt = m >= 256 ? 8 : 1;
+    auto part = [&](int k) {
+        for (int j = (int)((long)m * k / nt); j < (int)((long)m * (k + 1) / nt); j++) ngram_row(ht, h, t0 + j, out + (size_t)j * H);
+    };
+    if (nt == 1) { part(0); return; }
+    std::vector<std::thread> th;
+    for (int k = 1; k < nt; k++) th.emplace_back(part, k);
+    part(0);
+    for (auto& x : th) x.join();
+}
+
 int main(int argc, char** argv) {
     std::string ids_file, cold_file = "default";
-    std::string model = "models/Qwen3.8-Flash-Next-QE-INT4", ids_s, logits_path, devs_s = "0,1,2", w_s = "176,160,176";
+    std::string model = "models/Qwen3.8-Flash-Next-QE-INT4", ids_s, logits_path, devs_s, w_s;
     int gen = 16, ctx = 262144, kdraft = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -85,10 +104,20 @@ int main(int argc, char** argv) {
         else if (a == "--cold") cold_file = nxt();
     }
     std::vector<int> devs, prompt;
+    if (devs_s.empty()) {  // default: every visible GPU (CUDA_VISIBLE_DEVICES), at most 3
+        int n = 0;
+        CUDA_CHECK(cudaGetDeviceCount(&n));
+        for (int i = 0; i < std::min(n, 3); i++) devs_s += (i ? "," : "") + std::to_string(i);
+    }
     for (auto& x : split(devs_s, ',')) devs.push_back(std::stoi(x));
+    {  // one QEngine process per GPU (gpu_guard.h)
+        const std::string busy = qe_gpu_guard::acquire(devs);
+        if (!busy.empty()) { fprintf(stderr, "flash_run: %s\n", busy.c_str()); return 3; }
+    }
     for (auto& x : split(ids_s, ',')) prompt.push_back(std::stoi(x));
     std::vector<double> wts;
     for (auto& x : split(w_s, ',')) wts.push_back(std::stod(x));
+    if (wts.empty()) wts = default_group_weights((int)devs.size());
     std::vector<std::vector<int>> prompts_all;  // --ids-file: one prompt per line (plain greedy, for statistics)
     if (!ids_file.empty()) {
         FILE* f = fopen(ids_file.c_str(), "r");
@@ -173,9 +202,10 @@ int main(int argc, char** argv) {
         memcpy(ngd.voff, ht.voff, sizeof(ngd.voff));
         printf("[%.1fs] n-gram table pinned (%.1f GB)\n", secs(), (e - b) / 1e9);
     }
-    Comm comm = comm_create(ng, PFM * H, H);
+    Comm comm = comm_create(ng, ARU_MAX * H, H);
     const bool p2p = comm_enable_p2p(comm, devs.data());
     printf("all-reduce: %s\n", p2p ? "P2P" : "host memory");
+    comm_select_path(comm, devs.data(), "FLASH_COMM", true);
     auto plans = make_plan(ng, wts);
     std::vector<int> draft_ids;  // MTP draft vocabulary: the most frequent tokens (token_rank.bin)
     {
@@ -242,6 +272,63 @@ int main(int argc, char** argv) {
         if (kdraft > 0 && getenv("FLASH_NGRAM_PIN") && !atoi(getenv("FLASH_NGRAM_PIN")) && !(getenv("FLASH_NGRAM_HMM") && atoi(getenv("FLASH_NGRAM_HMM"))))
             W[r]->start_ngram_stage(&ht);
     }
+    if ((getenv("QE_STEER") && *getenv("QE_STEER")) || (getenv("QE_STEER_DIR") && *getenv("QE_STEER_DIR"))) {  // flash_steer.h
+        std::vector<SteerSpec> sv;
+        int def = -1;
+        try {
+            sv = steer_load_env(H, LAYERS, model, &def);
+        } catch (std::exception& ex) {
+            fprintf(stderr, "flash_run: %s\n", ex.what());
+            return 1;
+        }
+        const int nv = sv.size();
+        std::vector<int> lo(nv), hi(nv);
+        std::vector<float> w;
+        for (int v = 0; v < nv; v++) {
+            lo[v] = sv[v].flo; hi[v] = sv[v].fhi;
+            w.insert(w.end(), sv[v].w.begin(), sv[v].w.end());
+            printf("%s\n", sv[v].log_line().c_str());
+        }
+        for (int r = 0; r < ng; r++) W[r]->set_steer(nv, lo.data(), hi.data(), w.data());
+        int vec = def;  // QE_STEER_VEC=<name> picks another one, QE_STEER_OFF=1: none
+        if (const char* n = getenv("QE_STEER_VEC"))
+            for (int v = 0; v < nv; v++) if (sv[v].name == n) vec = v;
+        if (vec < 0 && nv == 1) vec = 0;
+        if (getenv("QE_STEER_OFF") && atoi(getenv("QE_STEER_OFF"))) vec = -1;
+        const float sc = getenv("QE_STEER_SCALE") ? atof(getenv("QE_STEER_SCALE")) : 1.f;
+        // QE_STEER_MODE=add|project, QE_STEER_LAYERS=lo:hi override the vector's defaults (as a request would)
+        int smd = -1, slo = -1, shi = -1;
+        if (const char* m = getenv("QE_STEER_MODE"); m && *m) smd = !strcmp(m, "project") ? 1 : !strcmp(m, "add") ? 0 : -9;
+        if (const char* l = getenv("QE_STEER_LAYERS"); l && *l && sscanf(l, "%d:%d", &slo, &shi) != 2) slo = shi = -9;
+        if (vec >= 0) {
+            const std::string err = steer_resolve(sv[vec], smd, slo, shi);
+            if (!err.empty()) { fprintf(stderr, "flash_run: %s\n", err.c_str()); return 1; }
+        }
+        for (int r = 0; r < ng; r++) W[r]->set_steer_slot(0, vec, smd, slo, shi, sc);
+        printf("steering: run with %s, mode %s, layers %d..%d, scale %g\n", vec >= 0 ? sv[vec].name.c_str() : "off",
+               smd == 1 ? "project" : "add", slo, shi, sc);
+    } else if (const char* sy = getenv("FLASH_STEER_SYNTH")) {  // gate / debug: random unit directions, mode:lo:hi:alpha:seed
+        auto f = split(sy, ':');
+        const int mode = f.at(0) == "project" ? 1 : 0, lo = std::stoi(f.at(1)), hi = std::stoi(f.at(2));
+        const float al = f.size() > 3 ? std::stof(f[3]) : 1.f;
+        unsigned long long x = f.size() > 4 ? std::stoull(f[4]) : 1;
+        std::vector<float> w((size_t)2 * LAYERS * H, 0.f);  // [2 modes][LAYERS][H]: the synthetic one in its mode
+        for (int l = lo; l <= hi; l++) {
+            double n2 = 0;
+            for (int d = 0; d < H; d++) {
+                x = x * 6364136223846793005ull + 1442695040888963407ull;
+                const float u = ((x >> 40) & 0xffffff) / 16777216.f - 0.5f;
+                w[((size_t)mode * LAYERS + l) * H + d] = u;
+                n2 += (double)u * u;
+            }
+            const float sc = (mode ? sqrtf(al) : al) / (float)sqrt(n2);
+            for (int d = 0; d < H; d++) w[((size_t)mode * LAYERS + l) * H + d] *= sc;
+        }
+        for (int r = 0; r < ng; r++) W[r]->set_steer(1, &lo, &hi, w.data());
+        const bool off = getenv("QE_STEER_OFF") && atoi(getenv("QE_STEER_OFF"));
+        for (int r = 0; r < ng; r++) W[r]->set_steer_slot(0, off ? -1 : 0, mode, lo, hi, 1.f);
+        printf("steering (synthetic): mode=%s, layers %d..%d, alpha %g%s\n", mode ? "project" : "add", lo, hi, al, off ? ", off" : "");
+    }
     printf("[%.1fs] loaded; context capacity %d tokens (QSA KV split by position)\n", secs(), ctx);
     for (int r = 0; r < ng; r++)
         printf("  GPU%d: allocated %.2f GB (+%.2f GB cold experts in host memory), free %.2f GiB\n", devs[r], W[r]->weight_gb(),
@@ -249,9 +336,15 @@ int main(int argc, char** argv) {
 
     {
         const Worker::EcStats& es = W[0]->ec_stats();
-        printf("expert cache: GPU0 %d cold groups, %d slots in the KV pool tail (%d live, %d resident), seed H2D %.1f GB/s\n",
-               es.ncold, es.slots, es.live_slots, es.resident, es.seed_gbs);
+        printf("expert cache: GPU0 %d cold groups, %d slots in the KV pool tail + big-batch buffers (%d of them borrowed tails; %d live, %d resident), seed H2D %.1f GB/s\n",
+               es.ncold, es.slots, es.bt_slots, es.live_slots, es.resident, es.seed_gbs);
     }
+    if (getenv("FLASH_GSUM") && atoi(getenv("FLASH_GSUM")))
+        for (int r = 0; r < ng; r++) {
+            unsigned long long e = 0, o = 0;
+            W[r]->gsum(nw[r], &e, &o);
+            printf("GSUM rank %d experts %016llx other %016llx\n", r, e, o);
+        }
     if (getenv("FLASH_CSUM"))
         for (int r = 0; r < ng; r++) printf("  GPU%d weights checksum %llx (%d allocations)\n", devs[r], W[r]->checksum(0, nw[r]), nw[r]);
     // persistent worker threads (spin on a step counter: no thread start per step)
@@ -484,14 +577,18 @@ int main(int argc, char** argv) {
     const bool pfb = pfp && !(getenv("FLASH_PFB") && atoi(getenv("FLASH_PFB")) == 0);
     if (pfb) {  // batched prefill: n <= pf_batch() rows per call (MoE half over the whole batch), then the MTP fill
         const int B = W[0]->pf_batch();
+        std::vector<int> cuts;  // FLASH_RUN_CUTS=p,q,...: a batch also ends at these positions (the server's checkpoints)
+        if (const char* c = getenv("FLASH_RUN_CUTS")) for (auto& x : split(c, ',')) if (!x.empty()) cuts.push_back(std::stoi(x));
         for (int i = 0, m = 0; i < np; i += m) {
             m = np - i <= B ? np - i : B - PFM;  // nominal batch B - PFM; a tail of <= PFM rows joins the last one
+            for (int c : cuts) if (c > i && c < i + m) { m = c - i; break; }
+            if (getenv("FLASH_RUN_CUTS") && getenv("FLASH_PFT")) printf("  batch [%d, %d)\n", i, i + m);
             std::vector<int> ch(prompt.begin() + i, prompt.begin() + i + m);
             std::vector<bf16> rows((size_t)m * H);
-            for (int j = 0; j < m; j++) {
-                hist.push_back(ch[j]);
-                ngram_row(ht, hist, (int)hist.size() - 1, rows.data() + (size_t)j * H);
-            }
+            const double tg0 = secs();
+            for (int j = 0; j < m; j++) hist.push_back(ch[j]);
+            ngram_rows(ht, hist, (int)hist.size() - m, m, rows.data());
+            if (getenv("FLASH_PFT_HOST")) fprintf(stderr, "[pft] batch at %d: n-gram rows %.2f ms\n", i, (secs() - tg0) * 1e3);
             int o = 0, d = 0;
             const bool last = i + m >= np;
             std::vector<int> mt;
@@ -574,7 +671,7 @@ int main(int argc, char** argv) {
         W[0]->rdump_.clear();
     }
     tp = secs() - tp;
-    if (nrep > 1) printf("prefill run %d: %d tokens in %.1f ms\n", rep, np, tp * 1e3);
+    if (nrep > 1) printf("prefill run %d: %d tokens in %.1f ms; next %d\n", rep, np, tp * 1e3, nxt);
     if (W[0]->dbgh_) {  // determinism check: per layer hashes of this repetition vs the first one (every card)
         static std::vector<std::vector<unsigned long long>> h0(ng);
         static const char* kind[12] = {"R after mixer", "routing", "MoE partial", "x (MoE input)", "x (QSA input)", "qkv proj",
@@ -600,11 +697,49 @@ int main(int argc, char** argv) {
                    fl < 0 ? "IDENTICAL" : "differs", fl, fk >= 0 ? kind[fk] : "-", nd, (LAYERS + 1) * Worker::DBGK, nxt);
         }
     }
+    for (int r = 0; r < ng; r++) W[r]->dbg_xqrep(rep);
+    if (W[0]->rowh_) {  // FLASH_DBGHASH=2: per (layer, row) hashes vs the first repetition: first differing per kind
+        static std::vector<std::vector<unsigned long long>> r0(ng);
+        static std::vector<std::vector<double>> l0(ng);
+        static const char* kn[4] = {"xh before MoE", "xq after MoE (in place)", "MoE partial", "routing"};
+        for (int r = 0; r < ng; r++) {
+            std::vector<unsigned long long> h;
+            W[r]->dbg_rowh(h);
+            std::vector<double> l1;
+            W[r]->dbg_rowl1(l1);
+            if (rep == 0) { r0[r] = h; l0[r] = l1; continue; }
+            const int RN = W[r]->rowh_n_;
+            for (int l = 0, done = 0; l < LAYERS && !done; l++)  // MoE partial L1 of the first differing rows
+                for (int row = 0; row < RN; row++)
+                    if (h[((size_t)l * RN + row) * 4 + 2] != r0[r][((size_t)l * RN + row) * 4 + 2]) {
+                        for (int q = std::max(0, row - 2); q < std::min(RN, row + 10); q++)
+                            printf("rowl1 rep %d rank %d layer %d row %d: %.6f vs %.6f (rel %.2e)%s\n", rep, r, l, q, l1[(size_t)l * RN + q],
+                                   l0[r][(size_t)l * RN + q], fabs(l1[(size_t)l * RN + q] - l0[r][(size_t)l * RN + q]) / (l0[r][(size_t)l * RN + q] + 1e-30),
+                                   h[((size_t)l * RN + q) * 4 + 2] != r0[r][((size_t)l * RN + q) * 4 + 2] ? " *" : "");
+                        done = 1;
+                        break;
+                    }
+            for (int k = 0; k < 4; k++) {
+                int fl = -1, fr = -1, nd = 0, nl = 0, lastl = -1;
+                for (int l = 0; l < LAYERS; l++)
+                    for (int row = 0; row < RN; row++)
+                        if (h[((size_t)l * RN + row) * 4 + k] != r0[r][((size_t)l * RN + row) * 4 + k]) {
+                            if (fl < 0) { fl = l; fr = row; }
+                            if (l == fl) { nd++; if (lastl < 0) lastl = row; nl = row; }
+                        }
+                if (fl >= 0) printf("rowh rep %d rank %d %s: first layer %d, rows %d..%d (%d rows differ there)\n", rep, r, kn[k], fl, fr, nl, nd);
+            }
+        }
+    }
     if (nrep > 1 && getenv("FLASH_LOGITS_NEXT")) {  // check every repetition (graph replays)
-        step2({nxt}, np, true, false, 0);
-        FILE* f = fopen((std::string(getenv("FLASH_LOGITS_NEXT")) + "." + std::to_string(rep)).c_str(), "wb");
-        fwrite(logits.data(), 4, nv0, f);
-        fclose(f);
+        // FLASH_LOGITS_NEXT_K=k: the same forward k times after this prefill (decode determinism on a fixed state)
+        const int kn = getenv("FLASH_LOGITS_NEXT_K") ? std::max(1, atoi(getenv("FLASH_LOGITS_NEXT_K"))) : 1;
+        for (int q = 0; q < kn; q++) {
+            step2({nxt}, np, true, false, 0);
+            FILE* f = fopen((std::string(getenv("FLASH_LOGITS_NEXT")) + "." + std::to_string(rep) + (kn > 1 ? "." + std::to_string(q) : "")).c_str(), "wb");
+            fwrite(logits.data(), 4, nv0, f);
+            fclose(f);
+        }
     }
     }
     if (W[0]->dump_) {
@@ -637,7 +772,11 @@ int main(int argc, char** argv) {
             fclose(f);
         }
     }
-    for (int r = 0; r < ng; r++) W[r]->nf_check("prefill", np);
+    for (int r = 0; r < ng; r++)
+        if (W[r]->nf_check("prefill", np)) {
+            fprintf(stderr, "[flash] FATAL: non-finite values in the prefill\n");
+            exit(1);
+        }
     printf("prefill %s\n", ec_summary(W).c_str());
     for (int r = 0; r < ng; r++) W[r]->ec_reset_stats();
     std::vector<int> gen_toks = {nxt};
@@ -681,12 +820,29 @@ int main(int argc, char** argv) {
             const double a0 = secs();
             const bool lk = Lnext > 0;
             const int ks = lk ? Lnext : kdraft;  // after a lookup step the chain ran on the device when needed
+            static const bool xrank = getenv("FLASH_XRANK") && atoi(getenv("FLASH_XRANK"));  // debug: per-rank emitted tokens
+            static const int ecv = getenv("FLASH_EC_VERIFY") ? atoi(getenv("FLASH_EC_VERIFY")) : 0;
+            std::vector<std::vector<int>> per(ng);
             job = [&](int r) {
                 std::vector<int> e(MAXM + 1);
                 const int n = W[r]->spec_step(ks, e.data(), lk);
-                if (r == 0) { em = e; em[MAXM] = n; }
+                e[MAXM] = n;
+                per[r].assign(e.begin(), e.begin() + n);
+                per[r].push_back(n);
+                if (ecv >= 2) { char w[40]; snprintf(w, sizeof(w), "after spec step %d", steps); W[r]->ec_verify(w); }
+                if (r == 0) em = e;
             };
             pool_run();
+            if (xrank)
+                for (int r = 1; r < ng; r++)
+                    if (per[r] != per[0]) {
+                        printf("XRANK MISMATCH at step %d: rank 0 emitted", steps);
+                        for (int t : per[0]) printf(" %d", t);
+                        printf(" | rank %d emitted", r);
+                        for (int t : per[r]) printf(" %d", t);
+                        printf("\n");
+                        fflush(stdout);
+                    }
             for (int i = 0; i < em[MAXM]; i++) gen_toks.push_back(em[i]);
             dt.push_back(secs() - a0);
             steps++;
@@ -763,6 +919,11 @@ int main(int argc, char** argv) {
                dt[dt.size() / 2] * 1e3, mean * 1e3, dt[dt.size() / 10] * 1e3, dt[dt.size() * 9 / 10] * 1e3, dt[0] * 1e3);
     }
     printf("decode %s\n", ec_summary(W).c_str());
+    if (getenv("FLASH_EC_VERIFY") && atoi(getenv("FLASH_EC_VERIFY")))
+        for (int r = 0; r < ng; r++) W[r]->ec_verify("after decode");
+    if (getenv("FLASH_JOBCHK") && atoi(getenv("FLASH_JOBCHK"))) {
+        for (int r = 0; r < ng; r++) { CUDA_CHECK(cudaSetDevice(devs[r])); CUDA_CHECK(cudaDeviceSynchronize()); W[r]->jobchk_report(); }
+    }
     if (getenv("FLASH_EC_STEPS")) {  // per decode step: misses (all cards) and host-timed step ms
         FILE* f = fopen(getenv("FLASH_EC_STEPS"), "w");
         std::vector<int> per;

@@ -77,6 +77,7 @@ struct SeqSlot {
     int* rdelta = nullptr;        // RoPE position shift of text after images (device)
     SpecState spec;               // this sequence's tokens / drafts / positions (device)
     SampleParams* sp = nullptr;   // sampling parameters (device)
+    PenState* pen = nullptr;      // presence / frequency penalty counts (device; sp->pen when a penalty is on)
     bool sampling = false;
     // grammar-constrained decoding (response_format): allowed-token bitmasks over the whole
     // vocabulary, one per verification row ([kMaxSpecK + 1][words], device, fixed address so
@@ -261,7 +262,13 @@ public:
     std::vector<int> draft_ids;
     // Sampling of the current slot: params live on the device; `sampling` selects greedy vs
     // sampled graphs.
-    void set_sampling(const SampleParams& p, bool on);
+    void set_sampling(const SampleParams& p, bool on);  // penalty off (set_penalty after it)
+    // presence / frequency penalty of the current slot: counts restart with the distinct seed tokens; pen_host:
+    // host-known tokens of the current slot at positions pos.. (first token, steps without drafts)
+    void set_penalty(float presence, float frequency, const int* seed, int n);
+    void pen_host(const int* toks, int n, int pos);
+    static constexpr int kPenSeedMax = 8192;
+    int* pseed_d_ = nullptr;
     bool sampling = false;
     // Grammar-constrained decoding of slot i: its logits are masked with its device bitmask
     // (words: (vocab + 31) / 32 uint32) before the token choice. upload_mask copies a host mask
@@ -281,6 +288,21 @@ public:
     size_t snapshot_bytes() const;
     void snapshot_save(void* dst);
     void snapshot_restore(const void* src);
+
+    // Activation steering (QE_STEER / QE_STEER_DIR, src/steer.h, kernels/steer.cuh): nv vectors, w =
+    // [nv][2 modes][layers][hidden] with the sidecar strength folded in (add: alpha v; project: sqrt(alpha) unit v),
+    // vector v present on layers flo[v]..fhi[v]; applied to the residual at the output of a slot's layers. Set once
+    // after the slots exist, before any forward (graphs capture the buffer addresses).
+    void set_steer(int nv, const int* flo, const int* fhi, const float* w);
+    bool steer_loaded() const { return steer_w_ != nullptr; }
+    // slot s: the vector (-1: off, the default), its mode (0 add, 1 project), layers lo..hi (inside the vector's) and
+    // scale; device values at fixed addresses written in this GPU's stream order (no graph changes)
+    void set_steer_slot(int s, int vec, int mode, int lo, int hi, float scale);
+    // activation capture (qe_capture, eager passes only): per layer the sum over the prompt rows >= cap_r0 of the
+    // layer output's residual; cap_begin zeroes, cap_end copies out [layers][hidden] and ends it
+    void cap_begin(int r0);
+    void cap_end(float* host);
+    bool capturing() const { return cap_ != nullptr; }
 
     // optional per-layer residual dump (host pointer, [layers][m][hidden] floats), debug only
     float* debug_hidden = nullptr;
@@ -347,8 +369,22 @@ private:
     const bf16* xbf_cur_ = nullptr;
     cudaStream_t comm_stream_ = nullptr;
     cudaStream_t pf_stream_ = nullptr;   // L2 prefetch side stream (decode graphs)
-    // all-reduce that overlaps an L2 prefetch of the next matmul's weights (decode, m <= 8)
-    void allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const W4* next);
+    // all-reduce that overlaps an L2 prefetch of the next matmul's weights (decode, m <= 8); sa: the layer output's
+    // steering (steer.cuh)
+    void allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const W4* next, const SteerArg* sa = nullptr);
+    // steering (set_steer): vectors, per-slot {vector, mode, lo, hi} [slots][4] and scale [slots] on the device, the
+    // host mirrors, the union of the vectors' file layers
+    float *steer_w_ = nullptr, *steer_sc_d_ = nullptr;
+    int* steer_sl_d_ = nullptr;
+    int steer_nv_ = 0, steer_lo_ = 1 << 30, steer_hi_ = -1;
+    std::vector<int> steer_sl_h_, steer_lo_v_, steer_hi_v_;
+    std::vector<float> steer_sc_h_;
+    // the steering of layer li's output for rows of slot `slot` (li = -1 in the result: nothing to do)
+    SteerArg steer_arg(int li, int slot) const;
+    float* cap_ = nullptr;      // capture accumulators [layers][hidden] (between cap_begin / cap_end)
+    float* cap_buf_ = nullptr;
+    int cap_r0_ = 0;
+    void capture_rows(int li, int m);  // layer li's output rows of the current pass (eager forward)
     // QE_EARLY_GEMV: the all-reduce + its consumer GEMV `w` (m <= 8, XH input xh_xn_)
     // launched together; the GEMV runs on pf_stream_, stages weights while the all-reduce is in flight
     // and waits for its tag. join = false leaves the join to the caller (early_join()). False: not

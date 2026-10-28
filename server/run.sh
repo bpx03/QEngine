@@ -2,7 +2,7 @@
 # Start the QEngine server (OpenAI + Anthropic API), tensor parallel over the selected GPUs.
 # usage: server/run.sh <port> [extra args for server/app.py]
 #
-# GPU selection (default: GPUs 0,1,2, tensor parallel 3 - the tested configuration):
+# GPU selection (default: GPUs 0,1,2, tensor parallel 3; 2 GPUs are supported too):
 #   QE_DEVICES=0,2 server/run.sh 8080     # physical GPU ids; sets CUDA_VISIBLE_DEVICES=0,2, --devices 0,1
 #   CUDA_VISIBLE_DEVICES=0,2 server/run.sh 8080   # same, all visible GPUs are used
 #   server/run.sh 8080 --devices 0,1      # explicit --devices (indices within CUDA_VISIBLE_DEVICES) is passed through
@@ -44,7 +44,7 @@ if [ "${#_req[@]}" -gt "$_avail" ]; then
   echo "QEngine: ${#_req[@]} devices requested (--devices $_devices) but only $_avail GPU(s) visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)" >&2
   exit 1
 fi
-if [ "${#_req[@]}" -ne 3 ]; then
-  echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engine is tuned and tested on 3 GPUs, other counts are less tested" >&2
+if [ "${#_req[@]}" -lt 2 ] || [ "${#_req[@]}" -gt 3 ]; then
+  echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engines are tested on 2 and 3 GPUs (Flash-Next needs 2 or 3)" >&2
 fi
 exec "${PYTHON:-python3}" server/app.py --host 127.0.0.1 --port "$PORT" "${_extra[@]}" "$@"

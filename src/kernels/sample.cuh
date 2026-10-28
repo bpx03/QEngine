@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+
 #include "../common.h"
 #include "spec.cuh"
 
@@ -7,6 +9,18 @@
 // counter), so all GPUs pick the same tokens without host round trips.
 constexpr int kTopK = 64;
 
+// Presence / frequency penalty state of one sequence slot (device, one per slot and card, fixed address): how often
+// each token occurs in the reply so far (saturating), plus the tokens committed at the last positions so a step that
+// is undone and redone (launch-ahead) replaces its predecessor's tokens instead of counting them twice.
+constexpr int kPenRing = 128;  // > the most tokens one step emits
+struct PenState {
+    int cpos;                 // position after the last committed token (-1: nothing committed since the reset)
+    int pad;
+    int ring[kPenRing];       // token at position p: ring[p % kPenRing] (positions [cpos - kPenRing, cpos))
+    unsigned char cnt[1];     // [vocab]: occurrences (seed tokens of the reset count once)
+};
+inline size_t pen_state_bytes(int vocab) { return (offsetof(PenState, cnt) + (size_t)vocab + 15) & ~(size_t)15; }
+
 struct SampleParams {  // lives in device memory so captured graphs pick up new values
     float temperature;   // > 0
     float top_p;         // (0, 1]
@@ -14,7 +28,28 @@ struct SampleParams {  // lives in device memory so captured graphs pick up new 
     float min_p;         // 0 disables
     unsigned long long seed;
     unsigned long long counter;  // advanced by every sampling kernel
+    // OpenAI-style penalties on the logits of the merged top-kTopK candidates before temperature / top-k / top-p:
+    // logit -= frequency * count + presence * (count > 0), count = occurrences in the reply so far (pen) plus the
+    // earlier rows of the same sequence in this launch (verify rows: their drafts are the reply if row i is used)
+    float presence = 0.f, frequency = 0.f;
+    PenState* pen = nullptr;     // this slot's (null: no penalty)
 };
+__host__ __device__ inline bool pen_active(const SampleParams& p) {
+    return p.pen != nullptr && (p.presence != 0.f || p.frequency != 0.f);
+}
+
+// After acceptance: the tokens toks[1 .. toks[0]] end at position *end_pos (the last one sits there) in the slot
+// whose parameters are *p; added to its penalty counts (no-op without an active penalty). A position below the last
+// committed one first takes back the tokens committed from there on (the step was undone and redone).
+void pen_commit(const SampleParams* p, const int* toks, const int* end_pos, cudaStream_t st);
+// batched: segment s (slot segs[s]) emitted toks + s * stride ([count, tokens...]) ending at position svp[slot * 2]
+// (after k_accept_b advanced it); base[slot] = the slot's parameters
+void pen_commit_b(const SampleParams* base, const int* segs, int nseg, const int* toks, int stride, const int* svp,
+                  cudaStream_t st);
+// host-known tokens (the first token after the prompt, steps without drafts) at positions pos, pos + 1, ...; n <= 16
+void pen_commit_host(const SampleParams* p, const int* toks, int n, int pos, cudaStream_t st);
+// reset the slot's counts (cpos = -1), then count each distinct seed token once (seed: device, n tokens)
+void pen_reset(PenState* pen, int vocab, const int* seed, int n, cudaStream_t st);
 
 // Grammar mask: rows [r0, r0 + rows) of this GPU's logits shard ([rows][v], global ids from
 // vocab_off) keep only the tokens whose bit is set in their mask bits + j * stride (masks of
@@ -26,9 +61,12 @@ void mask_logits(float* logits, int v, int vocab_off, const unsigned* bits, int 
 void topk_local(const float* logits, int v, int m, int vocab_off, float* pairs, cudaStream_t st);
 
 // Plain sampling: tokens[mi] ~ p(row mi) from gathered candidates [ngpu][m][kTopK][2].
+// chain: the rows are consecutive positions of one sequence being verified (sample-then-match): for the penalty
+// row mi sees the tokens sampled at rows < mi as generated (they equal the drafts whenever row mi is used)
 void sample_rows(const float* gathered, int ngpu, int m, SampleParams* p, int* tokens,
-                 cudaStream_t st);
-// batched rows of several sequences: row mi samples with base[rowslot[mi]], greedy (top candidate) when !on[slot]
+                 cudaStream_t st, bool chain = false);
+// batched rows of several sequences: row mi samples with base[rowslot[mi]], greedy (top candidate) when !on[slot];
+// rows of one slot are its verify rows (penalty: as sample_rows with chain)
 void sample_rows_slots(const float* gathered, int ngpu, int m, SampleParams* base, const int* rowslot,
                        const int* on, int* tokens, cudaStream_t st);
 

@@ -122,7 +122,11 @@ void Worker::add_slot() {
         ss.eos0 = c_.eos;
         ss.eos1 = c_.eos2;
         sl.sp = (SampleParams*)dalloc(sizeof(SampleParams), false);
+        sl.pen = (PenState*)dalloc(pen_state_bytes(c_.vocab), false);
+        pen_reset(sl.pen, c_.vocab, nullptr, 0, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
         SampleParams d{1.f, 1.f, kTopK, 0.f, 0, 0};
+        d.pen = sl.pen;
         CUDA_CHECK(cudaMemcpy(sl.sp, &d, sizeof(d), cudaMemcpyHostToDevice));
         const size_t mw = mask_words() * (kMaxSpecK + 1);
         sl.mask = (unsigned*)dalloc(mw * 4, false);
@@ -710,12 +714,15 @@ W4 Worker::load_w4(const SafeTensors& st, const std::vector<RowSpec>& rows, int 
         const TensorInfo& s = st.get(r.name + ".weight_scale");
         CHECK(q.shape[1] * 8 == K, "K mismatch in %s", r.name.c_str());
         const int h = r.r1 - r.r0;
-        CUDA_CHECK(cudaMemcpy2D(tq + (size_t)off * (kl / 8), kl / 2,
-                                q.data + ((size_t)r.r0 * (K / 8) + c0 / 8) * 4, K / 2, kl / 2, h,
-                                cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy2D(ts + (size_t)off * (kl / 128), kl / 128 * 2,
-                                s.data + ((size_t)r.r0 * (K / 128) + c0 / 128) * 2, K / 128 * 2,
-                                kl / 128 * 2, h, cudaMemcpyHostToDevice));
+        // H2D on the stream of the repack (as the Flash-Next loaders, qfn_prefill_r4): a plain cudaMemcpy2D from the
+        // pageable (mmapped) file runs on the legacy stream and may return before its DMA lands, and `stream` is
+        // non-blocking: the repack could read the reused scratch while it still held the previous tensor
+        CUDA_CHECK(cudaMemcpy2DAsync(tq + (size_t)off * (kl / 8), kl / 2,
+                                     q.data + ((size_t)r.r0 * (K / 8) + c0 / 8) * 4, K / 2, kl / 2, h,
+                                     cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(ts + (size_t)off * (kl / 128), kl / 128 * 2,
+                                     s.data + ((size_t)r.r0 * (K / 128) + c0 / 128) * 2, K / 128 * 2,
+                                     kl / 128 * 2, h, cudaMemcpyHostToDevice, stream));
         off += h;
     }
     W4 w;
@@ -758,9 +765,9 @@ bf16* Worker::gather_bf16(const SafeTensors& st, const std::vector<RowSpec>& row
     for (auto& r : rows) {
         const TensorInfo& t = st.get(r.name);
         CHECK(t.dtype == "BF16" && t.shape[1] == K, "w16 %s", r.name.c_str());
-        CUDA_CHECK(cudaMemcpy2D(tmp + (size_t)off * kl, (size_t)kl * 2,
-                                t.data + ((size_t)r.r0 * K + c0) * 2, (size_t)K * 2,
-                                (size_t)kl * 2, r.r1 - r.r0, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy2DAsync(tmp + (size_t)off * kl, (size_t)kl * 2,
+                                     t.data + ((size_t)r.r0 * K + c0) * 2, (size_t)K * 2,
+                                     (size_t)kl * 2, r.r1 - r.r0, cudaMemcpyHostToDevice, stream));  // ordered with the consumer
         off += round_up(r.r1 - r.r0, pad_to);
     }
     *n_out = n;
@@ -1020,7 +1027,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
             for (int i = 0; i < n; i++)
                 memcpy(&rows[(size_t)i * K], t.data + (size_t)draft_ids[i] * K * 2, (size_t)K * 2);
             bf16* tmp = (bf16*)g_scratch_q.get((size_t)n * K * 2);
-            CUDA_CHECK(cudaMemcpy(tmp, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpyAsync(tmp, rows.data(), rows.size() * 2, cudaMemcpyHostToDevice, stream));  // ordered with the quantize
             draft_head_.is4 = w4;
             if (w4) {
                 int32_t* q = (int32_t*)g_scratch_s.get((size_t)n * K / 2 + (size_t)n * (K / 128) * 2);
@@ -1267,8 +1274,32 @@ void Worker::snapshot_restore(const void* src) {
 void Worker::set_sampling(const SampleParams& p, bool on) {
     CUDA_CHECK(cudaSetDevice(device));
     SeqSlot& sl = slots_.at(cur_slot_);
-    CUDA_CHECK(cudaMemcpy(sl.sp, &p, sizeof(p), cudaMemcpyHostToDevice));
+    SampleParams h = p;
+    h.presence = h.frequency = 0.f;
+    h.pen = sl.pen;
+    CUDA_CHECK(cudaMemcpy(sl.sp, &h, sizeof(h), cudaMemcpyHostToDevice));
     sl.sampling = sampling = on;
+}
+
+void Worker::set_penalty(float presence, float frequency, const int* seed, int n) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    SeqSlot& sl = slots_.at(cur_slot_);
+    if (presence != 0.f || frequency != 0.f) {
+        if (!pseed_d_) pseed_d_ = (int*)dalloc((size_t)kPenSeedMax * 4, false);
+        n = std::max(0, std::min(n, kPenSeedMax));
+        if (n > 0) CUDA_CHECK(cudaMemcpy(pseed_d_, seed, (size_t)n * 4, cudaMemcpyHostToDevice));
+        pen_reset(sl.pen, c_.vocab, pseed_d_, n, stream);
+    }
+    const float pf[2] = {presence, frequency};
+    CUDA_CHECK(cudaMemcpyAsync((char*)sl.sp + offsetof(SampleParams, presence), pf, 8, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void Worker::pen_host(const int* toks, int n, int pos) {
+    CUDA_CHECK(cudaSetDevice(device));
+    const SampleParams* p = slots_.at(cur_slot_).sp;
+    for (int i = 0; i < n; i += 16) pen_commit_host(p, toks + i, std::min(16, n - i), pos + i, stream);
 }
 
 void Worker::set_constrained(int i, bool on) {
@@ -1441,9 +1472,13 @@ void Worker::forward(int m, bool logits, bool spec) {
         const bf16* next_norm = i + 1 < c_.layers ? layers_[i + 1].in_norm : final_norm_;
         const W4* nxt = nullptr;
         if (i + 1 < c_.layers) nxt = layers_[i + 1].full ? &layers_[i + 1].fa.qkv : &layers_[i + 1].dn.in;
-        early_in = nxt && !debug_hidden && allreduce_early(m, next_norm, *nxt, proj_, proj_ld_, nullptr, 0,
-                                                           layers_[i + 1].full, layers_[i + 1].full ? 2 : 4);
-        if (!early_in) allreduce_pf(resid_, m, next_norm, xn_, nxt);
+        // the layer output: its steering (fused into the all-reduce; the early-GEMV all-reduce has no hook)
+        const SteerArg sa = steer_arg(i, cur_slot_);
+        early_in = nxt && !debug_hidden && sa.li < 0 && !cap_ &&
+                   allreduce_early(m, next_norm, *nxt, proj_, proj_ld_, nullptr, 0, layers_[i + 1].full,
+                                   layers_[i + 1].full ? 2 : 4);
+        if (!early_in) allreduce_pf(resid_, m, next_norm, xn_, nxt, sa.li >= 0 ? &sa : nullptr);
+        if (cap_) capture_rows(i, m);
         if (debug_hidden) {
             CUDA_CHECK(cudaMemcpyAsync(debug_hidden + (size_t)i * m * H, resid_,
                                        (size_t)m * H * 4, cudaMemcpyDeviceToHost, st));
@@ -1540,11 +1575,12 @@ void Worker::early_join() {
     if (early_join_ev_) CUDA_CHECK(cudaStreamWaitEvent(stream, early_join_ev_, 0));
 }
 
-void Worker::allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const W4* next) {
+void Worker::allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const W4* next, const SteerArg* sa) {
     const int ll = next_ll(m);
     if (!next || pf_bytes_ == 0 || m > rows_cap_) {
         allreduce_add(resid, partial_, m, c_.hidden, comm_, rank, ctr_, stream, norm, c_.eps,
-                      xn_bf16(xn, m, next), ll, false, xn == xn_ && m <= rows_cap_ ? xh_xn_ : nullptr);
+                      xn_bf16(xn, m, next), ll, false, xn == xn_ && m <= rows_cap_ ? xh_xn_ : nullptr, false, 0, false,
+                      nullptr, sa);
         return;
     }
     cudaEvent_t fork = ev(), join = ev();
@@ -1553,7 +1589,8 @@ void Worker::allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const
     prefetch_l2(*next, pf_bytes_, pf_stream_);
     CUDA_CHECK(cudaEventRecord(join, pf_stream_));
     allreduce_add(resid, partial_, m, c_.hidden, comm_, rank, ctr_, stream, norm, c_.eps,
-                  xn_bf16(xn, m, next), ll, false, xn == xn_ && m <= rows_cap_ ? xh_xn_ : nullptr);
+                  xn_bf16(xn, m, next), ll, false, xn == xn_ && m <= rows_cap_ ? xh_xn_ : nullptr, false, 0, false,
+                  nullptr, sa);
     CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
 }
 
@@ -1663,7 +1700,13 @@ void Worker::forward_batch(const std::vector<int>& slots, const std::vector<int>
         const W4* nxt = nullptr;
         if (li + 1 < c_.layers)
             nxt = layers_[li + 1].full ? &layers_[li + 1].fa.qkv : &layers_[li + 1].dn.in;
-        allreduce_pf(resid_, M, next_norm, xn_, nxt);
+        SteerArg sa = steer_arg(li, 0);  // the layer output; each row its sequence's slot (fixed by the graph key)
+        if (sa.li >= 0) {
+            sa.nrs = M;
+            for (size_t i = 0; i < slots.size(); i++)
+                for (int j = 0; j < ms[i]; j++) sa.rs[r0[i] + j] = (unsigned char)slots[i];
+        }
+        allreduce_pf(resid_, M, next_norm, xn_, nxt, sa.li >= 0 ? &sa : nullptr);
     }
     for (size_t i = 0; i < slots.size(); i++)  // grammar-constrained sequences: a mask per row
         if (slots_[slots[i]].constrained)
@@ -2156,19 +2199,23 @@ void Worker::forward_prefill(int m, bool logits) {
     const int g_gu = gemm_i8_prequant_group(H, true), g_in = gemm_i8_prequant_group(H, false);
     const bool of_v2 = gemm_i8_variant() >= 2;
     // copy-engine all-reduce (QE_AR_CE): both micro-batches deferred, 3 GPUs (two peers per GPU)
-    const bool ce_on = env_int("QE_AR_CE", 1) && ngpu_ == 3 && ce_ar_ok(comm_, mbs[0], H, r0s[0]) &&
+    const bool ce_on = env_int("QE_AR_CE", 1) && comm_.xfer != kXferP2P && ngpu_ == 3 && ce_ar_ok(comm_, mbs[0], H, r0s[0]) &&
                        ce_ar_ok(comm_, mbs[1], H, r0s[1]) && defer_ok[0] && defer_ok[1];
     // owner finish on the SM all-reduce (QE_AR_OWNFIN, off: slower) or on the copy-engine one (QE_AR_CEOF)
     // (merge prefill-night-combo: the CE finish kernel writes only the gemm_i8t record layout (variant 1); the SM
     // owner finish of prefill-rest-x-gemm writes both, as before)
-    const bool of_on = (env_int("QE_AR_OWNFIN", 0) || (ce_on && env_int("QE_AR_CEOF", 0))) && defer_ok[0] &&
+    // (not with steering vectors loaded: the owner-finished tail has no steering hook)
+    const bool of_on = !steer_w_ && (env_int("QE_AR_OWNFIN", 0) || (ce_on && env_int("QE_AR_CEOF", 0))) && defer_ok[0] &&
                        defer_ok[1] && allreduce_ownfin_ok(comm_, H) &&
                        (ce_on ? gemm_i8_variant() == 1 : gemm_i8_variant() >= 1) && g_gu > 0 && g_in > 0 &&
                        !(dbg_skip() & 1);
     int pending_G[2] = {0, 0};
     bool pending_wxn[2] = {false, false};
+    SteerArg pending_sa[2];  // the layer-output steering of a deferred all-reduce (applied by its finish)
     xbf_[0] = xbf_[1] = nullptr;
-    auto reduce = [&](int b, const bf16* norm, bool glu_next, bool i8only) {  // all-reduce rows of b on the comm stream
+    // all-reduce rows of b on the comm stream; sli: the layer whose output these rows are (steering), else -1
+    auto reduce = [&](int b, const bf16* norm, bool glu_next, bool i8only, int sli = -1) {
+        const SteerArg sa = steer_arg(sli, cur_slot_);
         // copy-engine AR with fp32 partials: pack them to bf16 on this stream with all SMs (~20 us; on a
         // few comm-stream blocks it took ~230 us and slowed the concurrent kernels)
         const bool ce_pack_main = ce_on && !pb[b] && !(dbg_skip() & 64) && (of_on || env_int("QE_CE_PACK_MAIN", 1));
@@ -2246,10 +2293,12 @@ void Worker::forward_prefill(int m, bool logits) {
             ce_take_wait(seq, 1, cs);  // all sums landed
         } else {
             allreduce_add(resid_ + o, part, mbs[b], H, comm_, rank, ctr_, cs, norm, eps,
-                          xn_ + o, -1, true, nullptr, defer_ok[b], r0s[b], pb[b], of_on ? &of : nullptr);
+                          xn_ + o, -1, true, nullptr, defer_ok[b], r0s[b], pb[b], of_on ? &of : nullptr,
+                          !defer_ok[b] && sa.li >= 0 ? &sa : nullptr);
         }
         if (of_on) { pending[b] = norm; pending_G[b] = of.G; pending_wxn[b] = of.wxn; }
         else if (defer_ok[b]) { pending[b] = norm; pending_glu[b] = glu_next; pending_i8only[b] = i8only && !arf_xn; }
+        pending_sa[b] = defer_ok[b] ? sa : SteerArg();
         ready[b] = ev();
         CUDA_CHECK(cudaEventRecord(ready[b], cs));
     };
@@ -2276,7 +2325,8 @@ void Worker::forward_prefill(int m, bool logits) {
             // the W4A8 GEMM consuming these rows takes its int8 input straight from this kernel
             gemm_i8_prequant(xn_ + o, mbs[b], H, r0s[b], pending_glu[b], &xq, &xsc, &G, &ctr);
             allreduce_finish(resid_ + o, (dbg_skip() & 1) ? 1 : mbs[b], H, comm_, rank, pending[b], eps, xn_ + o, r0s[b], st, xq, xsc, G,
-                             xq ? ctr : nullptr, !(xq && pending_i8only[b]));
+                             xq ? ctr : nullptr, !(xq && pending_i8only[b]), pending_sa[b].li >= 0 ? &pending_sa[b] : nullptr);
+            pending_sa[b] = SteerArg();
             pending[b] = nullptr;
         }
     };
@@ -2304,7 +2354,7 @@ void Worker::forward_prefill(int m, bool logits) {
             matmul_part(L.down, act, I, mbs[b], r0s[b], pb[b]);
             // next mixer input: full attention reads only the int8 copy (qkv GEMM), DeltaNet also
             // the bf16 rows (ab projection), the final norm feeds lm_head / MTP in bf16
-            reduce(b, next_norm, false, i + 1 < c_.layers && layers_[i + 1].full);
+            reduce(b, next_norm, false, i + 1 < c_.layers && layers_[i + 1].full, i);
         }
     }
     wait(0);
@@ -2499,6 +2549,84 @@ static int overlap_min() {
     return v;
 }
 
+// ---------------------------------------------------------------- activation steering (QE_STEER)
+void Worker::set_steer(int nv, const int* flo, const int* fhi, const float* w) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CHECK(!steer_w_, "steering vectors set twice");
+    CHECK(nv >= 1, "no steering vectors");
+    const int ns = std::max(1, (int)slots_.size()), L = c_.layers, H = c_.hidden;
+    CHECK(ns <= 256, "steering: %d slots (row map holds 8 bits)", ns);
+    steer_nv_ = nv;
+    for (int v = 0; v < nv; v++) {
+        CHECK(flo[v] >= 0 && fhi[v] < L && flo[v] <= fhi[v], "steering vector %d: layers %d..%d", v, flo[v], fhi[v]);
+        steer_lo_ = std::min(steer_lo_, flo[v]);
+        steer_hi_ = std::max(steer_hi_, fhi[v]);
+    }
+    steer_lo_v_.assign(flo, flo + nv);
+    steer_hi_v_.assign(fhi, fhi + nv);
+    const size_t wn = (size_t)nv * 2 * L * H;
+    steer_w_ = (float*)dalloc(wn * 4, false);
+    CUDA_CHECK(cudaMemcpy(steer_w_, w, wn * 4, cudaMemcpyHostToDevice));
+    steer_sl_d_ = (int*)dalloc((size_t)ns * 16, false);
+    steer_sc_d_ = (float*)dalloc((size_t)ns * 4, false);
+    steer_sl_h_.assign((size_t)ns * 4, 0);
+    for (int s = 0; s < ns; s++) steer_sl_h_[(size_t)s * 4] = -1, steer_sl_h_[(size_t)s * 4 + 3] = -1;
+    steer_sc_h_.assign(ns, 0.f);
+    CUDA_CHECK(cudaMemcpy(steer_sl_d_, steer_sl_h_.data(), (size_t)ns * 16, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(steer_sc_d_, steer_sc_h_.data(), (size_t)ns * 4, cudaMemcpyHostToDevice));
+}
+
+void Worker::set_steer_slot(int s, int vec, int mode, int lo, int hi, float scale) {
+    if (!steer_w_) return;
+    CHECK(vec >= -1 && vec < steer_nv_, "steering vector %d of %d", vec, steer_nv_);
+    if (vec >= 0)
+        CHECK((mode == 0 || mode == 1) && lo >= steer_lo_v_[vec] && hi <= steer_hi_v_[vec] && lo <= hi,
+              "steering vector %d: mode %d layers %d..%d (vector layers %d..%d)", vec, mode, lo, hi, steer_lo_v_[vec],
+              steer_hi_v_[vec]);
+    int q[4] = {vec, vec >= 0 ? mode : 0, vec >= 0 ? lo : 0, vec >= 0 ? hi : -1};
+    const float sc = vec >= 0 ? scale : 0.f;
+    int* h = &steer_sl_h_.at((size_t)s * 4);
+    if (std::equal(q, q + 4, h) && steer_sc_h_.at(s) == sc) return;
+    std::copy(q, q + 4, h);
+    steer_sc_h_[s] = sc;
+    CUDA_CHECK(cudaSetDevice(device));
+    steer_set_slot(steer_sl_d_ + (size_t)s * 4, steer_sc_d_ + s, q[0], q[1], q[2], q[3], sc, stream);
+}
+
+SteerArg Worker::steer_arg(int li, int slot) const {
+    SteerArg a;
+    if (!steer_w_ || li < steer_lo_ || li > steer_hi_) return a;
+    a.w = steer_w_;
+    a.sl = steer_sl_d_;
+    a.sc = steer_sc_d_;
+    a.li = li;
+    a.layers = c_.layers;
+    a.slot = std::max(0, slot);
+    return a;
+}
+
+void Worker::cap_begin(int r0) {
+    CUDA_CHECK(cudaSetDevice(device));
+    const size_t n = (size_t)c_.layers * c_.hidden;
+    if (!cap_buf_) cap_buf_ = (float*)dalloc(n * 4, false);
+    CUDA_CHECK(cudaMemsetAsync(cap_buf_, 0, n * 4, stream));
+    cap_ = cap_buf_;
+    cap_r0_ = r0;
+}
+
+void Worker::cap_end(float* host) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (host && cap_buf_)
+        CUDA_CHECK(cudaMemcpy(host, cap_buf_, (size_t)c_.layers * c_.hidden * 4, cudaMemcpyDeviceToHost));
+    cap_ = nullptr;
+}
+
+void Worker::capture_rows(int li, int m) {
+    const int skip = std::max(0, std::min(m, cap_r0_ - std::max(0, pf_p0_)));
+    steer_capture(resid_, m, skip, c_.hidden, cap_ + (size_t)li * c_.hidden, stream);
+}
+
 void Worker::set_rope_delta(int delta) {
     CUDA_CHECK(cudaSetDevice(device));
     CUDA_CHECK(cudaMemcpy(slots_.at(cur_slot_).rdelta, &delta, 4, cudaMemcpyHostToDevice));
@@ -2525,7 +2653,8 @@ void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const in
     // every new prompt captured and instantiated a whole-model graph for a single launch): launch
     // it directly; a repeated key is captured as before (QE_PF_EAGER=0: always a graph)
     const auto gkey = std::make_tuple(m, last, mode(), cur_slot_);
-    if (m <= kMaxGemvTokens && env_int("QE_PF_EAGER", 1) && !debug_hidden && !graphs_.m.count(gkey) &&
+    if (cap_) forward(m, last);  // activation capture: eager, every layer output seen (capture_rows)
+    else if (m <= kMaxGemvTokens && env_int("QE_PF_EAGER", 1) && !debug_hidden && !graphs_.m.count(gkey) &&
         eager_seen_.insert(gkey).second)
         forward(m, last);
     else if (m <= kMaxGemvTokens) run(m, last);
