@@ -240,6 +240,8 @@ python3 tools/kv_scales.py calibrate --model models/Qwen3.8-27B-INT8 --corpus <t
 server/run.sh 8080 --model models/Qwen3.8-27B-INT8
 ```
 
+In Docker ([Run with Docker](#run-with-docker)), add `-e QE_MODEL=/app/models/Qwen3.8-27B-INT8` to the `docker run` command.
+
 INT8 layers decode on a W8A16 GEMV (fp32 accumulation; 1–2 rows at ~95 % of DRAM bandwidth, bit-identical
 across row counts up to 64, `tests/test_w8_rows.py`) and prefill on a W8A8 GEMM (`gemm_w8v_kernel`, int8 tensor cores, activations
 quantized per token and 32-k group, autotuned); batched decode passes of ≥ 33 rows take the GEMM as INT4 does.
