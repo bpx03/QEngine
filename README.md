@@ -204,15 +204,24 @@ Download the checkpoint (includes the MTP head `model_mtp.safetensors`):
 hf download RedHatAI/Qwen3.8-27B-INT4 --local-dir models/Qwen3.8-27B-INT4
 ```
 
-Two additional files are published as **release assets** of this repository (not in git). Put both into
+Two additional files are published as **release assets** of this repository (not in git), attached to the
+[latest release](https://github.com/bpx03/QEngine/releases/latest) (unchanged since v1.0). Put both into
 `models/Qwen3.8-27B-INT4/`:
+
+```bash
+cd models/Qwen3.8-27B-INT4
+for f in model_mtp_ft.safetensors token_rank.bin SHA256SUMS; do
+  curl -LO https://github.com/bpx03/QEngine/releases/latest/download/$f
+done
+sha256sum -c SHA256SUMS
+```
 
 | file | size | what |
 |---|---:|---|
 | `token_rank.bin` | 992,308 B | token-frequency ranking for the MTP draft vocabulary (`tools/draft_vocab.py`) |
 | `model_mtp_ft.safetensors` | 849,400,392 B | MTP head fine-tuned on the engine's own answers |
 
-Check them with `sha256sum -c SHA256SUMS` (also a release asset). Without them the engine still runs:
+`token_rank.bin` is the same file as `data/flash-next/token_rank.bin` (both models share the tokenizer). Without them the engine still runs:
 without `token_rank.bin` the drafts use the full vocabulary, and without `model_mtp_ft.safetensors` it
 uses the checkpoint's original MTP head (`QE_MTP_FILE` selects another head file). Both make it slower
 than the published numbers (fewer accepted drafts per step, more expensive drafting).
