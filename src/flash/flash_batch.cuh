@@ -267,6 +267,7 @@ __global__ void k_idx_prep_b(const float* __restrict__ ip, int ld, const bf16* _
     const int d = threadIdx.x, r0 = blockIdx.x * rps;
     float* tail = ttail[rslot[r0]];
     bf16* ikb = ikb0 + (size_t)(rbase[r0] / IDX_R) * IDX_HD;
+    int sl = -1;  // the slot of the rows being roped (multimodal positions)
     auto norm_rope = [&](float x, const bf16* w, int pos) {
         const float ss = block_sum<128>(x * x, red);
         x = x * rsqrtf(ss / IDX_HD + EPS) * (1.f + __bfloat162float(w[d]));
@@ -275,7 +276,7 @@ __global__ void k_idx_prep_b(const float* __restrict__ ip, int ld, const bf16* _
         __syncthreads();
         if (d < ROT) {
             const int i = d & 31;
-            const float f = (float)pos * powf((float)THETA, -2.f * i / ROT);
+            const float f = rope_freq(pos, i, sl);
             float sn, cs;
             sincosf(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
@@ -285,6 +286,7 @@ __global__ void k_idx_prep_b(const float* __restrict__ ip, int ld, const bf16* _
     for (int tt = 0; tt < rps; tt++) {
         const int t = r0 + tt;
         const int pos = rpos[t];
+        sl = rslot[t];
         for (int h = 0; h < IDX_NH; h++) iq[((size_t)t * IDX_NH + h) * IDX_HD + d] = norm_rope(ip[(size_t)t * ld + h * IDX_HD + d], qn, pos);
         const float rk = __bfloat162float(__float2bfloat16(ip[(size_t)t * ld + IDX_NH * IDX_HD + d]));
         tail[(pos & (IDX_TAIL - 1)) * IDX_HD + d] = rk;
@@ -451,7 +453,7 @@ void Worker::gdn_b(Layer& L, int li, int m, int rps) {
     k_dn_conv_b<<<dim3((ch + 255) / 256, m / rps), 256, 0, st_>>>(proj_, ld, ch, L.conv_w, tab(TB_CH, li), tab(TB_CP, li), rslot_, bpn_,
                                                                  rps, cv);
     float* o = gates_;
-    static const int qkp = getenv("FLASH_DN_QK") ? atoi(getenv("FLASH_DN_QK")) : 9;  // precomputed q / k norms from m rows (0: off)
+    static const int qkp = env_int("FLASH_DN_QK", 9);  // precomputed q / k norms from m rows (0: off)
     if (qkp > 0 && m >= qkp) {
         k_dn_qk<<<dim3(m, kl + 1), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, dnqk_, dngb_);
         k_dn_rec_bq<<<dim3(vl, 16, m / rps), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, dnqk_, dngb_, tab(TB_S, li), tab(TB_RP, li),
@@ -473,11 +475,11 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     gemv_w16_rows(L.idx, x_, H, proj2_, (IDX_NH + 1) * IDX_HD, m, st_);
     const int nqp = ql, qh0 = p_.q0;
     k_qsa_prep<<<dim3(nqp + 4, m), 256, 0, st_>>>(proj_, ld, L.q_norm, L.k_norm, posd_, qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, p_, nqp,
-                                                   qh0, rp, rb);
+                                                   qh0, rp, rb, rs, kvmap(L));
     k_idx_prep_b<<<m / rps, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, rp, rb, rs, gates_, tab(TB_IT, li),
                                               kb.ikb, p_, rps);
     KCHK("qsa_b prep");
-    const int lbmax = rows_ / IDX_R;
+    const int lbmax = srows_ / IDX_R;
     Xchg xq;
     for (int g = 0; g < p_.ngpu; g++) { xq.recv[g] = xqpr_[g]; xq.flags[g] = xqpf_[g]; }
     xq.seq = xqseq_;
@@ -492,13 +494,14 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     if (idx_gk_) k_idx_local<true><<<m, 1024, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
     else k_idx_local<<<m, 1024, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
     k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_);
-    k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp, idx_gk_);
+    k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp, idx_gk_, kvs_ ? L.kvp : KvPool(), rb,
+                                      kvs_ && m <= MAXM ? psel_ : nullptr);
     KCHK("qsa_b select");
     AttnDst d{};
     d.o[0] = attn_x_;
     for (int z = 1; z < dec_split_; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
     k_qsa_dec<<<dim3(NKV, m, dec_split_), 128, QD_SMEM, st_>>>(qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, posd_, d, p_, xq, isel_, insel_, lbmax,
-                                                               rp, rb);
+                                                               rp, rb, false, kvmap(L), kvs_ && m <= MAXM ? psel_ : nullptr);
     if (dec_split_ > 1) k_attn_merge<<<dim3(NQ, m), HD, 0, st_>>>(d, dec_split_);
     KCHK("qsa_b attn");
     Xchg xc;
@@ -515,14 +518,14 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
 // debug FLASH_BDUMP=prefix (FLASH_GRAPH=0): the residual of segment 0's rows after every mixer / MoE of a batched step
 // -> prefix.r<rank>.s<step> ([48][2][rps][10240] floats)
 void Worker::moe_dn_1w() {  // debug FLASH_MOE_DN_1W (see k_moe_dn)
-    if (!getenv("FLASH_MOE_DN_1W") || !atoi(getenv("FLASH_MOE_DN_1W"))) return;
+    if (!env_int("FLASH_MOE_DN_1W", 0)) return;
     CUDA_CHECK(cudaSetDevice(dev_));
     const int one = 1;
     CUDA_CHECK(cudaMemcpyToSymbol(g_moe_dn_1w, &one, 4));
 }
 
 void Worker::bdump(int li, int part, int m, int rps) {
-    static const char* pre = getenv("FLASH_BDUMP");
+    static const char* pre = env_str("FLASH_BDUMP");
     if (!pre) return;
     flush_y(m);
     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -633,6 +636,12 @@ void Worker::set_bhist(int slot, const int* ids, int n) {
     CUDA_CHECK(cudaSetDevice(dev_));
     const size_t hs = (size_t)max_ctx_ + 64;
     n = std::min<int>(n, (int)hs);
+    std::vector<int> hv;
+    if (std::any_of(ids, ids + n, [](int t) { return t >= kImgToken; })) {  // image rows: <|image_pad|>
+        hv.assign(ids, ids + n);
+        for (int& t : hv) t = dev_tok(t);
+        ids = hv.data();
+    }
     CUDA_CHECK(cudaMemcpyAsync(hdb_ + (size_t)slot * hs, ids, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(hnb_ + slot, &n, 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -659,39 +668,32 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     if (!ev0_) { CUDA_CHECK(cudaEventCreate(&ev0_)); CUDA_CHECK(cudaEventCreate(&ev1_)); }
     CUDA_CHECK(cudaEventRecord(ev0_, st_));
     // one graph per shape (not LRU-capped like the prefill caches: few shapes); eager the first time (lazy library
-    // allocations); an instantiate OOM drops the prefill graphs and retries, else the step runs eagerly
-    static const bool graphs = !getenv("FLASH_GRAPH") || atoi(getenv("FLASH_GRAPH"));
+    // allocations); an instantiate OOM drops every cached graph and retries, else the step runs eagerly
+    static const bool graphs = env_int("FLASH_GRAPH", 1);
     auto it = bgraphs_.find(key);
-    if (!graphs || dump_ || getenv("FLASH_BDUMP") || it == bgraphs_.end()) {
+    if (!graphs || dump_ || env_str("FLASH_BDUMP") || it == bgraphs_.end()) {
         if (graphs) bgraphs_[key] = nullptr;
         batch_body(nseg, k);
     } else {
+        bool ran = false;
         if (!it->second) {
-            cudaGraph_t g;
-            CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
-            batch_body(nseg, k);
-            CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            cudaError_t e = cudaGraphInstantiate(&it->second, g, 0);
-            if (e == cudaErrorMemoryAllocation) {
-                (void)cudaGetLastError();
-                CUDA_CHECK(cudaStreamSynchronize(st_));
-                for (auto* c : {&pgraphs_, &pbgraphs_}) {
-                    for (auto& kv : *c)
-                        if (kv.second) CUDA_CHECK(cudaGraphExecDestroy(kv.second));
-                    c->clear();
-                }
-                e = cudaGraphInstantiate(&it->second, g, 0);
-            }
-            CUDA_CHECK(cudaGraphDestroy(g));
-            if (e == cudaErrorMemoryAllocation) {
-                (void)cudaGetLastError();
-                it->second = nullptr;
+            if (graph_skip()) {  // after a failed retry (out of memory): no capture for a while
                 batch_body(nseg, k);
+                ran = true;
             } else {
-                CUDA_CHECK(e);
+                cudaGraph_t g;
+                CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
+                batch_body(nseg, k);
+                CUDA_CHECK(cudaStreamEndCapture(st_, &g));
+                // OOM: every cached graph of the card is dropped and the instantiate retried (flash_seq.cu)
+                if (!inst_graph(&it->second, g)) {
+                    batch_body(nseg, k);  // the captured work never ran
+                    ran = true;
+                }
+                CUDA_CHECK(cudaGraphDestroy(g));
             }
         }
-        if (it->second) CUDA_CHECK(cudaGraphLaunch(it->second, st_));
+        if (!ran && !(it->second && launch_graph(it->second))) batch_body(nseg, k);
     }
     if (bsamp_) CUDA_CHECK(cudaMemcpyAsync(sp_, spslot_ + cur_slot_, sizeof(SampleParams), cudaMemcpyDeviceToDevice, st_));
     con_ = con0;
@@ -715,7 +717,7 @@ void Worker::batch_finish(int* out, int* cnt) {
         set_slot_prev_m(bslots_[i], e[0]);
     }
     nf_check("batch step", 0);
-    static const bool js = getenv("FLASH_JOBSTAT") && atoi(getenv("FLASH_JOBSTAT"));
+    static const bool js = env_int("FLASH_JOBSTAT", 0);
     if (js && bgpu_ms_.size() % 50 == 0) {  // mean expert-group jobs per MoE call on this card, by row count
         unsigned long long st[MAXM + 1][2];
         CUDA_CHECK(cudaMemcpyFromSymbol(st, g_jobstat, sizeof st));

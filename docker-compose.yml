@@ -20,12 +20,14 @@ services:
       QE_GPUS: "${QE_GPUS:-0,1,2}"   # GPU ids to use, e.g. "0,2" for two GPUs (3 GPUs = tested default)
       QE_PORT: "8080"
       QE_EXTRA_ARGS: "${QE_EXTRA_ARGS:-}"
+      QE_STEERING: "${QE_STEERING:-0}"   # steering: 0 off, 1 = included refusal_projection (Flash-Next), or a vector name
     ports:
       - "${QE_HOST_PORT:-8080}:8080"
       - "127.0.0.1:${QE_METRICS_HOST_PORT:-9393}:9393"   # dashboard / Prometheus metrics
     volumes:
       - "${QE_MODELS_DIR:-./models}:/app/models:ro"
       - qengine-cache:/root/.cache/qengine
+      # - "${QE_VECTORS_DIR:-./vectors-user}:/vectors:ro"   # your steering vectors (*.gguf + .json), pick with QE_STEERING=<name>
 
 volumes:
   qengine-cache:

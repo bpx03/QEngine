@@ -12,10 +12,12 @@ import threading
 
 import numpy as np
 
+from qe_env import env_int, env_str
+
 # lookup drafts for constrained sequences (the engine's own lookup skips them): the longest earlier match (<= 32
 # tokens) of the token history's suffix, if >= LK_MIN tokens, proposes the tokens that followed it (QE_LK_GRAMMAR=0 off)
-LK_GRAMMAR = os.environ.get("QE_LK_GRAMMAR", "0") != "0"  # JSON copy bench: no gain (strings escape newlines), off
-LK_MIN = int(os.environ.get("QE_LK_MIN", "24"))
+LK_GRAMMAR = env_str("QE_LK_GRAMMAR", "0") != "0"  # JSON copy bench: no gain (strings escape newlines), off
+LK_MIN = env_int("QE_LK_MIN", 24)
 
 
 class TokenLookup:
@@ -77,7 +79,7 @@ UESC = {"all": {"json_allow_general_unicode_escapes": True},
 
 
 def uesc():
-    mode = os.environ.get("QE_JSON_UESC", "none")
+    mode = env_str("QE_JSON_UESC", "none").strip()
     if mode not in UESC:
         raise GrammarError(f"QE_JSON_UESC={mode!r}: use all, none or control")
     return UESC[mode]
@@ -88,7 +90,7 @@ FLEXIBLE = {"whitespace_flexible": True}
 
 
 def json_options(schema):
-    mode = os.environ.get("QE_JSON_WS", "")
+    mode = env_str("QE_JSON_WS", "").strip()
     if mode in ("flexible", "compact"):
         layout = FLEXIBLE if mode == "flexible" else COMPACT
     else:

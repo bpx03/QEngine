@@ -30,6 +30,8 @@ import re
 import threading
 import time
 
+from qe_env import env_int, env_str
+
 SPAWN_TOOLS = ("Agent", "Task")
 CLI_RE = re.compile(r"(official cli|claude agent sdk|claude agent, built on|claude code)", re.I)
 WS = re.compile(r"\s+")
@@ -149,9 +151,9 @@ class Info:
 
 class Tracker:
     def __init__(self, override=None, alarm_turns=None, max_sessions=64, max_convs=256, log=print):
-        override = os.environ.get("QE_MAIN_AGENT_RE", "") if override is None else override
+        override = env_str("QE_MAIN_AGENT_RE", "") if override is None else override
         self.override = re.compile(override, re.I | re.M) if override else None
-        self.alarm_turns = int(os.environ.get("QE_MAIN_ALARM_TURNS", "8")) if alarm_turns is None else alarm_turns
+        self.alarm_turns = env_int("QE_MAIN_ALARM_TURNS", 8) if alarm_turns is None else alarm_turns
         self.max_sessions, self.max_convs = max_sessions, max_convs
         self.sessions = {}
         self.lock = threading.Lock()

@@ -1,4 +1,5 @@
 // Qwen3.8-Flash-Next worker: loading of one card's slice and the decode forward (see flash.h).
+#include "../env.h"
 #include "flash.h"
 #include <cerrno>
 #include <atomic>
@@ -25,7 +26,9 @@
 // the first launch of a kernel loads its module, and in the eager first batch of a graph key that load can wait while
 // the device spins on a peer's flags whose card waits for this one: FLASH_COMM=ce + pfsel deadlocked 2 of 2 runs at the
 // base, 0 of 8 with EAGER (qfn_ce_eager_2026-10-27). A value set by the user is kept (CUDA_MODULE_LOADING=LAZY: off).
-__attribute__((constructor)) static void qe_eager_modules() { setenv("CUDA_MODULE_LOADING", "EAGER", 0); }
+__attribute__((constructor)) static void qe_eager_modules() {
+    if (!env_set("CUDA_MODULE_LOADING")) setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // empty = unset (env.h)
+}
 
 namespace flash {
 
@@ -33,7 +36,7 @@ namespace flash {
 // to FLASH_PIN_WAIT_S (60) seconds, logged, before it is fatal: a restart right after a crash finds the previous
 // process's memory still held while its core is written (10-28 00:25: "pin_host: cudaHostRegister: out of memory")
 static cudaError_t host_register_wait(void* p, size_t n, unsigned flags, const char* what) {
-    static const int wait_s = getenv("FLASH_PIN_WAIT_S") ? atoi(getenv("FLASH_PIN_WAIT_S")) : 60;
+    static const int wait_s = env_int("FLASH_PIN_WAIT_S", 60);
     cudaError_t e = cudaHostRegister(p, n, flags);
     for (int i = 0; e == cudaErrorMemoryAllocation && i < wait_s; i++) {
         cudaGetLastError();
@@ -58,7 +61,7 @@ char* pin_host_file(const std::string& path, size_t off, size_t n, const void* s
     CHECK(posix_memalign((void**)&p, PG, cap) == 0 && p, "pin_host_file: out of host memory (%.1f GB)", cap / 1e9);
     // 4 KB pages by default (as cudaHostAlloc gives): 2 MB pages (FLASH_PIN_THP=1) fault with direct compaction
     // under memory pressure (sys time 70-80 %, the fill dropped to ~1 GB/s next to a 31 GB process)
-    static const bool thp = getenv("FLASH_PIN_THP") && atoi(getenv("FLASH_PIN_THP"));
+    static const bool thp = env_int("FLASH_PIN_THP", 0);
     if (thp) madvise(p, cap, MADV_HUGEPAGE);
     numa_place(p, cap, numa);  // before the first touch
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
@@ -87,7 +90,7 @@ char* pin_host_file(const std::string& path, size_t off, size_t n, const void* s
                     for (size_t o = 0; o < rl;) {
                         ssize_t r = pread(fd, p + b + o, rl - o, foff + b + o);
                         {  // test: FLASH_TEST_PREAD_FAIL=n makes the n-th read fail (EIO) once
-                            static const long fail_at = getenv("FLASH_TEST_PREAD_FAIL") ? atol(getenv("FLASH_TEST_PREAD_FAIL")) : 0;
+                            static const long fail_at = env_ll("FLASH_TEST_PREAD_FAIL", 0);
                             static std::atomic<long> nread{0};
                             if (fail_at > 0 && ++nread == fail_at) { r = -1; errno = EIO; }
                         }
@@ -153,8 +156,8 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
         else KERNEL<4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                                     \
     } while (0)
 // W16 GEMV over any row count (<= 64 rows per call; ksplit: partial slices at y + s * ystride)
-static const bool g_rows_gemm = !getenv("FLASH_ROWS_GEMM") || atoi(getenv("FLASH_ROWS_GEMM"));  // smem-staged GEMM (N % 64 == 0)
-static const int g_rows_min = getenv("FLASH_ROWS_GEMV") ? atoi(getenv("FLASH_ROWS_GEMV")) : MAXM + 1;  // 0: off
+static const bool g_rows_gemm = env_int("FLASH_ROWS_GEMM", 1);  // smem-staged GEMM (N % 64 == 0)
+static const int g_rows_min = env_int("FLASH_ROWS_GEMV", MAXM + 1);  // 0: off
 static void gemv_w16_rows(const W16& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st, int ksplit = 1,
                           size_t ystride = 0) {
     if (g_rows_min > 0 && m >= g_rows_min && ksplit == 1) {
@@ -191,7 +194,7 @@ static void gemv_w8_rows(const W8& w, const bf16* x, int ldx, float* y, int ldy,
 // W8A8 row GEMM (prefill-r3): activations quantized per (row, 128-k group) into the MoE activation buffer (idle
 // outside the MoE gate_up -> down window, every user on st_), then k_rows_q
 void Worker::rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
-    static const bool on = !getenv("FLASH_ROWS_Q") || atoi(getenv("FLASH_ROWS_Q"));
+    static const bool on = env_int("FLASH_ROWS_Q", 1);
     const size_t need = (size_t)m * w.k + (size_t)m * (w.k / 128) * 8;
     if (!on || !pf_ || m < 64 || st != st_ || w.k % 128 || w.k > RQ_KMAX || ldx % 8 || need > pfact_bytes_ || (qsa_split_ && need > ((size_t)4 << 20))) {
         gemv_w8_rows(w, x, ldx, y, ldy, m, st);
@@ -205,7 +208,7 @@ void Worker::rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m
     k_rows_q<<<dim3((m + RQ_TB - 1) / RQ_TB, (w.n + RQ_NB - 1) / RQ_NB), 256, RQ_SMEM, st>>>(w.q, w.s, w.k, w.n, xq, xs, y, ldy, m);
     (void)0;
 }
-static const bool g_kchk = getenv("FLASH_KCHK") && atoi(getenv("FLASH_KCHK"));
+static const bool g_kchk = env_int("FLASH_KCHK", 0);
 #define KCHK(name) do { if (g_kchk) { cudaError_t e_ = cudaDeviceSynchronize(); if (e_ != cudaSuccess) { fprintf(stderr, "kernel %s: %s\n", name, cudaGetErrorString(e_)); exit(1); } } } while (0)
 
 std::vector<Plan> make_plan(int ngpu, const std::vector<double>& wts) {
@@ -315,7 +318,17 @@ struct RowSel {
 
 void* Worker::dalloc(size_t bytes) {
     void* p;
-    CUDA_CHECK(cudaMalloc(&p, bytes));
+    if (const cudaError_t r = cudaMalloc(&p, bytes); r == cudaErrorMemoryAllocation) {
+        // load time (weights, state, slots, KV pool, rings): the settings ask for more than the card holds
+        (void)cudaGetLastError();
+        fprintf(stderr, "[flash] GPU%d: out of device memory at load: %.1f MB requested, %.1f MB free, %.2f GB loaded so far. "
+                "The settings need more VRAM than this card has: lower FLASH_MAX_SEQS (%d slots, ~103 MB of state per slot "
+                "and card on 2 GPUs), the context (--max-ctx), or use FLASH_KV=ram; FLASH_EC_MARGIN_MB applies only to the "
+                "expert cache\n", dev_, bytes / 1048576.0, free_bytes() / 1048576.0, wbytes_ / 1e9, env_int("FLASH_MAX_SEQS", 16));
+        CHECK(false, "flash: out of device memory at load (see above)");
+    } else {
+        CUDA_CHECK(r);
+    }
     // on the work stream + wait: a legacy-stream cudaMemset is asynchronous and does not order with the
     // non-blocking stream, so it could land after the repack kernels that fill the buffer
     CUDA_CHECK(cudaMemsetAsync(p, 0, bytes, st_));
@@ -349,10 +362,22 @@ Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p)
     // the GEMM autotuner picks per process by timing (choices and so the rounding differ between processes); the cost
     // model's choice is as fast for the flash shapes (text 928 prefill 169.6 vs 169.7 ms) and the same in every
     // process: pinned unless QE_GEMM_TUNE is set explicitly
-    setenv("QE_GEMM_TUNE", "0", 0);
+    if (!env_set("QE_GEMM_TUNE")) setenv("QE_GEMM_TUNE", "0", 1);
     CUDA_CHECK(cudaSetDevice(dev_));
     CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
-    qsa_a_ = getenv("FLASH_QSA_A") && atoi(getenv("FLASH_QSA_A"));
+    qsa_a_ = env_int("FLASH_QSA_A", 0);
+    // FLASH_QX_LOCAL (slow-link prefill): every card also holds the q rows of the other cards' heads (2 cards ~8 MB,
+    // 3 cards ~10.5 MB per QSA layer) and computes their prefill q from its x rows (gathered anyway) instead of
+    // receiving them: the q exchange (6 / 8 KB per token and QSA layer) is gone. Same W8 rows, same row GEMM, same fp16
+    // format in the receive slot: bit-identical. Default: on with copy-engine transfers (FLASH_COMM=ce or auto -> CE)
+    {
+        const int e = env_set("FLASH_QX_LOCAL") ? env_int("FLASH_QX_LOCAL", 0) : (comm_.xfer == kXferCE ? 1 : 0);
+        qx_on_ = e && p_.ngpu > 1 && !qsa_a_;
+    }
+    // FLASH_MOE_AGQ (default 1): see k_agq_pack; off with the debug paths that read the MoE input rows
+    agq_on_ = env_int("FLASH_MOE_AGQ", 1) && p_.ngpu > 1 && env_int("FLASH_MOE_Q", 1) && env_int("FLASH_ROUTER8", 1) &&
+              !env_str("FLASH_STATS") && !(env_int("FLASH_PFX", 0) & 2) && !env_int("FLASH_DBGHASH", 0) &&
+              !env_int("FLASH_DBG_XQCHK", 0) && !env_int("FLASH_DBG_GU2X", 0);
     qe_wd_init(p_.rank, dev_);  // collective watchdog (budget QE_COLL_TIMEOUT_MS; uninitialized it trips on long waits)
     gemv_workspace_init();
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TA_SMEM));
@@ -367,6 +392,29 @@ Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p)
     ctr_.epoch = (unsigned*)dalloc(4);
     ctr_.ready = (unsigned*)dalloc(4096 * 4);
     CUDA_CHECK(cudaFuncSetAttribute(k_dn_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (128 * 128 + 256) * 4));
+}
+
+// test hook FLASH_TEST_VRAM_HOG_MB=n: after load every card allocates all its free memory but n MB and keeps it (a
+// card the graphs have already filled, deterministically: what is left for lazy growth, instantiates, launches)
+void Worker::test_hog(long long keep_mb) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    const size_t keep = (size_t)keep_mb << 20;
+    size_t got = 0;
+    for (size_t step : {(size_t)256 << 20, (size_t)16 << 20, (size_t)1 << 20}) {
+        while (free_bytes() > keep + step) {
+            void* p = nullptr;
+            if (cudaMalloc(&p, step) != cudaSuccess) {
+                (void)cudaGetLastError();
+                break;
+            }
+            hog_.push_back(p);
+            got += step;
+        }
+    }
+    size_t stk = 0;
+    CUDA_CHECK(cudaDeviceGetLimit(&stk, cudaLimitStackSize));
+    fprintf(stderr, "[flash] GPU%d: FLASH_TEST_VRAM_HOG_MB=%lld: %.0f MB taken, %.1f MB left free (stack limit %zu B)\n",
+            dev_, keep_mb, got / 1048576.0, free_bytes() / 1048576.0, stk);
 }
 
 size_t Worker::free_bytes() const {
@@ -406,7 +454,7 @@ W4 load_w4(const SafeTensors& st, const std::vector<RowSel>& rows, int c0, int c
     // H2D on the stream of the repack below (qfn_prefill_r4): a plain cudaMemcpy from pageable memory runs on the legacy
     // stream and may return before its DMA lands, and st_ is non-blocking (not ordered after the legacy stream): the
     // repack could read the reused scratch while it still held the previous tensor (weights loaded wrong at random)
-    static const bool lrace = getenv("FLASH_LOAD_RACE") && atoi(getenv("FLASH_LOAD_RACE"));  // debug: the old racy copy
+    static const bool lrace = env_int("FLASH_LOAD_RACE", 0);  // debug: the old racy copy
     if (lrace) {
         CUDA_CHECK(cudaMemcpy(dq0, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ds0, hs.data(), hs.size() * 2, cudaMemcpyHostToDevice));
@@ -445,7 +493,7 @@ W8 load_w8(int n, int k, const std::vector<Bf16Block>& blocks, Worker* w, void* 
         for (int i = 0; i < b.rows; i++) memcpy(&h[(size_t)(b.dr + i) * k + b.dc], b.src + (size_t)i * b.ld, b.cols * 2);
     bf16* d = (bf16*)g_s1.get(h.size() * 2);
     // H2D ordered with the conversion kernel on s (see load_w4: a plain cudaMemcpy raced the kernel on the non-blocking st_)
-    static const bool lrace = getenv("FLASH_LOAD_RACE") && atoi(getenv("FLASH_LOAD_RACE"));  // debug: the old racy copy
+    static const bool lrace = env_int("FLASH_LOAD_RACE", 0);  // debug: the old racy copy
     if (lrace) CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
     else CUDA_CHECK(cudaMemcpyAsync(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice, s));
     W8 out;
@@ -463,7 +511,7 @@ W16 load_w16(int n, int k, const std::vector<Bf16Block>& blocks, Worker* w, void
         for (int i = 0; i < b.rows; i++) memcpy(&h[(size_t)(b.dr + i) * k + b.dc], b.src + (size_t)i * b.ld, b.cols * 2);
     bf16* d = (bf16*)g_s1.get(h.size() * 2);
     // H2D ordered with the conversion kernel on s (see load_w4: a plain cudaMemcpy raced the kernel on the non-blocking st_)
-    static const bool lrace = getenv("FLASH_LOAD_RACE") && atoi(getenv("FLASH_LOAD_RACE"));  // debug: the old racy copy
+    static const bool lrace = env_int("FLASH_LOAD_RACE", 0);  // debug: the old racy copy
     if (lrace) CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
     else CUDA_CHECK(cudaMemcpyAsync(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice, s));
     W16 out;
@@ -479,7 +527,7 @@ const bf16* B(const SafeTensors& st, const std::string& n) { return (const bf16*
 
 void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors* mst) {
     // dynamic expert budget (default with the expert cache): device-resident groups = what fits after everything else
-    ec_defer_ = !(getenv("FLASH_EC") && atoi(getenv("FLASH_EC")) == 0) && !(getenv("FLASH_EC_BUDGET") && atoi(getenv("FLASH_EC_BUDGET")) == 0);
+    ec_defer_ = !(env_int("FLASH_EC", 1) == 0) && !(env_int("FLASH_EC_BUDGET", 1) == 0);
     CUDA_CHECK(cudaSetDevice(dev_));
     auto A = &Worker::dalloc;
     embed_ = nullptr;
@@ -499,7 +547,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         w.inject = inject;
         std::vector<Bf16Block> db = {{B(st, pre + "input_mix_weight_down.weight"), RW, LOWRANK, RW, 0, 0}};
         if (inject) db.push_back({B(st, pre + "block_inject_weight.weight"), RW, HC, RW, LOWRANK, 0});
-        static const bool fused = !getenv("FLASH_HCF") || atoi(getenv("FLASH_HCF"));
+        static const bool fused = env_int("FLASH_HCF", 1);
         w.norm = bf_dev(B(st, pre + "hc_norm.weight"), RW);
         if (fused) {
             const bf16* nw = B(st, pre + "hc_norm.weight");
@@ -543,7 +591,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             CUDA_CHECK(cudaMemcpy(w.us, sb.data(), sb.size() * 2, cudaMemcpyHostToDevice));
             return w;
         }
-        static const int hc16 = getenv("FLASH_HC16") ? atoi(getenv("FLASH_HC16")) : 0;  // bit 0: down bf16, bit 1: up bf16
+        static const int hc16 = env_int("FLASH_HC16", 0);  // bit 0: down bf16, bit 1: up bf16
         if (hc16 & 1) w.down16 = load_w16(HCD_ROWS, RW, db, this, A, st_);
         else w.down = load_w8(HCD_ROWS, RW, db, this, A, st_);
         if (hc16 & 2) w.up16 = load_w16(RW, HCU_K, {{B(st, pre + "input_mix_weight_up.weight"), LOWRANK, RW, LOWRANK, 0, 0}}, this, A, st_);
@@ -597,6 +645,16 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             qb.push_back({B(st, a + "k_proj.weight"), H, NKV * HD, H, nqp * HD + ql * HD, 0});
             qb.push_back({B(st, a + "v_proj.weight"), H, NKV * HD, H, nqp * HD + ql * HD + NKV * HD, 0});
             L.qkv = load_w8(nqp * HD + ql * HD + 2 * NKV * HD, H, qb, this, A, st_);
+            if (qx_on_) {
+                std::vector<Bf16Block> xb;
+                int j = 0;
+                for (int g = 0; g < p_.ngpu; g++)
+                    if (g != p_.rank)
+                        for (int h = g * QPC(p_); h < (g + 1) * QPC(p_); h++, j++)
+                            xb.push_back({q + (size_t)h * 2 * HD * H, H, HD, H, j * HD, 0});
+                L.qx = load_w8(j * HD, H, xb, this, A, st_);
+                if (!qxb_) qxb_ = (float*)dalloc((size_t)PFM * j * HD * 4);
+            }
             L.o = load_w8(H, ql * HD, {{B(st, a + "o_proj.weight") + p_.q0 * HD, NQ * HD, H, ql * HD, 0, 0}}, this, A, st_);
             L.idx = load_w16((IDX_NH + 1) * IDX_HD, H, {{B(st, a + "indexer.index_qk_proj.weight"), H, (IDX_NH + 1) * IDX_HD, H, 0, 0}}, this, A, st_);
             L.q_norm = bf_dev(B(st, a + "q_norm.weight"), HD);
@@ -605,7 +663,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             L.ik_norm = bf_dev(B(st, a + "indexer.k_layernorm.weight"), IDX_HD);
         }
         // MoE
-        static const bool r8 = !getenv("FLASH_ROUTER8") || atoi(getenv("FLASH_ROUTER8"));
+        static const bool r8 = env_int("FLASH_ROUTER8", 1);
         if (r8)
             L.router8 = load_w8(528, H, {{B(st, pre + "mlp.gate.weight"), H, NE, H, 0, 0},
                                          {B(st, pre + "mlp.shared_expert_gate.weight"), H, 1, H, NE, 0}},
@@ -667,7 +725,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         // balanced draft head (FLASH_DRAFT_BAL, default on): the draft vocabulary's frequent tokens sit mostly in the
         // first vocabulary slice (GPU0 had 52.9K of 65.5K rows, the others ~6K): every card instead holds every
         // ngpu-th draft token by rank, its own copy of those rows (all cards then read the same bytes)
-        static const bool bal = !getenv("FLASH_DRAFT_BAL") || atoi(getenv("FLASH_DRAFT_BAL"));
+        static const bool bal = env_int("FLASH_DRAFT_BAL", 1);
         if (bal && !draft_ids_.empty()) {
             std::vector<int> mine;
             for (size_t i = p_.rank; i < draft_ids_.size(); i += p_.ngpu) mine.push_back(draft_ids_[i]);
@@ -682,7 +740,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
     }
     // every load-time copy and conversion done before the scratch goes and inference starts (plain cudaMemcpy from
     // pageable memory may return before its DMA lands; the work streams are non-blocking)
-    if (!(getenv("FLASH_LOAD_RACE") && atoi(getenv("FLASH_LOAD_RACE")))) CUDA_CHECK(cudaDeviceSynchronize());
+    if (!(env_int("FLASH_LOAD_RACE", 0))) CUDA_CHECK(cudaDeviceSynchronize());
     g_s1.release();
     g_s2.release();
     g_s3.release();
@@ -741,7 +799,7 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
     const size_t gqw = (size_t)2 * GRP * (H / 8), gsw = (size_t)2 * GRP * (H / 128);
     const size_t dqw = (size_t)H * (GRP / 8), dsw = (size_t)H;
     const size_t SG = (gqw * 4 + gsw * 2 + dqw * 4 + dsw * 2 + 255) / 256 * 256;
-    static const int nth = getenv("FLASH_LOAD_THREADS") ? std::max(1, atoi(getenv("FLASH_LOAD_THREADS"))) : 8;
+    static const int nth = env_set("FLASH_LOAD_THREADS") ? std::max(1, env_int("FLASH_LOAD_THREADS", 8)) : 8;
     std::vector<int> ks;
     for (int k = 0; k < (NE + 1) * NGRP; k++)
         if (gm[k] >= 0) ks.push_back(k);
@@ -812,7 +870,87 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
     g_s2.release();
 }
 
+// FLASH_KV=ram (KV of the QSA layers in pinned host RAM, VRAM block cache) | vram (the pool in VRAM, as before);
+// FLASH_KV_STREAM=0/1 is the older spelling
+bool kv_ram_mode() {
+    if (const char* v = env_str("FLASH_KV")) {
+        if (!strcmp(v, "ram")) return true;
+        if (!strcmp(v, "vram")) return false;
+        fprintf(stderr, "[flash] FLASH_KV=%s: expected ram or vram (default used)\n", v);
+    }
+    if (env_set("FLASH_KV_STREAM")) return env_int("FLASH_KV_STREAM", kKvRamDefault) != 0;
+    return kKvRamDefault;
+}
+// size of the RAM pool, all conversations together: FLASH_KV_RAM_TOKENS (10000000, 10M, 1.5M, 500k; default
+// kKvRamDefaultTokens). Host RAM per token: 13 KV layers x 1,040 B (fp8 K / V + scales) = 13,520 B for the whole
+// machine (2 or 3 cards alike: each card holds its share of the positions), ~74K tokens per GB.
+constexpr double kKvRamTokBytes = 13.0 * (NKV * HD * 2 + NKV * 8);
+constexpr long long kKvRamDefaultTokens = 1000000;
+long long kv_ram_tokens() {
+    // empty = unset (src/env.h); a value that does not parse (no number, junk after the k/M/G suffix): warning + default
+    auto num = [](const char* v, double* x) {
+        char* e = nullptr;
+        *x = strtod(v, &e);
+        if (!e || e == v) return false;
+        if (*e == 'k' || *e == 'K') *x *= 1e3, ++e;
+        else if (*e == 'm' || *e == 'M') *x *= 1e6, ++e;
+        else if (*e == 'g' || *e == 'G') *x *= 1e9, ++e;
+        return qe_env_detail::tail_ok(e);
+    };
+    const char* name = env_set("FLASH_KV_RAM_TOKENS") ? "FLASH_KV_RAM_TOKENS" : "FLASH_KV_STREAM_CTX";
+    const char* v = env_str(name);
+    if (!v) return kKvRamDefaultTokens;
+    double x = 0;
+    if (!num(v, &x)) {
+        qe_env_detail::warn(name, v, "a token count (10000000, 10M, 1.5M, 500k)");
+        return kKvRamDefaultTokens;
+    }
+    return std::max(0LL, (long long)x);
+}
+
 void Worker::alloc_full(Layer& L) {
+    if (kvs_) {  // KV streaming: device K / V = block cache (P blocks) + expert-cache tail, host rows of the whole pool
+        L.kc = (uint8_t*)dalloc((size_t)srows_ * NKV * HD);
+        L.vc = (uint8_t*)dalloc((size_t)srows_ * NKV * HD);
+        L.ks = (float*)dalloc((size_t)kvs_P_ * IDX_R * NKV * 4);
+        L.vs = (float*)dalloc((size_t)kvs_P_ * IDX_R * NKV * 4);
+        L.ikb = (bf16*)dalloc((size_t)(rows_ / IDX_R) * IDX_HD * 2);
+        L.ik_tail = (float*)dalloc(IDX_TAIL * IDX_HD * 4);
+        KvPool& k = L.kvp;
+        auto hal = [&](size_t row) {
+            const size_t n = (size_t)rows_ * row;
+            if (kvh_lazy_) {  // address space only; pinned slab by slab (kv_host_ensure)
+                void* h = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                CHECK(h != MAP_FAILED, "flash: KV in RAM: cannot reserve %.1f GB of address space", n / 1e9);
+                kvh_arr_.push_back({(char*)h, row});
+                return h;
+            }
+            void* h = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&h, n, cudaHostAllocMapped | cudaHostAllocPortable));
+            memset(h, 0, n);
+            void* d = nullptr;
+            CUDA_CHECK(cudaHostGetDevicePointer(&d, h, 0));
+            kvs_host_ += n;
+            return d;
+        };
+        k.m.hk = (uint8_t*)hal((size_t)NKV * HD);
+        k.m.hv = (uint8_t*)hal((size_t)NKV * HD);
+        k.m.hks = (float*)hal((size_t)NKV * 4);
+        k.m.hvs = (float*)hal((size_t)NKV * 4);
+        k.pt = (int*)dalloc((size_t)(rows_ / IDX_R) * 4);
+        CUDA_CHECK(cudaMemset(k.pt, 0xff, (size_t)(rows_ / IDX_R) * 4));
+        k.m.pt = k.pt;
+        k.P = kvs_P_;
+        k.st = (unsigned long long*)dalloc((size_t)kvs_P_ * 8);
+        {
+            std::vector<unsigned long long> v((size_t)kvs_P_, 0xffffffffull);
+            CUDA_CHECK(cudaMemcpy(k.st, v.data(), v.size() * 8, cudaMemcpyHostToDevice));
+        }
+        k.ctl = (unsigned*)dalloc(8 * 4);
+        CUDA_CHECK(cudaMemset(k.ctl, 0, 8 * 4));
+        k.kc = L.kc; k.vc = L.vc; k.ks = L.ks; k.vs = L.vs;
+        return;
+    }
     L.kc = (uint8_t*)dalloc((size_t)rows_ * NKV * HD);
     L.vc = (uint8_t*)dalloc((size_t)rows_ * NKV * HD);
     L.ks = (float*)dalloc((size_t)rows_ * NKV * 4);
@@ -889,7 +1027,38 @@ void Worker::alloc_state() {
     CUDA_CHECK(cudaSetDevice(dev_));
     // owned KV rows for max_ctx positions
     const int periods = (max_ctx_ + p_.period - 1) / p_.period;
-    rows_ = periods * p_.own;
+    rows_ = srows_ = periods * p_.own;
+    // KV streaming (FLASH_KV_STREAM=1): the pool of FLASH_KV_STREAM_CTX positions (default 1M) lives in host memory,
+    // VRAM keeps the indexer keys of the pool + a block cache of FLASH_KV_CACHE_BLOCKS blocks of 4 rows per layer
+    kvs_ = kv_ram_mode();
+    if (kvs_) {
+        // the pool (all conversations together) in host RAM: FLASH_KV_RAM_TOKENS (e.g. 10M), at most what the host can
+        // pin next to the margin (host_mem.h; shared by the cards, 3/4 of the headroom at start: the archive keeps room)
+        const long long want = std::max<long long>(max_ctx_, kv_ram_tokens());
+        const double per_tok = 13.0 * (NKV * HD * 2 + NKV * 8) * p_.own / p_.period;  // host bytes per position on a card
+        static const long long cap_tok = (long long)(0.75 * (double)qe_hostmem::headroom(true) / p_.ngpu / per_tok);
+        long long pc = std::max<long long>(max_ctx_, std::min(want, cap_tok));
+        // 16384 (was 8192): a lone 262K prompt on 2 GPUs 111-139 s -> 57 s (VRAM mode 58 s); entries beyond the active
+        // contexts stay with the expert cache (set_kv_active), so the size costs VRAM only while long contexts run
+        kvs_P_ = std::min(srows_ / IDX_R, env_int("FLASH_KV_CACHE_BLOCKS", 16384));
+        if (pc < want && p_.rank == 0)
+            fprintf(stderr, "[flash] KV in RAM: %.2fM tokens (%.1f GB) requested, %.2fM tokens (%.1f GB) fit the host (MemAvailable %.1f GB, margin %.1f GB): pool capped\n",
+                    want / 1e6, want * kKvRamTokBytes / 1e9, pc / 1e6, pc * kKvRamTokBytes / 1e9, qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9);
+        if (p_.rank == 0)
+            fprintf(stderr, "[flash] KV in RAM: %.2fM tokens = ~%.1f GB pinned (all conversations together), max %d per conversation; "
+                    "VRAM: %.0f MB indexer keys + %.0f MB block cache per card\n",
+                    pc / 1e6, pc * kKvRamTokBytes / 1e9, max_ctx_, pc * 13.0 * IDX_HD * 2 / IDX_R * p_.own / p_.period / 1e6,
+                    13.0 * kvs_P_ * IDX_R * (NKV * HD * 2 + NKV * 8) / 1e6);
+        if (pc > 2000000000LL / p_.own * p_.period / 4) pc = 2000000000LL / p_.own * p_.period / 4;  // int rows / blocks
+        rows_ = (int)((pc + p_.period - 1) / p_.period) * p_.own;
+        // FLASH_KV_RAM_LAZY=1: pin as the pool fills (needs registered host memory at its host address on the device);
+        // default: the whole pool pinned at start, so cudaHostRegister stays out of running steps (it never runs
+        // next to the step's spin-wait kernels)
+        int hp = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&hp, cudaDevAttrCanUseHostPointerForRegisteredMem, dev_));
+        kvh_lazy_ = hp && env_int("FLASH_KV_RAM_LAZY", 0);
+        kvh_slab_ = 64 * p_.own;  // 64 periods: 98,304 positions on 3 cards (443 MB per card)
+    }
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV;
     for (auto& L : L_) {
@@ -907,11 +1076,20 @@ void Worker::alloc_state() {
         }
     }
     stepc_ = (unsigned*)dalloc(4);
+    if (env_int("FLASH_SELWIN", 0)) {  // KV streaming gate counters (k_sel_win)
+        const size_t lb = srows_ / IDX_R;
+        sw_stamp_ = (unsigned*)dalloc((size_t)(LAYERS + 1) * lb * 4);
+        CUDA_CHECK(cudaMemset(sw_stamp_, 0, (size_t)(LAYERS + 1) * lb * 4));
+        sw_cid_ = (unsigned*)dalloc((LAYERS + 1) * 4);
+        CUDA_CHECK(cudaMemset(sw_cid_, 0, (LAYERS + 1) * 4));
+        sw_c_ = (unsigned long long*)dalloc(2 * 16 * 8);
+        CUDA_CHECK(cudaMemset(sw_c_, 0, 2 * 16 * 8));
+    }
     coldcnt_ = (unsigned*)dalloc(4);
     rfcnt_ = (unsigned*)dalloc(4);
     rfpart_ = (float*)dalloc((size_t)RF_SPLIT * RF_TILES * 32 * 4 * 4);
 
-    if (getenv("FLASH_STATS")) {
+    if (env_str("FLASH_STATS")) {
         for (auto& L : L_) L.stats = (int*)dalloc(NE * 4);
         if (has_mtp_) mtp_.stats = (int*)dalloc(NE * 4);
     }
@@ -922,29 +1100,44 @@ void Worker::alloc_state() {
     {  // FLASH_PFB: rows of a batched prefill (multiple of PFM; <= PFM: chunk by chunk)
         // FLASH_PFB: the batch whose buffers are always there (2048 = the server chunk); FLASH_PFB_BIG (default 4096,
         // 0 off): larger batches, the extra rows' buffers borrowed from the expert cache while such a batch runs
-        const int v = getenv("FLASH_PFB") ? atoi(getenv("FLASH_PFB")) : 2048;
-        const int vb = getenv("FLASH_PFB_BIG") ? atoi(getenv("FLASH_PFB_BIG")) : 4096;
+        const int v = env_int("FLASH_PFB", 2048);
+        const int vb = env_int("FLASH_PFB_BIG", 4096);
         auto rows_of = [](int r) { return std::max(PFM, std::min(32 * PFM, (r + PFM - 1) / PFM * PFM)) + PFM; };  // + one chunk: a short tail joins the last batch
         pfbn_base_ = rows_of(v);
         pfbn_ = vb > v ? rows_of(vb) : pfbn_base_;
     }
     alloc_rows(PFM, pfb_, pfbn_);
+    if (agq_on_) {  // FLASH_MOE_AGQ owner scratch (the owner's rows of one collective unit)
+        constexpr int AC = ARU_MAX / 2 + 2;
+        agq_x_ = (bf16*)dalloc((size_t)AC * H * 2);
+        agq_r8_ = (int8_t*)dalloc((size_t)AC * H);
+        agq_r8s_ = (float2*)dalloc((size_t)AC * (H / 128) * 8);
+        agq_rlog_ = (float*)dalloc((size_t)AC * 528 * 4);
+        CUDA_CHECK(cudaFuncSetAttribute(k_rows_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RQ_SMEM));
+    }
     // decode rows alias the prefill buffers (never live at the same time; every forward starts from the embedding),
     // except the decode-only ping-pong residuals
     dec_ = pfb_;
     dec_.rows = MAXM;
     dec_.R2 = (float*)dalloc((size_t)MAXM * RW * 4);
     if (has_mtp_) dec_.Rm2 = (float*)dalloc((size_t)MAXM * RW * 4);
-    cposd_ = (int*)dalloc((size_t)2 * (pfbn_ / PFM) * 4);
+    const int mch = pfbn_ / PFM + PFSEG_MAX;  // chunks of a batch: prefill_multi cuts every segment's last chunk short
+    cposd_ = (int*)dalloc((size_t)2 * mch * 4);
     {  // prefill collectives: the highest priority, so their few blocks get SMs ahead of the queued blocks of the
        // compute kernels they overlap (default priority: an all-reduce waited for MoE / GEMM blocks to retire)
-        static const bool prio = !getenv("FLASH_CST_PRIO") || atoi(getenv("FLASH_CST_PRIO"));
+        static const bool prio = env_int("FLASH_CST_PRIO", 1);
         int lo = 0, hi = 0;
         CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
         CUDA_CHECK(cudaStreamCreateWithPriority(&cst_, cudaStreamNonBlocking, prio ? hi : 0));
+        // FLASH_AG_SPLIT: 1 (default) on the copy-engine path, 2 also on P2P (test), 0 off
+        const int ags = env_int("FLASH_AG_SPLIT", 1);
+        if (p_.ngpu > 1 && (ags >= 2 || (ags == 1 && comm_.xfer == kXferCE))) {
+            CUDA_CHECK(cudaStreamCreateWithPriority(&cst2_, cudaStreamNonBlocking, prio ? hi : 0));
+            CUDA_CHECK(cudaEventCreateWithFlags(&evs_, cudaEventDisableTiming));
+        }
     }
-    evp_.resize(pfbn_ / PFM);
-    evd_.resize(pfbn_ / PFM);
+    evp_.resize(mch);
+    evd_.resize(mch);
     for (auto& e : evp_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     for (auto& e : evd_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&evm_, cudaEventDisableTiming));
@@ -953,8 +1146,20 @@ void Worker::alloc_state() {
     CUDA_CHECK(cudaEventCreateWithFlags(&pfe1_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&pfq0_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&pfq1_, cudaEventDisableTiming));
-    hcl2_ = getenv("FLASH_HCL2") ? atoi(getenv("FLASH_HCL2")) : 2;
-    CUDA_CHECK(cudaHostAlloc((void**)&cposh_, (size_t)2 * (pfbn_ / PFM) * 4, cudaHostAllocDefault));
+    hcl2_ = env_int("FLASH_HCL2", 2);
+    CUDA_CHECK(cudaHostAlloc((void**)&cposh_, (size_t)2 * mch * 4, cudaHostAllocDefault));
+    {  // prefill_multi tables (small: ~0.1 MB per card + the per-slot MTP chain rows, allocated with the slots)
+        rbch_d_ = (int*)dalloc((size_t)mch * PFM * 4);
+        segslot_d_ = (int*)dalloc(PFSEG_MAX * 4);
+        rsl_d_ = (int*)dalloc((size_t)pfbn_ * 4);
+        hsl_d_ = (int*)dalloc(PFSEG_MAX * 4);
+        CUDA_CHECK(cudaHostAlloc((void**)&rbch_h_, (size_t)mch * PFM * 4, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&segslot_h_, PFSEG_MAX * 4, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&rsl_h_, (size_t)pfbn_ * 4, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&hsl_h_, PFSEG_MAX * 4, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc((void**)&pfmo_h_, 2 * PFSEG_MAX * 4, cudaHostAllocDefault));
+        mhR_ = (float*)dalloc((size_t)PFSEG_MAX * RW * 4);
+    }
     use(dec_);
     attn_x_ = (float*)dalloc((size_t)XROWS * NQ * (HD + 2) * 4);
     attn_all_ = (float*)dalloc((size_t)p_.ngpu * MAXM * NQ * (HD + 2) * 4);
@@ -1008,17 +1213,17 @@ void Worker::alloc_state() {
     dnqk_ = (float*)dalloc((size_t)PFM * 2 * LNK * DK * 4);
     dngb_ = (float*)dalloc((size_t)PFM * 2 * LNV * 4);
     zero_d_ = (int*)dalloc(4);
-    attn_split_ = getenv("FLASH_ATTN_SPLIT") ? atoi(getenv("FLASH_ATTN_SPLIT")) : 4;  // decode attention key splits (1: old kernel)
+    attn_split_ = env_int("FLASH_ATTN_SPLIT", 4);  // decode attention key splits (1: old kernel)
     attn_split_ = std::max(1, std::min(8, attn_split_));
-    dec_k_ = !getenv("FLASH_ATTN_DEC") || atoi(getenv("FLASH_ATTN_DEC"));  // GQA-tile decode attention (0: tc2 / old)
-    dec_split_ = getenv("FLASH_ATTN_DSPLIT") ? std::max(1, std::min(8, atoi(getenv("FLASH_ATTN_DSPLIT")))) : 8;
+    dec_k_ = env_int("FLASH_ATTN_DEC", 1);  // GQA-tile decode attention (0: tc2 / old)
+    dec_split_ = env_set("FLASH_ATTN_DSPLIT") ? std::max(1, std::min(8, env_int("FLASH_ATTN_DSPLIT", 8))) : 8;
     if (dec_k_) attn_split_ = std::max(attn_split_, dec_split_);
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_dec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)QD_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_idx_score_t, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)IS_SMEM));
     if (attn_split_ > 1) attn_spl_ = (float*)dalloc((size_t)(attn_split_ - 1) * XROWS * NQ * (HD + 2) * 4);
     mtok_ = (int*)dalloc(pfbn_ * 4);
     hh_pf_ = (__half*)dalloc((size_t)pfbn_ * LOWRANK * 2);
-    hcs_ = !getenv("FLASH_HCS") || atoi(getenv("FLASH_HCS"));  // decode HC down split by groups (0: k_hcd)
+    hcs_ = env_int("FLASH_HCS", 1);  // decode HC down split by groups (0: k_hcd)
     if (hcs_) hcp_ = (float*)dalloc((size_t)MAXM * HC * HCD_GPS * HCD_ROWS * 4);
     rinv_pf_ = (float*)dalloc((size_t)pfbn_ * HC * 4);
     logits_ = (float*)dalloc((size_t)MAXM * (p_.voc1 - p_.voc0) * 4);
@@ -1045,18 +1250,18 @@ void Worker::alloc_state() {
     hist2_ = (int*)dalloc(8);
     CUDA_CHECK(cudaHostAlloc((void**)&em_h_, (MAXM + 2 + 32) * 4, cudaHostAllocMapped | cudaHostAllocPortable));
     memset(em_h_, 0, (MAXM + 2 + 32) * 4);
-    lk_on_ = !getenv("FLASH_LOOKUP") || atoi(getenv("FLASH_LOOKUP"));  // device lookup drafts (0: off)
-    if (getenv("FLASH_DETERMINISTIC") && atoi(getenv("FLASH_DETERMINISTIC"))) {  // fixed-order / exact float sums
+    lk_on_ = env_int("FLASH_LOOKUP", 1);  // device lookup drafts (0: off)
+    if (env_int("FLASH_DETERMINISTIC", 0)) {  // fixed-order / exact float sums
         detpart_ = (unsigned long long*)dalloc((size_t)pfbn_ * std::max(H, HC * HCD_ROWS + HC) * 8);  // MoE partial / HC down sums
     }
-    if (getenv("FLASH_DBGHASH") && atoi(getenv("FLASH_DBGHASH"))) dbgh_ = (unsigned long long*)dalloc((size_t)(LAYERS + 1) * DBGK * 8);
-    if (getenv("FLASH_DBG_XQCHK") && atoi(getenv("FLASH_DBG_XQCHK"))) {
+    if (env_int("FLASH_DBGHASH", 0)) dbgh_ = (unsigned long long*)dalloc((size_t)(LAYERS + 1) * DBGK * 8);
+    if (env_int("FLASH_DBG_XQCHK", 0)) {
         xqsnap_ = dalloc((size_t)pfbn_ * H * 2 + (size_t)pfbn_ * (TOPK + 1) * 8);
-        if (getenv("FLASH_DBG_GU2X") && atoi(getenv("FLASH_DBG_GU2X"))) actsnap_ = dalloc((size_t)pfbn_ * (TOPK + 1) * NGRP * GRP * 2);
+        if (env_int("FLASH_DBG_GU2X", 0)) actsnap_ = dalloc((size_t)pfbn_ * (TOPK + 1) * NGRP * GRP * 2);
         CUDA_CHECK(cudaHostAlloc((void**)&xqrec_, 8 * 4 + 200 * 24, cudaHostAllocMapped));
         memset(xqrec_, 0, 8 * 4 + 200 * 24);
     }
-    if (getenv("FLASH_DBGHASH") && atoi(getenv("FLASH_DBGHASH")) == 2) {
+    if (env_int("FLASH_DBGHASH", 0) == 2) {
         rowh_n_ = pfbn_;
         rowh_ = (unsigned long long*)dalloc((size_t)LAYERS * rowh_n_ * 4 * 8);
         CUDA_CHECK(cudaMemset(rowh_, 0, (size_t)LAYERS * rowh_n_ * 4 * 8));
@@ -1083,10 +1288,10 @@ void Worker::alloc_state() {
     }
     // policy (offline sweep over agent / code / edit traces): a match of >= 24 tokens
     // -> 16 drafts, >= 6 -> 8 drafts, shorter -> MTP step
-    lk_mmin_ = getenv("FLASH_LK_MIN") ? atoi(getenv("FLASH_LK_MIN")) : 6;
-    lk_llo_ = getenv("FLASH_LK_LO") ? atoi(getenv("FLASH_LK_LO")) : 8;
-    lk_hi_ = getenv("FLASH_LK_HI") ? atoi(getenv("FLASH_LK_HI")) : 24;
-    lk_lmax_ = getenv("FLASH_LK_LMAX") ? std::min(MAXP - 1, atoi(getenv("FLASH_LK_LMAX"))) : 16;
+    lk_mmin_ = env_int("FLASH_LK_MIN", 6);
+    lk_llo_ = env_int("FLASH_LK_LO", 8);
+    lk_hi_ = env_int("FLASH_LK_HI", 24);
+    lk_lmax_ = env_set("FLASH_LK_LMAX") ? std::min(MAXP - 1, env_int("FLASH_LK_LMAX", 16)) : 16;
     lk_llo_ = std::min(lk_llo_, lk_lmax_);
     if (lk_on_) {
         hd_ = (int*)dalloc((size_t)(max_ctx_ + 64) * 4);
@@ -1096,9 +1301,9 @@ void Worker::alloc_state() {
         lkrg_ = (int*)dalloc(2 * 4);
         // FLASH_LK_REGION=1: region-aware policy: tool call / code nmin 3, L = clamp(l, 4, 16);
         // text nmin 12, L = clamp(l / 2, 4, 8); FLASH_LK_RP=8 comma values override (beta x4)
-        if (getenv("FLASH_LK_REGION") && atoi(getenv("FLASH_LK_REGION"))) {
+        if (env_int("FLASH_LK_REGION", 0)) {
             int rp[8] = {3, 4, 4, 16, 12, 2, 4, 8};
-            if (getenv("FLASH_LK_RP")) sscanf(getenv("FLASH_LK_RP"), "%d,%d,%d,%d,%d,%d,%d,%d", rp, rp + 1, rp + 2, rp + 3, rp + 4, rp + 5, rp + 6, rp + 7);
+            if (env_str("FLASH_LK_RP")) sscanf(env_str("FLASH_LK_RP"), "%d,%d,%d,%d,%d,%d,%d,%d", rp, rp + 1, rp + 2, rp + 3, rp + 4, rp + 5, rp + 6, rp + 7);
             rp[3] = std::min(rp[3], MAXP - 1);
             rp[7] = std::min(rp[7], MAXP - 1);
             lkrp_ = (int*)dalloc(8 * 4);
@@ -1106,7 +1311,7 @@ void Worker::alloc_state() {
         }
         CUDA_CHECK(cudaStreamCreateWithFlags(&lkst_, cudaStreamNonBlocking));
         // FLASH_CORPUS=1048576 (tokens) turns it on: server measurements were inconclusive
-        ccap_ = getenv("FLASH_CORPUS") ? atoi(getenv("FLASH_CORPUS")) : 0;
+        ccap_ = env_int("FLASH_CORPUS", 0);
         if (ccap_ > 0) {
             cd_ = (int*)dalloc((size_t)(ccap_ + 64) * 4);
             CUDA_CHECK(cudaMemset(cd_, 0xff, (size_t)(ccap_ + 64) * 4));  // -1: separator / empty
@@ -1117,7 +1322,7 @@ void Worker::alloc_state() {
         }
     }
     CUDA_CHECK(cudaHostGetDevicePointer((void**)&em_, em_h_, 0));
-    if (!getenv("FLASH_GUARD") || atoi(getenv("FLASH_GUARD"))) {
+    if (env_int("FLASH_GUARD", 1)) {
         CUDA_CHECK(cudaHostAlloc((void**)&nf_h_, 4, cudaHostAllocMapped | cudaHostAllocPortable));
         *nf_h_ = 0;
         CUDA_CHECK(cudaHostGetDevicePointer((void**)&nf_d_, nf_h_, 0));
@@ -1126,8 +1331,8 @@ void Worker::alloc_state() {
         CUDA_CHECK(cudaHostGetDevicePointer((void**)&nfr_d_, nfr_h_, 0));
     }
     // the QSA exchanges' receive slots and flags are written by the peers' kernels: device memory reached over P2P,
-    // or, without peer access (no P2P driver, QE_P2P=0), pinned host memory every card maps (zero-copy). Before
-    // rc3-fixes such a box wrote into the peers' device memory and crashed in the first prefill (Xid 31).
+    // or, without peer access (no P2P driver, QE_P2P=0), pinned host memory every card maps (zero-copy). Earlier
+    // versions on such a box wrote into the peers' device memory and crashed in the first prefill.
     auto palloc = [&](size_t bytes) -> void* {
         if (comm_.p2p || p_.ngpu < 2) return dalloc(bytes);
         void* h = nullptr;
@@ -1155,8 +1360,9 @@ void Worker::alloc_state() {
     xidone_ = (unsigned*)dalloc(4);
     alloc_staging();  // staged prefill transfers (FLASH_COMM ce / host)
     // block selection of a whole prefill chunk at once (XROWS rows: one indexer exchange per chunk, not per 32 rows)
-    iscore_ = (float*)dalloc((size_t)XROWS * (rows_ / IDX_R) * 4);
-    isel_ = (int*)dalloc((size_t)XROWS * (rows_ / IDX_R) * 4);
+    if (kvs_) psel_ = (int*)dalloc((size_t)MAXM * (srows_ / IDX_R) * 4);
+    iscore_ = (float*)dalloc((size_t)XROWS * (srows_ / IDX_R) * 4);
+    isel_ = (int*)dalloc((size_t)XROWS * (srows_ / IDX_R) * 4);
     insel_ = (int*)dalloc(XROWS * 4);
     {  // block unions of the prefill attention's row groups (k_qpf_union)
         const int ng = (XROWS + QP_R - 1) / QP_R;
@@ -1170,7 +1376,7 @@ void Worker::alloc_state() {
     {  // the local block keys in shared memory when they fit (3 cards at 262144: 87.5 KB), else in place of the scores
         int optin = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_));
-        const size_t kb = std::max<size_t>((size_t)(rows_ / IDX_R) * 4, 1024);
+        const size_t kb = std::max<size_t>((size_t)(srows_ / IDX_R) * 4, 1024);
         idx_gk_ = kb + 2048 > (size_t)optin;
         if (!idx_gk_) CUDA_CHECK(cudaFuncSetAttribute(k_idx_local<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kb));
     }
@@ -1178,6 +1384,24 @@ void Worker::alloc_state() {
     load_deferred_groups();
     ec_init();
     pfs_init();
+    if (kvs_) {
+        CHECK(dec_k_ && !qsa_a_ && env_int("FLASH_ATTN_TC", 2) == 2,
+              "flash: FLASH_KV_STREAM needs the default attention kernels (FLASH_ATTN_DEC, FLASH_ATTN_TC=2, no FLASH_QSA_A)");
+        if (!ec_n_ || !ec_on_) kvs_set_pe(kvs_P_);
+        if (kvh_lazy_) {  // pinned at start: one sequence of max_ctx; then one slab ahead of the regions' top
+            CUDA_CHECK(cudaSetDevice(dev_));
+            const int r1 = std::min(rows_, (srows_ + kvh_slab_ - 1) / kvh_slab_ * kvh_slab_);
+            kvh_pin(0, r1);
+            size_t rowb = 0;
+            for (auto& a : kvh_arr_) rowb += a.row;
+            kvs_host_ = (size_t)r1 * rowb;
+            kvh_pinned_ = kvh_min_ = r1;
+        }
+        fprintf(stderr, "[flash] GPU%d KV in RAM: pool %d rows (%lld positions, %.2f GB host%s), block cache %d x 4 rows per layer (%.0f MB), indexer keys %.0f MB\n",
+                dev_, rows_, (long long)rows_ / p_.own * p_.period, (double)rows_ * 13 * (NKV * HD * 2 + NKV * 8) / 1e9,
+                kvh_lazy_ ? ", pinned as used" : ", pinned at start", kvs_P_,
+                13.0 * kvs_P_ * IDX_R * (NKV * HD * 2 + NKV * 8) / 1e6, 13.0 * rows_ / IDX_R * IDX_HD * 2 / 1e6);
+    }
 }
 
 // Trunk expert groups after all other allocations (weights, the full max_ctx KV pool + MTP, buffers): free device
@@ -1185,6 +1409,39 @@ void Worker::alloc_state() {
 // card's routed groups stay on the device; the coldest (static cold list first, then by router-trace prior, then by
 // index) are host-backed (pinned, full copy) and cached dynamically in the KV tail. The shared expert stays on device.
 void Worker::load_deferred_groups() {
+    // lazily grown GEMM workspaces (gemm.cu tl_alloc): reserved here per device, before the budget, for the largest
+    // prefill chunk; a later growth that runs out of memory drops this card's cached graphs and retries (not while
+    // capturing). Both are per device: this runs on the loader thread, the card is served from another one
+    gemm_set_oom_hook([](void* w) -> int {
+        Worker* k = static_cast<Worker*>(w);
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(k->st_, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) return -1;
+        return k->drop_all_graphs(nullptr);
+    }, this);
+    // per-thread stack (local memory) for the largest kernel frame, reserved here before the budget. The context
+    // starts with a 1024 B limit and grows it at the first launch of a kernel with a bigger frame
+    // (sample_rows_slots_kernel, 1056 B: the first batched step with sampling, decode or prefill_multi). That growth is
+    // a device allocation inside the launch: on a card the cached graphs have filled to a few MB it fails as
+    // cudaErrorMemoryAllocation and the step aborts (final build check 1.3.1: first shared prefill batch after the 90K
+    // bench). FLASH_STACK_RESERVE=0: off (lazy growth as before; for the repro)
+    if (env_int("FLASH_STACK_RESERVE", 1)) {
+        size_t cur = 0;
+        CUDA_CHECK(cudaDeviceGetLimit(&cur, cudaLimitStackSize));
+        const size_t need = sample_stack_need();
+        if (need > cur) {
+            const double f0 = free_bytes();
+            CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, need));
+            if (p_.rank == 0)
+                fprintf(stderr, "[flash] kernel stack reserved at load: %zu B per thread (default %zu), %.1f MB per card\n",
+                        need, cur, (f0 - free_bytes()) / 1048576.0);
+        }
+    }
+    {
+        const double f0 = free_bytes();
+        gemm_reserve_ws(PFM, std::max(H, NQ * HD / std::max(1, p_.ngpu)), (size_t)8 << 20);
+        dn_chunk_reserve(p_.v1 - p_.v0, PFM);  // the chunked delta rule's scratch (gdn prefill, chunks of <= PFM rows)
+        if (p_.rank == 0) fprintf(stderr, "[flash] GEMM + DeltaNet workspaces reserved at load: %.1f MB per card\n", (f0 - free_bytes()) / 1048576.0);
+    }
     if (ec_defer_l_.empty()) return;
     std::vector<char> incold((size_t)LAYERS * NE, 0);
     for (int li = 0; li < LAYERS && li < (int)cold_.size(); li++)
@@ -1204,7 +1461,7 @@ void Worker::load_deferred_groups() {
     // free VRAM left after the resident groups: "256" for every card or a list per rank,
     // e.g. "256,2048,256" (room for the desktop on GPU1); a short list repeats its last value
     double margin_mb = 256;
-    if (const char* e = getenv("FLASH_EC_MARGIN_MB")) {
+    if (const char* e = env_str("FLASH_EC_MARGIN_MB")) {
         std::stringstream ss(e);
         int i = 0;
         for (std::string x; std::getline(ss, x, ',') && i <= p_.rank; i++) margin_mb = atof(x.c_str());
@@ -1216,19 +1473,28 @@ void Worker::load_deferred_groups() {
     nres = std::max(0LL, std::min<long long>(nres, gs.size()));
     // prefill staging ring (2 x the most cold groups of a layer, capped by FLASH_PF_STAGE_MB): its groups come out of the
     // resident budget (the budget, the per-layer cold counts and the ring size settle in a few rounds)
-    pfs_mode_ = getenv("FLASH_PF_STAGE") ? atoi(getenv("FLASH_PF_STAGE")) : 1;  // 2 (lent ring): staging stops when a long context reaches the ring slots
-    static const int pfs_mb = getenv("FLASH_PF_STAGE_MB") ? atoi(getenv("FLASH_PF_STAGE_MB")) : 512;
+    pfs_mode_ = env_int("FLASH_PF_STAGE", 1);  // 2 (lent ring): staging stops when a long context reaches the ring slots
+    static const int pfs_mb = env_int("FLASH_PF_STAGE_MB", 512);
+    // FLASH_PF_STAGE_XMB (default 1024, 0 off): the ring grows to hold every cold group of a layer (up to this size);
+    // the part past FLASH_PF_STAGE_MB is lent to the expert cache between big batches (2 GPUs: ~620 cold groups per
+    // layer vs 529 in a 512 MB ring; the rest was read zero-copy, ~2x per batch, over the PCIe link the ring copies
+    // already keep busy, and those layers fell back to whole-batch MoE with the atomics down: 90K 22.1 -> 17.4 s)
+    static const int pfs_xmb = env_int("FLASH_PF_STAGE_XMB", 1024);
+    long long ring0 = 0;
     if (pfs_mode_ == 1 && pfs_mb > 0) {  // own ring: its groups come out of the resident budget
         const long long nres0 = nres;
         long long ring = 0;
+        const long long cap_b = std::max<long long>((long long)pfs_mb, (long long)pfs_xmb) * 1048576 / GRP_BYTES;
         for (int it = 0; it < 4; it++) {
             std::map<int, int> per;
             int mx = 0;
             for (size_t i = 0; i < gs.size() - (size_t)nres; i++) mx = std::max(mx, ++per[gs[i].li]);
-            ring = std::min<long long>(2LL * mx, (long long)pfs_mb * 1048576 / GRP_BYTES);
+            ring = std::min<long long>(2LL * mx, cap_b);
+            ring0 = std::min<long long>(ring, (long long)pfs_mb * 1048576 / GRP_BYTES);
             nres = std::max(0LL, nres0 - ring);
         }
         pfs_cap_ = (int)(ring / 2);
+        pfs_cap0_ = (int)(ring0 / 2);
         pfs_resv_ = ring * (long long)GRP_BYTES;
     }
     const size_t ncold = gs.size() - nres;
@@ -1242,7 +1508,14 @@ void Worker::load_deferred_groups() {
     }
     ec_defer_l_.clear();
     g_hs.release();
-    if (pfs_mode_ == 1 && pfs_cap_ > 0) pfs_ring_ = (char*)dalloc((size_t)2 * pfs_cap_ * GRP_BYTES);
+    if (pfs_mode_ == 1 && pfs_cap_ > 0) {
+        pfs_ring_ = (char*)dalloc((size_t)2 * pfs_cap0_ * GRP_BYTES);
+        if (pfs_cap_ > pfs_cap0_) {  // the extension: a bt region (expert-cache slots outside big batches)
+            const size_t xb = (size_t)2 * (pfs_cap_ - pfs_cap0_) * GRP_BYTES;
+            pfs_ext_ = (char*)dalloc(xb);
+            bt_regs_.push_back({pfs_ext_, xb});
+        }
+    }
     fprintf(stderr, "[flash] GPU%d group load: gather %.1f s, buffer wait %.1f s, copy + repack launches %.1f s\n", dev_, g_tg, g_tw, g_tl);
     fprintf(stderr, "[flash] GPU%d expert budget: %.2f GiB free -> %lld of %zu routed groups on the device, %zu host-backed (%.2f GB)\n",
             dev_, fr / 1073741824.0, nres, gs.size(), ncold, ncold * (double)GRP_BYTES / 1e9);
@@ -1271,16 +1544,24 @@ void Worker::pfs_init() {
     std::vector<char*> ring;  // ring position -> device address ([0, cap): half 0, [cap, 2 cap): half 1)
     if (pfs_mode_ == 1) {
         if (!pfs_ring_) return;
-        for (int i = 0; i < 2 * pfs_cap_; i++) ring.push_back(pfs_ring_ + (size_t)i * GRP_BYTES);
+        for (int h = 0; h < 2; h++)
+            for (int p = 0; p < pfs_cap_; p++) ring.push_back(pfs_addr(h, p));
+        // the extension is lent to the cache when the cache made bt slots of it (FLASH_PFB_LEND, ec_init)
+        if (pfs_ext_) {
+            pfs_ext_lent_ = false;
+            for (const auto& sl : ec_slots_)
+                if (sl.bt && sl.addr >= pfs_ext_ && sl.addr < pfs_ext_ + (size_t)2 * (pfs_cap_ - pfs_cap0_) * GRP_BYTES) { pfs_ext_lent_ = true; break; }
+        }
     } else {
         // ring lent by the expert cache while prefills run: its slots at the highest KV offsets (the last a growing
         // context reclaims), at most FLASH_PF_STAGE_MB and FLASH_PF_STAGE_PCT % of the cache slots
         if (!ec_on_ || ec_slots_.empty()) { pfs_mode_ = 0; return; }
         int mx = 0;
         for (int li = 0; li < LAYERS; li++) mx = std::max(mx, L_[li].ncold);
-        static const int mb = getenv("FLASH_PF_STAGE_MB") ? atoi(getenv("FLASH_PF_STAGE_MB")) : 512;
-        static const int pct = getenv("FLASH_PF_STAGE_PCT") ? atoi(getenv("FLASH_PF_STAGE_PCT")) : 50;
+        static const int mb = env_int("FLASH_PF_STAGE_MB", 512);
+        static const int pct = env_int("FLASH_PF_STAGE_PCT", 50);
         pfs_cap_ = std::min({mx, (int)((long long)mb * 1048576 / GRP_BYTES / 2), (int)(ec_slots_.size() * pct / 200)});
+        pfs_cap0_ = pfs_cap_;
         if (pfs_cap_ <= 0) { pfs_mode_ = 0; return; }
         std::vector<int> idx(2 * pfs_cap_);
         for (int i = 0; i < 2 * pfs_cap_; i++) idx[i] = i;  // ec_slots_ is sorted by offset, descending
@@ -1297,25 +1578,31 @@ void Worker::pfs_init() {
             else rs.push_back({p, 1, a});
         }
     }
-    std::vector<uintptr_t> t(ec_n_, 0);
-    for (int li = 0; li < LAYERS; li++) {
-        const Layer& L = L_[li];
-        for (int j = 0; j < L.ncold; j++)
-            t[L.coff + j] = j < pfs_cap_ ? (uintptr_t)ring[(size_t)(li & 1) * pfs_cap_ + j]
-                                         : ((uintptr_t)(L.hgroups + (size_t)j * GRP_BYTES) | 1);
-    }
-    pfs_tab_d_ = (uintptr_t*)dalloc((size_t)ec_n_ * sizeof(uintptr_t));
-    CUDA_CHECK(cudaMemcpy(pfs_tab_d_, t.data(), t.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice));
+    auto table = [&](int cap) {
+        std::vector<uintptr_t> t(ec_n_, 0);
+        for (int li = 0; li < LAYERS; li++) {
+            const Layer& L = L_[li];
+            for (int j = 0; j < L.ncold; j++)
+                t[L.coff + j] = j < cap ? (uintptr_t)ring[(size_t)(li & 1) * pfs_cap_ + j]
+                                        : ((uintptr_t)(L.hgroups + (size_t)j * GRP_BYTES) | 1);
+        }
+        uintptr_t* d = (uintptr_t*)dalloc((size_t)ec_n_ * sizeof(uintptr_t));
+        CUDA_CHECK(cudaMemcpy(d, t.data(), t.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice));
+        return d;
+    };
+    pfs_tab_d_ = table(pfs_cap_);
+    pfs_tab0_d_ = pfs_cap0_ < pfs_cap_ ? table(pfs_cap0_) : pfs_tab_d_;
     pfs_touch_d_ = (unsigned char*)dalloc(ec_n_);
     CUDA_CHECK(cudaStreamCreateWithFlags(&dst_, cudaStreamNonBlocking));
     for (int i = 0; i < 2; i++) {
         CUDA_CHECK(cudaEventCreateWithFlags(&pfs_cp_[i], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&pfs_used_[i], cudaEventDisableTiming));
     }
-    if (p_.rank == 0 || getenv("FLASH_PF_STAGE_LOG"))
-        fprintf(stderr, "[flash] GPU%d prefill staging ring: 2 x %d groups (%.0f MB, %s, %zu + %zu copies per layer pair)\n", dev_,
+    if (p_.rank == 0 || env_str("FLASH_PF_STAGE_LOG"))
+        fprintf(stderr, "[flash] GPU%d prefill staging ring: 2 x %d groups (%.0f MB, %s, %zu + %zu copies per layer pair; %d of them per half %s)\n", dev_,
                 pfs_cap_, 2.0 * pfs_cap_ * GRP_BYTES / 1e6, pfs_mode_ == 1 ? "own memory" : "lent by the expert cache",
-                pfs_runs_[0].size(), pfs_runs_[1].size());
+                pfs_runs_[0].size(), pfs_runs_[1].size(), pfs_cap_ - pfs_cap0_,
+                pfs_ext_lent_ ? "in the extension, cache slots outside big batches" : "in the extension (own memory)");
 }
 
 // mode 2: take the ring's cache slots (their groups fall back to host reads) for the prefill batches; false when a
@@ -1355,7 +1642,7 @@ void Worker::pfs_release() {  // the ring's slots back to the cache (empty; pref
 // copy engine: layer li's host-backed groups (up to pfs_cap_) into ring half li & 1 (on dst_)
 void Worker::pfs_copy(int li) {
     const Layer& L = L_[li];
-    const int n = std::min(L.ncold, pfs_cap_);
+    const int n = std::min(L.ncold, pfs_capn());
     for (const PfsRun& r : pfs_runs_[li & 1]) {
         const int k = std::min(r.n, n - r.p0);
         if (k <= 0) break;
@@ -1371,7 +1658,7 @@ void Worker::ec_init() {
     for (Layer* L : ls) { L->coff = n; n += L->ncold; }
     ec_n_ = n;
     ec_st_.ncold = n;
-    ec_on_ = n > 0 && !(getenv("FLASH_EC") && atoi(getenv("FLASH_EC")) == 0);
+    ec_on_ = n > 0 && !(env_int("FLASH_EC", 1) == 0);
     if (!n) return;
     ec_tab_d_ = (uintptr_t*)dalloc((size_t)n * sizeof(uintptr_t));
     CUDA_CHECK(cudaHostAlloc((void**)&ec_tab_h_, (size_t)n * sizeof(uintptr_t), cudaHostAllocDefault));
@@ -1381,10 +1668,10 @@ void Worker::ec_init() {
     ec_host_.resize(n);
     ec_src_.resize(n);
     std::vector<double> prior(n, 0.0);
-    const double decay = getenv("FLASH_EC_DECAY") ? atof(getenv("FLASH_EC_DECAY")) : 0.999;  // per launch
+    const double decay = env_double("FLASH_EC_DECAY", 0.999);  // per launch
     ec_logd_ = std::log(decay);
-    if (getenv("FLASH_EC_HYST")) ec_hyst_ = atof(getenv("FLASH_EC_HYST"));
-    if (getenv("FLASH_EC_COPIES")) ec_maxcopy_ = atoi(getenv("FLASH_EC_COPIES"));
+    ec_hyst_ = env_double("FLASH_EC_HYST", ec_hyst_);
+    ec_maxcopy_ = env_int("FLASH_EC_COPIES", ec_maxcopy_);
     for (int li = 0; li < LAYERS; li++) {
         const Layer& L = L_[li];
         for (int j = 0; j < L.ncold; j++) {
@@ -1404,7 +1691,7 @@ void Worker::ec_init() {
     if (ec_on_) {
         std::vector<Layer*> kvl = ls;
         if (has_mtp_) kvl.push_back(&mtp_);
-        const size_t asz = (size_t)rows_ * NKV * HD;
+        const size_t asz = (size_t)srows_ * NKV * HD;
         const int per = (int)(asz / GRP_BYTES);
         for (Layer* L : kvl) {
             if (!L->full || !L->kc) continue;
@@ -1419,10 +1706,31 @@ void Worker::ec_init() {
                     ec_slots_.push_back(sl);
                 }
         }
-        // slots ordered by offset descending (the last to be reclaimed by a growing context first)
-        std::stable_sort(ec_slots_.begin(), ec_slots_.end(), [](const EcSlot& a, const EcSlot& b) { return a.off > b.off; });
+        // KV streaming: the indexer keys cover the whole (host-sized) pool; the tail above the contexts' blocks holds
+        // expert-cache slots too (taken back as the contexts grow, like the K / V tails)
+        const size_t iasz = (size_t)(rows_ / IDX_R) * IDX_HD * 2;
+        if (kvs_)
+            for (Layer* L : kvl) {
+                if (!L->full || !L->ikb) continue;
+                for (int s2 = 0; s2 < (int)(iasz / GRP_BYTES); s2++) {
+                    EcSlot sl;
+                    sl.off = iasz - (size_t)(s2 + 1) * GRP_BYTES;
+                    sl.addr = (char*)L->ikb + sl.off;
+                    sl.ci = -1;
+                    sl.live = true;
+                    sl.ik = true;
+                    CUDA_CHECK(cudaEventCreateWithFlags(&sl.ev, cudaEventDisableTiming));
+                    ec_slots_.push_back(sl);
+                }
+            }
+        // slots ordered by offset descending (the last to be reclaimed by a growing context first; indexer-key slots
+        // by their share of the array)
+        std::stable_sort(ec_slots_.begin(), ec_slots_.end(), [&](const EcSlot& a, const EcSlot& b) {
+            if (a.ik == b.ik) return a.off > b.off;
+            return (double)a.off / (a.ik ? iasz : asz) > (double)b.off / (b.ik ? iasz : asz);
+        });
         // the big-batch buffer tails (bt): after the KV slots (filled last), taken back for every big prefill batch
-        static const bool bt_on = !getenv("FLASH_PFB_LEND") || atoi(getenv("FLASH_PFB_LEND"));
+        static const bool bt_on = env_int("FLASH_PFB_LEND", 1);
         for (auto& [base, len] : bt_regs_) {
             if (!bt_on) break;
             const size_t a0 = ((size_t)base + 255) & ~(size_t)255, end = (size_t)base + len;
@@ -1444,7 +1752,7 @@ void Worker::ec_init() {
         std::vector<int> ord(n);
         for (int i = 0; i < n; i++) ord[i] = i;
         std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return prior[a] > prior[b]; });
-        static const int seed_max = getenv("FLASH_EC_SEED") ? atoi(getenv("FLASH_EC_SEED")) : 1 << 30;
+        static const int seed_max = env_int("FLASH_EC_SEED", 1 << 30);
         const int ns = std::min<int>({n, (int)ec_slots_.size(), seed_max});
         cudaEvent_t a, b;
         CUDA_CHECK(cudaEventCreate(&a));
@@ -1501,13 +1809,16 @@ void Worker::ec_collect() {
 }
 
 void Worker::ec_tick(int ctx_end, int kind) {
+    if (kvs_ && kvh_lazy_)  // KV in RAM: the host rows of every position in use pinned before the launch
+        kv_host_ensure((int)((std::max<long long>(ctx_end + ctx_off_, kv_top_) + p_.period - 1) / p_.period), true);
     if (!ec_n_) return;
+    const int own_end = ctx_end;  // this launch's context (relative to its region)
     ctx_end = (int)std::max<long long>(ctx_end + ctx_off_, kv_top_);  // sequence slots: the region's offset, all regions
     ec_collect();
     ec_kind_ = kind;
     if (!ec_on_) return;
     if (kind == 0) ec_now_++;  // the clock of the decayed counts: decode launches
-    static const int pfs_hold = getenv("FLASH_PF_STAGE_HOLD") ? atoi(getenv("FLASH_PF_STAGE_HOLD")) : 64;
+    static const int pfs_hold = env_int("FLASH_PF_STAGE_HOLD", 64);
     if (kind == 0 && pfs_borrowed_ && ++pfs_idle_ > pfs_hold) pfs_release();  // no prefill for a while: ring back to the cache
     // copies that landed: switch the table entries to the device slots
     for (auto& sl : ec_slots_)
@@ -1517,19 +1828,31 @@ void Worker::ec_tick(int ctx_end, int kind) {
             ec_dirty_ = true;
         }
     // KV pool first: slots overlapping the rows of positions < ctx_end (+ margin) go back to the pool
-    static const int margin = getenv("FLASH_EC_MARGIN") ? atoi(getenv("FLASH_EC_MARGIN")) : 256;  // rows
+    static const int margin = env_int("FLASH_EC_MARGIN", 256);  // rows
     // FLASH_EC_RESERVE=n: keep the slots of an n-token context reserved (measurement: the cache capacity of a long
     // context with a short prompt)
-    static const long long reserve = getenv("FLASH_EC_RESERVE") ? atoll(getenv("FLASH_EC_RESERVE")) : 0;
-    const long long c = std::min<long long>((long long)max_ctx_, std::max<long long>(ctx_end, reserve));
-    const long long rws = std::min<long long>(rows_, (c + p_.period - 1) / p_.period * p_.own + margin);
+    static const long long reserve = env_ll("FLASH_EC_RESERVE", 0);
+    const long long c = kvs_ ? std::max<long long>(ctx_end, reserve) : std::min<long long>((long long)max_ctx_, std::max<long long>(ctx_end, reserve));
+    long long rws = std::min<long long>(kvs_ ? rows_ : srows_, (c + p_.period - 1) / p_.period * p_.own + margin);
+    size_t ibound = 0;
+    if (kvs_) {  // streaming: the block cache grows with the contexts up to its P blocks, the expert cache keeps the rest
+        ibound = (size_t)((rws + IDX_R - 1) / IDX_R) * IDX_HD * 2;  // indexer keys of every row in use (by pool row: all regions)
+        // the block cache (fully associative) only needs entries for the active contexts (kv_act_): an idle region's
+        // blocks need none
+        if (kv_act_ >= 0) {
+            const long long ca = std::max<long long>(std::max<long long>(kv_act_, own_end), reserve);
+            rws = std::min(rws, std::min<long long>(rows_, (ca + p_.period - 1) / p_.period * p_.own + margin));
+        }
+        rws = std::min<long long>((long long)kvs_P_ * IDX_R, (rws + IDX_R - 1) / IDX_R * IDX_R);
+        kvs_set_pe((int)(rws / IDX_R));
+    }
     const size_t bound = (size_t)rws * NKV * HD;
     std::vector<int> killed;
     std::vector<std::pair<int, int>> copies;  // (slot, group)
-    if (bound != ec_bound_ || bt_want_ != bt_taken_) {
+    if (bound != ec_bound_ || ibound != ec_ibound_ || bt_want_ != bt_taken_) {
         for (int s2 = 0; s2 < (int)ec_slots_.size(); s2++) {
             EcSlot& sl = ec_slots_[s2];
-            const bool live = sl.bt ? !bt_want_ : sl.off >= bound;
+            const bool live = sl.bt ? !bt_want_ : sl.off >= (sl.ik ? ibound : bound);
             if (sl.live && !live) {
                 if (sl.bt) sl.prev = sl.ci;
                 if (sl.ci >= 0) {
@@ -1555,6 +1878,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
             sl.live = live;
         }
         ec_bound_ = bound;
+        ec_ibound_ = ibound;
         bt_taken_ = bt_want_;
     }
     // admissions: candidates by decayed count (desc), into free live slots, then over the coldest residents
@@ -1569,7 +1893,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
             else if (!ec_pend_[sl.ci]) vic.push_back(s2);
         }
         // FLASH_EC_LOWFIRST=1: stress test, free slots lowest offset first (the next ones a growing context reclaims)
-        static const bool lowfirst = getenv("FLASH_EC_LOWFIRST") && atoi(getenv("FLASH_EC_LOWFIRST"));
+        static const bool lowfirst = env_int("FLASH_EC_LOWFIRST", 0);
         if (lowfirst) std::reverse(fr.begin(), fr.end());
         size_t fi = 0, vi = 0;
         bool vsorted = false;
@@ -1614,7 +1938,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
         CUDA_CHECK(cudaEventRecord(ec_evt_, st_));
         CUDA_CHECK(cudaStreamWaitEvent(ec_cs_, ec_evt_, 0));
         // FLASH_EC_DELAY=ns: stress test, the copies land late (slot reclaim / pointer switch vs in-flight copies)
-        static const unsigned delay = getenv("FLASH_EC_DELAY") ? (unsigned)atoi(getenv("FLASH_EC_DELAY")) : 0u;
+        static const unsigned delay = (unsigned)env_int("FLASH_EC_DELAY", 0u);
         if (delay) k_spin<<<1, 1, 0, ec_cs_>>>(delay);
         for (auto& [s2, ci] : copies) {
             CUDA_CHECK(cudaMemcpyAsync(ec_slots_[s2].addr, ec_src_[ci], GRP_BYTES, cudaMemcpyHostToDevice, ec_cs_));
@@ -1737,8 +2061,8 @@ int Worker::ec_verify(const char* where) {
     if (pfs_mode_ == 1 && pfs_ring_)
         for (int li = LAYERS - 2; li < LAYERS; li++) {
             const Layer& L = L_[li];
-            for (int j = 0; j < std::min(L.ncold, pfs_cap_); j++)
-                it.push_back({pfs_ring_ + ((size_t)(li & 1) * pfs_cap_ + j) * GRP_BYTES, L.hgroups_h + (size_t)j * GRP_BYTES, -1, j, li, "staging ring"});
+            for (int j = 0; j < std::min(L.ncold, pfs_capn()); j++)
+                it.push_back({pfs_addr(li & 1, j), L.hgroups_h + (size_t)j * GRP_BYTES, -1, j, li, "staging ring"});
         }
     if (it.empty()) return 0;
     if (!ec_vsum_d_) ec_vsum_d_ = (unsigned long long*)dalloc((ec_slots_.size() + 2 * (size_t)std::max(1, pfs_cap_)) * 8);
@@ -1839,9 +2163,9 @@ void Worker::gsum(int nw, unsigned long long* experts, unsigned long long* other
         unsigned long long* d;
         CUDA_CHECK(cudaMalloc(&d, 8));
         CUDA_CHECK(cudaMemsetAsync(d, 0, 8, st_));
-        static const int gs2 = getenv("FLASH_GSUM") ? atoi(getenv("FLASH_GSUM")) : 0;
+        static const int gs2 = env_int("FLASH_GSUM", 0);
         FILE* fa = nullptr;
-        if (gs2 >= 2) { char fn[256]; snprintf(fn, sizeof(fn), "%s.rank%d", getenv("FLASH_GSUM_OUT") ? getenv("FLASH_GSUM_OUT") : "gsum", p_.rank); fa = fopen(fn, "w"); }
+        if (gs2 >= 2) { char fn[256]; snprintf(fn, sizeof(fn), "%s.rank%d", env_str("FLASH_GSUM_OUT") ? env_str("FLASH_GSUM_OUT") : "gsum", p_.rank); fa = fopen(fn, "w"); }
         for (int i = 0; i < nw && i < (int)allocs_.size(); i++) {
             if (std::find(gbase.begin(), gbase.end(), allocs_[i].first) != gbase.end()) continue;  // the expert group arrays
             if (fa) {  // per allocation (index, bytes, sum) for a diff between processes
@@ -2035,11 +2359,11 @@ void Worker::flush_y(int m) {  // apply a pending residual update (R_i += inj_i 
 }
 
 void Worker::hc_read(const HcW& w, int m, bool inject) {
-    static const bool fuse = getenv("FLASH_HCW") && atoi(getenv("FLASH_HCW"));  // measured slower (extra y loads in k_hcd)
+    static const bool fuse = env_int("FLASH_HCW", 0);  // measured slower (extra y loads in k_hcd)
     const bool hcs = hcs_ && w.uq && m <= MAXM;  // split decode HC down: the pending residual update is fused in
     SteerArg sfa;  // a pending layer-output steering fused into the mid kernel, else applied separately first
     if (steer_pend_ >= 0) {
-        static const bool fuse = !getenv("FLASH_STEER_FUSE") || atoi(getenv("FLASH_STEER_FUSE"));  // 0: separate kernel (check)
+        static const bool fuse = env_int("FLASH_STEER_FUSE", 1);  // 0: separate kernel (check)
         if (fuse && hcs && steer_pend_ >= 1 && steer_pend_ + 1 < LAYERS && &w == &L_[steer_pend_ + 1].hca) {
             sfa = steer_arg(steer_pend_, steer_prs_);
             steer_pend_ = -1;
@@ -2049,7 +2373,7 @@ void Worker::hc_read(const HcW& w, int m, bool inject) {
     }
     if (!hcs && (m > MAXM || !fuse || !R2_)) flush_y(m);
     if (w.uq && m > MAXM) {
-        static const int v2 = getenv("FLASH_HCPF") ? atoi(getenv("FLASH_HCPF")) : 2;
+        static const int v2 = env_int("FLASH_HCPF", 2);
         if (v2 == 2) {  // staged activations + K-split atomics, separate mid step
             if (detpart_) {  // deterministic: exact fixed-point K-split sums (the buffers are zeroed by the conversion)
                 unsigned long long* fu = detpart_;
@@ -2063,7 +2387,7 @@ void Worker::hc_read(const HcW& w, int m, bool inject) {
             k_hcd_pf2<<<dim3(3, HC * 4, (m + 31) / 32), 224, 0, st_>>>(w.fd.q, w.fd.s, R_, hu_, m, hss_);  // + sums of squares
             }
             k_hc_mid_pf<<<m, 352, 0, st_>>>(hu_, hss_, hh_pf_, rinv_pf_, inject ? inj_ : nullptr);
-            static const int hy = getenv("FLASH_HCU_Y") ? atoi(getenv("FLASH_HCU_Y")) : 1;  // blocks over 32-row groups (1: each block loops, cp.async one group ahead)
+            static const int hy = env_int("FLASH_HCU_Y", 1);  // blocks over 32-row groups (1: each block loops, cp.async one group ahead)
             k_hcu_pf2<<<dim3((HCU_TILES + 7) / 8, std::max(1, std::min(hy, (m + 31) / 32))), 256, 0, st_>>>(w.uq, w.us, hh_pf_, rinv_pf_, R_, w.norm, x_, xh_, m);
             KCHK("hc pf2");
             return;
@@ -2077,7 +2401,7 @@ void Worker::hc_read(const HcW& w, int m, bool inject) {
     if (w.uq) {
         if (hcs) {  // split by groups (no wave tail) + one mid kernel (h, rinv, inj once, not per hcu block)
             const float* yp = ypend_ ? y_ : nullptr;
-            static const int hcx = getenv("FLASH_HCDX") ? atoi(getenv("FLASH_HCDX")) : 9;  // staged-x HC down from m rows (0: off)
+            static const int hcx = env_int("FLASH_HCDX", 9);  // staged-x HC down from m rows (0: off)
             if (hcx > 0 && m >= hcx)
                 NT_LAUNCH(m, k_hcd_x, dim3(HC * HCD_GPS / HCD_GPW, HCD_ROWS / 16 / HCDX_TW), 32 * HCDX_TW, w.fd.q, w.fd.s, R_, hcp_, m, yp, inj_);
             else
@@ -2125,7 +2449,7 @@ void Worker::hc_read(const HcW& w, int m, bool inject) {
 
 void Worker::hc_write(int m) {
     // y = sum of the cards' partials, then R_i += inj_i * y
-    static const bool ll = !getenv("FLASH_LL") || atoi(getenv("FLASH_LL"));
+    static const bool ll = env_int("FLASH_LL", 1);
     KCHK("before AR");
     const bool l2d = (hcl2_ & 1) && !pf_ && next_hc_ && next_hc_->fd.q && m <= MAXM;
     if (l2d) {  // the next HC read's down weights into L2 while the (latency-bound) all-reduce runs
@@ -2145,7 +2469,7 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
     (void)li; (void)pos;
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV, ld = ch + vl * DV;
-    static const int pfx = getenv("FLASH_PFX") ? atoi(getenv("FLASH_PFX")) : 0;  // debug: bit0 GDN, bit1 MoE pf paths off
+    static const int pfx = env_int("FLASH_PFX", 0);  // debug: bit0 GDN, bit1 MoE pf paths off
     if (pf_ && !(pfx & 1)) {  // prefill: tensor-core GEMMs, rows committed at once
         gemm_w4(L.dn_in, x_, H, proj_, ld, m, st_);
         gemv_w16_rows(L.dn_ab, x_, H, proj2_, 2 * vl, m, st_);
@@ -2157,7 +2481,7 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
         } else
         k_dn_conv_d<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend, posd_ + 1, cv, m, true);
         float* o = gates_;
-        static const int cmin = getenv("FLASH_DN_CHUNK") ? atoi(getenv("FLASH_DN_CHUNK")) : 64;  // 0: sequential
+        static const int cmin = env_int("FLASH_DN_CHUNK", 64);  // 0: sequential
         if (cmin > 0 && m >= cmin) {  // chunked (WY) delta rule on tensor cores (dn_chunk.cu of the 27B engine)
             // rows of a previous forward still pending: commit them first (m = 0: commit + state write only)
             k_dn_rec_d<<<dim3(vl, 16), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, L.S, L.rec_pend,
@@ -2180,7 +2504,7 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
         gemm_w4(L.dn_out, ab_, vl * DV, part_, H, m, st_);
         return;
     }
-    static const bool abpe = !getenv("FLASH_DNAB_PAR") || atoi(getenv("FLASH_DNAB_PAR"));
+    static const bool abpe = env_int("FLASH_DNAB_PAR", 1);
     const bool abp = abpe && m <= 8;  // server agent c=8 (m = 32): 795 -> 642 tok/s with the side branch at every m
     if (abp) {  // the small a/b GEMV (2 blocks) on a side branch next to the in-projection
         CUDA_CHECK(cudaEventRecord(pfe0_, st_));
@@ -2215,7 +2539,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
     const int ld = L.qkv.n;
     // decode: the indexer projection + key prep on a graph side branch (only the block selection and later steps use
     // them), joined before the selection or at the end of the layer
-    static const bool ipar = !getenv("FLASH_IDX_PAR") || atoi(getenv("FLASH_IDX_PAR"));
+    static const bool ipar = env_int("FLASH_IDX_PAR", 1);
     const bool ip = ipar && !pf_ && m <= 8 && !dbgh_;
     cudaStream_t ist = ip ? pfs_ : st_;
     if (ip) {
@@ -2230,7 +2554,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
     if (!ip) gemv_w16_rows(L.idx, x_, H, proj2_, (IDX_NH + 1) * IDX_HD, m, st_);
     const int nqp = qsa_a_ ? NQ : ql, qh0 = qsa_a_ ? 0 : p_.q0;
     k_qsa_prep<<<dim3(nqp + 4, m), 256, 0, st_>>>(proj_, ld, L.q_norm, L.k_norm, curpos_, qbuf_, L.kc, L.vc, L.ks, L.vs, p_,
-                                                   nqp, qh0, nullptr, rbcur_);
+                                                   nqp, qh0, nullptr, rbcur_, nullptr, kvmap(L));
     KCHK("k_qsa_prep");
     unsigned long long* dh = (dbgh_ && pf_ && li >= 0 && li < LAYERS) ? dbgh_ + li * DBGK : nullptr;
     if (dh) {
@@ -2247,20 +2571,20 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_);
     KCHK("k_idx_prep");
     if (m > MAXM) k_possub<<<1, 32, 0, st_>>>(possub_, curpos_, (m + MAXM - 1) / MAXM);
-    static const bool p2p = !getenv("FLASH_XP2P") || atoi(getenv("FLASH_XP2P"));
-    const int lbmax = rows_ / IDX_R;
+    static const bool p2p = env_int("FLASH_XP2P", 1);
+    const int lbmax = srows_ / IDX_R;
     // attention over the chunk at once; with block selection in sub-chunks of MAXM rows (its buffers are MAXM rows)
-    static const bool selsub = getenv("FLASH_SEL_SUB") && atoi(getenv("FLASH_SEL_SUB"));  // old: selection per 32 rows
+    static const bool selsub = env_int("FLASH_SEL_SUB", 0);  // old: selection per 32 rows
     const int sub = sel_on_ && selsub ? MAXM : XROWS;
     for (int t0 = 0; t0 < m; t0 += sub) {
         const int mr = std::min(sub, m - t0);
         const int* pp = t0 > 0 ? possub_ + t0 / MAXM : curpos_;
         float* qb = qbuf_ + (size_t)t0 * (NQ + 4) * HD;
-        static const bool tc_on = !getenv("FLASH_ATTN_TC") || atoi(getenv("FLASH_ATTN_TC")) == 2;
-        static const bool x16_on = !getenv("FLASH_X16") || atoi(getenv("FLASH_X16"));  // fp16 exchanges (prefill)
+        static const bool tc_on = env_int("FLASH_ATTN_TC", 2) == 2;
+        static const bool x16_on = env_int("FLASH_X16", 1);  // fp16 exchanges (prefill)
         const bool x16 = tc_on && x16_on && !sel_on_ && mr > 8 && !qsa_a_;
         // the partial-output exchange does not depend on the attention kernel: fp16 also with block selection
-        static const bool x16s_on = !getenv("FLASH_X16_SEL") || atoi(getenv("FLASH_X16_SEL"));
+        static const bool x16s_on = env_int("FLASH_X16_SEL", 1);
         const bool x16o = x16 || (x16s_on && x16_on && mr > 8 && !qsa_a_);
         if (qsa_a_) {
             k_qsa_attn<<<dim3(NQ, mr), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, rbcur_);
@@ -2273,11 +2597,11 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             {  // debug: FLASH_SPIN_RANK=r,ns delays rank r before each attention exchange (cross-card skew stress)
                 static int sr = -1, sns = 0, sph = 0;
                 static bool init = false;
-                if (!init) { init = true; if (const char* e = getenv("FLASH_SPIN_RANK")) sscanf(e, "%d,%d,%d", &sr, &sns, &sph); }
+                if (!init) { init = true; if (const char* e = env_str("FLASH_SPIN_RANK")) sscanf(e, "%d,%d,%d", &sr, &sns, &sph); }
                 if (sr == p_.rank && sns > 0) k_spin<<<1, 1, 0, st_>>>(sns);
             }
             // block selection reads q in k_qsa_dec, which takes the peers' rows as fp16 too (x16o)
-            const bool q16 = x16 || (x16o && sel_on_ && dec_k_ && mr <= XROWS && !(pf_ && getenv("FLASH_DEC_NOPF")));
+            const bool q16 = x16 || (x16o && sel_on_ && dec_k_ && mr <= XROWS && !(pf_ && env_str("FLASH_DEC_NOPF")));
             // staged prefill transfers (FLASH_COMM ce / host): the rows go into the outbox, then by copies
             const int qpar = xstage_ ? (++xq_k_) & (XSLOT - 1) : 0;  // the consumers' slot s & (XSLOT - 1)
             const bool qstg = xstage_ && xout_ && mr > 8;
@@ -2286,7 +2610,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             // (joined before the attention, which waits for the peers' q anyway)
             // (opt-in: CE 16K -3 %, P2P neutral, host staging slower; with CE, 2 of 10 det 16K runs differed from the
             // reference, cause not found, 0 of 6 without it)
-            static const bool qside_on = getenv("FLASH_QX_SIDE") && atoi(getenv("FLASH_QX_SIDE"));
+            static const bool qside_on = env_int("FLASH_QX_SIDE", 0);
             const bool qside = qside_on && pf_ && sel_on_ && mr > 8 && !dh;
             cudaStream_t qs = st_;
             if (qside) {
@@ -2294,10 +2618,25 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 CUDA_CHECK(cudaStreamWaitEvent(pfs_, pfq0_, 0));
                 qs = pfs_;
             }
+            // FLASH_QX_LOCAL: the peers' heads' q from this card's own x rows into its receive slot (+ its own flags)
+            const bool qloc = qx_on_ && L.qx.q && pf_ && q16 && t0 == 0 && mr == m && !qside;
+            if (qloc) {
+                const int nqx = (NQ - ql) * HD;
+                rows8(L.qx, x_, H, qxb_, nqx, m, st_);
+                for (int g = 0, j = 0; g < p_.ngpu; g++)
+                    if (g != p_.rank)
+                        k_qsa_prep<<<dim3(QPC(p_), m), 256, 0, st_>>>(qxb_ + (size_t)(j++) * QPC(p_) * HD, nqx, L.q_norm, L.k_norm, curpos_,
+                                                                     qbuf_, L.kc, L.vc, L.ks, L.vs, p_, QPC(p_), g * QPC(p_),
+                                                                     nullptr, rbcur_, nullptr, kvmap(L));
+                k_qxlocal16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(qb, mr, xq, p_);
+                KCHK("q local");
+            } else {
+            xb_add(XB_Q, (size_t)mr * qper(p_) * (q16 ? 2 : 4) * (p_.ngpu - 1));
             if (q16) k_qxsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_);
             else k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_);
             KCHK("k_qxsend");
             if (qstg) xchg_send(0, xq, qpar, mr, (size_t)qper(p_) * (q16 ? 2 : 4), qper(p_), qs);
+            }
             if (qside) CUDA_CHECK(cudaEventRecord(pfq1_, pfs_));
             if (sel_on_) {  // context beyond 2051 tokens: indexer top-512 block selection
                 if (!ijoined) { CUDA_CHECK(cudaStreamWaitEvent(st_, pfe1_, 0)); ijoined = true; }
@@ -2306,7 +2645,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 xi.seq = xiseq_;
                 xi.done = xidone_;
                 const float* iq = gates_ + (size_t)t0 * IDX_NH * IDX_HD;
-                static const bool ist = !getenv("FLASH_IDX_TILE") || atoi(getenv("FLASH_IDX_TILE"));
+                static const bool ist = env_int("FLASH_IDX_TILE", 1);
                 if (ist && mr > 8)  // rows x blocks tiles: keys read once per 16 rows
                     k_idx_score_t<<<dim3((lbmax + IS_BLK - 1) / IS_BLK, (mr + IS_ROWS - 1) / IS_ROWS), 256, IS_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_);
                 else
@@ -2315,59 +2654,79 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 if (idx_gk_) k_idx_local<true><<<mr, 1024, 0, st_>>>(iscore_, pp, p_, lbmax, iloc_);
                 else k_idx_local<<<mr, 1024, (size_t)lbmax * 4, st_>>>(iscore_, pp, p_, lbmax, iloc_);
                 KCHK("k_idx_local");
-                k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, mr, xi, p_);
-                k_idx_select<<<mr, 1024, 0, st_>>>(iscore_, iloc_, pp, p_, lbmax, xi, isel_, insel_, nullptr, idx_gk_);
+                // copy-engine path (FLASH_IDX_CE, default 1 under FLASH_COMM=ce): the keys go into a local outbox, then by
+                // peer copies + a flag copy (as q / partials); else SM stores into the peers' memory (P2P), which on
+                // links with a high SM-store tax stall this card's other kernels while they run
+                static const bool idx_ce = env_int("FLASH_IDX_CE", 1);
+                const bool istg = idx_ce && xstage_ && xouti_ && comm_.xfer == kXferCE;
+                const int ipar = istg ? (++xi_k_) & (XSLOT - 1) : 0;
+                const Xchg xis = istg ? xchg_outbox(2, xi, ipar, IDX_TOPB) : xi;
+                const size_t ib = (size_t)mr * IDX_TOPB * 4;
+                // (emulation of the SM-store path on a slow link: the stores paced to the emulated rate)
+                const float ipace = !istg && xstage_ && comm_.lemu > 0.f && !((env_int("FLASH_TEST_LINK_SKIP", 0) >> 4) & 1) ? comm_.lemu : 0.f;
+                k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, mr, xis, p_, ipace, comm_.lbusy[p_.rank]);
+                if (istg) xchg_send(2, xi, ipar, mr, (size_t)IDX_TOPB * 4, IDX_TOPB, st_);
+                xb_add(XB_IDX, ib * (p_.ngpu - 1));
+                // (KV streaming: the rows' keys made resident by the same blocks, kv_need below skipped)
+                k_idx_select<<<mr, 1024, 0, st_>>>(iscore_, iloc_, pp, p_, lbmax, xi, isel_, insel_, nullptr, idx_gk_,
+                                                   kvs_ ? L.kvp : KvPool(), rbcur_, mr <= MAXM ? psel_ : nullptr);
                 KCHK("k_idx_select");
                 if (dh) k_dbg_selhash<<<mr, 256, 0, st_>>>(isel_, insel_, lbmax, dh + 8);
-                static const bool selstat = getenv("FLASH_SELSTAT") && atoi(getenv("FLASH_SELSTAT"));
+                static const bool selwin = env_int("FLASH_SELWIN", 0);
+                if (selwin && sw_c_) {
+                    const int lx = li < 0 ? LAYERS : li;
+                    k_sel_win<<<1, 1024, 0, st_>>>(isel_, insel_, pp, mr, lbmax, p_, sw_stamp_ + (size_t)lx * lbmax, sw_cid_ + lx,
+                                                   sw_c_ + (pf_ ? 16 : 0));
+                }
+                static const bool selstat = env_int("FLASH_SELSTAT", 0);
                 if (selstat && pf_) {
                     if (!selst_) selst_ = (unsigned long long*)dalloc(3 * 8);
                     k_sel_union<<<(mr + QP_R - 1) / QP_R, 256, 0, st_>>>(isel_, insel_, mr, lbmax, selst_);
                 }
             }
             if (qside) CUDA_CHECK(cudaStreamWaitEvent(st_, pfq1_, 0));  // join the q exchange
-            static const bool rows_k = !getenv("FLASH_ATTN_ROWS") || atoi(getenv("FLASH_ATTN_ROWS"));
-            static const bool tc_k = !getenv("FLASH_ATTN_TC") || atoi(getenv("FLASH_ATTN_TC"));
+            if (!sel_on_) kv_need(L, mr, pp, nullptr, rbcur_, mr <= MAXM ? psel_ : nullptr);  // streaming: every visible key resident (no selection)
+            static const bool rows_k = env_int("FLASH_ATTN_ROWS", 1);
+            static const bool tc_k = env_int("FLASH_ATTN_TC", 1);
             if (tc_k && !sel_on_ && mr > 8) {  // prefill chunk without block selection: tensor cores
-                static const int tcv = getenv("FLASH_ATTN_TC") ? atoi(getenv("FLASH_ATTN_TC")) : 2;
+                static const int tcv = env_int("FLASH_ATTN_TC", 2);
                 if (tcv == 2) {  // 2 heads x 32 rows per block, fast fp8 widening, Q in registers
                     AttnDst d{};
                     d.o[0] = attn_x_;
                     if (x16)
                         k_qsa_attn_tc2<2, true><<<dim3(NQ / 2, (mr + 31) / 32, 1), 128, TB_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp,
-                                                                                                   d, p_, xq, mr, rbcur_);
+                                                                                                   d, p_, xq, mr, rbcur_, kvmap(L));
                     else
                         k_qsa_attn_tc2<2><<<dim3(NQ / 2, (mr + 31) / 32, 1), 128, TB_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d,
-                                                                                              p_, xq, mr, rbcur_);
+                                                                                              p_, xq, mr, rbcur_, kvmap(L));
                 } else
                 k_qsa_attn_tc<<<dim3(NQ, (mr + TA_ROWS - 1) / TA_ROWS), 128, TA_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp,
                                                                                             attn_x_, p_, xq, mr, rbcur_);
-            } else if (dec_k_ && mr <= XROWS && !(pf_ && getenv("FLASH_DEC_NOPF"))) {
+            } else if (dec_k_ && mr <= XROWS && !(pf_ && env_str("FLASH_DEC_NOPF"))) {
                 // decode / verify rows: GQA tile (12 heads of a kv head x 16-key tiles), keys split over S blocks per
                 // (kv head, row), with or without block selection
                 AttnDst d{};
                 d.o[0] = attn_x_;
                 // prefill rows (a chunk with block selection): enough blocks from the rows, keys not split (no merge)
-                static const int spf = getenv("FLASH_ATTN_DSPLIT_PF") ? std::max(1, std::min(dec_split_, atoi(getenv("FLASH_ATTN_DSPLIT_PF")))) : 1;
+                static const int spf = env_set("FLASH_ATTN_DSPLIT_PF") ? std::max(1, std::min(dec_split_, env_int("FLASH_ATTN_DSPLIT_PF", 1))) : 1;
                 // prefill rows with block selection: 8 rows per block over the union of their blocks (prefill-r3,
                 // FLASH_ATTN_PFSEL=0: k_qsa_dec per row), FLASH_ATTN_PFS key splits (default 2: 2 x 64 x 2 blocks per
                 // 512-row chunk, one block per SM)
-                static const bool pfsel = !getenv("FLASH_ATTN_PFSEL") || atoi(getenv("FLASH_ATTN_PFSEL"));
-                static const int pfs = getenv("FLASH_ATTN_PFS") ? std::max(1, std::min(8, atoi(getenv("FLASH_ATTN_PFS")))) : 2;
-                static const int qpf_dbg = getenv("FLASH_QPF_DBG") ? atoi(getenv("FLASH_QPF_DBG")) : 0;
-                // (not with copy-engine exchanges: FLASH_COMM=ce + k_qsa_pfsel faults / NaN in batches > 2560 rows,
-                // cause open; the kernel's output equals k_qsa_dec's there when run as a shadow)
-                static const bool qpf_ce = getenv("FLASH_QPF_CE") && atoi(getenv("FLASH_QPF_CE"));  // debug: pfsel with CE
-                // copy-engine exchanges: the q flags waited for by k_qpf_qwait before the kernel (no spinning pfsel blocks);
-                // FLASH_QPF_CE=0: k_qsa_dec there as before
-                // (opt-in until validated: CE + pfsel still deadlocks intermittently in the eager first batch, qfn_prefill_r4)
-                static const bool qpf_ce_on = getenv("FLASH_QPF_CE") && atoi(getenv("FLASH_QPF_CE"));
+                static const bool pfsel = env_int("FLASH_ATTN_PFSEL", 1);
+                static const int pfs = env_set("FLASH_ATTN_PFS") ? std::max(1, std::min(8, env_int("FLASH_ATTN_PFS", 2))) : 2;
+                static const int qpf_dbg = env_int("FLASH_QPF_DBG", 0);
+                // copy-engine exchanges (FLASH_COMM=ce): FLASH_QPF_CE=1 runs pfsel there, the q flags waited for by
+                // k_qpf_qwait before the kernel (no spinning pfsel blocks); default 0: k_qsa_dec. Re-tested 2026-10-29
+                // (pfsel_ce_2026-10-29): clean (the old "faults / NaN in batches > 2560 rows" of 3008153 and the eager-batch
+                // deadlock were seen under an unstable GPU clock setting / lazy module loading) and bit-equal to the P2P
+                // default, but no faster: CE prefill is bound by the exchanges (16K -0.6 %, 100K +0.7 %), so it stays off
+                static const bool qpf_ce_on = env_int("FLASH_QPF_CE", 0);
                 const bool ce_x = xstage_ && comm_.xfer == kXferCE;
-                if (pfsel && pf_ && sel_on_ && mr > MAXM && std::min(pfs, attn_split_) >= 1 && (!ce_x || qpf_ce_on || qpf_ce)) {
+                if (pfsel && !pfdec_ && pf_ && sel_on_ && mr > MAXM && std::min(pfs, attn_split_) >= 1 && (!ce_x || qpf_ce_on)) {
                     const int S = std::min(pfs, attn_split_);
                     for (int z = 1; z < S; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
                     const size_t smem = qpf_smem(lbmax);
-                    static const int hv = getenv("FLASH_QPF_H") ? atoi(getenv("FLASH_QPF_H")) : 3;  // bit 0: fp16 P.V, bit 1: fp16 Q.K
+                    static const int hv = env_int("FLASH_QPF_H", 3);  // bit 0: fp16 P.V, bit 1: fp16 Q.K
                     auto kf = hv == 3 ? k_qsa_pfsel<true, true> : hv == 2 ? k_qsa_pfsel<false, true> : hv == 1 ? k_qsa_pfsel<true, false> : k_qsa_pfsel<false, false>;
                     if (qpf_attr_ < smem) {
                         for (auto f2 : {k_qsa_pfsel<true, true>, k_qsa_pfsel<false, true>, k_qsa_pfsel<true, false>, k_qsa_pfsel<false, false>})
@@ -2375,7 +2734,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                         qpf_attr_ = smem;
                     }
                     // the row groups' block unions once (prefill-r4, FLASH_QPF_UNION=0: built in every block)
-                    static const bool qun = !getenv("FLASH_QPF_UNION") || atoi(getenv("FLASH_QPF_UNION"));
+                    static const bool qun = env_int("FLASH_QPF_UNION", 1);
                     QpUnion qu;
                     if (qun && qpu_.U) {
                         qu = qpu_;
@@ -2383,8 +2742,8 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                         k_qpf_union<<<(mr + QP_R - 1) / QP_R, 256, (size_t)((lbmax + 31) / 32) * 4, st_>>>(isel_, insel_, mr, lbmax, qu);
                     }
                     // persistent blocks over the (kv head, split, row group) items (prefill-r4, opt-in FLASH_QPF_PERSIST=1;
-                    // default: one item per block until the rc2 test round validates it)
-                    static const bool qps = getenv("FLASH_QPF_PERSIST") && atoi(getenv("FLASH_QPF_PERSIST"));
+                    // default: one item per block until a test round validates it)
+                    static const bool qps = env_int("FLASH_QPF_PERSIST", 0);
                     const int ngrp = (mr + QP_R - 1) / QP_R;
                     const int qdbg = ce_x && qpf_dbg == 0 ? 5 : qpf_dbg;
                     if (qdbg == 5) k_qpf_qwait<<<1, 32, 0, st_>>>(xq, p_);
@@ -2393,12 +2752,12 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                         qu.S = S;
                         if (!nsm_) CUDA_CHECK(cudaDeviceGetAttribute(&nsm_, cudaDevAttrMultiProcessorCount, dev_));
                         kf<<<std::min(nsm_, NKV * ngrp * S), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, isel_,
-                                                                                insel_, lbmax, mr, rbcur_, q16, qdbg, qu, ngrp);
+                                                                                insel_, lbmax, mr, rbcur_, q16, qdbg, qu, ngrp, kvmap(L));
                     } else
                     kf<<<dim3(NKV, ngrp, S), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d,
-                                                                                p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, qdbg, qu, 0);
+                                                                                p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, qdbg, qu, 0, kvmap(L));
                     if (S > 1) k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S);
-                    static const bool qnan = getenv("FLASH_QPF_NAN") && atoi(getenv("FLASH_QPF_NAN"));  // debug: first NaN (device-side)
+                    static const bool qnan = env_int("FLASH_QPF_NAN", 0);  // debug: first NaN (device-side)
                     if (qnan) {
                         if (!qnan_rec_) { CUDA_CHECK(cudaHostAlloc((void**)&qnan_rec_, 4096 * 16, cudaHostAllocMapped)); memset(qnan_rec_, 0, 4096 * 16); }
                         if (qnan_n_ < 4096) {
@@ -2411,9 +2770,10 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 const int S = mr > MAXM ? spf : dec_split_;
                 for (int z = 1; z < S; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
                 k_qsa_dec<<<dim3(NKV, mr, S), 128, QD_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq,
-                                                                  sel_on_ ? isel_ : nullptr, insel_, lbmax, nullptr, rbcur_, q16);
+                                                                  sel_on_ ? isel_ : nullptr, insel_, lbmax, nullptr, rbcur_, q16, kvmap(L),
+                                                                  kvs_ && mr <= MAXM ? psel_ : nullptr);
                 if (S > 1) k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S);
-                static const bool qcmp = getenv("FLASH_QPF_CMP") && atoi(getenv("FLASH_QPF_CMP"));
+                static const bool qcmp = env_int("FLASH_QPF_CMP", 0);
                 if (qcmp && pf_ && sel_on_ && mr > MAXM && attnB_ && S == 1) {  // debug: k_qsa_pfsel shadow vs k_qsa_dec (eager)
                     const size_t smem = qpf_smem(lbmax);
                     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_pfsel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
@@ -2465,8 +2825,20 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             const int cpar = xstage_ ? (++xc_k_) & (XSLOT - 1) : 0;
             const bool cstg = xstage_ && xout_ && mr > 8;
             const Xchg xcs = cstg ? xchg_outbox(1, xc, cpar, xper(p_)) : xc;
-            if (x16o && qsa_split_ && !cstg && mr == m && !dh) {  // pipelined: the combine + o_proj in qsa_back
+            xb_add(XB_PART, (size_t)mr * (x16o ? (size_t)QPC(p_) * XP16 * 4 : (size_t)xper(p_) * 4) * (p_.ngpu - 1));
+            if (x16o && qsa_split_ && (!cstg || xcs_) && mr == m && !dh) {  // pipelined: the combine + o_proj in qsa_back
+                // CE (FLASH_QSA_PIPE_CE): the outbox of this parity is free once its previous side copies finished; the
+                // copies + flag (value computed here, before the pending chunk's combine bumps the counter) on xcs_
+                if (cstg && xce_rec_[cpar]) CUDA_CHECK(cudaStreamWaitEvent(st_, xce_[cpar], 0));
                 k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_, qsa_ahead_);
+                if (cstg) {
+                    k_seq_word<<<1, 1, 0, st_>>>(xsw_ + 4 + cpar, xc.seq, qsa_ahead_);
+                    CUDA_CHECK(cudaEventRecord(xcf_, st_));
+                    CUDA_CHECK(cudaStreamWaitEvent(xcs_, xcf_, 0));
+                    xchg_send(1, xc, cpar, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_), xcs_, xsw_ + 4 + cpar);
+                    CUDA_CHECK(cudaEventRecord(xce_[cpar], xcs_));
+                    xce_rec_[cpar] = true;
+                }
                 QsaBack& q = qpend_[qsa_buf_];
                 q.L = &L; q.prow = prow; q.ax = attn_x_; q.mr = mr; q.ld = ld; q.ql = ql; q.nqp = nqp;
                 return;
@@ -2510,18 +2882,21 @@ void Worker::qsa_back(int slot) {
 }
 
 void Worker::moe(Layer& L, int m) {
-    static const int pfx = getenv("FLASH_PFX") ? atoi(getenv("FLASH_PFX")) : 0;
+    static const int pfx = env_int("FLASH_PFX", 0);
     if (pf_ && !(pfx & 2)) {  // prefill: router GEMM, per-expert row lists, each expert group read once for its rows
         int ns = 4;
+        if (moe_pre_) {
+        } else {
         if (L.router8.q) { rows8(L.router8, x_, H, rlog_, 528, m, st_); ns = 1; }
         else gemv_w16_rows(L.router, x_, H, rlog_, 528, m, st_, 4, (size_t)m * 528);
         k_topk_rows<<<m, NE, 0, st_>>>(rlog_, ns, gsel_, gw_, gsh_, L.stats, m);
+        }
         // down into the slot buffer + ordered sums (FLASH_MOE_SLOT, not in deterministic mode: its fixed-point atomics
         // are exact) when the batch's slots fit the mixer scratch block
-        static const bool slot_on = !getenv("FLASH_MOE_SLOT") || atoi(getenv("FLASH_MOE_SLOT"));
+        static const bool slot_on = env_int("FLASH_MOE_SLOT", 1);
         const size_t srows = (size_t)moe_slot_rows_ + (bt_taken_ ? moe_slot_rows2_ : 0);
         const bool slot = slot_on && !detpart_ && moe_slots_ && (size_t)m * (TOPK + 1) <= srows;
-        static const int msync = getenv("FLASH_DBG_MOESYNC") ? atoi(getenv("FLASH_DBG_MOESYNC")) : 0;  // debug (eager only)
+        static const int msync = env_int("FLASH_DBG_MOESYNC", 0);  // debug (eager only)
         if (msync) {  // bits: 1 expert-cache copy stream, 2 staging-ring copy stream, 4 comm stream, 8 st_ itself
             CUDA_CHECK(cudaStreamSynchronize(st_));
             if ((msync & 1) && ec_cs_) CUDA_CHECK(cudaStreamSynchronize(ec_cs_));
@@ -2534,26 +2909,26 @@ void Worker::moe(Layer& L, int m) {
         if (!detpart_ && !slot) CUDA_CHECK(cudaMemsetAsync(part_, 0, (size_t)m * H * 4, st_));
         const int mj = std::min(maxjob_pf_, maxjob_ + maxlg_ * ((m * (TOPK + 1) + PF_SHJ - 1) / PF_SHJ));  // bound of the job count
         k_jobtrap<<<1, 1, 0, st_>>>(njobs_, mj);  // a count past the grid would drop expert work silently: abort instead
-        static const bool jobchk = getenv("FLASH_JOBCHK") && atoi(getenv("FLASH_JOBCHK"));
+        static const bool jobchk = env_int("FLASH_JOBCHK", 0);
         if (jobchk) { if (!jobchk_) { CUDA_CHECK(cudaHostAlloc((void**)&jobchk_, 32, cudaHostAllocMapped)); memset(jobchk_, 0, 32); }
                       k_jobchk<<<1, 1, 0, st_>>>(njobs_, mj, maxjob_pf_, 1, m, jobchk_); }
-        static const bool gu2 = !getenv("FLASH_MOE_GU2") || atoi(getenv("FLASH_MOE_GU2"));
+        static const bool gu2 = env_int("FLASH_MOE_GU2", 1);
         // W4A8 gate_up (prefill-r3, FLASH_MOE_Q=0: fp16 v2): the part's XH rows are quantized in place (each row's
         // XQ bytes + scales fit its 2H bytes; the rows are dead after this MoE, the next layer's input is gathered
         // into them later)
-        static const bool moe_q = !getenv("FLASH_MOE_Q") || atoi(getenv("FLASH_MOE_Q"));
+        static const bool moe_q = env_int("FLASH_MOE_Q", 1);
         if (moe_q) {
             int8_t* const xq = reinterpret_cast<int8_t*>(xh_);
             float2* const xqs = reinterpret_cast<float2*>(xq + H);
-            k_xh_to_q<64><<<m, 160, 0, st_>>>(xh_, xq, xqs);
+            if (!moe_pre_) k_xh_to_q<64><<<m, 160, 0, st_>>>(xh_, xq, xqs);
             // half-group blocks (WT = 1: 128 registers, 2 blocks / SM) by default. The whole-group variant (FLASH_MOE_QW=2,
             // 248 registers, 1 block / SM) gives different activations for a few tokens now and then when it runs next
             // to the engine's other streams (det 16K in-process repeats: 4/10 differ on 3 GPUs, 6/6 on 2; the same
             // launch twice on unchanged inputs differed). Standalone it is deterministic and racecheck / synccheck /
             // memcheck are clean; L2-only scale loads (gu_q_job) fixed 3 GPUs but not 2 (3/8 differ, some runs abort).
-            // WT = 1: 10/10 and 8/8 identical, 16K 3 GPUs 2750.6 vs 2751.3 ms (rc3_fixes_2026-10-27).
-            static const int qw = getenv("FLASH_MOE_QW") ? atoi(getenv("FLASH_MOE_QW")) : 1;
-            static const bool xqchk = getenv("FLASH_DBG_XQCHK") && atoi(getenv("FLASH_DBG_XQCHK"));  // debug: inputs changed?
+            // WT = 1: 10/10 and 8/8 identical, 16K 3 GPUs 2750.6 vs 2751.3 ms.
+            static const int qw = env_int("FLASH_MOE_QW", 1);
+            static const bool xqchk = env_int("FLASH_DBG_XQCHK", 0);  // debug: inputs changed?
             const int li_dbg = (int)(&L - L_.data());
             if (xqchk && xqsnap_) {
                 CUDA_CHECK(cudaMemcpyAsync(xqsnap_, xh_, (size_t)m * H * 2, cudaMemcpyDeviceToDevice, st_));
@@ -2561,7 +2936,7 @@ void Worker::moe(Layer& L, int m) {
             }
             if (qw == 1) k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
             else k_moe_gu_q<64><<<mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
-            static const bool gu2x = getenv("FLASH_DBG_GU2X") && atoi(getenv("FLASH_DBG_GU2X"));  // debug: gate_up twice
+            static const bool gu2x = env_int("FLASH_DBG_GU2X", 0);  // debug: gate_up twice
             if (gu2x && actsnap_) {
                 const size_t rows = pfact_bytes_ / (GRP * 2);
                 CUDA_CHECK(cudaMemcpyAsync(actsnap_, pfact_, pfact_bytes_, cudaMemcpyDeviceToDevice, st_));
@@ -2578,7 +2953,7 @@ void Worker::moe(Layer& L, int m) {
         KCHK("k_moe_gu_pf");
         if (slot) {
             // W4A8 down (prefill-r3, FLASH_MOE_DQ=0: fp16): the act rows quantized in place, then s8 MMA
-            static const bool dq = !getenv("FLASH_MOE_DQ") || atoi(getenv("FLASH_MOE_DQ"));  // default (user decision): kernel -15 %, e2e = fp16 today (co-run bound)
+            static const bool dq = env_int("FLASH_MOE_DQ", 1);  // default (user decision): kernel -15 %, e2e = fp16 today (co-run bound)
             if (dq) {
                 if (!maxloc_) {  // most local groups of one expert on this card (the act rows: <= m x 11 x maxloc)
                     for (int e = 0; e <= NE; e++) {
@@ -2590,7 +2965,7 @@ void Worker::moe(Layer& L, int m) {
                 }
                 const int nact = m * (TOPK + 1) * maxloc_;  // bound of the act rows of this part
                 k_act_to_q<<<(nact * 8 + 255) / 256, 256, 0, st_>>>(pfact_, nact);
-                static const int dtt = getenv("FLASH_MOE_DQT") ? atoi(getenv("FLASH_MOE_DQT")) : 2;
+                static const int dtt = env_int("FLASH_MOE_DQT", 2);
                 if (dtt == 1) k_moe_dn_q<1><<<dim3(H / 16 / 4, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, SlotBuf{moe_slots_, moe_slot_rows_, moe_slots2_});
                 else k_moe_dn_q<2><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, SlotBuf{moe_slots_, moe_slot_rows_, moe_slots2_});
             } else
@@ -2616,9 +2991,9 @@ void Worker::moe(Layer& L, int m) {
         }
         return;
     }
-    static const int rv = getenv("FLASH_ROUTE") ? atoi(getenv("FLASH_ROUTE")) : 0;  // 0: v5 if m <= 8, else v4 / route2
+    static const int rv = env_int("FLASH_ROUTE", 0);  // 0: v5 if m <= 8, else v4 / route2
     // grouped MoE: from FLASH_MOE_G rows (default 9; 0 off) each job computes only the rows that picked its expert
-    static const int gmin = getenv("FLASH_MOE_G") ? atoi(getenv("FLASH_MOE_G")) : 9;
+    static const int gmin = env_int("FLASH_MOE_G", 9);
     const bool grouped = gmin > 0 && m >= gmin && m > 1 && !(L.router8.q && m <= 8 && (rv == 0 || rv == 5)) && rv != 2;
     if (L.router8.q && m <= 8 && (rv == 0 || rv == 5)) {  // router v5: GEMV + top-10 + jobs in one kernel
         k_route_f<<<dim3(9, RF_SPLIT), 512, 0, st_>>>(L.router8.q, L.router8.s, x_, m, rfpart_, rfcnt_, rlog_, gsel_, gw_,
@@ -2641,11 +3016,11 @@ void Worker::moe(Layer& L, int m) {
     }
     // grid over the worst-case job count of this card (blocks past *njobs exit)
     const int maxj = std::min(maxjob_, NGRP * (m * TOPK + 1));  // blocks past *njobs exit
-    static const bool jobchk_d = getenv("FLASH_JOBCHK") && atoi(getenv("FLASH_JOBCHK"));
+    static const bool jobchk_d = env_int("FLASH_JOBCHK", 0);
     if (jobchk_d) { if (!jobchk_) { CUDA_CHECK(cudaHostAlloc((void**)&jobchk_, 32, cudaHostAllocMapped)); memset(jobchk_, 0, 32); }
                     k_jobchk<<<1, 1, 0, st_>>>(njobs_, maxj, maxjob_, 2, m, jobchk_); }
     if (grouped) {
-        static const int gy = getenv("FLASH_MOE_GY") ? atoi(getenv("FLASH_MOE_GY")) : 320;  // job blocks (loop past it)
+        static const int gy = env_int("FLASH_MOE_GY", 320);  // job blocks (loop past it)
         k_moe_gu_g<<<dim3(2 * GRP / 16, std::min(maxj, gy > 0 ? gy : maxj)), 128, 0, st_>>>(jobs_, njobs_, jrow_, jw_, xh_, acth_);
         KCHK("k_moe_gu_g");
         k_moe_dn_g<<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
@@ -2814,14 +3189,14 @@ void Worker::set_no_lookup(int slot, bool off) {
     CUDA_CHECK(cudaStreamSynchronize(st_));
 }
 
-void Worker::head_sample_b(int m, int* dst) {  // as head_sample, every row with its slot's parameters (greedy rows: argmax)
+void Worker::head_sample_b(int m, int* dst, const int* rs) {  // as head_sample, every row with its slot's parameters (greedy rows: argmax)
     const int nv = p_.voc1 - p_.voc0;
     if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard, as in head()
     gemv_w8(lm_, x_, H, logits_, nv, m, st_);
     topk_local(logits_, nv, m, 0, cand_, st_);
     k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_);
     allgather_small(cand_, m * kTopK * 2, cand_all_, comm_, p_.rank, ctr_, st_);
-    sample_rows_slots(cand_all_, p_.ngpu, m, spslot_, rslot_, sson_d_, dst, st_);
+    sample_rows_slots(cand_all_, p_.ngpu, m, spslot_, rs ? rs : rslot_, sson_d_, dst, st_);
 }
 
 void Worker::start_ngram_stage(const HostTables* ht) {
@@ -2845,7 +3220,7 @@ void Worker::start_ngram_stage(const HostTables* ht) {
     // the GPU must never read the (pageable) file mapping in this mode: no table pointers on the device side
     for (int i = 0; i < 128; i++) { ngp_.q8[i] = nullptr; ngp_.shard[i] = nullptr; }
     // the host side: poll the request, copy the rows (page cache / disk through the file mapping), report done
-    const bool slog = getenv("FLASH_NGRAM_STAGE_LOG") && atoi(getenv("FLASH_NGRAM_STAGE_LOG"));
+    const bool slog = env_int("FLASH_NGRAM_STAGE_LOG", 0);
     const int rank = p_.rank;
     std::thread([ht, req, stage, flags, slog, rank] {
         unsigned last = 0;
@@ -2975,16 +3350,27 @@ void Worker::prefill_body(int m, bool mtp_fill, int) {
 // runs fn eagerly the first time a key is seen (lazy library allocations), captured into a graph afterwards
 template <class F>
 void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long key, F fn) {
-    static const bool graphs = !getenv("FLASH_GRAPH") || atoi(getenv("FLASH_GRAPH"));
+    static const bool graphs = env_int("FLASH_GRAPH", 1);
     auto it = cache.find(key);
+    // FLASH_XBYTES: the bytes of this key's work, counted when it is enqueued (eager / capture), added per replay
+    const std::pair<const void*, long long> xk{&cache, key};
+    unsigned long long xb0[XB_N];
+    memcpy(xb0, xb_, sizeof(xb0));
+    auto xb_keep = [&](bool undo) {
+        std::vector<unsigned long long> d(XB_N);
+        for (int k = 0; k < XB_N; k++) d[k] = xb_[k] - xb0[k];
+        xb_key_[xk] = d;
+        if (undo) memcpy(xb_, xb0, sizeof(xb0));
+    };
     if (!graphs || dump_ || cap_ || it == cache.end()) {
         if (graphs && !dump_ && !cap_) cache[key] = nullptr;  // seen once
         fn();
+        xb_keep(false);
         return;
     }
     // LRU bound (FLASH_PFGRAPH_CAP, default 4 per cache): every prompt length is its own key, so a server that sees
     // many lengths would otherwise keep instantiating graphs (device memory) until it runs out
-    static const int cap = getenv("FLASH_PFGRAPH_CAP") ? std::max(1, atoi(getenv("FLASH_PFGRAPH_CAP"))) : 4;
+    static const int cap = env_set("FLASH_PFGRAPH_CAP") ? std::max(1, env_int("FLASH_PFGRAPH_CAP", 4)) : 4;
     auto& use = graph_use_[&cache];
     if (!it->second) {
         int live = 0;
@@ -2999,31 +3385,24 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
             cache[victim] = nullptr;
             graphs_evicted_++;
         }
+        if (graph_skip()) { fn(); return; }  // after a failed retry (out of memory): no capture for a while
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
         fn();
+        xb_keep(true);  // captured, not run: counted at the launch below
         CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-        cudaError_t e = cudaGraphInstantiate(&it->second, g, 0);
-        if (e == cudaErrorMemoryAllocation) {  // little free memory (262K context): drop every cached graph, retry once
-            (void)cudaGetLastError();
-            CUDA_CHECK(cudaStreamSynchronize(st_));
-            for (auto& kv : cache)
-                if (kv.second) { CUDA_CHECK(cudaGraphExecDestroy(kv.second)); kv.second = nullptr; graphs_evicted_++; }
-            it->second = nullptr;
-            e = cudaGraphInstantiate(&it->second, g, 0);
-        }
+        // little free memory: every cached graph of the card is dropped and the instantiate retried (flash_seq.cu)
+        const bool ok = inst_graph(&it->second, g);
         CUDA_CHECK(cudaGraphDestroy(g));
-        if (e == cudaErrorMemoryAllocation) {  // still no room: this key runs eagerly (the captured work never ran)
-            (void)cudaGetLastError();
-            it->second = nullptr;
-            graph_oom_++;
+        if (!ok) {  // still no room: this key runs eagerly (the captured work never ran)
             fn();
             return;
         }
-        CUDA_CHECK(e);
     }
     use[key] = ++graph_tick_;
-    CUDA_CHECK(cudaGraphLaunch(it->second, st_));
+    if (auto xi = xb_key_.find(xk); xi != xb_key_.end())
+        for (int k = 0; k < XB_N; k++) xb_[k] += xi->second[k];
+    if (!launch_graph(it->second)) fn();  // out of memory at the launch: graphs dropped, this key eagerly
 }
 
 void Worker::prefill(const int* tokens, int pos, int m, const bf16* ple_rows, int* out, const int* mtp_toks, int* draft) {
@@ -3093,15 +3472,19 @@ void Worker::set_agpeer(int g, const Worker* w) {
 void Worker::alloc_staging() {
     if (comm_.xfer == kXferP2P || p_.ngpu < 2) return;
     if (p_.rank == 0) {
-        const char* ml = getenv("CUDA_MODULE_LOADING");
+        const char* ml = env_str("CUDA_MODULE_LOADING");
         fprintf(stderr, "[flash] staged transfers: CUDA module loading %s%s\n", ml ? ml : "(driver default)",
                 ml && strcmp(ml, "EAGER") ? " (not EAGER: the first-launch deadlock guard is off)" : "");
     }
     xout_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
-    xoutc_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
+    xoutc_ = (float*)dalloc((size_t)2 * p_.ngpu * XROWS * xper(p_) * 4);  // [parity]: pipelined partials (CE side copies)
     xdummy_ = (unsigned*)dalloc(4 * 4);
     if (comm_.xfer == kXferCE) {  // the sequence-number words the copy engine copies into the peers' flags
-        xsw_ = (unsigned*)dalloc(4 * 4);
+        xouti_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
+        xsw_ = (unsigned*)dalloc(8 * 4);  // [e 0..2], [4 + parity]: precomputed flags of the pipelined partials
+        CUDA_CHECK(cudaStreamCreateWithFlags(&xcs_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&xcf_, cudaEventDisableTiming));
+        for (auto& e : xce_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         agw_ = (unsigned*)dalloc(4 * 4);
     }
     auto mapped = [&](size_t b) {
@@ -3135,7 +3518,7 @@ void Worker::alloc_staging() {
 Xchg Worker::xchg_outbox(int e, const Xchg& x, int par, size_t per) const {
     Xchg o = x;
     const ptrdiff_t slot = (ptrdiff_t)((size_t)par * p_.ngpu + p_.rank) * XROWS * per;
-    float* const ob = e == 0 ? xout_ : xoutc_;
+    float* const ob = e == 0 ? xout_ : e == 1 ? xoutc_ + (size_t)par * p_.ngpu * XROWS * xper(p_) : xouti_;
     for (int g = 0; g < 4; g++) {
         o.recv[g] = (float*)((uintptr_t)(ob + (size_t)g * XROWS * xper(p_)) - (uintptr_t)(slot * 4));
         o.flags[g] = xdummy_;
@@ -3150,11 +3533,11 @@ Xchg Worker::xchg_outbox(int e, const Xchg& x, int par, size_t per) const {
 // The receiver copies: a push (the sender's copy into the peer's slot, then its flag by an SM store) has no ordering
 // between the copy engine's writes landing in the peer's memory and the flag store; the receiver's own copy is
 // complete on its stream before the consumer kernel starts.
-void Worker::xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per, cudaStream_t sx) {
+void Worker::xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per, cudaStream_t sx, const unsigned* flagw) {
     const int R = p_.rank, ng = p_.ngpu;
     cudaStream_t const st = sx ? sx : st_;
     const size_t bytes = (size_t)mr * rowb;
-    float* const ob = e == 0 ? xout_ : xoutc_;
+    float* const ob = e == 0 ? xout_ : e == 1 ? xoutc_ + (size_t)par * ng * XROWS * xper(p_) : xouti_;
     if (comm_.xfer == kXferCE) {
         // copy engine: push the outbox regions into the peers' receive slots, then the exchange's sequence number into
         // their flag words by copies of the same stream (the flag lands after the rows: an SM flag store after a pushed
@@ -3163,9 +3546,11 @@ void Worker::xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per,
             if (g != R)
                 CUDA_CHECK(cudaMemcpyAsync(x.recv[g] + ((size_t)par * ng + R) * XROWS * per, ob + (size_t)g * XROWS * xper(p_), bytes,
                                            cudaMemcpyDeviceToDevice, st));
-        k_seq_word<<<1, 1, 0, st>>>(xsw_ + e, x.seq);
+        comm_link_emul(comm_, R, bytes * (ng - 1), st, 2 + e);
+        if (!flagw) k_seq_word<<<1, 1, 0, st>>>(xsw_ + e, x.seq);
+        const unsigned* const fw = flagw ? flagw : xsw_ + e;
         for (int g = 0; g < ng; g++)
-            if (g != R) CUDA_CHECK(cudaMemcpyAsync(x.flags[g] + R, xsw_ + e, 4, cudaMemcpyDeviceToDevice, st));
+            if (g != R) CUDA_CHECK(cudaMemcpyAsync(x.flags[g] + R, fw, 4, cudaMemcpyDeviceToDevice, st));
         KCHK("xchg ce");
         return;
     }
@@ -3209,18 +3594,18 @@ void Worker::hc_rows(const HcW& w, float* R, float* inj, bf16* x, __half* xh, in
         k_hcd_pf2<<<dim3(3, HC * 4, (m + 31) / 32), 224, 0, s>>>(w.fd.q, w.fd.s, R, sp_hu, m, sp_hss);
     }
     k_hc_mid_pf<<<m, 352, 0, s>>>(sp_hu, sp_hss, sp_hh, sp_rinv, inj);
-    static const int hy = getenv("FLASH_HCU_Y") ? atoi(getenv("FLASH_HCU_Y")) : 1;
+    static const int hy = env_int("FLASH_HCU_Y", 1);
     k_hcu_pf2<<<dim3((HCU_TILES + 7) / 8, std::max(1, std::min(hy, (m + 31) / 32))), 256, 0, s>>>(w.uq, w.us, sp_hh, sp_rinv, R, w.norm,
                                                                                                   x, xh, m);
     KCHK("hc_rows");
 }
 
 // own rows [r0, r1) of x (bit 0), xh (bit 1), R (bit 2) to every card, then wait for the peers' rows (channel ch)
-void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, const int* rr) {
+void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, const int* rr, int rowb0) {
     RowAg a;
     for (int k = 0; k < 3; k++)
         for (int g = 0; g < 4; g++) a.dst[k][g] = agdst_[k][g];
-    a.rowb[0] = H * 2;
+    a.rowb[0] = rowb0 ? rowb0 : H * 2;  // (rowb0: the x arrays as compact rows of that size, FLASH_MOE_AGQ)
     a.rowb[1] = H * 2;
     a.rowb[2] = RW * 4;
     for (int g = 0; g < 4; g++) a.flags[g] = agpf_[g] ? agpf_[g] + ch * 4 : nullptr;
@@ -3229,7 +3614,7 @@ void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, cons
     a.scnt = agscnt_ + ch * 8;
     a.pm = 0;
     for (int g = 0; g < 8; g++) a.rr[g] = rr ? rr[g] : 0;
-    static const bool ce_env = getenv("FLASH_AG_CE") && atoi(getenv("FLASH_AG_CE"));  // 1: rows by the copy engine (26K 6.05 -> 6.13 s: slower)
+    static const bool ce_env = env_int("FLASH_AG_CE", 0);  // 1: rows by the copy engine (26K 6.05 -> 6.13 s: slower)
     const bool ce = ce_env || comm_.xfer == kXferCE;
     if (comm_.xfer == kXferHost && hag_h_ && hagf_ && rr) {
         // host staging: each card PULLS the peers' rows into its own arrays after their flags, then acknowledges, so the
@@ -3274,6 +3659,10 @@ void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, cons
                     CUDA_CHECK(cudaMemcpyAsync(a.dst[k][g] + (size_t)r0 * a.rowb[k], a.dst[k][p_.rank] + (size_t)r0 * a.rowb[k],
                                                (size_t)(r1 - r0) * a.rowb[k], cudaMemcpyDeviceToDevice, s));
         }
+        size_t eb = 0;
+        for (int k = 0; k < 3; k++)
+            if (((amask >> k) & 1) && r1 > r0) eb += (size_t)(r1 - r0) * a.rowb[k] * (p_.ngpu - 1);
+        comm_link_emul(comm_, p_.rank, eb, s, 1);
         if (agw_) {
             k_seq_word<<<1, 1, 0, s>>>(agw_ + ch, a.seq);
             for (int g = 0; g < p_.ngpu; g++)
@@ -3296,10 +3685,10 @@ void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, cons
 }
 
 bool Worker::hcsp_ok(int n) const {
-    static const bool on = !getenv("FLASH_HCSP") || atoi(getenv("FLASH_HCSP"));
-    static const bool ov = (!getenv("FLASH_AROV") || atoi(getenv("FLASH_AROV"))) && !g_kchk;
-    static const bool fused = !getenv("FLASH_ARHC") || atoi(getenv("FLASH_ARHC"));
-    static const bool dbg_sp = getenv("FLASH_DBGHASH") && atoi(getenv("FLASH_DBGHASH")) == 2;  // hashes on the sp path too
+    static const bool on = env_int("FLASH_HCSP", 1);
+    static const bool ov = (env_int("FLASH_AROV", 1)) && !g_kchk;
+    static const bool fused = env_int("FLASH_ARHC", 1);
+    static const bool dbg_sp = env_int("FLASH_DBGHASH", 0) == 2;  // hashes on the sp path too
     if (!on || !ov || !fused || p_.ngpu < 2 || (dbgh_ && !dbg_sp) || !agpf_[0] || n <= PFM) return false;
     for (int g = 0; g < p_.ngpu; g++) if (!agpf_[g] || !agdst_[0][g]) return false;
     for (int off = 0; off < n; off += PFM)
@@ -3318,10 +3707,10 @@ bool Worker::hcsp_ok(int n) const {
 // the all-reduce (a third of every chunk), then all-gathers x / xh. Layer 0 and layer 1's mixer input (PLE needs the
 // residual of every row) run as before. The last row's residual is gathered for the heads.
 void Worker::trunk_batch_sp1(int n, unsigned selmask) {
-    static const int fastn = getenv("FLASH_AROV_FAST") ? atoi(getenv("FLASH_AROV_FAST")) : 2;
+    static const int fastn = env_int("FLASH_AROV_FAST", 2);
     // overlapped all-reduce blocks: 16 here (the comm stream now also carries the HC reads and gathers: 26K 6.30 -> 6.19 s)
-    static const int ovb = getenv("FLASH_HCSP_OVB") ? atoi(getenv("FLASH_HCSP_OVB")) : 16;
-    static const bool xh_only = !getenv("FLASH_HCSP_X") || atoi(getenv("FLASH_HCSP_X")) == 0;  // 1: gather x and xh (exact x)
+    static const int ovb = env_int("FLASH_HCSP_OVB", 16);
+    static const bool xh_only = env_int("FLASH_HCSP_X", 0) == 0;  // 1: gather x and xh (exact x)
     ll_idx_ = 0;
     pfs_use_ = false;
     k_step_bump<<<1, 1, 0, st_>>>(stepc_);
@@ -3520,7 +3909,7 @@ void Worker::trunk_batch_sp1(int n, unsigned selmask) {
 //   layer's mixer u0 (the 27B's two micro-batches, with the MoE weights read once per unit).
 // ub: nu + 1 row bounds, cb: nu + 1 chunk bounds; returns nu
 int Worker::pf_units(int n, int* ub, int* cb) const {
-    static const int aru = getenv("FLASH_ARU") ? atoi(getenv("FLASH_ARU")) : ARU_MAX;
+    static const int aru = env_int("FLASH_ARU", ARU_MAX);
     const int nch = (n + PFM - 1) / PFM;
     int cpu = std::max(1, std::min(ARU_MAX, aru) / PFM);
     if (nch <= 2) cpu = 1;
@@ -3541,21 +3930,29 @@ int Worker::pf_units(int n, int* ub, int* cb) const {
 // The sync waits only for work whose peer half every card has already issued (all cards enqueue the same sequence).
 // Captured graphs (every later batch of the key) are unaffected.
 void Worker::eager_stage_sync() {
-    static const bool on = getenv("FLASH_CE_EAGER_SYNC") && atoi(getenv("FLASH_CE_EAGER_SYNC"));  // opt-in until validated
+    static const bool on = env_int("FLASH_CE_EAGER_SYNC", 0);  // opt-in until validated
     if (!on || !xstage_) return;
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(st_, &cs));
     if (cs == cudaStreamCaptureStatusNone) { CUDA_CHECK(cudaStreamSynchronize(st_)); CUDA_CHECK(cudaStreamSynchronize(cst_)); }
 }
 
+// several prompts in one batch: the step counter of every segment's slot (as k_step_bump of the bound one)
+__global__ void k_pf_bump(unsigned* __restrict__ stepcs, const int* __restrict__ segs, int nseg) {
+    if ((int)threadIdx.x < nseg) stepcs[segs[threadIdx.x]] += 1u;
+}
+
 void Worker::trunk_batch_sp(int n, unsigned selmask) {
-    static const bool units_on = !getenv("FLASH_PFU") || atoi(getenv("FLASH_PFU"));  // 0: per-chunk collectives (before r2)
+    static const bool units_on = env_int("FLASH_PFU", 1);  // 0: per-chunk collectives (before r2)
     if (!units_on) { trunk_batch_sp1(n, selmask); return; }
     // all-reduce blocks of a unit (every collective is overlapped now)
-    static const int ovb = getenv("FLASH_PFU_B") ? atoi(getenv("FLASH_PFU_B")) : 16;
+    static const int ovb = env_int("FLASH_PFU_B", 16);
     ll_idx_ = 0;
     pfs_use_ = false;
-    k_step_bump<<<1, 1, 0, st_>>>(stepc_);
+    // the step counter (parity of the pending-row buffers): the bound slot's, or every segment's in its storage
+    if (pfm_) k_pf_bump<<<1, 32, 0, st_>>>(stepcs_, segslot_d_, pfm_nseg_);
+    else k_step_bump<<<1, 1, 0, st_>>>(stepc_);
+    int* const rbc0 = rbcur_;
     float* const Rb = R_;
     bf16* const plerb = pler_;
     int* const posd0 = posd_;
@@ -3566,12 +3963,12 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     k_embed<<<n, 256, 0, st_>>>(embed_, toks_, Rb);
     KCHK("k_embed");
     int ub[64], cb[64];
-    const int nu = pf_units(n, ub, cb);
+    const int nu = pfm_ ? pf_units_multi(pf_co_, ub, cb) : pf_units(n, ub, cb);
     CHECK(nu <= (int)evd_.size(), "prefill units %d", nu);
     // MoE parts: whole units of FLASH_MOE_U rows at most (default: one unit; a larger part reads the expert weights
     // once for more rows, its collectives still go unit by unit), at least 2 parts when there are 2 units
     // (big batches, n > pfbn_base_: 2048-row parts, prefill-r3)
-    static const int moeu_e = getenv("FLASH_MOE_U") ? atoi(getenv("FLASH_MOE_U")) : -1;
+    static const int moeu_e = env_int("FLASH_MOE_U", -1);
     const int moeu = moeu_e >= 0 ? moeu_e : (n > pfbn_base_ ? 2048 : 0);
     int mb[65], nmp = 0;
     for (int u = 0; u < nu;) {
@@ -3584,10 +3981,10 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     // a layer whose MoE reads many host-backed groups zero-copy (not staged: a batch below FLASH_PF_STAGE_MIN, or past
     // the ring's capacity, e.g. 2 cards with ~15 GB host-backed) runs its MoE over the whole batch: every part would
     // read them over PCIe again (2 cards 26K: 9.8 -> 10.5 s with 2 parts)
-    static const double zc_mb = getenv("FLASH_MOE_ZC_MB") ? atof(getenv("FLASH_MOE_ZC_MB")) : 8.0;
+    static const double zc_mb = env_double("FLASH_MOE_ZC_MB", 8.0);
     const int mb1[2] = {0, nu};
     auto parts_of = [&](const Layer& L, const int*& pb) {
-        const int zc = pfs_use_ && &L != &mtp_ ? std::max(0, L.ncold - pfs_cap_) : L.ncold;  // (MTP: never staged)
+        const int zc = pfs_use_ && &L != &mtp_ ? std::max(0, L.ncold - pfs_capn()) : L.ncold;  // (MTP: never staged)
         if (nmp > 1 && (double)zc * GRP_BYTES > zc_mb * 1048576.0) { pb = mb1; return 1; }
         pb = mb;
         return nmp;
@@ -3604,22 +4001,61 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     }
     // the collective of unit u on cst_ after event `after`: sp = sequence-parallel (R updated on own rows, then the
     // next HC read on them and the all-gather of xh), else every row updated on every card; sli: steered layer output
-    auto ar_unit = [&](int u, cudaEvent_t after, bool sp, const HcW* next, int sli) {
+    // xk: byte-counter kind of the reduce-scatter (XB_RS_MIX / XB_RS_MOE; the gather after it is xk + 1)
+    // ml: the layer whose MoE input `next` is (FLASH_MOE_AGQ: quantized + routed here on the owner rows)
+    auto ar_unit = [&](int u, cudaEvent_t after, bool sp, const HcW* next, int sli, int xk, const Layer* ml = nullptr) {
         const int off = ub[u], mc = ub[u + 1] - off;
         CUDA_CHECK(cudaStreamWaitEvent(cst_, after, 0));
         CHECK(allreduce_add_hc(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H, mc, H, comm_, p_.rank,
                                ctr_, cst_, ovb, sp), "prefill unit: all-reduce");
         const int o0 = rows_of(u, p_.rank), o1 = rows_of(u, p_.rank + 1);
-        if (!sp) steer(sli, mc, nullptr, cst_, Rb + (size_t)off * RW, nullptr, nullptr);
-        else if (sli >= 0) steer(sli, o1 - o0, nullptr, cst_, Rb + (size_t)o0 * RW, nullptr, nullptr);
-        if (sp && next) {
+        xb_add(xk, (size_t)(mc - (o1 - o0)) * H * 2);                                  // partial rows to their owners (bf16)
+        if (!sp) xb_add(xk + 1, (size_t)(o1 - o0) * H * 2 * (p_.ngpu - 1));             // full mode: the owner's sums (bf16)
+        const bool agq = sp && next && ml && agq_on_ && ml->router8.q;
+        // CE: HC read + gather on the second comm stream (FLASH_AG_SPLIT), the next reduce-scatter starts meanwhile
+        const bool split = sp && next && cst2_ && ((xstage_ && comm_.xfer == kXferCE) || comm_.xfer == kXferP2P);
+        cudaStream_t const ps = split ? cst2_ : cst_;
+        if (sp && next) xb_add(xk + 1, (size_t)(o1 - o0) * (agq ? AGQ_ROWB : H * 2) * (p_.ngpu - 1));  // the next HC read's rows
+        // (several prompts: every row with its slot's steering)
+        if (!sp) steer(sli, mc, pfm_ ? rsl_d_ + off : nullptr, cst_, Rb + (size_t)off * RW, nullptr, nullptr);
+        else if (sli >= 0) steer(sli, o1 - o0, pfm_ ? rsl_d_ + o0 : nullptr, cst_, Rb + (size_t)o0 * RW, nullptr, nullptr);
+        if (split) {
+            CUDA_CHECK(cudaEventRecord(evs_, cst_));
+            CUDA_CHECK(cudaStreamWaitEvent(cst2_, evs_, 0));
+        }
+        if (sp && next && agq) {
+            // MoE input (FLASH_MOE_AGQ): HC read, router (W8A8 row GEMM + top-10 from bf16(xh), as moe() does) and the
+            // INT8 g64 quantization on the owner rows, compact rows (k_agq_pack) through the x arrays, unpacked into
+            // XQ + scales in the XH rows and the batch routing rows (gsel_ / gw_ / gsh_ at absolute rows)
             int rr[8];
             for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_of(u, g), rr[2 * g + 1] = rows_of(u, g + 1);
-            hc_rows(*next, Rb + (size_t)o0 * RW, injb + (size_t)o0 * HC, xb + (size_t)o0 * H, xhb + (size_t)o0 * H, o1 - o0, cst_);
-            row_ag(2, o0, o1, cst_, 0, rr);
-            k_xh_to_x<<<64, 256, 0, cst_>>>(xhb + (size_t)off * H, xb + (size_t)off * H, (size_t)mc * H / 2);
+            const int nr = o1 - o0;
+            __half* const xho = xhb + (size_t)o0 * H;
+            if (nr > 0) {
+                hc_rows(*next, Rb + (size_t)o0 * RW, injb + (size_t)o0 * HC, agq_x_, xho, nr, ps);
+                k_xh_to_x<<<64, 256, 0, ps>>>(xho, agq_x_, (size_t)nr * H / 2);
+                k_x_to_r8<<<nr, H / 16, 0, ps>>>(agq_x_, H, H, agq_r8_, agq_r8s_);
+                k_rows_q<<<dim3((nr + RQ_TB - 1) / RQ_TB, (ml->router8.n + RQ_NB - 1) / RQ_NB), 256, RQ_SMEM, ps>>>(
+                    ml->router8.q, ml->router8.s, H, ml->router8.n, agq_r8_, agq_r8s_, agq_rlog_, 528, nr);
+                k_topk_rows<<<nr, NE, 0, ps>>>(agq_rlog_, 1, gsel_ + (size_t)o0 * TOPK, gw_ + (size_t)o0 * TOPK, gsh_ + o0, nullptr, nr);
+                int8_t* const xq = reinterpret_cast<int8_t*>(xho);
+                k_xh_to_q<64><<<nr, 160, 0, ps>>>(xho, xq, reinterpret_cast<float2*>(xq + H));
+                k_agq_pack<<<nr, 160, 0, ps>>>(xho, gsel_ + (size_t)o0 * TOPK, gw_ + (size_t)o0 * TOPK, gsh_ + o0,
+                                                 reinterpret_cast<char*>(xb) + (size_t)o0 * AGQ_ROWB);
+                KCHK("agq owner");
+            }
+            row_ag(1, o0, o1, ps, 0, rr, AGQ_ROWB);
+            k_agq_unpack<<<mc, 160, 0, ps>>>(reinterpret_cast<const char*>(xb) + (size_t)off * AGQ_ROWB, xhb + (size_t)off * H,
+                                               gsel_ + (size_t)off * TOPK, gw_ + (size_t)off * TOPK, gsh_ + off, o0 - off, o1 - off);
+            KCHK("agq unpack");
+        } else if (sp && next) {
+            int rr[8];
+            for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_of(u, g), rr[2 * g + 1] = rows_of(u, g + 1);
+            hc_rows(*next, Rb + (size_t)o0 * RW, injb + (size_t)o0 * HC, xb + (size_t)o0 * H, xhb + (size_t)o0 * H, o1 - o0, ps);
+            row_ag(2, o0, o1, ps, 0, rr);
+            k_xh_to_x<<<64, 256, 0, ps>>>(xhb + (size_t)off * H, xb + (size_t)off * H, (size_t)mc * H / 2);
         }
-        CUDA_CHECK(cudaEventRecord(evd_[u], cst_));
+        CUDA_CHECK(cudaEventRecord(evd_[u], ps));
     };
     auto at_rows = [&](int off) {  // batch row views at row off
         R_ = Rb + (size_t)off * RW;
@@ -3629,11 +4065,19 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         x_ = xb + (size_t)off * H;
         xh_ = xhb + (size_t)off * H;
     };
+    // several prompts (pfm_): the chunk's KV region rows and attention variant; its segment's recurrent state of the
+    // layer comes into the workspace before its first chunk and goes back to the slot after its last one
     auto mixer_chunk = [&](Layer& L, int li, int c, bool spx) {
-        const int off = c * PFM, mc = std::min(PFM, n - off);
+        const int off = chunk_off(c, n), mc = chunk_off(c + 1, n) - off;
         posd_ = cposd_ + 2 * c;
         curpos_ = posd_;
         sel_on_ = (selmask >> c) & 1;
+        const int sg = pfm_ ? pf_cseg_[c] : -1;
+        if (pfm_) {
+            rbcur_ = rbch_d_ + (size_t)c * PFM;
+            pfdec_ = (pf_decmask_ >> c) & 1;
+            if (c == pf_sfirst_[sg]) pf_swap(li < 0 ? LAYERS : li, sg, true);
+        }
         at_rows(off);
         ypend_ = false;
         if (!spx) {
@@ -3642,6 +4086,10 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         }
         if (L.full) qsa(L, li, 0, mc);
         else gdn(L, li, 0, mc);
+        if (pfm_) {
+            if (c == pf_slast_[sg]) pf_swap(li < 0 ? LAYERS : li, sg, false);
+            rbcur_ = rbc0;
+        }
         eager_stage_sync();
     };
     auto last_row_R = [&](cudaStream_t s, int ch) {  // the last row's residual (owned by one rank of the last unit)
@@ -3653,6 +4101,24 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             rr[2 * g + 1] = has ? n : 0;
         }
         row_ag(4, rr[2 * p_.rank], rr[2 * p_.rank + 1], s, ch, rr);
+        xb_add(XB_MISC, (size_t)(rr[2 * p_.rank + 1] - rr[2 * p_.rank]) * RW * 4 * (p_.ngpu - 1));
+    };
+    // several prompts: the residual of every prompt-end row gathered from its owner, copied into mhR_ row j
+    auto ends_R = [&](cudaStream_t s, int ch) {
+        for (int j = 0; j < (int)pf_end_.size(); j++) {
+            const int row = pf_end_[j] - 1;
+            int u = 0;
+            while (ub[u + 1] <= row) u++;
+            int rr[8];
+            for (int g = 0; g < p_.ngpu; g++) {
+                const bool has = row >= rows_of(u, g) && row < rows_of(u, g + 1);
+                rr[2 * g] = has ? row : 0;
+                rr[2 * g + 1] = has ? row + 1 : 0;
+            }
+            row_ag(4, rr[2 * p_.rank], rr[2 * p_.rank + 1], s, ch, rr);
+            xb_add(XB_MISC, (size_t)(rr[2 * p_.rank + 1] - rr[2 * p_.rank]) * RW * 4 * (p_.ngpu - 1));
+            k_copy_row<<<RW / 512, 512, 0, s>>>(mhR_ + (size_t)j * RW, Rb, nullptr, row);
+        }
     };
     auto reset_rows = [&]() { at_rows(0); posd_ = posd0; curpos_ = posd_; };
     for (int li = 0; li < LAYERS; li++) {
@@ -3660,15 +4126,23 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         const bool spm = li >= 1;  // this layer's mixer all-reduce is sequence-parallel (the MoE input HC on own rows)
         const bool spx = li >= 2;  // this layer's mixer input was gathered by the previous layer's MoE all-reduce
         // QSA layers, P2P: chunk c's partial combine + o_proj after chunk c + 1's front half (FLASH_QSA_PIPE=1)
-        static const bool qpipe = getenv("FLASH_QSA_PIPE") && atoi(getenv("FLASH_QSA_PIPE"));  // opt-in: 26K -0.3 % (noise)
-        if (L.full && qpipe && projB_ && !xstage_ && comm_.p2p && !dbgh_ && cb[nu] > 1) {
+        static const bool qpipe = env_int("FLASH_QSA_PIPE", 0);  // opt-in: 26K -0.3 % (noise)
+        // CE (FLASH_QSA_PIPE_CE, default 1): the same pipeline with the partial copies on a side stream. Only with the q
+        // exchange (FLASH_QX_LOCAL=0): the q exchange of chunk c + 2 keeps a peer from writing that chunk's partials into
+        // the receive slot of chunk c before its combine ran here. With QX_LOCAL on, the earlier rule "all chunks of the
+        // batch have block selection (the indexer exchange orders it)" was not enough: on a 2-GPU CE server
+        // (FLASH_MAX_SEQS=4, 10K-240K prompts) the first spec step after the prefill hit non-finite values on most
+        // requests (2026-10-30); either switch off alone was clean
+        static const bool qpipe_ce = env_int("FLASH_QSA_PIPE_CE", 1);
+        const bool pipe_ce = qpipe_ce && xstage_ && comm_.xfer == kXferCE && xcs_ && !qx_on_;
+        if (L.full && projB_ && !dbgh_ && cb[nu] > 1 && ((qpipe && !xstage_ && comm_.p2p) || pipe_ce)) {
             int pend = -1, pend_u = -1;
             auto back = [&](int c, int uu) {
-                at_rows(c * PFM);
+                at_rows(chunk_off(c, n));
                 qsa_back(c & 1);
                 if (c == cb[uu + 1] - 1) {  // the unit's last chunk: its collective
                     CUDA_CHECK(cudaEventRecord(evp_[uu], st_));
-                    ar_unit(uu, evp_[uu], spm, spm ? &L.hcm : nullptr, -1);
+                    ar_unit(uu, evp_[uu], spm, spm ? &L.hcm : nullptr, -1, XB_RS_MIX, &L);
                 }
             };
             for (int u = 0; u < nu; u++) {
@@ -3686,19 +4160,21 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             }
             back(pend, pend_u);
             qsa_ahead_ = 0;
+            for (int q = 0; q < 2; q++)  // join the side copies (CE pipeline)
+                if (xce_rec_[q]) CUDA_CHECK(cudaStreamWaitEvent(st_, xce_[q], 0));
         } else
         for (int u = 0; u < nu; u++) {
             if (li > 0) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));  // the previous layer's MoE unit u
             for (int c = cb[u]; c < cb[u + 1]; c++) mixer_chunk(L, li, c, spx);
             CUDA_CHECK(cudaEventRecord(evp_[u], st_));
-            ar_unit(u, evp_[u], spm, spm ? &L.hcm : nullptr, -1);
+            ar_unit(u, evp_[u], spm, spm ? &L.hcm : nullptr, -1, XB_RS_MIX, &L);
         }
         const int* pb = mb;
         const int np = parts_of(L, pb);
         for (int p = 0; p < np; p++) {  // MoE parts: units [pb[p], pb[p + 1])
             const int u0 = pb[p], u1 = pb[p + 1], off = ub[u0], mc = ub[u1] - off;
             for (int u = u0; u < u1; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));
-            static const int dbg_ser = getenv("FLASH_DBG_MOESER") ? atoi(getenv("FLASH_DBG_MOESER")) : 0;  // debug
+            static const int dbg_ser = env_int("FLASH_DBG_MOESER", 0);  // debug
             if (dbg_ser && p > 0) for (int u = pb[p - 1]; u < u0; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));
             reset_rows();
             at_rows(off);
@@ -3706,7 +4182,12 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             if (p == 0 && pfs_use_) CUDA_CHECK(cudaStreamWaitEvent(st_, pfs_cp_[li & 1], 0));
             if (dbgh_) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), (size_t)mc * H / 2, dbgh_ + li * DBGK + 3);
             if (rowh_) k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 0);
+            // MoE input quantized + routed by the mixer collectives (FLASH_MOE_AGQ): the routing rows of this part
+            const bool pre = spm && agq_on_ && L.router8.q;
+            int* const gs0 = gsel_; float* const gw0 = gw_; float* const gh0 = gsh_;
+            if (pre) { gsel_ = gs0 + (size_t)off * TOPK; gw_ = gw0 + (size_t)off * TOPK; gsh_ = gh0 + off; moe_pre_ = true; }
             moe(L, mc);
+            if (pre) { gsel_ = gs0; gw_ = gw0; gsh_ = gh0; moe_pre_ = false; }
             if (rowh_) {
                 k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 1);
                 k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), H, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 2);
@@ -3715,8 +4196,8 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             }
             CUDA_CHECK(cudaEventRecord(evp_[u0], st_));
             for (int u = u0; u < u1; u++) {
-                if (li == 0) ar_unit(u, evp_[u0], false, nullptr, li);  // layer 1's mixer input (PLE) needs every row's residual
-                else ar_unit(u, evp_[u0], true, li + 1 < LAYERS ? &L_[li + 1].hca : nullptr, li);
+                if (li == 0) ar_unit(u, evp_[u0], false, nullptr, li, XB_RS_MOE);  // layer 1's mixer input (PLE) needs every row's residual
+                else ar_unit(u, evp_[u0], true, li + 1 < LAYERS ? &L_[li + 1].hca : nullptr, li, XB_RS_MOE);
             }
             eager_stage_sync();
         }
@@ -3735,6 +4216,19 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     }
     for (int u = 0; u < nu; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));  // join
     ypend_ = false;
+    const int nend = (int)pf_end_.size();
+    if (pfm_) {  // several prompts: the heads of the prompt ends (their residual rows gathered in mhR_)
+        if (nend > 0) {
+            ends_R(st_, 1);
+            R_ = mhR_;
+            hc_read(mixer_, nend, false);
+            R_ = Rb;
+            bool samp = false;
+            for (int j = 0; j < nend; j++) samp = samp || sson_.at(hsl_h_[j]);
+            if (samp) head_sample_b(nend, otok_, hsl_d_);
+            else head(nend, otok_);
+        }
+    } else {
     last_row_R(st_, 1);
     x_ = xb + (size_t)(n - 1) * H;
     xh_ = xhb + (size_t)(n - 1) * H;
@@ -3743,12 +4237,17 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     R_ = Rb;
     if (sampling_) head_sample(1, otok_);
     else head(1, otok_);
+    }
     x_ = xb;
     xh_ = xhb;
     if (!mtpb_) return;
     // MTP block as a 49th layer: residual rows from the trunk's own rows (in place), hca on own rows + gather on st_
     // (channel 1), its collectives on cst_ (channel 0), unit by unit as the trunk
-    if (mtpb_last_) k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, n, otok_);
+    if (pfm_)
+        for (int j = 0; j < nend; j++) k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, pf_end_[j], otok_ + j);
+    else if (mtpb_last_) k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, n, otok_);
+    xb_base_ = 8;
+    struct XbBase { int& b; ~XbBase() { b = 0; } } xbb{xb_base_};
     for (int u = 0; u < nu; u++) {
         const int off = ub[u], mc = ub[u + 1] - off;
         const int o0 = rows_of(u, p_.rank), o1 = rows_of(u, p_.rank + 1), nr = o1 - o0;
@@ -3764,18 +4263,29 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         int rr[8];
         for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_of(u, g), rr[2 * g + 1] = rows_of(u, g + 1);
         row_ag(2, o0, o1, st_, 1, rr);
+        xb_add(XB_AG_MIXIN, (size_t)nr * H * 2 * (p_.ngpu - 1));
         k_xh_to_x<<<64, 256, 0, st_>>>(xhb + (size_t)off * H, xb + (size_t)off * H, (size_t)mc * H / 2);
         for (int c = cb[u]; c < cb[u + 1]; c++) {
-            const int coff = c * PFM, cm = std::min(PFM, n - coff);
+            const int coff = chunk_off(c, n), cm = chunk_off(c + 1, n) - coff;
             posd_ = cposd_ + 2 * c;
             curpos_ = posd_;
             sel_on_ = (selmask >> c) & 1;
+            const int sg = pfm_ ? pf_cseg_[c] : -1;
+            if (pfm_) {
+                rbcur_ = rbch_d_ + (size_t)c * PFM;
+                pfdec_ = (pf_decmask_ >> c) & 1;
+                if (c == pf_sfirst_[sg]) pf_swap(LAYERS, sg, true);
+            }
             at_rows(coff);
             ypend_ = false;
             qsa(mtp_, -1, 0, cm);
+            if (pfm_) {
+                if (c == pf_slast_[sg]) pf_swap(LAYERS, sg, false);
+                rbcur_ = rbc0;
+            }
         }
         CUDA_CHECK(cudaEventRecord(evp_[u], st_));
-        ar_unit(u, evp_[u], true, &mtp_.hcm, -1);
+        ar_unit(u, evp_[u], true, &mtp_.hcm, -1, XB_RS_MIX);
     }
     {
         const int* pb = mb;
@@ -3787,12 +4297,24 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             at_rows(off);
             moe(mtp_, mc);
             CUDA_CHECK(cudaEventRecord(evp_[u0], st_));
-            for (int u = u0; u < u1; u++) ar_unit(u, evp_[u0], true, nullptr, -1);
+            for (int u = u0; u < u1; u++) ar_unit(u, evp_[u0], true, nullptr, -1, XB_RS_MOE);
         }
     }
     reset_rows();
     for (int u = 0; u < nu; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));  // join
     ypend_ = false;
+    if (pfm_) {  // several prompts: the MTP drafts of the prompt ends; their chain rows stay in mhR_ (prefill_multi)
+        if (nend > 0) {
+            ends_R(st_, 1);
+            R_ = mhR_;
+            hc_read(mtp_mixer_, nend, false);
+            R_ = Rb;
+            head(nend, motok_, true);
+        }
+        x_ = xb;
+        xh_ = xhb;
+        return;
+    }
     last_row_R(st_, 1);
     k_copy_row<<<RW / 512, 512, 0, st_>>>(Rmin_, Rb, nullptr, n - 1);  // the draft chain continues from the last row
     x_ = xb + (size_t)(n - 1) * H;
@@ -3813,19 +4335,21 @@ void Worker::trunk_batch(int n, unsigned selmask) {
         explicit Stage(Worker* x) : w(x) {
             if (!w->xout_) return;
             k_xpar_align<<<1, 1, 0, w->st_>>>(w->xseq_, w->xqseq_);
+            if (w->xouti_) k_xpar_align<<<1, 1, 0, w->st_>>>(w->xiseq_, w->xiseq_);
             w->xstage_ = true;
-            w->xq_k_ = w->xc_k_ = 0;
+            w->xq_k_ = w->xc_k_ = w->xi_k_ = 0;
+            w->xce_rec_[0] = w->xce_rec_[1] = false;
         }
         ~Stage() { w->xstage_ = false; }
     } stage(this);
-    if (hcsp_ok(n)) {
+    if (pfm_ || hcsp_ok(n)) {  // (several prompts: always this path, pf_multi_ok checked its conditions)
         static bool said = false;
         if (!said && p_.rank == 0) { said = true; fprintf(stderr, "[flash] prefill: sequence-parallel HC (FLASH_HCSP)\n"); }
         trunk_batch_sp(n, selmask);
         return;
     }
-    static const bool ll = !getenv("FLASH_LL") || atoi(getenv("FLASH_LL"));
-    static const bool ov = (!getenv("FLASH_AROV") || atoi(getenv("FLASH_AROV"))) && !g_kchk;  // FLASH_AROV=0: same stream
+    static const bool ll = env_int("FLASH_LL", 1);
+    static const bool ov = (env_int("FLASH_AROV", 1)) && !g_kchk;  // FLASH_AROV=0: same stream
     ll_idx_ = 0;
     pfs_use_ = false;  // staged cold groups only in the overlapped multi-chunk path below (it issues the copies)
     k_step_bump<<<1, 1, 0, st_>>>(stepc_);
@@ -3846,14 +4370,14 @@ void Worker::trunk_batch(int n, unsigned selmask) {
         CUDA_CHECK(cudaStreamWaitEvent(cst_, evm_, 0));  // fork (graph capture: cst_ joins here)
         // fast = the all-reduce is on the critical path (the last mixer chunk before the MoE half, the first MoE piece
         // before the next layer): 64 blocks instead of the few overlapped ones
-        static const int fastn = getenv("FLASH_AROV_FAST") ? atoi(getenv("FLASH_AROV_FAST")) : 2;
+        static const int fastn = env_int("FLASH_AROV_FAST", 2);
         auto ar_chunk = [&](int c, cudaEvent_t after, bool fast = false, int sli = -1) {
             const int off = c * PFM, mc = std::min(PFM, n - off);
             CUDA_CHECK(cudaStreamWaitEvent(cst_, after, 0));
-            static const int sc = getenv("FLASH_AROV_SPINC") ? atoi(getenv("FLASH_AROV_SPINC")) : 0;  // debug: lag the comm stream (ns)
+            static const int sc = env_int("FLASH_AROV_SPINC", 0);  // debug: lag the comm stream (ns)
             if (sc) k_spin<<<1, 1, 0, cst_>>>(sc);
-            static const bool fused = !getenv("FLASH_ARHC") || atoi(getenv("FLASH_ARHC"));  // residual update in the AR tail
-            static const int ovb = getenv("QE_AR_OV_BLOCKS") ? atoi(getenv("QE_AR_OV_BLOCKS")) : 8;  // fused tail: 8 (sweep 4 / 8 / 12 / 16)
+            static const bool fused = env_int("FLASH_ARHC", 1);  // residual update in the AR tail
+            static const int ovb = env_int("QE_AR_OV_BLOCKS", 8);  // fused tail: 8 (sweep 4 / 8 / 12 / 16)
             if (!(fused && allreduce_add_hc(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H, mc, H, comm_,
                                             p_.rank, ctr_, cst_, fast ? 64 : ovb))) {
                 allreduce_add(yb + (size_t)off * H, partb + (size_t)off * H, mc, H, comm_, p_.rank, ctr_, cst_, nullptr, 0.f,
@@ -3876,7 +4400,7 @@ void Worker::trunk_batch(int n, unsigned selmask) {
             for (int c = 0; c < nch; c++) {
                 const int off = c * PFM, mc = std::min(PFM, n - off);
                 if (li > 0) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));  // MoE piece c of the previous layer
-                static const int sm = getenv("FLASH_AROV_SPINM") ? atoi(getenv("FLASH_AROV_SPINM")) : 0;  // debug: lag compute
+                static const int sm = env_int("FLASH_AROV_SPINM", 0);  // debug: lag compute
                 if (sm && ((li * 7 + c * 3 + p_.rank) % 5 == 0)) k_spin<<<1, 1, 0, st_>>>(sm);
                 posd_ = cposd_ + 2 * c;
                 curpos_ = posd_;
@@ -4016,7 +4540,7 @@ void Worker::trunk_batch(int n, unsigned selmask) {
 // it. Rows past pfbn_base_ are expert cache slots between big batches (bt_regs_), i.e. arbitrary bytes when a big batch
 // takes them: those rows of y are cleared at the start of every big batch (inside its graph). Without this, a chunk whose
 // all-reduce takes the generic path (allreduce_add into y + k_hc_write: a last chunk of < 3 x ngpu rows, or FLASH_AROV=0)
-// added the sums to expert weights: NaN / garbage residual rows from that layer on (1.3-rc2 server garble: batches end at
+// added the sums to expert weights: NaN / garbage residual rows from that layer on (a server garble seen in testing: batches end at
 // the checkpoints, e.g. [20986, 24576) = 3590 rows, last chunk 6 rows; flash_run never cut there).
 void Worker::bt_clear_y(int n) {
     if (n > pfbn_base_) CUDA_CHECK(cudaMemsetAsync(y_ + (size_t)pfbn_base_ * H, 0, (size_t)(n - pfbn_base_) * H * 4, st_));
@@ -4029,27 +4553,37 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
     CHECK(pos + n <= max_ctx_, "flash: context %d > %d", pos + n, max_ctx_);
     bt_want_ = n > pfbn_base_;
     CHECK(!bt_want_ || ec_on_ || !ec_n_, "flash: big batch without the expert cache");
-    static const bool pft_host = getenv("FLASH_PFT_HOST") && atoi(getenv("FLASH_PFT_HOST"));  // debug: host phases
+    static const bool pft_host = env_int("FLASH_PFT_HOST", 0);  // debug: host phases
     const double th0 = pft_host ? now_s() : 0.0;
     ec_tick(pos + n, 1);
     const double th1 = pft_host ? now_s() : 0.0;
     bt_want_ = false;  // (the next tick gives the tails back to the cache unless it is another big batch)
     // cold groups staged by the copy engine for batches of >= FLASH_PF_STAGE_MIN rows (short ones read only the groups
     // they touch, zero-copy)
-    static const int pfs_min = getenv("FLASH_PF_STAGE_MIN") ? atoi(getenv("FLASH_PF_STAGE_MIN")) : 2048;
+    static const int pfs_min = env_int("FLASH_PF_STAGE_MIN", 2048);
     pfs_now_ = pfs_mode_ && n >= pfs_min && (n + PFM - 1) / PFM > 1 && pfs_borrow();
+    // the ring extension: always (own memory) or while the cache has given its slots back (a big batch; the graph key
+    // has n, so a replay always sees the same choice)
+    pfs_full_ = pfs_ext_ ? (!pfs_ext_lent_ || bt_taken_) : true;
     use(pfb_);
     pf_ = true;
     rd_pos_ = pos;
     const unsigned sel = batch_sel(pos, n);
     memcpy(pfh_tok_, tokens, (size_t)n * 4);
     memcpy(pfh_ple_, ple_rows, (size_t)n * H * 2);
-    static const bool mtp_in = !getenv("FLASH_MTPB") || atoi(getenv("FLASH_MTPB"));  // MTP fill inside the batch pipeline
+    static const bool mtp_in = env_int("FLASH_MTPB", 1);  // MTP fill inside the batch pipeline
     mtpb_ = mtp_toks && has_mtp_ && mtp_in && (n + PFM - 1) / PFM > 1;
     mtpb_last_ = last;
     if (mtpb_) memcpy(pfh_mt_, mtp_toks, (size_t)n * 4);
     const int nch = (n + PFM - 1) / PFM;
+    // long contexts: QSA prefill attention per row (k_qsa_dec) instead of the row-group kernel (k_qsa_pfsel): the union
+    // of 8 rows' selected blocks grows with the context (x1.35 of one row at 2K, ~x3.2 at 60-90K), so pfsel's per-tile
+    // work for 96 q rows is mostly masked there (2 GPUs 90K: 17.45 -> 16.91 s; 16K: 3.093 vs 3.114 s, pfsel kept below
+    // FLASH_ATTN_PFSEL_MAX positions, default 8192 (90K: 32768 17.09 s, 16384 17.02, 8192 16.93, 0 16.91); KL at 90K 8.7e-3 vs run-to-run noise 3.8e-2)
+    static const long long pfsel_max = env_ll("FLASH_ATTN_PFSEL_MAX", 8192);
+    pfdec_ = (long long)pos >= pfsel_max;
     const long long key = ((long long)sel << 24) | ((long long)n << 3) | ((long long)sampling_ << 1) | (prev_m_ > 0 ? 1 : 0) |
+                          ((long long)pfdec_ << 59) |
                           ((long long)con_ << 50) |
                           ((long long)mtpb_ << 61) | ((long long)(mtpb_ && last) << 62) | ((long long)pfs_now_ << 58);
     const double th2 = pft_host ? now_s() : 0.0;
@@ -4079,7 +4613,7 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
             }
         fprintf(stderr, "[qpf_nan] rank %d: %d checks\n", p_.rank, qnan_n_);
     }
-    static const bool ecv = getenv("FLASH_EC_VERIFY") && atoi(getenv("FLASH_EC_VERIFY"));
+    static const bool ecv = env_int("FLASH_EC_VERIFY", 0);
     if (ecv) { char w[48]; snprintf(w, sizeof(w), "after prefill batch pos %d", pos); ec_verify(w); }
     if (selst_) {
         unsigned long long h[3];
@@ -4093,9 +4627,269 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
     mtpb_ = false;
     if (draft && !done_mtp) *draft = -2;  // not handled here: the caller runs prefill_batch_mtp
     pfs_now_ = false;
+    pfdec_ = false;
     pf_ = false;
     use(dec_);
     prev_m_ = 0;  // prefill rows are committed already
+}
+
+// ---------------------------------------------------------------- several prompts in one batch (batched-prefill)
+// A batch of rows of several prompts: each prompt's rows are a segment cut into PFM-row chunks from its first row, the
+// mixer runs chunk by chunk with the chunk's own positions (cposd_), KV region rows (rbch_d_) and the segment's recurrent
+// state (moved between its slot storage and the workspace around the segment's chunks, k_pf_swap), the HC / collective
+// units and the MoE half over all rows of all prompts (each expert group read once per batch for every prompt).
+struct PfSwapArg {
+    float* ws[TB_N];
+    int n[TB_N];        // floats of each piece (0: the layer has none)
+    float** tab;        // [TB_N][LAYERS + 1][slots] slot storage
+    int ns, li;
+    const int* slot;    // the segment's slot (device: one graph serves any slot assignment)
+    const int* commit;  // its pending rows (cposd_ of its first chunk): the pending pieces only when > 0
+    unsigned* wstep;    // the workspace step counter
+    const unsigned* sstep;  // per-slot step counters
+    int load;
+};
+__global__ void k_pf_swap(PfSwapArg a) {
+    const int s = *a.slot;
+    const bool pend = a.load && a.commit && *a.commit > 0;
+    if (a.load && blockIdx.x == 0 && threadIdx.x == 0) *a.wstep = a.sstep[s];
+    for (int k = 0; k < TB_N; k++) {
+        if (!a.n[k] || !a.ws[k]) continue;
+        if ((k == TB_CP || k == TB_RP || k == TB_PP) && !pend) continue;  // pending rows: read by the commit only
+        float* st = a.tab[((size_t)k * (LAYERS + 1) + a.li) * a.ns + s];
+        if (!st) continue;
+        float* dst = a.load ? a.ws[k] : st;
+        const float* src = a.load ? st : a.ws[k];
+        const int n4 = a.n[k] / 4;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x)
+            reinterpret_cast<float4*>(dst)[i] = reinterpret_cast<const float4*>(src)[i];
+        for (int i = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < a.n[k]; i += gridDim.x * blockDim.x) dst[i] = src[i];
+    }
+}
+
+void Worker::pf_swap(int li, int seg, bool load) {
+    const Layer& L = li < LAYERS ? L_[li] : mtp_;
+    const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
+    const int ch = 2 * kl * DK + vl * DV;
+    PfSwapArg a{};
+    float* const ws[TB_N] = {L.S, L.conv_hist, L.conv_pend, L.rec_pend, L.ple_hist, L.ple_pend, L.ik_tail};
+    const long long nf[TB_N] = {(long long)vl * DK * DV, 3LL * ch, (long long)MAXP * ch, 2LL * MAXP * vl * (2 * 128 + 2),
+                                9LL * RW, (long long)MAXP * RW, (long long)IDX_TAIL * IDX_HD};
+    bool any = false;
+    for (int k = 0; k < TB_N; k++) {
+        a.ws[k] = ws[k];
+        a.n[k] = ws[k] ? (int)nf[k] : 0;
+        any = any || (ws[k] && !(k == TB_CP || k == TB_RP || k == TB_PP));
+    }
+    if (!any) return;  // nothing per sequence in this layer's mixer (KV rows are addressed per chunk)
+    a.tab = tab_;
+    a.ns = (int)slots_.size();
+    a.li = li;
+    a.slot = segslot_d_ + seg;
+    a.commit = cposd_ + 2 * pf_sfirst_[seg] + 1;
+    a.wstep = stepc_;
+    a.sstep = stepcs_;
+    a.load = load ? 1 : 0;
+    k_pf_swap<<<64, 256, 0, st_>>>(a);
+    KCHK("k_pf_swap");
+}
+
+int Worker::pf_layout(const int* segn, int nseg, std::vector<int>& co, std::vector<int>& cseg) const {
+    co.clear();
+    cseg.clear();
+    int r = 0;
+    for (int j = 0; j < nseg; j++) {
+        for (int o = 0; o < segn[j]; o += PFM) {
+            co.push_back(r + o);
+            cseg.push_back(j);
+        }
+        r += segn[j];
+    }
+    co.push_back(r);
+    return (int)co.size() - 1;
+}
+
+// collective units of a multi-prompt batch: consecutive chunks (any prompts) of at most ARU_MAX rows together
+int Worker::pf_units_multi(const std::vector<int>& co, int* ub, int* cb) const {
+    static const int aru = env_int("FLASH_ARU", ARU_MAX);
+    const int cap = std::max(PFM, std::min(ARU_MAX, aru));
+    const int nch = (int)co.size() - 1;
+    int nu = 0;
+    for (int c = 0; c < nch;) {
+        cb[nu] = c;
+        ub[nu] = co[c];
+        int e = c + 1;
+        while (e < nch && co[e + 1] - co[c] <= cap) e++;
+        c = e;
+        nu++;
+    }
+    cb[nu] = nch;
+    ub[nu] = co[nch];
+    return nu;
+}
+
+bool Worker::pf_multi_ok(const int* segn, int nseg) const {
+    static const bool on = env_int("FLASH_HCSP", 1) && env_int("FLASH_PFU", 1) && env_int("FLASH_AROV", 1) &&
+                           env_int("FLASH_ARHC", 1) && !g_kchk;
+    if (!on || p_.ngpu < 2 || nseg < 1 || nseg > PFSEG_MAX || dbgh_ || rowh_ || !agpf_[0] || (has_mtp_ && !Rmins_)) return false;
+    for (int g = 0; g < p_.ngpu; g++) if (!agpf_[g] || !agdst_[0][g]) return false;
+    for (const Layer& L : L_) if (!L.hca.uq || !L.hcm.uq) return false;
+    if (has_mtp_ && (!mtp_.hca.uq || !mtp_.hcm.uq)) return false;
+    int n = 0;
+    for (int j = 0; j < nseg; j++) {
+        if (segn[j] < 1) return false;
+        n += segn[j];
+    }
+    if (n > pfbn_) return false;
+    std::vector<int> co, cseg;
+    const int nch = pf_layout(segn, nseg, co, cseg);
+    if (nch > 32 || nch > (int)evd_.size()) return false;  // selection / attention masks are 32 bits
+    int ub[64], cb[64];
+    const int nu = pf_units_multi(co, ub, cb);
+    if (nu > 63) return false;
+    for (int u = 0; u < nu; u++)
+        if (!allreduce_hc_ok(comm_, ub[u + 1] - ub[u], H) || ub[u + 1] - ub[u] > AG_CAP * p_.ngpu) {
+            static const bool lg = env_int("FLASH_PF_MULTI_LOG", 0) != 0;
+            if (lg) fprintf(stderr, "[flash] prefill batch: unit %d of %d has %d rows (collective limit %d rows)\n", u, nu,
+                            ub[u + 1] - ub[u], comm_.rs_rows);
+            return false;
+        }
+    return true;
+}
+
+void Worker::rmin_load(int slot) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    if (!Rmins_ || !Rmin_) return;
+    CUDA_CHECK(cudaMemcpyAsync(Rmin_, Rmins_ + (size_t)slot * RW, (size_t)RW * 4, cudaMemcpyDeviceToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+
+void Worker::prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const bf16* ple_rows, const int* mtp_toks, int* out,
+                           int* draft) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    std::vector<int> segn(nseg);
+    int n = 0;
+    long long ctx_abs = 0;
+    for (int j = 0; j < nseg; j++) {
+        segn[j] = sg[j].n;
+        n += sg[j].n;
+        CHECK(sg[j].pos + sg[j].n <= max_ctx_, "flash: context %d > %d", sg[j].pos + sg[j].n, max_ctx_);
+        ctx_abs = std::max(ctx_abs, (long long)sg[j].base * p_.period + sg[j].pos + sg[j].n);
+    }
+    CHECK(pf_multi_ok(segn.data(), nseg), "flash prefill_multi: layout of %d prompts, %d rows", nseg, n);
+    // the bound slot's state and sampling parameters to its storage: every segment's state is read from its slot
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    ws_save();
+    if (spslot_) CUDA_CHECK(cudaMemcpyAsync(spslot_ + cur_slot_, sp_, sizeof(SampleParams), cudaMemcpyDeviceToDevice, st_));
+    {  // multimodal RoPE: no segment has image rows or a shift (prefill_multi callers): plain positions for every chunk
+        const int c[2] = {-2, 0};
+        if (mmcur_) CUDA_CHECK(cudaMemcpyAsync(mmcur_, c, 8, cudaMemcpyHostToDevice, st_));
+    }
+    pf_nch_ = pf_layout(segn.data(), nseg, pf_co_, pf_cseg_);
+    pfm_nseg_ = nseg;
+    pf_sfirst_.assign(nseg, -1);
+    pf_slast_.assign(nseg, -1);
+    pf_end_.clear();
+    std::vector<int> segstart(nseg, 0);
+    for (int j = 1; j < nseg; j++) segstart[j] = segstart[j - 1] + segn[j - 1];
+    static const long long pfsel_max = env_ll("FLASH_ATTN_PFSEL_MAX", 8192);
+    unsigned sel = 0;
+    pf_decmask_ = 0;
+    for (int c = 0; c < pf_nch_; c++) {
+        const int j = pf_cseg_[c];
+        if (pf_sfirst_[j] < 0) pf_sfirst_[j] = c;
+        pf_slast_[j] = c;
+        const int pc = sg[j].pos + (pf_co_[c] - segstart[j]), mc = pf_co_[c + 1] - pf_co_[c];
+        cposh_[2 * c] = pc;
+        cposh_[2 * c + 1] = c == pf_sfirst_[j] ? sg[j].commit : 0;
+        if (pc + mc > IDX_BUDGET + IDX_R - 1) sel |= 1u << c;
+        if ((long long)pc >= pfsel_max) pf_decmask_ |= 1u << c;
+        for (int r = 0; r < PFM; r++) rbch_h_[(size_t)c * PFM + r] = sg[j].base * p_.own;
+    }
+    bool samp = false;
+    for (int j = 0; j < nseg; j++) {
+        segslot_h_[j] = sg[j].slot;
+        for (int r = 0; r < sg[j].n; r++) rsl_h_[segstart[j] + r] = sg[j].slot;
+        if (sg[j].end) {
+            hsl_h_[pf_end_.size()] = sg[j].slot;
+            pf_end_.push_back(segstart[j] + sg[j].n);
+            samp = samp || sson_.at(sg[j].slot);
+        }
+    }
+    const int nend = (int)pf_end_.size();
+    bt_want_ = n > pfbn_base_;
+    CHECK(!bt_want_ || ec_on_ || !ec_n_, "flash: big batch without the expert cache");
+    ec_tick((int)(ctx_abs - ctx_off_), 1);  // KV in RAM: host rows up to the furthest segment end pinned
+    bt_want_ = false;
+    static const int pfs_min = env_int("FLASH_PF_STAGE_MIN", 2048);
+    pfs_now_ = pfs_mode_ && n >= pfs_min && pf_nch_ > 1 && pfs_borrow();
+    pfs_full_ = pfs_ext_ ? (!pfs_ext_lent_ || bt_taken_) : true;
+    use(pfb_);
+    pf_ = true;
+    rd_pos_ = 0;
+    memcpy(pfh_tok_, tokens, (size_t)n * 4);
+    memcpy(pfh_ple_, ple_rows, (size_t)n * H * 2);
+    static const bool mtp_in = env_int("FLASH_MTPB", 1);
+    mtpb_ = mtp_toks && has_mtp_ && mtp_in;
+    mtpb_last_ = false;
+    if (mtpb_) memcpy(pfh_mt_, mtp_toks, (size_t)n * 4);
+    const bool con0 = con_;
+    con_ = false;  // constrained requests never join (callers); the bound slot's mask does not apply here
+    pfm_ = true;
+    // graph key: the layout (chunk rows, segments, prompt ends) and what the capture branches on
+    std::vector<int> desc = {n, pf_nch_, nseg, (int)sel, (int)pf_decmask_, mtpb_, samp, pfs_now_, pfs_full_};
+    for (int c = 0; c <= pf_nch_; c++) desc.push_back(pf_co_[c]);
+    for (int c = 0; c < pf_nch_; c++) desc.push_back(pf_cseg_[c]);
+    for (int e : pf_end_) desc.push_back(e);
+    auto [it, fresh] = pm_ids_.emplace(desc, (long long)pm_ids_.size() + 1);
+    (void)fresh;
+    const long long key = it->second;
+    const int nch = pf_nch_;
+    run_cached(pmgraphs_, key, [&] {
+        CUDA_CHECK(cudaMemcpyAsync(cposd_, cposh_, (size_t)2 * nch * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(toks_, pfh_tok_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(pler_, pfh_ple_, (size_t)n * H * 2, cudaMemcpyHostToDevice, st_));
+        if (mtpb_) CUDA_CHECK(cudaMemcpyAsync(mtok_, pfh_mt_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(rbch_d_, rbch_h_, (size_t)nch * PFM * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(segslot_d_, segslot_h_, PFSEG_MAX * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(rsl_d_, rsl_h_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(hsl_d_, hsl_h_, PFSEG_MAX * 4, cudaMemcpyHostToDevice, st_));
+        bt_clear_y(n);
+        comm_begin_unit(ctr_, st_);
+        trunk_batch(n, sel);
+        if (nend > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(pfmo_h_, otok_, (size_t)nend * 4, cudaMemcpyDeviceToHost, st_));
+            if (mtpb_) CUDA_CHECK(cudaMemcpyAsync(pfmo_h_ + PFSEG_MAX, motok_, (size_t)nend * 4, cudaMemcpyDeviceToHost, st_));
+        }
+    });
+    // the MTP chain rows of the prompt ends to their slots (qe_start_finish: rmin_load before the first drafts)
+    if (mtpb_)
+        for (int j = 0; j < nend; j++)
+            CUDA_CHECK(cudaMemcpyAsync(Rmins_ + (size_t)hsl_h_[j] * RW, mhR_ + (size_t)j * RW, (size_t)RW * 4,
+                                       cudaMemcpyDeviceToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    CUDA_CHECK(cudaGetLastError());
+    for (int j = 0; j < nend; j++) {
+        out[j] = pfmo_h_[j];
+        draft[j] = mtpb_ ? pfmo_h_[PFSEG_MAX + j] : -1;
+    }
+    // back to the bound slot: its parameters (sampling counter), RoPE shift, state in the workspace; nothing pending
+    pfm_ = false;
+    con_ = con0;
+    mtpb_ = false;
+    pfs_now_ = false;
+    pfdec_ = false;
+    pf_ = false;
+    pf_end_.clear();
+    use(dec_);
+    if (spslot_) CUDA_CHECK(cudaMemcpyAsync(sp_, spslot_ + cur_slot_, sizeof(SampleParams), cudaMemcpyDeviceToDevice, st_));
+    if (mmcur_) {
+        const int c[2] = {cur_slot_, mmdel_h_.empty() ? 0 : mmdel_h_.at(cur_slot_)};
+        CUDA_CHECK(cudaMemcpyAsync(mmcur_, c, 8, cudaMemcpyHostToDevice, st_));
+    }
+    for (int j = 0; j < nseg; j++) set_slot_prev_m(sg[j].slot, 0);  // prefill rows are committed already
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    ws_ensure();
 }
 
 // MTP block over the rows of the last prefill_batch (its trunk residual rows are still in the batch R), chunk by chunk
@@ -4252,11 +5046,74 @@ void Worker::lk_chain() {
     pfs_ = ps0;
 }
 
+// ---- multimodal prompts (flash_kernels.cuh: g_img, g_mm)
+void Worker::mm_init(int ns) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    mmcur_ = (int*)dalloc(2 * 4);
+    mmdel_ = (int*)dalloc((size_t)ns * 4);
+    mmtab_rows_ = pfbn_ + 8;  // a prefill chunk (<= pf_batch() rows) + the 3 rows before it (pooled indexer keys)
+    mmtab_ = (int*)dalloc((size_t)(3 + 3 * mmtab_rows_) * 4);
+    CUDA_CHECK(cudaMemset(mmcur_, 0, 2 * 4));
+    CUDA_CHECK(cudaMemset(mmdel_, 0, (size_t)ns * 4));
+    const int hdr[3] = {0, 0, -1};
+    CUDA_CHECK(cudaMemcpy(mmtab_, hdr, sizeof hdr, cudaMemcpyHostToDevice));
+    mmdel_h_.assign(ns, 0);
+    mmtab_slot_ = -1;
+    MmPos m;
+    m.cur = mmcur_;
+    m.del = mmdel_;
+    m.tab = mmtab_;
+    CUDA_CHECK(cudaMemcpyToSymbol(g_mm, &m, sizeof m));
+}
+void Worker::set_image_table(const bf16* t) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_img, &t, sizeof t));
+}
+void Worker::set_rope_slot(int s, int delta) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    if (mmdel_h_.at(s) == delta) return;
+    mmdel_h_[s] = delta;
+    CUDA_CHECK(cudaMemcpyAsync(mmdel_ + s, &mmdel_h_[s], 4, cudaMemcpyHostToDevice, st_));
+    if (s == cur_slot_) {
+        const int c[2] = {s, delta};
+        CUDA_CHECK(cudaMemcpyAsync(mmcur_, c, 8, cudaMemcpyHostToDevice, st_));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+void Worker::set_rope_chunk(int s, int i0, int m, const int* r3) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    if (!r3) {
+        if (mmtab_slot_ != s) return;
+        const int hdr[3] = {0, 0, -1};
+        CUDA_CHECK(cudaMemcpyAsync(mmtab_, hdr, sizeof hdr, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        mmtab_slot_ = -1;
+        return;
+    }
+    const int a = std::max(0, i0 - 3), rows = i0 + m - a;
+    CHECK(rows <= mmtab_rows_, "flash: multimodal chunk of %d rows (table %d)", rows, mmtab_rows_);
+    std::vector<int> v(3 + 3 * (size_t)rows);
+    v[0] = rows;
+    v[1] = a;
+    v[2] = s;
+    std::copy(r3 + 3 * (size_t)a, r3 + 3 * (size_t)(i0 + m), v.begin() + 3);
+    CUDA_CHECK(cudaMemcpyAsync(mmtab_, v.data(), v.size() * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    mmtab_slot_ = s;
+}
+
 void Worker::set_history(const int* ids, int n, int kfull) {
     CUDA_CHECK(cudaSetDevice(dev_));
     if (!lk_on_) return;
     CHECK(lk_kfull_ < 0 || lk_kfull_ == kfull, "flash lookup: MTP k changed (%d -> %d)", lk_kfull_, kfull);
     lk_kfull_ = kfull;
+    std::vector<int> hv;
+    if (std::any_of(ids, ids + n, [](int t) { return t >= kImgToken; })) {  // image rows: <|image_pad|> (never drafted)
+        hv.assign(ids, ids + n);
+        for (int& t : hv) t = dev_tok(t);
+        ids = hv.data();
+    }
     CUDA_CHECK(cudaMemcpy(hd_, ids, (size_t)n * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(hn_d_, &n, 4, cudaMemcpyHostToDevice));
     {
@@ -4284,16 +5141,16 @@ __global__ void k_lk_agree(const float* __restrict__ all, int n, int ngpu, int* 
 void Worker::lk_scan_emit() {
     k_lk_scan<<<(max_ctx_ + 255) / 256, 256, 0, st_>>>(hd_, hn_d_, lkbest_);
     // FLASH_CORPUS_MIN: shortest corpus match used (default 12)
-    static const int cmin = getenv("FLASH_CORPUS_MIN") ? atoi(getenv("FLASH_CORPUS_MIN")) : 12;
+    static const int cmin = env_int("FLASH_CORPUS_MIN", 12);
     if (cd_) k_lk_scan_c<<<std::min(1024, (ccap_ + 255) / 256), 256, 0, st_>>>(cd_, cn_d_, hd_, hn_d_, lkbestc_);
     k_lk_emit<<<1, 32, 0, st_>>>(hd_, hn_d_, lkbest_, lk_mmin_, lk_llo_, lk_hi_, lk_lmax_, lk_, em_ + MAXM + 2, lkrg_, lkrp_,
                                  cd_, lkbestc_, cmin);
-    // one lookup result on every rank (qfn decode hang, rc2): the step graph branches on lk_[0] on each device (k_lk_cond:
+    // one lookup result on every rank (decode hang seen in testing): the step graph branches on lk_[0] on each device (k_lk_cond:
     // the MTP draft chain, whose collectives every rank must enter) and k_vtok_lk builds the next verify rows from
     // lk_[1..]; a rank whose lookup differed (e.g. a corpus update landing between ranks) skipped the chain while the
     // others spun on its exchanges. All ranks take rank 0's lk_ (FLASH_LK_UNIFORM=0: off). The em_ copy only rank 0's
     // host reads.
-    static const bool uni = !getenv("FLASH_LK_UNIFORM") || atoi(getenv("FLASH_LK_UNIFORM"));
+    static const bool uni = env_int("FLASH_LK_UNIFORM", 1);
     if (uni && p_.ngpu > 1) {
         if (!lkall_) {
             lkall_ = (float*)dalloc((size_t)p_.ngpu * kLkWords * 4);
@@ -4312,7 +5169,7 @@ void Worker::corpus_add(const int* ids, int n) {
     CUDA_CHECK(cudaSetDevice(dev_));
     if (n > ccap_ - 1) ids += n - (ccap_ - 1), n = ccap_ - 1;
     if (cpos_ + n + 1 > ccap_) cpos_ = 0;
-    // on the work stream (qfn decode hang, rc2): a plain cudaMemcpy ran unordered with a step graph in flight (the
+    // on the work stream (decode hang seen in testing): a plain cudaMemcpy ran unordered with a step graph in flight (the
     // lookahead keeps one queued), which reads the corpus in k_lk_scan_c; the ranks saw the answer at different moments
     // and took different branches of the device-side lookup conditional. Pageable sources: the async copy returns once
     // they are staged; the step after it sees the corpus on every rank.
@@ -4334,7 +5191,7 @@ void Worker::spec_init(int last_tok, const int* drafts, int k, int pos, int comm
     const int pp[2] = {pos, commit};
     CUDA_CHECK(cudaMemcpy(posd_, pp, 8, cudaMemcpyHostToDevice));
     spos_ = pos;
-    const int hh[2] = {h0, h1};  // [t - 2, t - 1] committed tokens before the first verify row
+    const int hh[2] = {dev_tok(h0), dev_tok(h1)};  // [t - 2, t - 1] committed tokens before the first verify row
     CUDA_CHECK(cudaMemcpy(hist2_, hh, 8, cudaMemcpyHostToDevice));
 }
 
@@ -4356,23 +5213,23 @@ void Worker::spec_discard() {
 void Worker::spec_launch(int k, bool lookup) {
     CUDA_CHECK(cudaSetDevice(dev_));
     ec_tick(spos_ + 2 * k + 2, 0);
-    static const bool graphs = !getenv("FLASH_GRAPH") || atoi(getenv("FLASH_GRAPH"));
+    static const bool graphs = env_int("FLASH_GRAPH", 1);
     if (!graphs) {
         spec_body(k, lookup);
     } else {
         sel_on_ = spos_ + 2 * k + 2 > IDX_BUDGET + IDX_R - 1;  // verify rows and the draft chain of this step
         cudaGraphExec_t& ge = sgraph_[sampling_][sel_on_][lookup][k];
-        if (!ge) {
+        if (!ge && !graph_skip()) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             spec_body(k, lookup);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            inst_graph(&ge, g);  // OOM: frees the other slots' graphs and retries (flash_seq.cu)
+            inst_graph(&ge, g);  // OOM: drops every cached graph and retries, else no graph (flash_seq.cu)
             CUDA_CHECK(cudaGraphDestroy(g));
         }
         if (!ev0_) { CUDA_CHECK(cudaEventCreate(&ev0_)); CUDA_CHECK(cudaEventCreate(&ev1_)); }
         CUDA_CHECK(cudaEventRecord(ev0_, st_));
-        CUDA_CHECK(cudaGraphLaunch(ge, st_));
+        if (!(ge && launch_graph(ge))) spec_body(k, lookup);  // no graph (out of memory): the same kernels eagerly
         CUDA_CHECK(cudaEventRecord(ev1_, st_));
     }
 }
@@ -4380,7 +5237,7 @@ void Worker::spec_launch(int k, bool lookup) {
 void Worker::spec_launch_con(int kv, int kd) {
     CUDA_CHECK(cudaSetDevice(dev_));
     ec_tick(spos_ + 2 * std::max(kv, kd) + 2, 0);
-    static const bool graphs = !getenv("FLASH_GRAPH") || atoi(getenv("FLASH_GRAPH"));
+    static const bool graphs = env_int("FLASH_GRAPH", 1);
     if (!graphs) {
         spec_body(kv, false, kd);
         return;
@@ -4388,7 +5245,7 @@ void Worker::spec_launch_con(int kv, int kd) {
     sel_on_ = spos_ + 2 * std::max(kv, kd) + 2 > IDX_BUDGET + IDX_R - 1;
     const long long key = ((long long)sampling_ << 20) | ((long long)sel_on_ << 16) | ((long long)kv << 8) | kd;
     cudaGraphExec_t& ge = cgraph_[key];
-    if (!ge) {
+    if (!ge && !graph_skip()) {
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
         spec_body(kv, false, kd);
@@ -4398,7 +5255,7 @@ void Worker::spec_launch_con(int kv, int kd) {
     }
     if (!ev0_) { CUDA_CHECK(cudaEventCreate(&ev0_)); CUDA_CHECK(cudaEventCreate(&ev1_)); }
     CUDA_CHECK(cudaEventRecord(ev0_, st_));
-    CUDA_CHECK(cudaGraphLaunch(ge, st_));
+    if (!(ge && launch_graph(ge))) spec_body(kv, false, kd);
     CUDA_CHECK(cudaEventRecord(ev1_, st_));
 }
 
@@ -4421,14 +5278,14 @@ int Worker::spec_finish(int* emitted) {
 // guard: the lm_head input of a launch had non-finite values (the logits would be garbage): log it (stderr), once per
 // new count, and return the flagged rows. NaN / Inf only, finite garbage passes. FLASH_GUARD=1 (default): the caller
 // fails the sequences of those rows (flash_capi.cpp: the request gets an error, its conversation is dropped, the
-// server goes on), 2: log only (debugging), 3: abort the process (before 1.3-rc5), 0: off.
+// server goes on), 2: log only (debugging), 3: abort the process (the old behaviour), 0: off.
 unsigned Worker::nf_check(const char* what, int pos) {
     if (!nf_h_) return 0;
-    static const bool inject = getenv("FLASH_GUARD_TEST") && atoi(getenv("FLASH_GUARD_TEST"));  // test: as if it fired
+    static const bool inject = env_int("FLASH_GUARD_TEST", 0);  // test: as if it fired
     // FLASH_GUARD_TEST_AT=a,b,...: only the a-th, b-th, ... check of each card fires (unset: every check, as before)
     static const std::vector<int> inject_at = [] {
         std::vector<int> v;
-        if (const char* e = getenv("FLASH_GUARD_TEST_AT"))
+        if (const char* e = env_str("FLASH_GUARD_TEST_AT"))
             for (const char* q = e; *q;) {
                 v.push_back(atoi(q));
                 while (*q && *q != ',') q++;
@@ -4451,7 +5308,7 @@ unsigned Worker::nf_check(const char* what, int pos) {
             p_.rank, what, pos, mask, c);
     fflush(stderr);
     nf_seen_ = real;  // (an injected fault does not shift the count)
-    static const int mode = getenv("FLASH_GUARD") ? atoi(getenv("FLASH_GUARD")) : 1;
+    static const int mode = env_int("FLASH_GUARD", 1);
     if (mode == 3) {
         static std::atomic<int> once{0};
         if (once.exchange(1)) for (;;) pause();  // one card reports and aborts (one stack dump in the log)
@@ -4474,20 +5331,20 @@ void Worker::forward_mtp(const int* tokens, int pos, int m, bool chain, int* out
     memcpy(tok_h_, tokens, m * 4);
     pos_h_[0] = pos;
     pos_h_[1] = 0;
-    static const bool graphs = !getenv("FLASH_GRAPH") || atoi(getenv("FLASH_GRAPH"));
+    static const bool graphs = env_int("FLASH_GRAPH", 1);
     if (!graphs) {
         body_mtp(m, chain);
     } else {
         cudaGraphExec_t& ge = mgraph_[sel_on_][chain][m];
-        if (!ge) {
+        if (!ge && !graph_skip()) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             body_mtp(m, chain);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            inst_graph(&ge, g);  // OOM: frees the other slots' graphs and retries (flash_seq.cu)
+            inst_graph(&ge, g);  // OOM: drops every cached graph and retries, else no graph (flash_seq.cu)
             CUDA_CHECK(cudaGraphDestroy(g));
         }
-        CUDA_CHECK(cudaGraphLaunch(ge, st_));
+        if (!(ge && launch_graph(ge))) body_mtp(m, chain);
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
     CUDA_CHECK(cudaGetLastError());
@@ -4506,12 +5363,12 @@ void Worker::forward(const int* tokens, int pos, int m, const bf16* ple_rows, in
     pos_h_[1] = commit < 0 ? prev_m_ : commit;
     prev_m_ = m;
     memcpy(ple_h_, ple_rows, (size_t)m * H * 2);
-    static const bool graphs = !getenv("FLASH_GRAPH") || atoi(getenv("FLASH_GRAPH"));
+    static const bool graphs = env_int("FLASH_GRAPH", 1);
     if (!graphs || dump_) {
         body(m);
     } else {
         cudaGraphExec_t& gm = graph_[sampling_][sel_on_][m];
-        if (!gm) {
+        if (!gm && !graph_skip()) {
             cudaGraph_t g;
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             body(m);
@@ -4519,7 +5376,7 @@ void Worker::forward(const int* tokens, int pos, int m, const bf16* ple_rows, in
             inst_graph(&gm, g);
             CUDA_CHECK(cudaGraphDestroy(g));
         }
-        CUDA_CHECK(cudaGraphLaunch(gm, st_));
+        if (!(gm && launch_graph(gm))) body(m);
     }
     const int nv = p_.voc1 - p_.voc0;
     if (logits_host)
@@ -4534,6 +5391,178 @@ void Worker::dump_resid(float* host, int m) {
     CUDA_CHECK(cudaMemcpy(host, R_, (size_t)m * RW * 4, cudaMemcpyDeviceToHost));
 }
 
+// ---- KV streaming (FLASH_KV_STREAM, k_kv_need)
+void Worker::kv_need(Layer& L, int m, const int* pos0, const int* rpos, const int* rbase, int* psel) {
+    if (!kvs_ || m <= 0) return;
+    // without selection a row sees at most 2051 positions: (KN_ENT + 7) / 8 blocks of 8 warps cover its blocks; the
+    // rows of one sequence see nested prefixes, so the last row's blocks cover all (batched rows: every row)
+    const dim3 g((KN_ENT + 7) / 8, rpos ? m : 1);
+    k_kv_need<<<g, 256, 0, st_>>>(L.kvp, pos0, rpos, rbase, nullptr, insel_, srows_ / IDX_R, p_, rpos ? 0 : m - 1, rpos ? nullptr : psel);
+    KCHK("k_kv_need");
+}
+
+void Worker::kvs_set_pe(int pe) {
+    if (!kvs_ || pe == kvs_pe_) return;
+    pe = std::max(0, std::min(pe, kvs_P_));
+    for (int li = 0; li <= LAYERS; li++) {
+        Layer& L = li < LAYERS ? L_[li] : mtp_;
+        if (li == LAYERS && !has_mtp_) break;
+        if (!L.kvp.ctl) continue;
+        k_kv_trim<<<std::max(1, std::min(64, (kvs_P_ - pe + 255) / 256)), 256, 0, st_>>>(L.kvp, pe);
+    }
+    kvs_pe_ = pe;
+    // block-cache entries in use (the rest is lent to the expert cache): logged on large changes (>= P / 8)
+    static thread_local int logged = -1;
+    if (logged < 0 || std::abs(pe - logged) >= std::max(1, kvs_P_ / 8) || (pe == kvs_P_ && logged != pe) || (pe < 256 && logged >= 256)) {
+        logged = pe;
+        if (p_.rank == 0)
+            fprintf(stderr, "[flash] KV in RAM: block cache in use %d of %d blocks (%.0f of %.0f MB per card)\n", pe, kvs_P_,
+                    13.0 * pe * IDX_R * (NKV * HD * 2 + NKV * 8) / 1e6, 13.0 * kvs_P_ * IDX_R * (NKV * HD * 2 + NKV * 8) / 1e6);
+    }
+}
+
+int Worker::kv_ram_periods() const {
+    if (!kvs_ || !kvh_lazy_) return periods();
+    size_t rowb = 0;
+    for (auto& a : kvh_arr_) rowb += a.row;
+    const double grow = 0.75 * (double)qe_hostmem::headroom() / p_.ngpu / std::max<size_t>(rowb, 1);  // rows
+    const long long r = (long long)kvh_pinned_ + (long long)grow;
+    return (int)std::min<long long>(periods(), r / p_.own);
+}
+
+void Worker::kvh_pin(int r0, int r1) {  // slab by slab (a release unregisters whole slabs)
+    for (int a0 = r0; a0 < r1; a0 += kvh_slab_)
+        for (auto& a : kvh_arr_)
+            CUDA_CHECK(cudaHostRegister(a.p + (size_t)a0 * a.row, (size_t)(std::min(r1, a0 + kvh_slab_) - a0) * a.row,
+                                        cudaHostRegisterMapped | cudaHostRegisterPortable));
+}
+
+void Worker::kv_host_ensure(int periods, bool may_release) {
+    if (!kvs_ || !kvh_lazy_) return;
+    CUDA_CHECK(cudaSetDevice(dev_));
+    size_t rowb = 0;
+    for (auto& a : kvh_arr_) rowb += a.row;
+    const int want = std::min(rows_, (int)(((long long)periods * p_.own + kvh_slab_ - 1) / kvh_slab_ * kvh_slab_));
+    if (kvh_th_.joinable() && (kvh_done_.load() || want > kvh_pinned_)) {  // the slab pinned ahead
+        kvh_th_.join();
+        kvs_host_ += (size_t)(kvh_bg_ - kvh_pinned_) * rowb;
+        kvh_pinned_ = kvh_bg_;
+    }
+    static const bool lg = env_int("FLASH_KV_RAM_LOG", 1);
+    if (want > kvh_pinned_) {  // not pinned ahead (a jump): now, synchronously
+        const auto t0 = std::chrono::steady_clock::now();
+        kvh_pin(kvh_pinned_, want);
+        kvs_host_ += (size_t)(want - kvh_pinned_) * rowb;
+        if (lg)
+            fprintf(stderr, "[flash] GPU%d KV in RAM: pinned rows %d -> %d (%.2f GB, %.0f ms in the step)\n", dev_, kvh_pinned_, want, kvs_host_ / 1e9,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        kvh_pinned_ = want;
+    } else if (!(kvh_pinned_ - std::max(want, kvh_min_) >= 2 * kvh_slab_)) {
+        kvh_low_ = 0;
+    } else if (may_release && !kvh_th_.joinable() && ++kvh_low_ >= 256) {  // release all but one slab above the top
+        // (only at a launch, after 256 launches in a row below: a region move lowers the top for a moment while
+        // the rows above still hold a sequence)
+        kvh_low_ = 0;
+        const int keep = std::max(want, kvh_min_) + kvh_slab_;
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        for (int r0 = (kvh_pinned_ - 1) / kvh_slab_ * kvh_slab_; r0 >= keep; r0 -= kvh_slab_) {
+            const int n = std::min(kvh_slab_, rows_ - r0);
+            for (auto& a : kvh_arr_) {
+                CUDA_CHECK(cudaHostUnregister(a.p + (size_t)r0 * a.row));
+                madvise(a.p + (size_t)r0 * a.row, (size_t)n * a.row, MADV_DONTNEED);
+            }
+            kvs_host_ -= (size_t)n * rowb;
+        }
+        fprintf(stderr, "[flash] GPU%d KV in RAM: released rows %d -> %d (%.2f GB pinned)\n", dev_, kvh_pinned_, keep, kvs_host_ / 1e9);
+        kvh_pinned_ = keep;
+    }
+    // keep one slab pinned beyond the top (background thread), while the host has room for it on every card
+    if (!kvh_th_.joinable() && kvh_pinned_ < rows_ && kvh_pinned_ - want < kvh_slab_ &&
+        qe_hostmem::headroom() > (size_t)p_.ngpu * kvh_slab_ * rowb * 2) {
+        const int r0 = kvh_pinned_, r1 = std::min(rows_, kvh_pinned_ + kvh_slab_);
+        kvh_bg_ = r1;
+        kvh_done_ = false;
+        const int dev = dev_;
+        kvh_th_ = std::thread([this, r0, r1, dev] {
+            CUDA_CHECK(cudaSetDevice(dev));
+            kvh_pin(r0, r1);
+            kvh_done_ = true;
+        });
+    }
+}
+
+void Worker::kv_inval(int base, int t0, int t1) {
+    if (!kvs_) return;
+    CUDA_CHECK(cudaSetDevice(dev_));
+    const long long rb = (long long)base * p_.own;
+    const int r0 = kv_rows(t0), r1 = kv_rows(t1);
+    if (r1 <= r0) return;
+    const int b0 = (int)((rb + r0) / IDX_R), b1 = (int)((rb + r1 + IDX_R - 1) / IDX_R);
+    for (int li = 0; li <= LAYERS; li++) {
+        Layer& L = li < LAYERS ? L_[li] : mtp_;
+        if (li == LAYERS && !has_mtp_) break;
+        if (!L.kvp.ctl) continue;
+        k_kv_inval<<<std::min(256, (b1 - b0 + 255) / 256), 256, 0, st_>>>(L.kvp, b0, b1);
+    }
+}
+
+void Worker::kvs_report() {
+    if (!kvs_) return;
+    CUDA_CHECK(cudaSetDevice(dev_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    unsigned long long miss = 0, fb = 0, hit = 0;
+    for (int li = 0; li <= LAYERS; li++) {
+        Layer& L = li < LAYERS ? L_[li] : mtp_;
+        if (li == LAYERS && !has_mtp_) break;
+        if (!L.kvp.ctl) continue;
+        unsigned c[8];
+        CUDA_CHECK(cudaMemcpy(c, L.kvp.ctl, 32, cudaMemcpyDeviceToHost));
+        miss += c[3]; fb += c[4]; hit += c[5];
+    }
+    fprintf(stderr, "[kvstream] rank %d: block cache %d x 4 rows per layer (usable %d), hits %llu, misses %llu (%.1f MB from host), host fallbacks %llu; host rows %.2f GB\n",
+            p_.rank, kvs_P_, kvs_pe_, hit, miss, miss * 4160.0 / 1e6, fb, kvs_host_ / 1e9);
+}
+
+void Worker::selwin_report() {
+    if (!sw_c_) return;
+    CUDA_CHECK(cudaSetDevice(dev_));
+    unsigned long long h[32];
+    CUDA_CHECK(cudaMemcpy(h, sw_c_, sizeof(h), cudaMemcpyDeviceToHost));
+    for (int k = 0; k < 2; k++) {
+        const unsigned long long* c = h + 16 * k;
+        if (!c[0]) continue;
+        const double r = (double)c[0], ca = (double)c[12];
+        fprintf(stderr, "[selwin] rank %d %s: %llu rows in %llu layer calls, visible blocks/row %.0f, selected/row %.1f; outside 8K %.1f%% 16K %.1f%% 32K %.1f%%; "
+                "union/call %.1f (out16K %.1f, out32K %.1f); misses/call out16K: H1 %.2f H8 %.2f H64 %.2f never-used %.2f; out32K H8 %.2f\n",
+                p_.rank, k ? "prefill" : "decode", c[0], c[12], c[13] / r, c[1] / r, 100.0 * c[2] / c[1], 100.0 * c[3] / c[1], 100.0 * c[4] / c[1],
+                c[5] / ca, c[6] / ca, c[7] / ca, c[8] / ca, c[9] / ca, c[10] / ca, c[14] / ca, c[11] / ca);
+    }
+}
+
 }  // namespace flash
 
 #include "flash_batch.cuh"  // batched steps over several sequence slots
+
+// FLASH_XBYTES=1: the bytes this card sent to its peers in the prefill forwards so far, per exchange kind, per prompt
+// token and per token and layer of that kind (QSA kinds: per QSA layer)
+void flash::Worker::xb_report(size_t ntok) const {
+    static const char* kn[8] = {"mixer RS (bf16 partials)", "MoE-input AG (xh fp16)", "MoE RS (bf16 partials)",
+                                "mixer-input AG (xh fp16)", "QSA q (fp16)", "QSA partials (fp16 + m, l)",
+                                "QSA indexer keys", "last-row residual"};
+    int nq = 0;
+    for (const Layer& L : L_) nq += L.full;
+    double tot = 0, trunk_pl = 0;
+    for (int k = 0; k < XB_N; k++) tot += xb_[k];
+    fprintf(stderr, "[xbytes] rank %d: %.1f MB sent to peers for %zu prompt tokens = %.1f KB/token (%d layers, %d QSA)\n", p_.rank,
+            tot / 1e6, ntok, ntok ? tot / ntok / 1e3 : 0.0, LAYERS, nq);
+    for (int k = 0; k < XB_N; k++) {
+        if (!xb_[k]) continue;
+        const bool q = (k & 7) >= XB_Q && (k & 7) <= XB_IDX;
+        const int nl = k >= 8 ? 1 : q ? nq : LAYERS;
+        const double pl = ntok ? (double)xb_[k] / ntok / nl : 0.0;
+        if (k < 8) trunk_pl += ntok ? (double)xb_[k] / ntok / LAYERS : 0.0;
+        fprintf(stderr, "[xbytes] rank %d %s%-28s %9.1f MB  %8.0f B/token/%s\n", p_.rank, k >= 8 ? "MTP " : "", kn[k & 7],
+                xb_[k] / 1e6, pl, k >= 8 ? "block" : q ? "QSA layer" : "layer");
+    }
+    fprintf(stderr, "[xbytes] rank %d trunk average %.0f B/token/layer\n", p_.rank, trunk_pl);
+}

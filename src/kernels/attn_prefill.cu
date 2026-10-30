@@ -7,6 +7,7 @@
 // Keys stream from the kv cache in tiles of 32. With an FP8 (e4m3) cache, tiles arrive as fp8
 // through a double-buffered cp.async stage (half the bytes) and are widened to bf16 in shared
 // memory; the per-tensor k/v scales are folded into the score scale and the output.
+#include "../env.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -3202,11 +3203,11 @@ static void set_pf8() {
 }
 // QE_PATTN_NW: warps of attn_pf8_kernel (8 = 128 rows, 64-key tiles, 1 block/SM; 4 = 64 rows, 32-key tiles, 2 blocks/SM)
 static bool pf8_pp() {  // QE_PATTN_PP=1: the ping-pong kernel attn_pp8_kernel (fp16 Q K^T only)
-    static const bool pp = getenv("QE_PATTN_PP") ? atoi(getenv("QE_PATTN_PP")) != 0 : false;
+    static const bool pp = env_set("QE_PATTN_PP") ? env_int("QE_PATTN_PP", false) != 0 : false;
     return pp;
 }
 static int pf8_nw() {
-    static const int nw = getenv("QE_PATTN_NW") ? atoi(getenv("QE_PATTN_NW")) : 8;
+    static const int nw = env_int("QE_PATTN_NW", 8);
     return nw == 4 ? 4 : 8;
 }
 template <bool QK8, int NW>
@@ -3227,10 +3228,10 @@ void attention_prefill_init() {
     CUDA_CHECK(cudaFuncSetAttribute(attn_pkp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kPKSmem));
     CUDA_CHECK(cudaFuncSetAttribute(attn_pkp_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     {
-        const int cpos = getenv("QE_PKP_CPOS") ? atoi(getenv("QE_PKP_CPOS")) : 50;
+        const int cpos = env_int("QE_PKP_CPOS", 50);
         CUDA_CHECK(cudaMemcpyToSymbol(s_pkp_cpos, &cpos, sizeof(int)));
     }
-    if (getenv("QE_PKP_DIAG")) {  // debug: host-mapped wait state of attn_pkp_kernel + a watchdog thread
+    if (env_str("QE_PKP_DIAG")) {  // debug: host-mapped wait state of attn_pkp_kernel + a watchdog thread
         int dev = 0;
         CUDA_CHECK(cudaGetDevice(&dev));
         int* h = nullptr;
@@ -3260,7 +3261,7 @@ void attention_prefill_init() {
 
 // QE_PATTN_V2=0: the 4-warp attn_tc_kernel for fp8 prefill (before attn_pf8_kernel); also used for m < 128
 static bool pattn_v2(const AttnShape& s, int m) {
-    static const int v2 = getenv("QE_PATTN_V2") ? atoi(getenv("QE_PATTN_V2")) : 1;
+    static const int v2 = env_int("QE_PATTN_V2", 1);
     return v2 && s.fp8 && m >= 128;
 }
 
@@ -3291,20 +3292,20 @@ void attention_decode_tc_init() {
 // has the lowest KL vs fp32 attention of all variants, short and long prompts. QE_PATTN_QK8_MIN = n > 0: only for calls whose queries start at >= n (fp16 Q K^T below);
 // QE_PATTN_QK8=1 / 0 forces it on / off everywhere.
 static bool pattn_qk8(const AttnShape& s) {
-    static const int qk8_env = getenv("QE_PATTN_QK8") ? atoi(getenv("QE_PATTN_QK8")) : -1;
-    static const int qk8_min = getenv("QE_PATTN_QK8_MIN") ? atoi(getenv("QE_PATTN_QK8_MIN")) : 0;
+    static const int qk8_env = env_int("QE_PATTN_QK8", -1);
+    static const int qk8_min = env_int("QE_PATTN_QK8_MIN", 0);
     return qk8_env >= 0 ? qk8_env != 0 : (qk8_min <= 0 || (s.pf_p0 >= 0 && s.pf_p0 >= qk8_min));
 }
 // K smoothing (k - mean over the call, + q . mean exact): off - short-prompt KL 7,4e-4 vs 7,05e-4 without
 static bool pattn_smooth() {
-    static const bool v = getenv("QE_PATTN_KSMOOTH") && atoi(getenv("QE_PATTN_KSMOOTH"));
+    static const bool v = env_int("QE_PATTN_KSMOOTH", 0);
     return v;
 }
 // windowed precomputed K / V: QE_PATTN_KVPRE = 2 (default) persistent kernel attn_pkp_kernel, 1 = one
 // conversion + attention launch pair per window (attn_pkv_kernel), 0 = off
 int g_pattn_kvpre = -1, g_pkp_splits = -1, g_pkp_min = -1;  // bench overrides (qe_pattn_mode), -1: env / default
 static int pattn_kvpre() {
-    static const int v = getenv("QE_PATTN_KVPRE") ? atoi(getenv("QE_PATTN_KVPRE")) : 2;
+    static const int v = env_int("QE_PATTN_KVPRE", 2);
     return g_pattn_kvpre >= 0 ? g_pattn_kvpre : v;
 }
 // the per-key int8 K scale scratch holds every local key row the call can reach
@@ -3319,7 +3320,7 @@ static bool pkp_on(const AttnShape& s, int m) {
     if (!pattn_qk8(s) || pattn_smooth() || !pattn_ksc_fits(s)) return false;
     // QE_PKP_MIN (default 16384): calls whose queries end below it keep attn_pf8, bit for bit as master (e2e gain
     // below 16K is within noise)
-    static const int pmin = getenv("QE_PKP_MIN") ? atoi(getenv("QE_PKP_MIN")) : 16384;
+    static const int pmin = env_int("QE_PKP_MIN", 16384);
     if (s.pf_p0 + m < (g_pkp_min >= 0 ? g_pkp_min : pmin)) return false;
     int rows = 0;
     for (int j = 0; j < s.nkv; j++) rows = std::max(rows, pm_rank(s.kv_pm[j], s.pf_p0 + m));
@@ -3365,7 +3366,7 @@ static double pkp_model(const AttnShape& s, int m, int S, int nsm) {
 // split slots of the persistent kernel per window (>= 2: the combine always runs): QE_PKP_SPLITS, else the
 // best of 2..5 by pkp_model (cached for the last call shape: the layers of a micro-batch repeat it)
 static int pkp_splits(const AttnShape& s, int m, int smax) {
-    static const int v = getenv("QE_PKP_SPLITS") ? atoi(getenv("QE_PKP_SPLITS")) : 0;
+    static const int v = env_int("QE_PKP_SPLITS", 0);
     const int f = g_pkp_splits > 0 ? g_pkp_splits : v;
     if (f > 0) return std::max(2, std::min(f, smax));
     static thread_local long long key = -1;
@@ -3400,7 +3401,7 @@ int attention_prefill_splits(const AttnShape& s, int m, size_t work_floats, bool
         const double c = waves / sp * (sp > 1 ? 1.02 : 1.0);  // + partials and combine
         if (c < best - 1e-9) best = c, splits = sp;
     }
-    static const int force = getenv("QE_PATTN_SPLITS") ? atoi(getenv("QE_PATTN_SPLITS")) : 0;
+    static const int force = env_int("QE_PATTN_SPLITS", 0);
     if (force) splits = force;
     while (splits > 1 && attention_prefill_work_floats(splits * m, s.nq) > work_floats) splits--;
     if (!have_work) splits = 1;
@@ -3502,7 +3503,7 @@ void attention_prefill(const bf16* q, const void* kc, const void* vc, const Attn
 }
 
 static int dec8d_mode() {
-    static const int d8d = getenv("QE_ATTN_DEC8D") ? atoi(getenv("QE_ATTN_DEC8D")) : 2;
+    static const int d8d = env_int("QE_ATTN_DEC8D", 2);
     return d8d;
 }
 bool attention_dec8d_fused() { return dec8d_mode() == 2; }
@@ -3510,7 +3511,7 @@ bool attention_dec8d_fused() { return dec8d_mode() == 2; }
 // (grid.y = splits x tiles): more blocks (warps) per SM for the same splits; K/V tiles are read once per row
 // tile (the repeats from L2). Every row's arithmetic is unchanged: bit-identical.
 static int d8_rowsplit() {  // 0 off, 1 always (microbench), 2 auto: one sequence, gated by context length
-    static const int v = getenv("QE_D8_ROWSPLIT") ? atoi(getenv("QE_D8_ROWSPLIT")) : 2;
+    static const int v = env_int("QE_D8_ROWSPLIT", 2);
     return v;
 }
 static bool has_split_heads(const AttnShape& s) {
@@ -3538,7 +3539,7 @@ void attention_dec8_seg(const AttnSegs& g, const AttnShape& s, int G, cudaStream
 }
 
 bool attention_dec8_enabled() {
-    static const bool on = getenv("QE_ATTN_DEC8") ? atoi(getenv("QE_ATTN_DEC8")) != 0 : true;
+    static const bool on = env_set("QE_ATTN_DEC8") ? env_int("QE_ATTN_DEC8", true) != 0 : true;
     return on;
 }
 

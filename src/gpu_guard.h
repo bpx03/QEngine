@@ -7,6 +7,7 @@
 // QE_ALLOW_SHARED_GPU=1 skips the check (experts: e.g. a small test engine next to a server on purpose).
 // The bench lock (.gpu.lock) is a separate, coarse lock of the test scripts; this one is taken only by the engine
 // process itself, so a script that holds .gpu.lock and starts a server is unaffected.
+#include "env.h"
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -54,8 +55,8 @@ inline void mkdirs(const std::string& path) {
 // Locks every CUDA device in `devs` (ordinals within CUDA_VISIBLE_DEVICES); "" when the process may use them, else the
 // error message (nothing stays locked then). Locks this process already holds are kept (a second engine in-process).
 inline std::string acquire(const std::vector<int>& devs) {
-    if (getenv("QE_ALLOW_SHARED_GPU") && atoi(getenv("QE_ALLOW_SHARED_GPU"))) return "";
-    const char* home = getenv("HOME");
+    if (env_int("QE_ALLOW_SHARED_GPU", 0)) return "";
+    const char* home = env_str("HOME");
     const std::string dir = std::string(home && *home ? home : "/tmp") + "/.cache/qengine/locks";
     mkdirs(dir);
     static std::vector<std::pair<std::string, int>> held;  // uuid -> fd, for the process lifetime

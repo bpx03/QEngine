@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cfloat>
 
 #include "sample.cuh"
@@ -357,6 +358,17 @@ void sample_rows_slots(const float* gathered, int ngpu, int m, SampleParams* bas
 void sample_rows(const float* gathered, int ngpu, int m, SampleParams* p, int* tokens,
                  cudaStream_t st, bool chain) {
     sample_rows_kernel<<<1, 32, 0, st>>>(gathered, ngpu, m, p, tokens, chain ? 1 : 0);
+}
+
+size_t sample_stack_need() {
+    size_t mx = 0;
+    const void* k[] = {(const void*)sample_rows_kernel, (const void*)sample_rows_slots_kernel,
+                       (const void*)accept_sampled_kernel, (const void*)accept_batch_kernel};
+    for (const void* f : k) {
+        cudaFuncAttributes a;
+        if (cudaFuncGetAttributes(&a, f) == cudaSuccess) mx = std::max(mx, a.localSizeBytes);
+    }
+    return mx;
 }
 
 void spec_accept_batch(const float* gathered, int ngpu, const AcceptBatch& b, cudaStream_t st) {

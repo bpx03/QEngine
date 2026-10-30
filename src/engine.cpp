@@ -1,3 +1,4 @@
+#include "env.h"
 #include "engine.h"
 
 #include <sys/mman.h>
@@ -80,7 +81,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     if (!steer_.empty() && cfg_.layers > 64) throw std::runtime_error("steering: the cache key holds 6 bits per layer index");
     std::vector<double> weights = split_weights;
     if (weights.empty())
-        if (const char* e = getenv("QE_SPLIT")) {  // relative per-GPU work, e.g. "1,1.04,0.98"
+        if (const char* e = env_str("QE_SPLIT")) {  // relative per-GPU work, e.g. "1,1.04,0.98"
             std::stringstream ss(e);
             for (std::string x; std::getline(ss, x, ',');) weights.push_back(std::stod(x));
         }
@@ -91,8 +92,8 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     // QE_KV_PERIOD: positions per ownership period (default 1024). Needs P2P between the cards
     // and 3 GPUs with 4 kv heads (else the old layout).
     {
-        const char* e = getenv("QE_KV_SPLIT");
-        if (const char* pe = getenv("QE_KV_PERIOD")) kvs_.period = std::max(64, atoi(pe) / 32 * 32);
+        const char* e = env_str("QE_KV_SPLIT");
+        if (env_set("QE_KV_PERIOD")) kvs_.period = std::max(64, env_int("QE_KV_PERIOD", kvs_.period) / 32 * 32);
         const bool can = devices.size() == 3 && cfg_.n_kv == 4;
         if (!e || !strcmp(e, "auto")) {
             kvs_auto_ = can;
@@ -111,8 +112,8 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     }
     {   // the stats exchange lives in the batched fp8 attention path (one flag per launch): bf16
         // KV or a bf16 MTP cache (QE_KV_FP8=0 / QE_MTP_FP8=0) go through attention() per sequence
-        const bool kv8 = !getenv("QE_KV_FP8") || atoi(getenv("QE_KV_FP8")) != 0;
-        const bool mtp8 = kv8 && (!getenv("QE_MTP_FP8") || atoi(getenv("QE_MTP_FP8")) != 0);
+        const bool kv8 = env_int("QE_KV_FP8", 1) != 0;
+        const bool mtp8 = kv8 && (env_int("QE_MTP_FP8", 1) != 0);
         if ((kvs_.on() || kvs_auto_) && !(kv8 && mtp8)) {
             fprintf(stderr, "QE_KV_SPLIT: needs fp8 KV and MTP caches (QE_KV_FP8=1, QE_MTP_FP8=1), old layout\n");
             kvs_ = KvSplit{kvs_.period, 0, 0};
@@ -123,7 +124,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     print_plan(cfg_, plan_);
     st_.open(model_dir + "/model.safetensors");
     // QE_MTP_FILE: another MTP head (e.g. a fine-tuned one), same tensor names
-    const std::string mtp_file = getenv("QE_MTP_FILE") ? getenv("QE_MTP_FILE") : model_dir + "/model_mtp.safetensors";
+    const std::string mtp_file = env_str("QE_MTP_FILE") ? env_str("QE_MTP_FILE") : model_dir + "/model_mtp.safetensors";
     if (FILE* f = fopen(mtp_file.c_str(), "rb")) {
         fclose(f);
         mtp_st_.reset(new SafeTensors);
@@ -140,30 +141,30 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         }
         gemm_tune_set_model(fp.str());
     }
-    if (const char* e = getenv("QE_MTP_ADAPT")) adapt_ = atoi(e);
-    if (const char* e = getenv("QE_SPEC_COST")) sscanf(e, "%lf,%lf", &cost0_, &cost1_);
-    if (const char* e = getenv("QE_SNAPSHOTS")) max_snaps_ = std::max(1, atoi(e));
+    if (env_set("QE_MTP_ADAPT")) adapt_ = env_int("QE_MTP_ADAPT", adapt_);
+    if (const char* e = env_str("QE_SPEC_COST")) sscanf(e, "%lf,%lf", &cost0_, &cost1_);
+    if (env_set("QE_SNAPSHOTS")) max_snaps_ = std::max(1, env_int("QE_SNAPSHOTS", max_snaps_));
     // snapshot store: checkpoints keep max_snaps_/2 entries of their own (snap_policy.h)
     snap_reserve0_ = max_snaps_ / 2;
-    if (const char* e = getenv("QE_SNAP_CKPT_RESERVE")) snap_reserve0_ = std::max(0, std::min(max_snaps_, atoi(e)));
+    if (env_set("QE_SNAP_CKPT_RESERVE")) snap_reserve0_ = std::max(0, std::min(max_snaps_, env_int("QE_SNAP_CKPT_RESERVE", snap_reserve0_)));
     // checkpoint spacing of a prompt's prefill (state saved every QE_CKPT tokens, multiple of 256)
-    if (const char* e = getenv("QE_CKPT")) ckpt_every_ = std::max(256, atoi(e) / 256 * 256);
+    if (env_set("QE_CKPT")) ckpt_every_ = std::max(256, env_int("QE_CKPT", ckpt_every_) / 256 * 256);
     // prompt-end state one token before the end when at least QE_END_CUT tokens are prefilled
     // (an identical prompt then reuses n-1 instead of falling back to a checkpoint); 0 = off
-    if (const char* e = getenv("QE_END_CUT")) end_cut_ = std::max(0, atoi(e));
+    if (env_set("QE_END_CUT")) end_cut_ = std::max(0, env_int("QE_END_CUT", end_cut_));
     // tail checkpoints: in the last QE_TAIL_CKPT tokens of a prompt, a checkpoint at chunk
     // boundaries at least kChunk apart (no extra passes): requests sharing everything but the
     // tail (RAG: one document, other chunks / questions) resume close to where they diverge
-    if (const char* e = getenv("QE_TAIL_CKPT")) tail_ckpt_ = std::max(0, atoi(e));
+    if (env_set("QE_TAIL_CKPT")) tail_ckpt_ = std::max(0, env_int("QE_TAIL_CKPT", tail_ckpt_));
     // a prefill keeps at most QE_CKPT_KEEP of its periodic / tail checkpoints (older ones are
     // overwritten): a 200K prompt no longer flushes every other conversation's checkpoints
-    if (const char* e = getenv("QE_CKPT_KEEP")) ckpt_keep_ = std::max(1, atoi(e));
+    if (env_set("QE_CKPT_KEEP")) ckpt_keep_ = std::max(1, env_int("QE_CKPT_KEEP", ckpt_keep_));
 
     // Embedding table in pinned host memory, read by every GPU over PCIe (one row per token).
     const TensorInfo& emb = st_.get("model.language_model.embed_tokens.weight");
     {  // out of host memory right after a crash (the previous process's memory is freed while its core is written):
         // retried for up to QE_PIN_WAIT_S (60) seconds, with the largest processes in the log
-        static const int wait_s = getenv("QE_PIN_WAIT_S") ? atoi(getenv("QE_PIN_WAIT_S")) : 60;
+        static const int wait_s = env_int("QE_PIN_WAIT_S", 60);
         cudaError_t e = cudaHostAlloc(&embed_, emb.nbytes, cudaHostAllocMapped | cudaHostAllocPortable);
         for (int i = 0; e == cudaErrorMemoryAllocation && i < wait_s; i++) {
             cudaGetLastError();
@@ -200,7 +201,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     // MTP drafts only over the most frequent tokens (tools/draft_vocab.py ranking), split
     // across GPUs; QE_DRAFT_VOCAB=0 uses the full vocabulary
     {
-        int nd = getenv("QE_DRAFT_VOCAB") ? atoi(getenv("QE_DRAFT_VOCAB")) : 65536;
+        int nd = env_int("QE_DRAFT_VOCAB", 65536);
         FILE* f = fopen((model_dir + "/token_rank.bin").c_str(), "rb");
         if (f && nd > 0 && mtp_st_) {
             nd = std::min(nd, cfg_.vocab) / (16 * (int)devices.size()) * 16 * devices.size();
@@ -252,16 +253,16 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     // instead of on the request path.
     std::vector<size_t> sizes;
     for (auto& w : workers_) sizes.push_back(w->snapshot_bytes());
-    archive_budget_ = (size_t)((getenv("QE_KV_ARCHIVE_GB") ? atof(getenv("QE_KV_ARCHIVE_GB")) : 32.0) *
+    archive_budget_ = (size_t)((env_double("QE_KV_ARCHIVE_GB", 32.0)) *
                                (1ull << 30));
-    if (const char* e = getenv("QE_ARCHIVE_MIN")) archive_min_ = atoi(e);
-    if (const char* e = getenv("QE_SHARE_PREFIX")) share_prefix_ = atoi(e) != 0;
-    pool_log_ = getenv("QE_POOL_LOG") && atoi(getenv("QE_POOL_LOG"));
-    prefix_budget_ = (size_t)((getenv("QE_PREFIX_GB") ? atof(getenv("QE_PREFIX_GB")) : 8.0) * (1ull << 30));
+    if (env_set("QE_ARCHIVE_MIN")) archive_min_ = env_int("QE_ARCHIVE_MIN", archive_min_);
+    if (env_set("QE_SHARE_PREFIX")) share_prefix_ = env_int("QE_SHARE_PREFIX", share_prefix_) != 0;
+    pool_log_ = env_int("QE_POOL_LOG", 0);
+    prefix_budget_ = (size_t)((env_double("QE_PREFIX_GB", 8.0)) * (1ull << 30));
     disk_init();
-    if (!getenv("QE_ARCHIVE_PINNED") || atoi(getenv("QE_ARCHIVE_PINNED")))
+    if (env_int("QE_ARCHIVE_PINNED", 1))
         hpool_.start(archive_budget_ + prefix_budget_,
-                     (size_t)((getenv("QE_ARCHIVE_SLAB_GB") ? atof(getenv("QE_ARCHIVE_SLAB_GB")) : 4.0) * (1ull << 30)));
+                     (size_t)((env_double("QE_ARCHIVE_SLAB_GB", 4.0)) * (1ull << 30)));
     alloc_thread_ = std::thread([this, sizes] {
         // errors (e.g. the process exiting while pinning) just end the background allocation
         for (int i = 0; i < max_snaps_ && !stop_alloc_; i++) {
@@ -309,9 +310,9 @@ Engine::~Engine() {
 // kMaxBatch decoding together) get regions of it on demand (ensure_cap), so one long
 // conversation can use most of the memory and many short ones share it.
 void Engine::plan_slots(int main_cap) {
-    int nslots = getenv("QE_MAX_SEQS") ? atoi(getenv("QE_MAX_SEQS")) : 16;
-    size_t cap_tokens = getenv("QE_POOL_TOKENS") ? atoll(getenv("QE_POOL_TOKENS")) : SIZE_MAX;
-    if (const char* e = getenv("QE_SLOTS")) {  // legacy: "a,b,c" = 3 slots sharing a+b+c tokens
+    int nslots = env_int("QE_MAX_SEQS", 16);
+    size_t cap_tokens = env_ll("QE_POOL_TOKENS", SIZE_MAX);
+    if (const char* e = env_str("QE_SLOTS")) {  // legacy: "a,b,c" = 3 slots sharing a+b+c tokens
         std::stringstream ss(e);
         size_t sum = 0;
         nslots = 0;
@@ -326,7 +327,7 @@ void Engine::plan_slots(int main_cap) {
     // VRAM left outside the KV pool, per card in worker order: "1.5" for every card or a list
     // "1.5,3,1.5" (more room on the card driving the desktop); a short list repeats its last value
     std::vector<size_t> reserve(workers_.size(), (size_t)1.5e9);
-    if (const char* e = getenv("QE_RESERVE_GB")) {
+    if (const char* e = env_str("QE_RESERVE_GB")) {
         std::stringstream ss(e);
         size_t r = 0;
         double last = 1.5;
@@ -381,10 +382,10 @@ void Engine::plan_slots(int main_cap) {
         // shares chosen once are kept (QE_KV_SPLIT_FILE, default $QE_DISK_CACHE or
         // ~/.cache/qengine: kv_split_<model>_<gpus>.txt) while their pool stays within 1 % of the
         // fresh choice's; a larger loss (other reserves, other weights, other cards) picks and stores anew
-        const char* home = getenv("HOME");
-        std::string dir = getenv("QE_DISK_CACHE") && *getenv("QE_DISK_CACHE") ? getenv("QE_DISK_CACHE")
+        const char* home = env_str("HOME");
+        std::string dir = env_str("QE_DISK_CACHE") && *env_str("QE_DISK_CACHE") ? env_str("QE_DISK_CACHE")
                           : home ? std::string(home) + "/.cache/qengine" : std::string();
-        std::string file = getenv("QE_KV_SPLIT_FILE") ? getenv("QE_KV_SPLIT_FILE") : "";
+        std::string file = env_str("QE_KV_SPLIT_FILE") ? env_str("QE_KV_SPLIT_FILE") : "";
         if (file.empty() && !dir.empty()) {
             std::string base = model_dir_;
             while (!base.empty() && base.back() == '/') base.pop_back();
@@ -422,15 +423,15 @@ void Engine::plan_slots(int main_cap) {
     // every card holds the same token offsets; its bytes per token follow its share of the kv
     // heads (kv-pos-split), so the pool is the smallest (free / bytes per token)
     // lookup drafts on the GPU (QE_LOOKUP=1): the current sequence's history on every card (1 MB), before the pool
-    lk_on_ = has_mtp() && (!getenv("QE_LOOKUP") || atoi(getenv("QE_LOOKUP")));  // QE_LOOKUP=0: off
+    lk_on_ = has_mtp() && (env_int("QE_LOOKUP", 1));  // QE_LOOKUP=0: off
     if (lk_on_) {
-        const int mmin = getenv("QE_LK_MIN") ? atoi(getenv("QE_LK_MIN")) : 24;  // shorter matches: MTP drafts as well (k up to 7)
-        const int lmax = getenv("QE_LK_LMAX") ? std::max(1, std::min(kMaxLookupK, atoi(getenv("QE_LK_LMAX")))) : kMaxLookupK;
+        const int mmin = env_int("QE_LK_MIN", 24);  // shorter matches: MTP drafts as well (k up to 7)
+        const int lmax = env_set("QE_LK_LMAX") ? std::max(1, std::min(kMaxLookupK, env_int("QE_LK_LMAX", kMaxLookupK))) : kMaxLookupK;
         pool_->run([&](int r) { workers_[r]->lk_init(kMaxPos + 64, mmin, lmax); });
         lkb_on_ = workers_[0]->lkb_on();
-        if (getenv("QE_LKB_ROWS")) lkb_rows_ = atoi(getenv("QE_LKB_ROWS"));  // rows a batched step may grow to
-        if (getenv("QE_LKB_HOLD")) lkb_hold_ = atoi(getenv("QE_LKB_HOLD"));  // steps without a find before MTP again
-        if (getenv("QE_LKB_MIN")) lkb_min_ = atoi(getenv("QE_LKB_MIN"));     // fewest lookup drafts worth a step
+        lkb_rows_ = env_int("QE_LKB_ROWS", lkb_rows_);  // rows a batched step may grow to
+        lkb_hold_ = env_int("QE_LKB_HOLD", lkb_hold_);  // steps without a find before MTP again
+        lkb_min_ = env_int("QE_LKB_MIN", lkb_min_);     // fewest lookup drafts worth a step
         lkb_len_.assign(nslots, -1);
         lkb_miss_.assign(nslots, 0);
         lkb_dirty_.assign(nslots, 0);
@@ -456,8 +457,8 @@ void Engine::plan_slots(int main_cap) {
 }
 
 int Engine::round_cap(int need) const {  // headroom so that a growing conversation moves rarely
-    static const size_t head = getenv("QE_POOL_HEADROOM") ? atoll(getenv("QE_POOL_HEADROOM")) : 4096;  // 16384 left 32 regions larger than a 2-GPU pool
-    static const double frac = getenv("QE_POOL_GROW_FRAC") ? atof(getenv("QE_POOL_GROW_FRAC")) : 0.25;
+    static const size_t head = env_ll("QE_POOL_HEADROOM", 4096);  // 16384 left 32 regions larger than a 2-GPU pool
+    static const double frac = env_double("QE_POOL_GROW_FRAC", 0.25);
     const size_t want = ((size_t)need + head + (size_t)(need * frac) + 255) / 256 * 256;
     return (int)std::max<size_t>(need, std::min<size_t>(want, max_ctx_));
 }
@@ -467,7 +468,7 @@ int Engine::round_cap(int need) const {  // headroom so that a growing conversat
 // the next step again: every place() rewrites all its rows (the layout depends on the capacity, in
 // chunks no longer than the growth) and drops its CUDA graphs (an agent session fell from 150 to 10 tok/s at 75K).
 int Engine::min_cap(int need) const {
-    static const size_t head = getenv("QE_POOL_MIN_HEAD") ? atoll(getenv("QE_POOL_MIN_HEAD")) : 2048;
+    static const size_t head = env_ll("QE_POOL_MIN_HEAD", 2048);
     const size_t want = ((size_t)need + std::max<size_t>(head, (size_t)need / 16) + 255) / 256 * 256;
     return (int)std::max<size_t>(need, std::min<size_t>(want, max_ctx_));
 }
@@ -501,7 +502,7 @@ int Engine::held_rows(int s) const {
 // Moves / resizes slot s's region to (off, cap) keeping its rows, on every GPU.
 void Engine::place(int s, size_t off, int cap) {
     Seq& q = seqs_[s];
-    static const bool log = getenv("QE_POOL_LOG") && atoi(getenv("QE_POOL_LOG"));
+    static const bool log = env_int("QE_POOL_LOG", 0);
     if (log)
         printf("pool: slot %d [%zu +%d) -> [%zu +%d), %d rows%s\n", s, q.off, q.max_t, off, cap, held_rows(s),
                q.active ? " (active)" : ""), fflush(stdout);
@@ -949,7 +950,7 @@ void Engine::archive_info(double* out) const {
 
 // headroom counted per sequence at admission (its growth before it has to move); QE_ADMIT_HEADROOM overrides
 static size_t admit_headroom() {
-    static const size_t ah = getenv("QE_ADMIT_HEADROOM") ? atoll(getenv("QE_ADMIT_HEADROOM")) : 8192;  // 16384 admitted only 22 of 32 sequences on 2 GPUs
+    static const size_t ah = env_ll("QE_ADMIT_HEADROOM", 8192);  // 16384 admitted only 22 of 32 sequences on 2 GPUs
     return ah;
 }
 
@@ -1188,7 +1189,7 @@ void Engine::HostPool::start(size_t budget, size_t slab) {
             }
             // 2 MB pages (THP is madvise-only on this host): 4 KB pages made the registration ~11M pages for
             // 43 GB and slowed every decode step by ~1.5 ms at n = 1; QE_ARCHIVE_THP=0: 4 KB
-            static const bool thp = !getenv("QE_ARCHIVE_THP") || atoi(getenv("QE_ARCHIVE_THP"));
+            static const bool thp = env_int("QE_ARCHIVE_THP", 1);
             if (thp) madvise(p, sz, MADV_HUGEPAGE);
             memset(p, 0, sz);  // fault the pages in without the driver
             if (stop_) { ::free(p); return; }
@@ -1864,22 +1865,22 @@ bool Engine::archive_load(KvArchive& a) {
 // Disk cache setup: identity of the model / split (archives of another configuration are
 // ignored), index of the existing files (LRU order by modification time), writer thread.
 void Engine::disk_init() {
-    const char* d = getenv("QE_DISK_CACHE");
+    const char* d = env_str("QE_DISK_CACHE");
     if (!d || !*d) return;
     disk_dir_ = d;
-    disk_budget_ = (size_t)((getenv("QE_DISK_CACHE_GB") ? atof(getenv("QE_DISK_CACHE_GB")) : 200.0) *
+    disk_budget_ = (size_t)((env_double("QE_DISK_CACHE_GB", 200.0)) *
                             (1ull << 30));
     mkdir(disk_dir_.c_str(), 0755);
     std::ostringstream fp;
     char rp[PATH_MAX];
     // v3: archives written before the KV-pool compaction fix (23781c9) may hold overwritten rows
     fp << "v3|" << (realpath(model_dir_.c_str(), rp) ? rp : model_dir_.c_str());
-    if (getenv("QE_MTP_FILE")) fp << "|mtp:" << getenv("QE_MTP_FILE");
+    if (env_str("QE_MTP_FILE")) fp << "|mtp:" << env_str("QE_MTP_FILE");
     for (const char* f : {"/model.safetensors", "/model_mtp.safetensors"}) {
         struct stat stt;
         if (stat((model_dir_ + f).c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;
     }
-    fp << "|g" << workers_.size() << "|" << (getenv("QE_SPLIT") ? getenv("QE_SPLIT") : "");
+    fp << "|g" << workers_.size() << "|" << (env_str("QE_SPLIT") ? env_str("QE_SPLIT") : "");
     if (kvs_.on()) fp << "|kvsplit" << kvs_.period << "," << kvs_.a01 << "," << kvs_.a12;
     for (auto& w : workers_) fp << "|" << w->archive_bytes(0, 1) << "," << w->archive_bytes(0, 2) << "," << w->snapshot_bytes();
     fingerprint_ = fp.str();
@@ -2236,7 +2237,7 @@ void Engine::observe_time(int buf) {
 int Engine::next_k() {
     if (!adapt_ || k_ <= 1) return k_;
     if (adapt_ == 2) return std::min(std::max(k_heur_, 1), k_);
-    static const bool measured = !getenv("QE_COST_MEASURED") || atoi(getenv("QE_COST_MEASURED"));
+    static const bool measured = env_int("QE_COST_MEASURED", 1);
     double c0 = cost0_, c1 = cost1_;
     if (measured && rs_[0] > 8) {
         const double mx = rs_[1] / rs_[0], my = rs_[3] / rs_[0];
@@ -2298,7 +2299,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     const int kstart = next_k();  // drafts produced at the end of the prompt
     // QE_TIMING=1: one line per start with the time of each phase (slot choice, archiving the
     // slot's previous context, pool room, cache search, restore copy)
-    static const bool timing = getenv("QE_TIMING") && atoi(getenv("QE_TIMING"));
+    static const bool timing = env_int("QE_TIMING", 0);
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     const auto t0 = now();
@@ -2632,7 +2633,7 @@ bool Engine::prefill_more_slot(int slot, int budget) {
             if (mk > i && mk < i + m) m = mk - i;
         // a chunk just past a multiple of 256 rows costs a whole extra block of the prefill
         // GEMMs (1036 tokens: 309 ms; 1024 + 12 in a small pass of their own: 275 ms)
-        static const int tail = getenv("QE_PREFILL_TAIL") ? atoi(getenv("QE_PREFILL_TAIL")) : 32;
+        static const int tail = env_int("QE_PREFILL_TAIL", 32);
         if (m > 256 && m % 256 > 0 && m % 256 <= tail) m -= m % 256;
         pf.last_m = m;
         pool_->run([&](int r) { workers_[r]->prefill_chunk(pids, i, m, n, pf.kstart, r3); });
@@ -2890,7 +2891,7 @@ void Engine::launch_batch(int buf, bool ahead) {
             int fr = lkb_len_[s];
             if (fr < 0 || fr > hn) fr = 0;
             if (fr == hn && !lkb_dirty_[s] && lkb_len_[s] >= 0) {
-                static const bool chk = getenv("QE_LKB_CHECK") && atoi(getenv("QE_LKB_CHECK"));
+                static const bool chk = env_int("QE_LKB_CHECK", 0);
                 if (chk) {  // debug: the cards' history of a slot that needs no upload equals the host's tokens
                     Worker& w0 = *workers_[0];
                     CUDA_CHECK(cudaSetDevice(w0.device));
@@ -2959,8 +2960,8 @@ void Engine::launch_batch(int buf, bool ahead) {
             // rows come from the budget (target - rows); slots that do not fit keep their MTP drafts
             const int target = std::min(kMaxBatchRows, std::max(rows, lkb_rows_));
             int spare = target - rows;
-            static const float lkb_mul = getenv("QE_LKB_MUL") ? atof(getenv("QE_LKB_MUL")) : 1.5f;
-            static const bool lkq = !getenv("QE_LKB_Q") || atoi(getenv("QE_LKB_Q"));
+            static const float lkb_mul = env_double("QE_LKB_MUL", 1.5f);
+            static const bool lkq = env_int("QE_LKB_Q", 1);
             std::vector<int> order;
             for (int i = 0; i < n; i++)
                 if (cand[i]) order.push_back(i);
@@ -3041,15 +3042,14 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
     // rows per batched step (up to 8 sequences): 24 = 2 MTP drafts each at 8 sequences, +14% tok/s
     // over 16 rows (1 draft) at ctx 0 and +15% at 19K, +28-32% at 6 sequences; 32 rows (3 drafts at
     // 8) costs 0.7 ms per extra row and loses at ctx 0
-    static const int rows = getenv("QE_BATCH_ROWS") ? atoi(getenv("QE_BATCH_ROWS")) : 24;
+    static const int rows = env_int("QE_BATCH_ROWS", 24);
     const std::vector<int> sl(slots, slots + n);
     // drafts per sequence. More than 8 sequences: as many rows per sequence as at 8 (rows / 8, at
     // least 2 = one draft each) while they fit in kMaxBatchRows: 2 drafts up to 10 sequences with 24
     // rows (9 x 19K: 27 rows 990 tok/s vs 878 with 18), 1 draft up to 16, none beyond
     // QE_BATCH_MAXROWS caps the rows of a step (32 = the policy before the wide GEMV: no drafts beyond 16
     // sequences); 33..64 rows run the wide kernel (gemv_w4hx)
-    static const int maxrows = std::max(8, std::min(kMaxBatchRows, getenv("QE_BATCH_MAXROWS")
-                                                                       ? atoi(getenv("QE_BATCH_MAXROWS")) : 64));
+    static const int maxrows = std::max(8, std::min(kMaxBatchRows, env_int("QE_BATCH_MAXROWS", 64)));
     // beyond 10 sequences one draft each (2 rows): 2 drafts at 16 sequences (48 rows) measured -13 %, one draft
     // at 24 / 32 sequences (48 / 64 rows) +13 / +24 % over none
     const int brows = std::min(maxrows, n <= 8 ? rows : n * (n <= 10 ? std::max(2, rows / 8) : 2));
@@ -3195,7 +3195,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         if (lkb_on_) {
             const int s = sl[i];
             if (lkb_len_[s] >= 0) lkb_len_[s] += c;
-            static const float ema_min = getenv("QE_LKB_EMA_MIN") ? atof(getenv("QE_LKB_EMA_MIN")) : 2.f;
+            static const float ema_min = env_double("QE_LKB_EMA_MIN", 2.f);
             if (lkstep) {
                 lkb_ema_[s] = 0.7f * lkb_ema_[s] + 0.3f * (c - 1);
                 if (lkb_ema_[s] < ema_min) lkb_mode_[s] = 0, lkb_cool_[s] = 16, lkb_ema_[s] = 3.5f;  // no better than MTP
@@ -3220,7 +3220,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
     }
     bbuf_ ^= 1;
     binflight_ = ahead;
-    static const int lks = getenv("QE_LKB_STATS") ? atoi(getenv("QE_LKB_STATS")) : 0;
+    static const int lks = env_int("QE_LKB_STATS", 0);
     if (lkb_on_ && lks > 0 && ++lkb_bsteps_ % lks == 0)
         fprintf(stderr, "[lkb] %lld batched steps, %lld slot-steps, lookup %lld (%.1f%%), %.2f rows %.2f tok per lookup step\n",
                 lkb_bsteps_, lkb_slotsteps_, lkb_steps_, 100.0 * lkb_steps_ / std::max(1LL, lkb_slotsteps_),

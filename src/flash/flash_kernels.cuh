@@ -48,11 +48,42 @@ __device__ __forceinline__ float block_max(float v, float* sh) {
     return r;
 }
 
+// ------------------------------------------------------------------ multimodal prompts
+// Image rows: device-side ids >= kImgToken select rows of the image embedding table (vision encoder output, mapped
+// host memory; Worker::set_image_table) in place of the token embedding, for the trunk and the MTP input.
+__device__ const bf16* g_img = nullptr;
+__device__ __forceinline__ const bf16* emb_row(const bf16* emb, int tok) {
+    return tok >= kImgToken ? g_img + (size_t)(tok - kImgToken) * H : emb + (size_t)tok * H;
+}
+// Qwen M-RoPE positions (Worker::set_rope_slot / set_rope_chunk): rows of a multimodal prompt chunk take the (t, h, w)
+// position of their table row, every other cache index p of slot s the text position p + shift(s) (text after
+// images; 0 for text-only sequences, so text rows are bit-identical to the plain RoPE). The bound slot (cur) serves
+// the single-sequence kernels, del[slot] the batched ones.
+struct MmPos {
+    const int* cur = nullptr;  // [2] bound slot, its shift
+    const int* del = nullptr;  // [slots] shift
+    const int* tab = nullptr;  // [3 + 3 * rows]: rows, first cache index, slot (-1: none), then (t, h, w) per row
+};
+__device__ MmPos g_mm;
+// angle of rotary frequency i (of ROT / 2) at cache index pos of slot `slot` (-1: the bound slot). Interleaved
+// sections 11/11/10: frequency i uses the h position if i % 3 == 1, w if i % 3 == 2 (i < 30), else t
+__device__ __forceinline__ float rope_freq(int pos, int i, int slot = -1) {
+    int rp = pos;
+    const MmPos m = g_mm;
+    if (m.cur) {
+        const int s = slot < 0 ? m.cur[0] : slot;
+        const int r = pos - m.tab[1];
+        if (m.tab[2] == s && r >= 0 && r < m.tab[0]) rp = m.tab[3 + 3 * r + (i % 3 == 1 ? 1 : (i % 3 == 2 && i < 30 ? 2 : 0))];
+        else rp = pos + (slot < 0 ? m.cur[1] : m.del[slot]);
+    }
+    return (float)rp * powf((float)THETA, -2.f * i / ROT);
+}
+
 // ------------------------------------------------------------------ embedding
 // R[t][i * H + d] = embed[tok][d] for the 4 streams (embed: mapped host memory)
 __global__ void k_embed(const bf16* __restrict__ emb, const int* __restrict__ tok, float* __restrict__ R) {
     const int t = blockIdx.x;
-    const bf16* e = emb + (size_t)tok[t] * H;
+    const bf16* e = emb_row(emb, tok[t]);
     for (int d = threadIdx.x; d < H; d += blockDim.x) {
         const float v = __bfloat162float(e[d]);
 #pragma unroll
@@ -72,7 +103,7 @@ __global__ void k_mtp_prep(const bf16* __restrict__ emb, const int* __restrict__
 #pragma unroll
     for (int j = 0; j < 10; j++) {
         const int d = threadIdx.x + j * 256;
-        v[j] = y == 0 ? __bfloat162float(emb[(size_t)tok[t] * H + d]) : h[(size_t)t * RW + (y - 1) * H + d];
+        v[j] = y == 0 ? __bfloat162float(emb_row(emb, tok[t])[d]) : h[(size_t)t * RW + (y - 1) * H + d];
         ss += v[j] * v[j];
     }
     ss = block_sum<256>(ss, sh);
@@ -1127,20 +1158,43 @@ __device__ __forceinline__ int own_row(const Plan& p, int pos) {  // -1: not own
     if (r < 0 || r >= p.own) return -1;
     return pos / p.period * p.own + r;
 }
+// ---- KV streaming (FLASH_KV_STREAM): the K / V rows + scales of every logical row live in mapped pinned host memory
+// (hk / hv / hks / hvs, [logical rows][2][256] as the device arrays), VRAM keeps a block cache per layer: physical
+// block i = device rows [4 i, 4 i + 4) of kc / vc / ks / vs. pt[logical block] = physical block or -1 (not cached:
+// readers fall back to the host row). Logical row g = region start row + owned row of the sequence. pt == nullptr:
+// no streaming (device rows = logical rows, as before).
+// K / V row pointers and scales of the sequence row r (region start rb) for kv head kvh
+__device__ __forceinline__ void kv_rowp(const KvMap& km, const uint8_t* kc, const uint8_t* vc, const float* ks,
+                                        const float* vs, size_t rb, int r, int kvh, const uint8_t*& kp,
+                                        const uint8_t*& vp, const float*& ksp, const float*& vsp) {
+    size_t row = (size_t)r;
+    if (km.pt) {
+        const size_t g = rb + (size_t)r;
+        const int b = km.pt[g >> 2];
+        if (b >= 0) row = (size_t)b * 4 + (g & 3);
+        else { kc = km.hk; vc = km.hv; ks = km.hks; vs = km.hvs; row = g; }
+    }
+    kp = kc + (row * NKV + kvh) * HD;
+    vp = vc + (row * NKV + kvh) * HD;
+    ksp = ks + row * NKV + kvh;
+    vsp = vs + row * NKV + kvh;
+}
 // q (24 heads), k, v (2 heads) of row t: RMSNorm (1 + w) + partial RoPE (64 dims, rotate_half) -> qb [m][24 + 4][256]
 // (q heads, k0, k1, v0, v1); owned rows also go to the fp8 cache. grid (28, m), 256 threads
 // proj rows [q nqp heads (global qh0..)][gate local][k 2][v 2]; grid (nqp + 4, m)
 __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* __restrict__ qn, const bf16* __restrict__ kn,
                            const int* __restrict__ pos0, float* __restrict__ qb, uint8_t* __restrict__ kc,
                            uint8_t* __restrict__ vc, float* __restrict__ ks, float* __restrict__ vs, Plan p, int nqp, int qh0,
-                           const int* __restrict__ rpos = nullptr, const int* __restrict__ rbase = nullptr) {
+                           const int* __restrict__ rpos = nullptr, const int* __restrict__ rbase = nullptr,
+                           const int* __restrict__ rsl = nullptr, KvMap km = KvMap()) {
     __shared__ float red[32];
     __shared__ float xs[HD];
     const int hb = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const int h = hb < nqp ? qh0 + hb : NQ + hb - nqp;  // q head (global) or NQ + {k0, k1, v0, v1}
     // batched rows (rpos / rbase, flash_batch.cuh): the row's own position and KV region (first row of its slot)
     const int pos = rpos ? rpos[t] : *pos0 + t;
-    if (rbase) { const size_t rb = rbase[t]; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
+    const size_t rb0 = rbase ? (size_t)rbase[t] : 0;
+    if (rbase && !km.pt) { const size_t rb = rb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
     const int kvo = (nqp + (p.q1 - p.q0)) * HD;
     const float* src;
     const bf16* w = nullptr;
@@ -1155,7 +1209,7 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
         __syncthreads();
         if (d < ROT) {
             const int i = d & 31;
-            const float f = (float)pos * powf((float)THETA, -2.f * i / ROT);
+            const float f = rope_freq(pos, i, rsl ? rsl[t] : -1);
             float sn, cs;
             sincosf(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
@@ -1170,7 +1224,19 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
         const int kvh = (h - NQ) & 1;
         const bool isk = h < NQ + 2;
         __nv_fp8_e4m3 q8(x / sc);
-        (isk ? kc : vc)[((size_t)row * NKV + kvh) * HD + d] = *reinterpret_cast<uint8_t*>(&q8);
+        const uint8_t q8b = *reinterpret_cast<uint8_t*>(&q8);
+        if (km.pt) {  // streaming: the host row always (write-through), the cached block's row when it is resident
+            const size_t g = rb0 + (size_t)row;
+            __stwt((isk ? km.hk : km.hv) + (g * NKV + kvh) * HD + d, q8b);
+            if (d == 0) __stwt((isk ? km.hks : km.hvs) + g * NKV + kvh, sc);
+            const int b = km.pt[g >> 2];
+            if (b < 0) return;
+            const size_t pr = (size_t)b * 4 + (g & 3);
+            (isk ? kc : vc)[(pr * NKV + kvh) * HD + d] = q8b;
+            if (d == 0) (isk ? ks : vs)[pr * NKV + kvh] = sc;
+            return;
+        }
+        (isk ? kc : vc)[((size_t)row * NKV + kvh) * HD + d] = q8b;
         if (d == 0) (isk ? ks : vs)[row * NKV + kvh] = sc;
     }
 }
@@ -1191,7 +1257,7 @@ __global__ void k_idx_prep(const float* __restrict__ ip, int ld, const bf16* __r
         __syncthreads();
         if (d < ROT) {
             const int i = d & 31;
-            const float f = (float)pos * powf((float)THETA, -2.f * i / ROT);
+            const float f = rope_freq(pos, i);
             float sn, cs;
             sincosf(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
@@ -1234,7 +1300,7 @@ __global__ void k_idx_prep_rows(const float* __restrict__ ip, int ld, const bf16
         __syncthreads();
         if (d < ROT) {
             const int i = d & 31;
-            const float f = (float)ps * powf((float)THETA, -2.f * i / ROT);
+            const float f = rope_freq(ps, i);
             float sn, cs;
             sincosf(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
@@ -1545,7 +1611,7 @@ __global__ void k_xs_flag(FlagP p, const unsigned* seq, int rank, int ngpu) {
 // words of every sender, which the consumer kernel waits for
 // copy-engine staged transfers: the transfer's flag value (*seq + 1) into a local word, which the stream's copies then
 // write into the peers' flag words after the rows
-__global__ void k_seq_word(unsigned* w, const unsigned* seq) { *w = *seq + 1; }
+__global__ void k_seq_word(unsigned* w, const unsigned* seq, int ahead = 0) { *w = *seq + 1 + ahead; }
 __global__ void k_xs_local(unsigned* mine, const unsigned* seq, int rank, int ngpu) {
     if (threadIdx.x != 0) return;
     const unsigned s = *seq + 1;
@@ -1635,6 +1701,132 @@ __device__ __forceinline__ int owned_upto(const Plan& p, int pos) {
     if (pos < 0) return 0;
     const int nper = pos / p.period, rem = pos % p.period - p.own0;
     return nper * p.own + (rem < 0 ? 0 : min(rem + 1, p.own));
+}
+// ---- KV streaming: block residency. One call per (layer, kind) launch: every block a coming reader / writer of the
+// call's rows needs is made resident in the layer's block cache, synchronously (copied from the host rows by the
+// warp that claims it). Physical block state st[i] = (use id << 32) | logical block (0xffffffff: none); a block used
+// by the current call (use id == call id) is never evicted, so the call's whole set stays until its kernels ran.
+// Victims: a clock over the physical blocks (hand), first block whose use id is older. No victim (the call needs
+// more than P blocks): the block stays uncached (pt -1) and its readers read the host rows.
+// entries e = warp0, warp0 + nw, ... of a row: its selected blocks sel[0..ns) then its blocks [tb0, tb1) (tail, or
+// every visible block without selection); rb = the row's region start row
+// pout (optional): per entry the resolved block for the reader (physical block, or -(logical block + 1): host rows)
+__device__ __forceinline__ void kv_need_ents(const KvPool& kp, unsigned id, size_t rb, const int* sel, int ns, int tb0,
+                                             int tb1, int warp0, int nw, int* pout = nullptr) {
+    const int lane = threadIdx.x & 31;
+    const int ne = ns + (tb1 - tb0);
+    for (int e = warp0; e < ne; e += nw) {
+        const int b = (int)(rb / IDX_R) + (e < ns ? sel[e] : tb0 + (e - ns));  // logical block
+        int phys = -1, res = -(b + 1);
+        bool load = false;
+        if (lane == 0) {
+            for (int tries = 0; tries < 1 << 20; tries++) {
+                const int c = __ldcg(kp.pt + b);
+                if (c >= 0) {
+                    const unsigned long long w = __ldcg(kp.st + c);
+                    if ((unsigned)w != (unsigned)b) continue;  // being evicted: its pt changes next
+                    if ((unsigned)(w >> 32) == id) { res = c; break; }  // hit, already marked by this call
+                    if (atomicCAS(kp.st + c, w, ((unsigned long long)id << 32) | (unsigned)b) == w) { res = c; break; }  // hit
+                    continue;
+                }
+                if (c == -2) {  // another warp loads it in this call: without a result list nothing to wait for
+                    if (!pout) break;
+                    __nanosleep(32);
+                    continue;
+                }
+                if (atomicCAS(kp.pt + b, -1, -2) != -1) continue;
+                // claimed: a victim among the blocks the cache may use now (ctl[6])
+                const int Pe = (int)__ldcg(kp.ctl + 6);
+                for (int k = 0; k < 2 * Pe && phys < 0; k++) {
+                    const int i = (int)(atomicAdd(kp.ctl + 1, 1u) % (unsigned)Pe);
+                    const unsigned long long w = __ldcg(kp.st + i);
+                    if ((unsigned)(w >> 32) >= id) continue;
+                    if (atomicCAS(kp.st + i, w, ((unsigned long long)id << 32) | (unsigned)b) != w) continue;
+                    const unsigned o = (unsigned)w;
+                    if (o != 0xffffffffu) atomicCAS(kp.pt + o, i, -1);
+                    phys = i;
+                }
+                if (phys < 0) { atomicExch(kp.pt + b, -1); atomicAdd(kp.ctl + 4, 1u); }
+                else { load = true; atomicAdd(kp.ctl + 3, 1u); res = phys; }
+                break;
+            }
+            if (pout) pout[e] = res;
+        }
+        load = __shfl_sync(0xffffffffu, load, 0);
+        phys = __shfl_sync(0xffffffffu, phys, 0);
+        if (!load) continue;
+        // 4 rows: K 2048 B, V 2048 B (128 uint4 each), scales 8 + 8 floats
+        const size_t g0 = (size_t)b * IDX_R, d0 = (size_t)phys * IDX_R;
+        const uint4* sk = reinterpret_cast<const uint4*>(kp.m.hk + g0 * NKV * HD);
+        const uint4* sv = reinterpret_cast<const uint4*>(kp.m.hv + g0 * NKV * HD);
+        uint4* dk = reinterpret_cast<uint4*>(kp.kc + d0 * NKV * HD);
+        uint4* dv = reinterpret_cast<uint4*>(kp.vc + d0 * NKV * HD);
+        uint4 x[8];
+#pragma unroll
+        for (int j = 0; j < 4; j++) { x[j] = __ldcv(sk + lane + 32 * j); x[4 + j] = __ldcv(sv + lane + 32 * j); }
+        float sc = 0.f;
+        if (lane < 8) sc = __ldcv(kp.m.hks + g0 * NKV + lane);
+        else if (lane < 16) sc = __ldcv(kp.m.hvs + g0 * NKV + lane - 8);
+#pragma unroll
+        for (int j = 0; j < 4; j++) { dk[lane + 32 * j] = x[j]; dv[lane + 32 * j] = x[4 + j]; }
+        if (lane < 8) kp.ks[d0 * NKV + lane] = sc;
+        else if (lane < 16) kp.vs[d0 * NKV + lane - 8] = sc;
+        __threadfence();
+        __syncwarp();
+        if (lane == 0) atomicExch(kp.pt + b, phys);
+    }
+}
+// the row's block range besides its selection: the tail (rows of its incomplete block) or, without selection (ns < 0),
+// every visible block
+__device__ __forceinline__ void kv_need_range(const Plan& p, int pos, int ns, int& tb0, int& tb1) {
+    const int nra = owned_upto(p, pos);
+    tb1 = (nra + IDX_R - 1) / IDX_R;
+    tb0 = ns < 0 ? 0 : owned_upto(p, IDX_R * ((pos + 1) / IDX_R) - 1) / IDX_R;
+}
+// the last block of a call advances the call id (thread 0, after the block's entries)
+__device__ __forceinline__ void kv_need_done(const KvPool& kp, unsigned id, unsigned nblocks) {
+    __threadfence();
+    if (atomicAdd(kp.ctl + 2, 1u) == nblocks - 1) {
+        kp.ctl[2] = 0;
+        atomicExch(kp.ctl, id);
+        __threadfence();
+    }
+}
+// readers' keys of each row resident (no selection, or a selection not fused into k_idx_select).
+// grid (ceil(KN_ENT / 8), rows), 256 threads (a warp per entry)
+constexpr int KN_ENT = IDX_TOPB + 2;
+__global__ void __launch_bounds__(256) k_kv_need(KvPool kp, const int* __restrict__ pos0, const int* __restrict__ rpos,
+                                                 const int* __restrict__ rbase, const int* __restrict__ sel,
+                                                 const int* __restrict__ nsel, int lbmax, Plan p, int toff = 0,
+                                                 int* __restrict__ psel = nullptr) {
+    const unsigned id = __ldcg(kp.ctl) + 1;
+    const int t = blockIdx.y + toff;
+    const int pos = rpos ? rpos[t] : *pos0 + t;
+    const size_t rb = rbase ? (size_t)rbase[t] : 0;
+    int ns = sel ? nsel[t] : -1, tb0, tb1;
+    kv_need_range(p, pos, ns, tb0, tb1);
+    if (ns < 0) ns = 0;
+    kv_need_ents(kp, id, rb, sel ? sel + (size_t)t * lbmax : nullptr, ns, tb0, tb1, blockIdx.x * 8 + (threadIdx.x >> 5), gridDim.x * 8,
+                 psel ? psel + (size_t)blockIdx.y * lbmax : nullptr);
+    __syncthreads();
+    if (threadIdx.x == 0) kv_need_done(kp, id, gridDim.x * gridDim.y);
+}
+// the cache may use physical blocks [0, pe) from now on: blocks >= pe are dropped (lent to the expert cache)
+__global__ void k_kv_trim(KvPool kp, int pe) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) kp.ctl[6] = (unsigned)pe;
+    for (int i = pe + blockIdx.x * blockDim.x + threadIdx.x; i < kp.P; i += gridDim.x * blockDim.x) {
+        const unsigned long long w = kp.st[i];
+        const unsigned o = (unsigned)w;
+        if (o != 0xffffffffu && kp.pt[o] == i) kp.pt[o] = -1;
+        kp.st[i] = 0xffffffffull;
+    }
+}
+// drop the cached copies of logical blocks [b0, b1) (their host rows changed: archive restore, region move)
+__global__ void k_kv_inval(KvPool kp, int b0, int b1) {
+    for (int b = b0 + blockIdx.x * blockDim.x + threadIdx.x; b < b1; b += gridDim.x * blockDim.x) {
+        const int c = kp.pt[b];
+        if (c >= 0) { kp.st[c] = 0xffffffffull; kp.pt[b] = -1; }
+    }
 }
 // scores[t][lb] = sum_h relu(iq_h . K_lb) / sqrt(128) of this card's complete visible blocks (when the row selects:
 // more than IDX_TOPB complete blocks visible). grid (ceil(lbmax / 256), m)
@@ -1841,10 +2033,46 @@ __global__ void k_idx_local(float* __restrict__ scores, const int* __restrict__ 
         if (keys[i] == kth) { const int j = atomicAdd(&s_cnt, 1); if (j < IDX_TOPB) o[j] = kth; }
 }
 // every card sends its local top keys of all rows to both peers ([2 slots][ngpu][MAXM][IDX_TOPB] keys)
-__global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Plan p) {
+// pace > 0 (test, slow-link emulation of the SM-store path): the stores are spread over bytes * pace ns, so they are in
+// flight (and tax the card's other kernels) as long as on a link of 1 / pace GB/s
+__global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Plan p, float pace = 0.f,
+                           unsigned long long* busy = nullptr) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
     unsigned* dst = reinterpret_cast<unsigned*>(xc.recv[peer]) + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * IDX_TOPB;
+    if (pace > 0.f) {
+        __shared__ unsigned long long s_t0;
+        if (threadIdx.x == 0) {  // this peer's bytes take their turn on the card's emulated egress link (FIFO, as the copies)
+            unsigned long long now;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+            unsigned long long st = now;
+            if (busy) {
+                const unsigned long long d = (unsigned long long)((double)m * IDX_TOPB * 4 * pace);
+                unsigned long long old = *(volatile unsigned long long*)busy;
+                for (;;) {
+                    st = old > now ? old : now;
+                    const unsigned long long seen = atomicCAS(busy, old, st + d);
+                    if (seen == old) break;
+                    old = seen;
+                }
+            }
+            s_t0 = st;
+        }
+        __syncthreads();
+        const unsigned long long t0 = s_t0;
+        constexpr int CH = 4096;  // words per paced piece
+        for (int c0 = 0; c0 < m * IDX_TOPB; c0 += CH) {
+            if (threadIdx.x == 0)
+                for (;;) {
+                    unsigned long long t;
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                    if (t >= t0 + (unsigned long long)((double)c0 * 4 * pace)) break;
+                    __nanosleep(500);
+                }
+            __syncthreads();
+            for (int idx = c0 + threadIdx.x; idx < min(m * IDX_TOPB, c0 + CH); idx += blockDim.x) dst[idx] = loc[idx];
+        }
+    } else
     for (int idx = threadIdx.x; idx < m * IDX_TOPB; idx += blockDim.x) dst[idx] = loc[idx];
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1856,7 +2084,8 @@ __global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Pla
 // (score key >= threshold) into sel[t][0..nsel[t]). One block per row; the last block bumps the exchange.
 __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* __restrict__ loc, const int* __restrict__ pos0,
                              Plan p, int lbmax, Xchg xc, int* __restrict__ sel, int* __restrict__ nsel,
-                             const int* __restrict__ rpos = nullptr, bool skeys = false) {
+                             const int* __restrict__ rpos = nullptr, bool skeys = false, KvPool kp = KvPool(),
+                             const int* __restrict__ rbase = nullptr, int* __restrict__ psel = nullptr) {
     __shared__ unsigned keys[3 * IDX_TOPB];  // ngpu <= 3
     __shared__ unsigned hist[256];
     __shared__ unsigned s_s;
@@ -1906,6 +2135,16 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
         nsel[t] = -1;  // no selection: every visible key
     }
     __syncthreads();
+    if (kp.ctl) {  // KV streaming: this row's keys resident (the selection just written by this block)
+        const unsigned id = __ldcg(kp.ctl) + 1;
+        int ns = nbg > IDX_TOPB ? min(s_cnt, lbmax) : -1, tb0, tb1;
+        kv_need_range(p, pos, ns, tb0, tb1);
+        if (ns < 0) ns = 0;
+        kv_need_ents(kp, id, rbase ? (size_t)rbase[t] : 0, sel + (size_t)t * lbmax, ns, tb0, tb1, threadIdx.x >> 5, blockDim.x >> 5,
+                     psel ? psel + (size_t)t * lbmax : nullptr);
+        __syncthreads();
+        if (threadIdx.x == 0) kv_need_done(kp, id, gridDim.x);
+    }
     if (threadIdx.x == 0) {
         __threadfence();
         if (atomicAdd(xc.done, 1u) == gridDim.x - 1) {
@@ -1914,6 +2153,54 @@ __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* _
             __threadfence();
         }
     }
+}
+
+// gate counters of KV streaming (FLASH_SELWIN, debug): per call (one layer of one forward) the selected blocks of
+// the rows vs windows of the last 8K / 16K / 32K positions, and the union of the call's blocks vs a recency cache
+// (block stamped with the call id of its last use; miss = not used in the last H calls of this layer). One block.
+// c[0] rows, 1 selected, 2 sel outside 8K, 3 outside 16K, 4 outside 32K, 5 union, 6 union out 16K, 7 union out 32K,
+// 8 miss(out 16K, H=1), 9 miss(16K, H=8), 10 miss(16K, H=64), 11 miss(32K, H=8), 12 calls, 13 visible owned blocks,
+// 14 miss(16K, never used)
+__global__ void k_sel_win(const int* __restrict__ sel, const int* __restrict__ nsel, const int* __restrict__ pos0, int m,
+                          int lbmax, Plan p, unsigned* __restrict__ stamp, unsigned* __restrict__ cid,
+                          unsigned long long* __restrict__ c) {
+    __shared__ unsigned s_id;
+    __shared__ unsigned long long acc[15];
+    if (threadIdx.x < 15) acc[threadIdx.x] = 0;
+    if (threadIdx.x == 0) s_id = *cid + 1;
+    __syncthreads();
+    const unsigned id = s_id;
+    for (int t = 0; t < m; t++) {
+        const int ns = nsel[t];
+        if (ns < 0) continue;
+        const int pos = *pos0 + t;
+        if (threadIdx.x == 0) { atomicAdd(&acc[0], 1ull); atomicAdd(&acc[1], (unsigned long long)ns);
+                                atomicAdd(&acc[13], (unsigned long long)(owned_upto(p, pos) / IDX_R)); }
+        for (int i = threadIdx.x; i < ns; i += blockDim.x) {
+            const int b = sel[(size_t)t * lbmax + i], r = b * IDX_R;
+            const int bp = (r / p.own) * p.period + p.own0 + r % p.own + IDX_R - 1;  // last position of the block
+            const int age = pos - bp;
+            if (age > 8192) atomicAdd(&acc[2], 1ull);
+            if (age > 16384) atomicAdd(&acc[3], 1ull);
+            if (age > 32768) atomicAdd(&acc[4], 1ull);
+            const unsigned old = atomicMax(stamp + b, id);
+            if (old < id) {
+                atomicAdd(&acc[5], 1ull);
+                if (age > 16384) {
+                    atomicAdd(&acc[6], 1ull);
+                    if (id - old > 1) atomicAdd(&acc[8], 1ull);
+                    if (id - old > 8) atomicAdd(&acc[9], 1ull);
+                    if (id - old > 64) atomicAdd(&acc[10], 1ull);
+                    if (old == 0) atomicAdd(&acc[14], 1ull);
+                }
+                if (age > 32768) { atomicAdd(&acc[7], 1ull); if (id - old > 8) atomicAdd(&acc[11], 1ull); }
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) { *cid = id; acc[12] = 1; }
+    __syncthreads();
+    if (threadIdx.x < 15) atomicAdd(c + threadIdx.x, acc[threadIdx.x]);
 }
 
 // QSA variant B: q is computed for the local heads only; every card sends its 8 heads' q rows ([MAXM][8][HD]) to
@@ -1943,6 +2230,29 @@ __global__ void k_qxsend16(const float* __restrict__ qb, int m, Xchg xc, Plan p)
         reinterpret_cast<uint4*>(dst)[idx] = make_uint4(f2h2(a.x * k, a.y * k), f2h2(a.z * k, a.w * k), f2h2(b.x * k, b.y * k), f2h2(b.z * k, b.w * k));
     }
     xsend_done(xc, peer, s, p);
+}
+// FLASH_QX_LOCAL: the q heads of owner `peer` (computed on this card into qb) in the fp16 format of k_qxsend16, into this
+// card's own receive slot of that owner; the last block of an owner raises this card's own flag word for it
+__global__ void k_qxlocal16(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
+    const int owner = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
+    const unsigned s = *xc.seq + 1;
+    __half* dst = reinterpret_cast<__half*>(xc.recv[p.rank] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p));
+    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * qper(p) / 8; idx += gridDim.y * blockDim.x) {
+        const int t = idx / (qper(p) / 8), r = idx % (qper(p) / 8);
+        const float4* src = reinterpret_cast<const float4*>(qb + ((size_t)t * (NQ + 4) + owner * QPC(p)) * HD) + 2 * r;
+        const float4 a = src[0], b = src[1];
+        constexpr float k = 1.f / 16.f;
+        reinterpret_cast<uint4*>(dst)[idx] = make_uint4(f2h2(a.x * k, a.y * k), f2h2(a.z * k, a.w * k), f2h2(b.x * k, b.y * k), f2h2(b.z * k, b.w * k));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        if (atomicAdd(xc.scnt + owner, 1u) == gridDim.y - 1) {
+            xc.scnt[owner] = 0u;
+            __threadfence();
+            qe_st_release_sys(xc.flags[p.rank] + owner, s);
+        }
+    }
 }
 // ahead: exchanges of this kind sent but not yet consumed here (pipelined QSA chunks, prefill-r3)
 __global__ void k_xsend16(const float* __restrict__ part, int m, Xchg xc, Plan p, int ahead = 0) {
@@ -2363,9 +2673,10 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
                                                       const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                       const float* __restrict__ vs, const int* __restrict__ pos0,
                                                       AttnDst dst, Plan p, Xchg xq, int m,
-                                                      const int* __restrict__ kvb0 = nullptr) {
+                                                      const int* __restrict__ kvb0 = nullptr, KvMap km = KvMap()) {
     extern __shared__ __align__(16) unsigned char ta_sm[];
-    if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
+    const size_t rb0 = kvb0 ? (size_t)*kvb0 : 0;
+    if (kvb0 && !km.pt) { const size_t rb = rb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
     __half* Ks = reinterpret_cast<__half*>(ta_sm);
     __half* Vs = Ks + TB_KEYS * TA_SROW;
     float* kss = reinterpret_cast<float*>(Vs + TB_KEYS * TA_SROW);
@@ -2450,19 +2761,24 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
         for (int c = threadIdx.x; c < TB_KEYS * (HD / 16); c += blockDim.x) {
             const int key = c / (HD / 16), ch = c % (HD / 16), r = k0 + key;
             const bool ok = r < kend;
-            const size_t go = ((size_t)(ok ? r : 0) * NKV + kvh) * HD + ch * 16;
+            const uint8_t *k8, *v8;
+            const float *s0, *s1;
+            kv_rowp(km, kc, vc, ks, vs, rb0, ok ? r : 0, kvh, k8, v8, s0, s1);
             const unsigned sk = (unsigned)__cvta_generic_to_shared(Kr + key * HD + ch * 16);
             const unsigned sv = (unsigned)__cvta_generic_to_shared(Vr + key * HD + ch * 16);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sk), "l"(kc + go), "r"(ok ? 16 : 0));
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sv), "l"(vc + go), "r"(ok ? 16 : 0));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sk), "l"(k8 + ch * 16), "r"(ok ? 16 : 0));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sv), "l"(v8 + ch * 16), "r"(ok ? 16 : 0));
         }
         if (threadIdx.x < TB_KEYS) {
             const int r = k0 + threadIdx.x;
             const bool ok = r < kend;
+            const uint8_t *k8, *v8;
+            const float *s0, *s1;
+            kv_rowp(km, kc, vc, ks, vs, rb0, ok ? r : 0, kvh, k8, v8, s0, s1);
             const unsigned a = (unsigned)__cvta_generic_to_shared(ksr + threadIdx.x);
             const unsigned b = (unsigned)__cvta_generic_to_shared(vsr + threadIdx.x);
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(a), "l"(ks + (ok ? r : 0) * NKV + kvh), "r"(ok ? 4 : 0));
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(b), "l"(vs + (ok ? r : 0) * NKV + kvh), "r"(ok ? 4 : 0));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(a), "l"(s0), "r"(ok ? 4 : 0));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(b), "l"(s1), "r"(ok ? 4 : 0));
         }
         asm volatile("cp.async.commit_group;");
     };
@@ -2619,7 +2935,8 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
                                                  const float* __restrict__ vs, const int* __restrict__ pos0, AttnDst dst,
                                                  Plan p, Xchg xq, const int* __restrict__ sel, const int* __restrict__ nsel,
                                                  int lbmax, const int* __restrict__ rpos = nullptr,
-                                                 const int* __restrict__ rbase = nullptr, bool q16 = false) {
+                                                 const int* __restrict__ rbase = nullptr, bool q16 = false,
+                                                 KvMap km = KvMap(), const int* __restrict__ psel = nullptr) {
     // q16: the peers' q rows arrived as fp16 (k_qxsend16: q / 16, the same values this kernel converts to)
     extern __shared__ __align__(16) unsigned char qd_sm[];
     __shared__ unsigned s_s;
@@ -2678,7 +2995,8 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
     }
     // the row's key list (batched rows: the row's own position and KV region)
     const int pos = rpos ? rpos[t] : *pos0 + t;
-    if (rbase) { const size_t rb = rbase[t]; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
+    const size_t rb0 = rbase ? (size_t)rbase[t] : 0;
+    if (rbase && !km.pt) { const size_t rb = rb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
     const int ns = sel ? nsel[t] : -1;
     const int nrows_all = owned_upto(p, pos);
     const int rc = ns < 0 ? nrows_all : owned_upto(p, IDX_R * ((pos + 1) / IDX_R) - 1);
@@ -2697,8 +3015,21 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
             const int key = lane >> 1, hf = lane & 1, it = k0 + key;
             const bool ok = it < nit;
             const int r = ok ? key_row(it) : 0;
-            const uint4* kp = reinterpret_cast<const uint4*>(kc + ((size_t)r * NKV + kvh) * HD + hf * 128);
-            const uint4* vp = reinterpret_cast<const uint4*>(vc + ((size_t)r * NKV + kvh) * HD + hf * 128);
+            const uint8_t *kr8, *vr8;
+            const float *ksr, *vsr;
+            if (psel) {  // KV streaming, blocks resolved by the residency pass: entry it / 4 (selection, then the tail)
+                const int bl = ok ? psel[(size_t)(sel ? t : 0) * lbmax + (it >> 2)] : 0;
+                const size_t row = bl >= 0 ? (size_t)bl * 4 + (it & 3) : (size_t)(-bl - 1) * 4 + (it & 3);
+                const uint8_t* kb_ = bl >= 0 ? kc : km.hk;
+                const uint8_t* vb_ = bl >= 0 ? vc : km.hv;
+                kr8 = kb_ + (row * NKV + kvh) * HD;
+                vr8 = vb_ + (row * NKV + kvh) * HD;
+                ksr = (bl >= 0 ? ks : km.hks) + row * NKV + kvh;
+                vsr = (bl >= 0 ? vs : km.hvs) + row * NKV + kvh;
+            } else
+            kv_rowp(km, kc, vc, ks, vs, rb0, r, kvh, kr8, vr8, ksr, vsr);
+            const uint4* kp = reinterpret_cast<const uint4*>(kr8 + hf * 128);
+            const uint4* vp = reinterpret_cast<const uint4*>(vr8 + hf * 128);
 #pragma unroll
             for (int c = 0; c < 8; c++) {
                 const uint4 kw = ok ? __ldg(kp + c) : make_uint4(0, 0, 0, 0), vw = ok ? __ldg(vp + c) : make_uint4(0, 0, 0, 0);
@@ -2711,8 +3042,8 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
                 vd[0] = make_uint4(vh[0], vh[1], vh[2], vh[3]); vd[1] = make_uint4(vh[4], vh[5], vh[6], vh[7]);
             }
             if (hf == 0) {
-                kss[key] = ok ? ks[r * NKV + kvh] * 256.f : 0.f;
-                vss[key] = ok ? vs[r * NKV + kvh] * 256.f : 0.f;
+                kss[key] = ok ? *ksr * 256.f : 0.f;
+                vss[key] = ok ? *vsr * 256.f : 0.f;
             }
         }
         __syncwarp();

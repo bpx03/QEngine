@@ -1,3 +1,4 @@
+#include "../env.h"
 #include <type_traits>
 #include <algorithm>
 
@@ -83,7 +84,13 @@ __device__ void exchange(const Comm& c, int rank, const CommCounters& ctr, unsig
             }
             st_release_gpu(ctr.go, s);
         } else {
-            while (ld_acquire_gpu(ctr.go) != s) __nanosleep(128);
+            // the other blocks wait for this GPU's leader (which waits for the peers): watched like the peer waits,
+            // so a rank stuck here also records a watchdog wait (peer -1: same GPU)
+            unsigned ws = 0;
+            while (ld_acquire_gpu(ctr.go) != s) {
+                __nanosleep(128);
+                QE_WD_POLL(ws, site, -1, s, ld_acquire_gpu(ctr.go));
+            }
         }
     }
     __syncthreads();
@@ -1420,8 +1427,8 @@ Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
     c.ngpu = ngpu;
     c.max_elems = max_elems;
     c.ll_hidden = ll_hidden;
-    c.clear = !(getenv("QE_LL_NOCLEAR") && atoi(getenv("QE_LL_NOCLEAR")));
-    c.coal = getenv("QE_AR_COAL") ? atoi(getenv("QE_AR_COAL")) != 0 : true;
+    c.clear = !(env_int("QE_LL_NOCLEAR", 0));
+    c.coal = env_set("QE_AR_COAL") ? env_int("QE_AR_COAL", true) != 0 : true;
     const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
     const size_t llb = (size_t)ngpu * 4 * kMaxBatchRows * ((ll_hidden + 2) / 3) * sizeof(uint2);
     CUDA_CHECK(cudaHostAlloc(&c.ll, llb, fl));
@@ -1433,8 +1440,7 @@ Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
 }
 
 bool comm_enable_p2p(Comm& c, const int* devices) {
-    const char* e = getenv("QE_P2P");
-    if ((e && !atoi(e)) || c.ngpu < 2 || c.ngpu > 4) return false;
+    if (!env_int("QE_P2P", 1) || c.ngpu < 2 || c.ngpu > 4) return false;
     for (int i = 0; i < c.ngpu; i++)
         for (int j = 0; j < c.ngpu; j++) {
             int can = 0;
@@ -1464,13 +1470,13 @@ bool comm_enable_p2p(Comm& c, const int* devices) {
         CUDA_CHECK(cudaMalloc(&c.prs2[i], (size_t)c.rs_rows * c.ll_hidden * 2));
         CUDA_CHECK(cudaMalloc(&c.pflags[i], (size_t)c.ngpu * kCommSlots * sizeof(unsigned)));
         CUDA_CHECK(cudaMemset(c.pflags[i], 0, (size_t)c.ngpu * kCommSlots * sizeof(unsigned)));
-        if (!getenv("QE_AR_CE") || atoi(getenv("QE_AR_CE"))) {  // copy-engine prefill all-reduce
+        if (env_int("QE_AR_CE", 1)) {  // copy-engine prefill all-reduce
             CUDA_CHECK(cudaMalloc(&c.cfl[i], (size_t)2 * c.ngpu * kCeSlots * sizeof(unsigned)));
             CUDA_CHECK(cudaMemset(c.cfl[i], 0, (size_t)2 * c.ngpu * kCeSlots * sizeof(unsigned)));
             CUDA_CHECK(cudaMalloc(&c.pstage[i], (size_t)c.rs_rows * c.ll_hidden * 2));
         }
-        if ((getenv("QE_AR_OWNFIN") && atoi(getenv("QE_AR_OWNFIN"))) ||
-            ((!getenv("QE_AR_CE") || atoi(getenv("QE_AR_CE"))) && getenv("QE_AR_CEOF") && atoi(getenv("QE_AR_CEOF")))) {
+        if ((env_int("QE_AR_OWNFIN", 0)) ||
+            ((env_int("QE_AR_CE", 1)) && env_int("QE_AR_CEOF", 0))) {
             // owner-finished prefill AR: receive rows (SM path off by default: slower; CE path QE_AR_CEOF=1)
             c.pxsc_row = (c.ll_hidden / 128) * 4 * 2 * 2;  // the largest record set: gemm_i8v G = 32 (>= x_to_i8 layout)
             CUDA_CHECK(cudaMalloc(&c.pxn[i], (size_t)c.rs_rows * c.ll_hidden * 2));
@@ -1507,12 +1513,12 @@ void comm_begin_unit(const CommCounters& ctr, cudaStream_t st) {
 }
 
 static bool rs_rows_p2p(const Comm& c, int m, int h) {
-    static const bool rs = getenv("QE_AR_RS_ROWS") ? atoi(getenv("QE_AR_RS_ROWS")) != 0 : true;
+    static const bool rs = env_set("QE_AR_RS_ROWS") ? env_int("QE_AR_RS_ROWS", true) != 0 : true;
     return rs && c.ngpu > 1 && m >= 3 * c.ngpu && m > kMaxGemvW4Tokens && c.p2p && c.prs1[0] != nullptr &&
            c.pflags[0] != nullptr && m <= c.rs_rows && h == c.ll_hidden;
 }
 bool allreduce_deferrable(const Comm& c, int m, int h, int rs_off) {
-    static const bool on = !getenv("QE_AR_DEFER") || atoi(getenv("QE_AR_DEFER"));
+    static const bool on = env_int("QE_AR_DEFER", 1);
     return on && rs_rows_p2p(c, m, h) && rs_off + m <= c.rs_rows;
 }
 void allreduce_finish(float* resid, int m, int h, const Comm& c, int rank, const bf16* norm_w, float eps,
@@ -1538,11 +1544,11 @@ void allreduce_finish(float* resid, int m, int h, const Comm& c, int rank, const
 }
 
 static bool ar_rsum() {
-    static const bool on = !getenv("QE_AR_RSUM") || atoi(getenv("QE_AR_RSUM"));
+    static const bool on = env_int("QE_AR_RSUM", 1);
     return on;
 }
 static int ar_rs_min() {  // min rows of the decode reduce-scatter + all-gather (MODE 2)
-    static const int v = getenv("QE_AR_RS_MIN") ? atoi(getenv("QE_AR_RS_MIN")) : 3;  // m >= 3: fewer bytes beat the extra hop (ar_bench)
+    static const int v = env_int("QE_AR_RS_MIN", 3);  // m >= 3: fewer bytes beat the extra hop (ar_bench)
     return v;
 }
 
@@ -1564,13 +1570,13 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
     if (ll_idx >= 0 && m <= kMaxBatchRows) {
         CHECK(ll_idx < 1023 && h == c.ll_hidden && h <= 3 * kLLThreads * kLLMaxWords &&
                   c.ngpu <= 4, "ll");
-        static const int ll16 = getenv("QE_LL16") ? atoi(getenv("QE_LL16")) : 1;  // min rows (0: off); one protocol for every row count keeps the norm bit-identical (MTP == greedy)
+        static const int ll16 = env_int("QE_LL16", 1);  // min rows (0: off); one protocol for every row count keeps the norm bit-identical (MTP == greedy)
         // QE_AR_RSUM (default 1): the reduced sum is rounded to bf16 before the residual update (as
         // the prefill reduce-scatter does); this lets rows >= QE_AR_RS_MIN use the reduce-scatter +
         // all-gather protocol (MODE 2, P2P) with results bit-identical to the all-to-all (MODE 1).
         // QE_AR_RSUM=0: the old fp32 sum, all-to-all only.
         const int mode = !ar_rsum() ? 0 : (c.p2p && c.ngpu > 2 && m >= ar_rs_min()) ? 2 : 1;
-        static const int arq = getenv("QE_AR_Q") ? atoi(getenv("QE_AR_Q")) : 0;  // experimental, lossy
+        static const int arq = env_int("QE_AR_Q", 0);  // experimental, lossy
         if (arq && c.p2p && c.ngpu > 2 && h <= kQE * kLL16Threads) {
             const bool rs = m >= ar_rs_min();
             if (arq == 2) {
@@ -1582,7 +1588,7 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
             }
         } else if (ll16 > 0 && m >= ll16 && h <= 7 * kLL16Threads) {
             // QE_AR_LOSSLESS = min rows of the packed protocol (default 8: ar_bench m8 11,6 -> 10,5 us, m4 slower; 0: off)
-            static const int lossless = getenv("QE_AR_LOSSLESS") ? atoi(getenv("QE_AR_LOSSLESS")) : 8;
+            static const int lossless = env_int("QE_AR_LOSSLESS", 8);
             if (mode == 2 && lossless > 0 && m >= lossless)
                 allreduce_llc_kernel<<<m, kLL16Threads, h * sizeof(float), st>>>(resid, partial, h, c, rank, ctr, ll_idx,
                                                                              norm_w, eps, xn, xh, S), fused = true;
@@ -1604,8 +1610,8 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
                                                       eps, xn, xh, ar_rsum());
     else {
         const int ovb = env_int("QE_AR_OV_BLOCKS", 4);  // (read per call: in-process A/B)
-        static const bool rs = getenv("QE_AR_RS_ROWS") ? atoi(getenv("QE_AR_RS_ROWS")) != 0 : true;
-        static const int allb = getenv("QE_AR_BLOCKS_ALL") ? atoi(getenv("QE_AR_BLOCKS_ALL")) : 0;  // experiments
+        static const bool rs = env_set("QE_AR_RS_ROWS") ? env_int("QE_AR_RS_ROWS", true) != 0 : true;
+        static const int allb = env_int("QE_AR_BLOCKS_ALL", 0);  // experiments
         const int nb = std::min(m, allb ? allb : overlapped ? ovb : 64);
         if (of) {
             auto go = [&](auto pbt, auto gt) {
@@ -2065,6 +2071,32 @@ __global__ void __launch_bounds__(512) xs_tail_kernel(float* __restrict__ R, con
 }
 }  // namespace
 
+__global__ void k_link_emul(unsigned long long* busy, unsigned long long bytes, float emu, float real) {
+    unsigned long long now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    const unsigned long long d = (unsigned long long)((double)bytes * emu), r = (unsigned long long)((double)bytes * real);
+    const unsigned long long s0 = now > r ? now - r : 0;  // the real copy started about r ns ago
+    unsigned long long old = *(volatile unsigned long long*)busy, end;
+    for (;;) {  // FIFO on the card's egress link: start after the previous transfer of any stream
+        end = (old > s0 ? old : s0) + d;
+        const unsigned long long seen = atomicCAS(busy, old, end);
+        if (seen == old) break;
+        old = seen;
+    }
+    for (;;) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+        if (now >= end) break;
+        __nanosleep(end - now > 20000 ? 10000 : 500);
+    }
+}
+void comm_link_emul(const Comm& c, int rank, size_t bytes, cudaStream_t st, int kind) {
+    // FLASH_TEST_LINK_SKIP (bits, attribution test): kinds whose transfers are not slowed (1 HC all-reduce, 2 row
+    // all-gather, 4 QSA q, 8 QSA partials, 16 indexer keys)
+    static const int skip = env_int("FLASH_TEST_LINK_SKIP", 0);
+    if (c.lemu <= 0.f || !c.lbusy[rank] || !bytes || ((skip >> kind) & 1)) return;
+    k_link_emul<<<1, 1, 0, st>>>(c.lbusy[rank], bytes, c.lemu, c.lreal);
+}
+
 static void allreduce_hc_staged(float* R, const float* inj, const float* partial, int m, int h, const Comm& c, int rank,
                                 cudaStream_t st, int blocks, bool own_rows) {
     // Host staging: every card PULLS the rows it needs (owner: the peers' partial rows of its range; full mode: the
@@ -2092,6 +2124,7 @@ static void allreduce_hc_staged(float* R, const float* inj, const float* partial
             if (g != rank && ob(g + 1) > ob(g))
                 CUDA_CHECK(cudaMemcpyAsync(c.prs1[g] + (size_t)rank * c.rs_own * h4, stage + (size_t)ob(g) * h4,
                                            (size_t)(ob(g + 1) - ob(g)) * row, cudaMemcpyDeviceToDevice, st));
+        comm_link_emul(c, rank, (size_t)(m - (o1 - o0)) * row, st, 0);
         xs_seqw_kernel<<<1, 1, 0, st>>>(c.xsw[rank], c.xcnt[rank]);
         ce_flags(0);
     }
@@ -2115,6 +2148,7 @@ static void allreduce_hc_staged(float* R, const float* inj, const float* partial
                 if (g != rank)
                     CUDA_CHECK(cudaMemcpyAsync(c.prs2[g] + (size_t)o0 * h4, c.prs2[rank] + (size_t)o0 * h4, (size_t)(o1 - o0) * row,
                                                cudaMemcpyDeviceToDevice, st));
+        if (!own_rows) comm_link_emul(c, rank, (size_t)(o1 - o0) * row * (ng - 1), st, 0);
         ce_flags(1);
     }
     xs_wait_kernel<<<1, 32, 0, st>>>(c, rank, 1, true);

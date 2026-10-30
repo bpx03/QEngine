@@ -8,6 +8,7 @@ import ctypes
 import os
 
 from steering import SteeringMixin
+from qe_env import env_str
 
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -31,6 +32,7 @@ SIGS = {
     "qe_vocab": (c_int, [c_void_p]),
     "qe_num_slots": (c_int, [c_void_p]),
     "qe_pool_tokens": (c_i64, [c_void_p]),
+    "qe_kv_in_ram": (c_int, [c_void_p]),
     "qe_can_admit": (c_int, [c_void_p, c_int]),
     "qe_pause_for": (c_int, [c_void_p, c_int, c_int]),
     "qe_set_limit": (None, [c_void_p, c_int, c_int]),
@@ -40,6 +42,8 @@ SIGS = {
     "qe_prefill_more": (c_int, [c_void_p, c_int]),
     "qe_start_finish": (c_int, [c_void_p]),
     "qe_prefill_more_slot": (c_int, [c_void_p, c_int, c_int]),
+    "qe_prefill_multi": (c_int, [c_void_p, P_int, c_int, c_int, P_int]),
+    "qe_prefill_pass_bound": (c_int, [c_void_p]),
     "qe_start_finish_slot": (c_int, [c_void_p, c_int]),
     "qe_num_prefills": (c_int, [c_void_p]),
     "qe_prefill_pos": (c_int, [c_void_p, c_int]),
@@ -97,7 +101,7 @@ GROUPS = {
     "grammar": ("qe_mask_buffer", "qe_spec_io", "qe_constrain", "qe_constrained", "qe_vocab"),
     "vision": ("qe_start_mm", "qe_start_begin"),
 }
-SINGLE = ("qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
+SINGLE = ("qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_kv_in_ram", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
           "qe_reset", "qe_set_lookahead")
 
 
@@ -116,7 +120,7 @@ def bind(lib):
 
 class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/steering.py)
     def __init__(self, model_dir, devices="0,1,2", max_t=262144, split="", lib_path=None, vocab=None):
-        self.lib_path = lib_path or os.environ.get("QE_LIB") or os.path.join(_ROOT, "build", "libqengine.so")
+        self.lib_path = lib_path or env_str("QE_LIB") or os.path.join(_ROOT, "build", "libqengine.so")
         self.lib = ctypes.CDLL(self.lib_path)
         self._init(model_dir, devices, max_t, split, vocab)
 
@@ -140,6 +144,7 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             raise RuntimeError(f"qe_create failed for {model_dir}")
         self.max_t = L.qe_max_context(self.h)
         self.pool_tokens = L.qe_pool_tokens(self.h) if "qe_pool_tokens" in self.fns else self.max_t
+        self.kv_in_ram = bool(L.qe_kv_in_ram(self.h)) if "qe_kv_in_ram" in self.fns else False
         n = L.qe_num_slots(self.h) if "qe_num_slots" in self.fns else 1
         if n > 1 and not (self.caps["chunked"] and self.caps["batch"]):
             raise RuntimeError(f"{self.lib_path}: {n} slots need the chunked-prefill and batch functions")
@@ -247,6 +252,25 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         if slot is None:
             return bool(self.lib.qe_prefill_more(self.h, int(budget)))
         return bool(self.lib.qe_prefill_more_slot(self.h, int(slot), int(budget)))
+
+    def can_prefill_multi(self):
+        return "qe_prefill_multi" in self.fns and self.caps["chunked"]
+
+    def prefill_pass_bound(self):
+        """True: each prefill pass copies the host-backed experts over PCIe (2 cards): larger batches pay off."""
+        return "qe_prefill_pass_bound" in self.fns and bool(self.lib.qe_prefill_pass_bound(self.h))
+
+    def prefill_multi(self, slots, budget):
+        """One batch over several prompts in flight (Flash-Next, batched prefill): rows of the prompts on `slots` (priority
+        order) up to `budget` tokens. Returns the slots whose prompts are complete (start_finish next), or None when no
+        shared batch ran (the caller prefills one prompt on its own)."""
+        if not self.can_prefill_multi() or len(slots) < 2:
+            return None
+        arr = (ctypes.c_int * len(slots))(*slots)
+        done = (ctypes.c_int * len(slots))()
+        if self.lib.qe_prefill_multi(self.h, arr, len(slots), int(budget), done) <= 0:
+            return None
+        return [s for s, d in zip(slots, done) if d]
 
     def start_finish(self, slot=None):
         """First token; (tok, reused, slot) like start()."""

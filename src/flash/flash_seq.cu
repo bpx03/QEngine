@@ -9,6 +9,7 @@
 //    key rings (IDX_TAIL positions by position mod IDX_TAIL, every QSA layer + MTP). With `pend`: the deferred-commit
 //    inputs of the last forward (conv / recurrence / PLE rows) and the step counter whose parity picks the recurrence
 //    buffer - a sequence saved after a speculative step resumes with its pending rows exactly as if it never left.
+#include "../env.h"
 #include "flash.h"
 #include <map>
 
@@ -32,10 +33,15 @@ void Worker::kv_pieces_at(int base, int t0, int t1, std::vector<Piece>& out) {
     const int b0 = r0 / IDX_R, b1 = (r1 + IDX_R - 1) / IDX_R;
     const size_t row = (size_t)NKV * HD;
     for (const KvBase& k : kvb_) {
-        out.push_back({(char*)k.kc + (rb + r0) * row, (size_t)(r1 - r0) * row});
-        out.push_back({(char*)k.vc + (rb + r0) * row, (size_t)(r1 - r0) * row});
-        out.push_back({(char*)(k.ks + (rb + r0) * NKV), (size_t)(r1 - r0) * NKV * 4});
-        out.push_back({(char*)(k.vs + (rb + r0) * NKV), (size_t)(r1 - r0) * NKV * 4});
+        // streaming: the K / V rows are the host rows (copies use cudaMemcpyDefault; writers call kv_inval)
+        uint8_t* kc = k.hm ? k.hm->hk : k.kc;
+        uint8_t* vc = k.hm ? k.hm->hv : k.vc;
+        float* ks = k.hm ? k.hm->hks : k.ks;
+        float* vs = k.hm ? k.hm->hvs : k.vs;
+        out.push_back({(char*)kc + (rb + r0) * row, (size_t)(r1 - r0) * row});
+        out.push_back({(char*)vc + (rb + r0) * row, (size_t)(r1 - r0) * row});
+        out.push_back({(char*)(ks + (rb + r0) * NKV), (size_t)(r1 - r0) * NKV * 4});
+        out.push_back({(char*)(vs + (rb + r0) * NKV), (size_t)(r1 - r0) * NKV * 4});
         out.push_back({(char*)(k.ikb + (rb / IDX_R + b0) * IDX_HD), (size_t)(b1 - b0) * IDX_HD * 2});
     }
 }
@@ -85,7 +91,7 @@ void Worker::pieces_of(const SlotState& q, bool pend, std::vector<Piece>& out) c
 
 // FLASH_MAX_SEQS slots (default 16), each with its own state storage; the workspace (alloc_state) holds the bound one
 void Worker::alloc_slots() {
-    int ns = getenv("FLASH_MAX_SEQS") ? atoi(getenv("FLASH_MAX_SEQS")) : 16;
+    int ns = env_int("FLASH_MAX_SEQS", 16);
     ns = std::max(1, std::min(16, ns));
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV;
@@ -134,7 +140,7 @@ void Worker::alloc_slots() {
     for (int li = 0; li <= LAYERS; li++) {
         Layer& L = li < LAYERS ? L_[li] : mtp_;
         if (li == LAYERS && !has_mtp_) break;
-        if (L.kc) kvb_.push_back({L.kc, L.vc, L.ks, L.vs, L.ikb});
+        if (L.kc) kvb_.push_back({L.kc, L.vc, L.ks, L.vs, L.ikb, kvs_ ? &L.kvp.m : nullptr});
     }
     moe_dn_1w();
     gstash_.assign(ns, GraphSet{});
@@ -148,6 +154,7 @@ void Worker::alloc_slots() {
     for (int i = 0; i < ns; i++) slots_[i].stepc = stepcs_ + i;
     rbcur_ = (int*)dalloc((size_t)PFM * 4);
     CUDA_CHECK(cudaMemset(rbcur_, 0, (size_t)PFM * 4));
+    mm_init(ns);
     ws_live_ = true;  // the workspace (alloc_state's state) holds slot 0 (zero, as its storage)
     {
         std::vector<float*> t((size_t)TB_N * (LAYERS + 1) * ns, nullptr);
@@ -187,11 +194,12 @@ void Worker::alloc_slots() {
     bdr_ = (int*)dalloc((size_t)MAXM * MAXM * 4);
     CUDA_CHECK(cudaMemset(bdr_, 0, (size_t)MAXM * MAXM * 4));
     if (has_mtp_) Rminb_ = (float*)dalloc((size_t)MAXM * RW * 4);
+    if (has_mtp_) Rmins_ = (float*)dalloc((size_t)ns * RW * 4);  // prefill_multi: each slot's MTP chain row
     CUDA_CHECK(cudaHostAlloc((void**)&bem_h_, (size_t)MAXM * (MAXM + 2) * 4, cudaHostAllocMapped | cudaHostAllocPortable));
     memset(bem_h_, 0, (size_t)MAXM * (MAXM + 2) * 4);
     CUDA_CHECK(cudaHostGetDevicePointer((void**)&bem_, bem_h_, 0));
-    blk_ = !getenv("FLASH_BATCH_LOOKUP") || atoi(getenv("FLASH_BATCH_LOOKUP"));
-    if (getenv("FLASH_BATCH_LK_MIN")) blk_min_ = atoi(getenv("FLASH_BATCH_LK_MIN"));
+    blk_ = env_int("FLASH_BATCH_LOOKUP", 1);
+    blk_min_ = env_int("FLASH_BATCH_LK_MIN", blk_min_);
     if (blk_ && ns > 1) {
         hdb_ = (int*)dalloc((size_t)ns * ((size_t)max_ctx_ + 64) * 4);
         hnb_ = (int*)dalloc((size_t)ns * 4);
@@ -211,6 +219,8 @@ void Worker::alloc_slots() {
 void Worker::bind_slot(int s, int base) {
     std::vector<int> v(PFM, base * p_.own);  // XROWS (= PFM) rows
     CUDA_CHECK(cudaMemcpyAsync(rbcur_, v.data(), v.size() * 4, cudaMemcpyHostToDevice, st_));
+    const int mc[2] = {s, mmdel_h_.empty() ? 0 : mmdel_h_.at(s)};  // multimodal RoPE: the bound slot and its shift
+    if (mmcur_) CUDA_CHECK(cudaMemcpyAsync(mmcur_, mc, 8, cudaMemcpyHostToDevice, st_));
     if (steer_csl_d_) {  // the single-sequence paths read the bound slot's steering {vector, mode, lo, hi} / scale
         CUDA_CHECK(cudaMemcpyAsync(steer_csl_d_, &steer_sl_h_.at((size_t)s * 4), 16, cudaMemcpyHostToDevice, st_));
         CUDA_CHECK(cudaMemcpyAsync(steer_csc_d_, &steer_sc_h_.at(s), 4, cudaMemcpyHostToDevice, st_));
@@ -267,35 +277,66 @@ void Worker::use_slot(int s, int base) {
     cur_base_ = base;
 }
 
-void Worker::drop_graphs(GraphSet& g) {
-    auto d = [](cudaGraphExec_t& x) { if (x) { CUDA_CHECK(cudaGraphExecDestroy(x)); x = nullptr; } };
-    for (auto& a : g.g) for (auto& b : a) for (auto& c : b) d(c);
-    for (auto& a : g.mg) for (auto& b : a) for (auto& c : b) d(c);
-    for (auto& a : g.sg) for (auto& b : a) for (auto& c : b) for (auto& x : c) d(x);
-    for (auto& [k, x] : g.pg) d(x);
-    for (auto& [k, x] : g.pbg) d(x);
-    g = GraphSet{};
+// every cached graph executable of this card except *keep (decode / MTP / speculative / constrained of the bound
+// slot, stashed per-slot sets, batched, prefill). Map entries stay with nullptr (= seen: captured again on the next
+// use), so the references and iterators the callers hold stay valid. Syncs first: an in-flight graph frees its
+// memory only when it completes.
+int Worker::drop_all_graphs(const cudaGraphExec_t* keep) {
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    int n = 0;
+    auto d = [&](cudaGraphExec_t& x) {
+        if (x && &x != keep) { CUDA_CHECK(cudaGraphExecDestroy(x)); x = nullptr; n++; }
+    };
+    for (auto& a : graph_) for (auto& b : a) for (auto& c : b) d(c);
+    for (auto& a : mgraph_) for (auto& b : a) for (auto& c : b) d(c);
+    for (auto& a : sgraph_) for (auto& b : a) for (auto& c : b) for (auto& x : c) d(x);
+    for (auto& gs : gstash_) {
+        for (auto& a : gs.g) for (auto& b : a) for (auto& c : b) d(c);
+        for (auto& a : gs.mg) for (auto& b : a) for (auto& c : b) d(c);
+        for (auto& a : gs.sg) for (auto& b : a) for (auto& c : b) for (auto& x : c) d(x);
+        for (auto* c : {&gs.pg, &gs.pbg}) for (auto& kv : *c) d(kv.second);
+    }
+    for (auto* c : {&cgraph_, &bgraphs_, &pgraphs_, &pbgraphs_, &pmgraphs_}) for (auto& kv : *c) d(kv.second);
+    graphs_evicted_ += n;
+    return n;
 }
 
-// graph instantiation with little free memory (262K context leaves ~0.3 GB): on OOM drop the other slots' decode
-// graphs and the prefill graphs, then retry once
-void Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
-    cudaError_t r = cudaGraphInstantiate(e, g, 0);
+// graph instantiation with little free memory (graph_oom.h, club-3090#1846: 4 slots, the expert cache sized to the
+// 256 MB margin, many conversation shapes): on OOM drop every other cached graph and retry once; if that fails too
+// the caller runs the step eagerly and the next graph_oom::kCoolSteps missing graphs are not captured. Never aborts.
+bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
+    static const graph_oom::Inject inj = [] {
+        graph_oom::Inject x;
+        x.at = graph_oom::parse_list(env_str("FLASH_TEST_GRAPH_OOM"));
+        x.hard = env_int("FLASH_TEST_GRAPH_OOM_HARD", 0) != 0;
+        x.rank = env_int("FLASH_TEST_GRAPH_OOM_RANK", -1);
+        return x;
+    }();
+    const int call = ++ginst_calls_;
+    *e = nullptr;
+    cudaError_t r = inj.first(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
     if (r == cudaErrorMemoryAllocation) {
         (void)cudaGetLastError();
-        for (int i = 0; i < (int)gstash_.size(); i++)
-            if (i != cur_slot_) drop_graphs(gstash_[i]);
-        for (auto* c : {&pgraphs_, &pbgraphs_}) {
-            for (auto& kv : *c)
-                if (kv.second) CUDA_CHECK(cudaGraphExecDestroy(kv.second));
-            c->clear();
+        *e = nullptr;
+        graph_oom_++;
+        const double f0 = free_bytes() / 1048576.0;
+        const int n = drop_all_graphs(e);  // their memory goes back to the driver's pool (not shown as free)
+        fprintf(stderr, "[flash] GPU%d: graph instantiate out of memory (%.0f MB free): dropped %d cached graphs, retrying%s\n",
+                dev_, f0, n, inj.first(call, p_.rank) ? " (FLASH_TEST_GRAPH_OOM)" : "");
+        r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+        if (r == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            *e = nullptr;
+            graph_eager_++;
+            gcool_.trip();
+            fprintf(stderr, "[flash] GPU%d: graph instantiate still out of memory (%.0f MB free): this step and the next %d new "
+                    "shapes run without graphs\n", dev_, free_bytes() / 1048576.0, graph_oom::kCoolSteps);
+            fflush(stderr);
+            return false;
         }
-        for (auto& kv : bgraphs_)
-            if (kv.second) { CUDA_CHECK(cudaGraphExecDestroy(kv.second)); kv.second = nullptr; }
-        fprintf(stderr, "[flash] GPU%d: graph instantiate out of memory, other graphs dropped\n", dev_);
-        r = cudaGraphInstantiate(e, g, 0);
     }
     CUDA_CHECK(r);
+    return true;
 }
 
 void Worker::reset_slot(int s) {
@@ -320,19 +361,51 @@ void Worker::kv_move(int from, int to, int ntok) {
     std::vector<int> starts;
     for (int r = 0; r < nr; r += chunk) starts.push_back(r);
     if (to > from) std::reverse(starts.begin(), starts.end());  // moving up: highest chunk first
+    if (kvs_) CUDA_CHECK(cudaStreamSynchronize(st_));  // host rows written by queued kernels before the host moves them
     for (int r : starts) {
         const int n = std::min(chunk, nr - r);
         const int b0 = r / IDX_R, b1 = (r + n + IDX_R - 1) / IDX_R;
         for (const KvBase& k : kvb_) {
+            if (k.hm) {  // KV in RAM: host rows, moved on the host (a copy may span several pinned slabs)
+                memmove(k.hm->hk + (tb + r) * row, k.hm->hk + (fb + r) * row, (size_t)n * row);
+                memmove(k.hm->hv + (tb + r) * row, k.hm->hv + (fb + r) * row, (size_t)n * row);
+                memmove(k.hm->hks + (tb + r) * NKV, k.hm->hks + (fb + r) * NKV, (size_t)n * NKV * 4);
+                memmove(k.hm->hvs + (tb + r) * NKV, k.hm->hvs + (fb + r) * NKV, (size_t)n * NKV * 4);
+            } else {
             CUDA_CHECK(cudaMemcpyAsync(k.kc + (tb + r) * row, k.kc + (fb + r) * row, (size_t)n * row, cudaMemcpyDeviceToDevice, st_));
             CUDA_CHECK(cudaMemcpyAsync(k.vc + (tb + r) * row, k.vc + (fb + r) * row, (size_t)n * row, cudaMemcpyDeviceToDevice, st_));
             CUDA_CHECK(cudaMemcpyAsync(k.ks + (tb + r) * NKV, k.ks + (fb + r) * NKV, (size_t)n * NKV * 4, cudaMemcpyDeviceToDevice, st_));
             CUDA_CHECK(cudaMemcpyAsync(k.vs + (tb + r) * NKV, k.vs + (fb + r) * NKV, (size_t)n * NKV * 4, cudaMemcpyDeviceToDevice, st_));
+            }
             CUDA_CHECK(cudaMemcpyAsync(k.ikb + (tb / IDX_R + b0) * IDX_HD, k.ikb + (fb / IDX_R + b0) * IDX_HD, (size_t)(b1 - b0) * IDX_HD * 2,
                                        cudaMemcpyDeviceToDevice, st_));
         }
     }
+    kv_inval(to, 0, ntok);  // streaming: the destination's cached blocks are stale
     CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+
+
+// graph launch with little free memory: a launch that fails as out of memory (nothing was enqueued) drops every
+// cached graph of the card (e included) and returns false; the caller then runs the same kernels eagerly. Never aborts.
+// Test hook FLASH_TEST_GRAPH_LAUNCH_OOM=n: the n-th graph launch of each card (1-based) fails as out of memory.
+bool Worker::launch_graph(cudaGraphExec_t& e) {
+    static const int inj = env_int("FLASH_TEST_GRAPH_LAUNCH_OOM", 0);
+    const bool fake = inj > 0 && ++glaunch_calls_ == inj;
+    cudaError_t r = fake ? cudaErrorMemoryAllocation : cudaGraphLaunch(e, st_);
+    if (r != cudaErrorMemoryAllocation) {
+        CUDA_CHECK(r);
+        return true;
+    }
+    (void)cudaGetLastError();
+    graph_oom_++;
+    const int n = drop_all_graphs(nullptr);
+    e = nullptr;
+    gcool_.trip();
+    fprintf(stderr, "[flash] GPU%d: graph launch out of memory (%.0f MB free): dropped %d cached graphs, this step runs "
+            "without a graph%s\n", dev_, free_bytes() / 1048576.0, n, fake ? " (FLASH_TEST_GRAPH_LAUNCH_OOM)" : "");
+    fflush(stderr);
+    return false;
 }
 
 }  // namespace flash

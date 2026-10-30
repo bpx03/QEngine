@@ -32,13 +32,10 @@ void qe_fatal_begin();
 
 typedef __nv_bfloat16 bf16;
 
-// Runtime switch read on every call (not cached): lets one process A/B prefill variants by
-// changing the environment between prompts. Only for host code outside
-// the hot decode path (prefill launches: a getenv per call is negligible).
-inline int env_int(const char* name, int def) {
-    const char* e = getenv(name);
-    return e && *e ? atoi(e) : def;
-}
+// env_int / env_double / env_ll / env_str (env.h): empty = unset. env_int reads on every call (not
+// cached): lets one process A/B prefill variants by changing the environment between prompts
+//. Only for host code outside the hot decode path.
+#include "env.h"
 typedef __nv_bfloat162 bf162;
 
 // Max tokens processed by the tensor-core GEMV path (decode + MTP verification).

@@ -287,6 +287,8 @@ void dn_core_seq(const float* conv_out, int ch, const DeltaShape& s, const float
                  const float* dt_bias, float* S, size_t slot_floats, const int* cur, int m,
                  float* qk, float* gb, float* o, cudaStream_t st);
 void dn_chunk_init();
+// load time: the chunk scratch for nv value heads and chunks of up to m_max rows, reserved per device (see qe_ws_alloc)
+void dn_chunk_reserve(int nv, int m_max);
 void dn_core_chunked(const float* conv_out, int ch, const DeltaShape& s, const float* qk,
                      const float* gb, float* S, size_t slot_floats, const int* cur, int m,
                      float* o, cudaStream_t st, int slot_off, bool h16 = false, const struct DnConvIn* ci = nullptr);

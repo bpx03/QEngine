@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agents import Tracker
+from qe_env import env_float, env_int, env_str
 import loop_guard
 from engine import Engine, SequenceFault
 import engine_stats
@@ -37,7 +38,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 # QE_STEP_PROF=1: per-step host timing of the single-sequence decode loop (ctypes step call, metrics,
 # feed = detokenize + parser hand-off, check_done, the rest of the loop iteration), one JSON line per
 # request to $QE_STEP_PROF_FILE (default step_prof.jsonl) with the prompt ids, plus a log summary
-STEP_PROF = os.environ.get("QE_STEP_PROF", "0") not in ("", "0")
+STEP_PROF = env_str("QE_STEP_PROF", "0") != "0"
 _pc = time.perf_counter
 
 # ----------------------------------------------------------------------------- template
@@ -169,7 +170,7 @@ def agent_label(sys_txt, messages):
     return "chat" if not lines else "agent"
 
 
-DIAG_PATH = os.path.expanduser(os.environ.get("QE_DIAG_LOG", "~/.local/state/qengine/diag.log"))
+DIAG_PATH = os.path.expanduser(env_str("QE_DIAG_LOG", "~/.local/state/qengine/diag.log"))
 
 
 def diag(kind, msg):
@@ -212,6 +213,36 @@ def lcp_len(a, b):
         else:
             hi = m - 1
     return lo
+
+
+_TOOL_HEAD = {"type": 0, "function": 1, "name": 2, "description": 3, "parameters": 4}
+
+
+def _canon_json(x, head=False):
+    """x with every mapping's keys sorted (head: the stock tool keys first, in the order clients send them)."""
+    if isinstance(x, dict):
+        keys = sorted(x, key=(lambda k: (_TOOL_HEAD.get(k, 9), str(k))) if head else str)
+        return {k: _canon_json(x[k], head and k == "function") for k in keys}
+    if isinstance(x, list):
+        return [_canon_json(v) for v in x]
+    return x
+
+
+def canonical_tools(tools):
+    """The tools in a canonical form, so an equal tool set renders a byte-identical prompt whatever order the client
+    sends it in (clients such as omp re-inject MCP tools between turns; the tools block sits at the very start of the
+    prompt, so a reordering used to invalidate the whole prompt cache): sorted by function name (stable: equal names
+    keep their order), every key of each tool's JSON sorted (the head keys type / function / name / description /
+    parameters keep the stock order). Tool-call parsing looks tools up by name, so it does not depend on the order."""
+    if not tools or not isinstance(tools, list):
+        return tools
+
+    def name(t):
+        f = t.get("function", t) if isinstance(t, dict) else None
+        n = f.get("name") if isinstance(f, dict) else None
+        return n if isinstance(n, str) else ""
+
+    return [_canon_json(t, head=True) for t in sorted(tools, key=name)]
 
 
 def parse_tool_calls(text, tools):
@@ -298,6 +329,14 @@ class Admission:
         self.backfill_wait = getattr(a, "backfill_wait", 0)
         self.k = a.mtp_k
         self.last_note = 0.0
+        # several prompts in one prefill batch (Flash-Next): every admitted text prompt joins the next batches
+        self.multi = gen.engine.can_prefill_multi() if hasattr(gen.engine, "can_prefill_multi") else False
+        # passes bound by the PCIe copies of the host-backed experts (2 cards): the large batch also while requests wait
+        self.pass_bound = self.multi and gen.engine.prefill_pass_bound()
+        if self.multi:
+            print(f"[sched] several queued prompts share prefill batches"
+                  f"{' (passes bound by host-backed expert copies: large batches also while requests wait)' if self.pass_bound else ''}",
+                  flush=True)
 
     def note(self, msg):  # scheduler notes that would repeat every loop: at most one per second
         if time.time() - self.last_note > 1.0:
@@ -329,17 +368,53 @@ class Admission:
                        - (self.main_bonus if q[i].prio >= 2 else 0))
         if not prefills:
             return order
-        if len(prefills) >= 2 or self.pre_max <= 0:
+        join = []
+        if self.multi and len(prefills) < MULTI_MAX:
+            # text prompts join the shared batches of the ones in flight while all of them fit one batch (a long prompt
+            # gains nothing from sharing and admitting it early only claims its KV region ahead); else the cut-in rule
+            cap = self.join_cap()
+            left = sum(len(j.ids) - max(0, self.e.prefill_pos(j.slot)) for j in prefills)
+            join = [i for i in order if not getattr(q[i].ids, "mm", None) and left + q[i].est <= cap]
+            if join:
+                return join
+        if self.pre_max <= 0 or (len(prefills) >= 2 and not self.multi):
             return []
-        long_ = prefills[-1]
+        left_of = lambda j: len(j.ids) - max(0, self.e.prefill_pos(j.slot))
+        long_ = max(prefills, key=left_of)
         pos = max(0, self.e.prefill_pos(long_.slot))
         if len(long_.ids) - pos < self.pre_min:
             return []
-        # fairness: the long prompt advances at least preempt_min tokens between cut-ins
-        if long_.cut_at is not None and pos - long_.cut_at < self.pre_min:
+        cuts = [j for j in prefills if j is not long_]
+        if cuts:
+            # a cut-in round (shared batches): more short requests join it while any of its cut-ins is in flight, up to
+            # one batch of prompt tokens per round in all (before: one cut-in at a time, the rest of a burst waited
+            # preempt_min tokens of the long prompt each). The long prompt still advances preempt_min tokens between
+            # rounds, so it keeps a bounded share and finishes in bounded time however many requests keep arriving
+            if len(prefills) >= MULTI_MAX:
+                return []
+            room = self.join_cap() - long_.round_tok
+            return [i for i in order if not getattr(q[i].ids, "mm", None) and q[i].est <= min(self.pre_max, room)]
+        # fairness: between cut-in rounds the long prompt advances preempt_min tokens per join-cap batch of cut-in tokens
+        # in the last round (a full round: preempt_min; a lone 600-token cut-in: ~1K), so cut-ins take at most
+        # join_cap / (join_cap + preempt_min) of the prompt rows (~36 % with the defaults) and the long one finishes
+        if long_.cut_at is not None and pos - long_.cut_at < min(self.pre_min, long_.round_tok * self.pre_min / self.join_cap()):
             return []
         return [i for i in order if not getattr(q[i].ids, "mm", None) and
                 (q[i].est <= self.pre_max or (q[i].prio >= 2 and long_.prio < 2))]
+
+    def join_cap(self):  # prompt rows in flight that still share one prefill batch (the idle batch + a tail chunk)
+        return max(self.g.args.prefill_chunk, self.g.args.prefill_chunk_idle) + 512
+
+    def batch_order(self, now, prefills):
+        """Prompts in flight in the order they get rows of a shared prefill batch: least left first, aged, main thread
+        ahead (as pick_next); a long prompt gets what is left of the batch. Prompts that end within one batch (cut-ins)
+        always come before longer ones: aged by its wait in the queue, a long prompt in progress for ~45 s sorted ahead
+        of a cut-in, took the whole batch and the cut-in waited for all of it (KV in RAM, t8 + 262K: TTFT p50 58 s)."""
+        cap = self.join_cap()
+        def key(j):
+            left = len(j.ids) - max(0, self.e.prefill_pos(j.slot))
+            return (left > cap, left - (now - j.t_enq) * self.aging - (self.main_bonus if j.prio >= 2 else 0))
+        return sorted(prefills, key=key)
 
     def admit_next(self, now, prefills):
         """Index of the queued request to start now, or None. The best candidate that fits the pool
@@ -440,13 +515,14 @@ class Generator:
                                              loop_guard=self.guard_stats())
         if args.metrics_port:
             self.metrics.serve(args.metrics_host, args.metrics_port)
-        if os.environ.get("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
+        if env_str("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
             # sampling mode: requests normally carry a temperature (Claude Code does), and the
             # server default is 0.6
             print(f"graph warm-up: {self.engine.warmup(greedy=args.temperature <= 0):.1f}s", flush=True)
         self.engine.set_concurrent(True)
         self.cv = threading.Condition()
         self.queue = []
+        self.stopping = False  # SIGTERM / SIGINT: requests end with an error event (stop_requests)
         self.ctrl = []  # (fn, done event) run by the scheduler thread when nothing is generating
         self.n_faults = 0  # engine NaN guard faults seen (faults())
         self.cur_slot = -1
@@ -485,12 +561,14 @@ class Generator:
         if guard and self.args.loop_guard_note:  # the repeated call's result tells the model it is looping
             messages, guard["note"] = loop_guard.add_note(messages, guard["turns"])
         messages = self.clean_history(messages)
+        if getattr(self.args, "sort_tools", 1):
+            tools = canonical_tools(tools)
         text = self.tmpl.render(messages, tools, **kw)
         sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
         label = "main agent" if info is not None and info.main else agent_label(sys_txt, messages)
         affinity = int.from_bytes(hashlib.blake2b(sys_txt.encode(), digest_size=8).digest(), "little")
-        if os.environ.get("QE_DUMP_PROMPTS"):
-            d = os.environ["QE_DUMP_PROMPTS"]
+        if env_str("QE_DUMP_PROMPTS"):
+            d = env_str("QE_DUMP_PROMPTS")
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
                 f.write(text)
@@ -499,8 +577,14 @@ class Generator:
         if images:
             from vision import load_image_bytes
             t0 = time.time()
-            with self.vision_lock:
-                exp, emb, rope3, delta = self.vision.expand(list(ids), [load_image_bytes(s) for s in images])
+            try:
+                raw = [load_image_bytes(s) for s in images]
+                with self.vision_lock:
+                    exp, emb, rope3, delta = self.vision.expand(list(ids), raw)
+            except InputError:
+                raise
+            except Exception as ex:  # undecodable base64 / not an image / URL not reachable / placeholder mismatch
+                raise InputError(f"image input: {ex}") from ex
             hint = ids.hint
             ids = Ids(exp)
             ids.hint, ids.mm, ids.label, ids.agent, ids.guard = hint, (emb, rope3, delta), label, info, guard
@@ -661,8 +745,23 @@ class Generator:
         cap = max(self.engine.slots) - self.args.mtp_k - 2
         return f"prompt is too long: {len(ids)} tokens > {cap} maximum" if len(ids) > cap else None
 
+    def stop_requests(self):
+        """Shutdown (SIGTERM / SIGINT, before uvicorn waits for the open streams): queued requests fail now, prompts
+        being prefilled at the scheduler's next pass, generating ones at their next step; each ends with an error
+        event, so the server exits instead of waiting for them (docker stop without SIGKILL)."""
+        with self.cv:
+            self.stopping = True
+            q, self.queue = self.queue, []
+            for j in q:
+                j.fail(SequenceFault("server is shutting down"))
+            self.cv.notify()
+        if q:
+            print(f"shutdown: {len(q)} queued requests ended", flush=True)
+
     def run(self, ids, p, on_text, cancelled, affinity=0):
         """Blocking generation; calls on_text(str) for new text. Returns stats dict."""
+        if self.stopping:
+            raise SequenceFault("server is shutting down")
         if len(ids) + self.args.mtp_k + 2 > max(self.engine.slots):
             raise ValueError(f"prompt has {len(ids)} tokens; the largest context slot holds "
                              f"{max(self.engine.slots)}")
@@ -675,6 +774,8 @@ class Generator:
         job.done.wait()
         if job.error:
             raise job.error
+        if getattr(job, "shut", False):
+            raise SequenceFault("server is shutting down: the reply was cut")
         return job.stats
 
     # ------------------------------------------------------------ scheduler (engine thread)
@@ -715,10 +816,11 @@ class Generator:
         decode_until = 0.0  # while another prompt is prefilled, decode steps run until this time
         bg_done = True  # idle archiving has nothing left (reset whenever a request finishes)
         pre_min, pre_max = self.args.preempt_min, self.args.preempt_max
+        burst_wait = max(0.0, getattr(self.args, "burst_wait", 5.0)) / 1000.0
 
         adm = Admission(self)
 
-        trace = open(os.environ["QE_SCHED_TRACE"], "w", buffering=1) if os.environ.get("QE_SCHED_TRACE") else None
+        trace = open(env_str("QE_SCHED_TRACE"), "w", buffering=1) if env_str("QE_SCHED_TRACE") else None
         prof_last = 0.0  # QE_STEP_PROF: return time of the last single step (0: none to chain from)
 
         def tr(kind, t0, n=0, toks=0):  # scheduler trace (QE_SCHED_TRACE=file): one JSON line per event
@@ -780,23 +882,39 @@ class Generator:
                 finally:
                     if ev:
                         ev.set()
-            with self.cv:
-                if not self.queue and not active and not prefills:
-                    continue
-                # admit the next request (shortest remaining prefill first, aged) while a
-                # sequence slot is free and the pool has room for it
-                admit = None
-                i = adm.admit_next(time.time(), prefills)
-                if i is not None:
-                    admit = self.queue.pop(i)
-                    if prefills:  # a cut-in on the long prompt in progress
-                        long_ = prefills[-1]
-                        long_.cut_at = max(0, e.prefill_pos(long_.slot))
-                        if admit.prio >= 2 and long_.prio < 2 and admit.est > pre_max:
-                            self.sched["main_cutins"] += 1
-                        print(f"[sched] {admit.est} tokens to prefill cut in on {len(long_.ids)} at "
-                              f"{long_.cut_at}{' (main thread)' if admit.prio >= 2 else ''}", flush=True)
-            if admit is not None:
+            while True:  # several prompts in one batch: every request that can join is admitted before the next batch
+                with self.cv:
+                    if not self.queue and not active and not prefills:
+                        break
+                    if burst_wait > 0 and self.queue and not active and not prefills:
+                        # idle server, a request arrived: wait until no new one has come for burst_wait (at most 30 ms),
+                        # so a burst shares the first prefill batch. Without it the first request of an 8-request burst
+                        # was often prefilled alone and the rest queued behind it (1 + 4 + 3 batches, TTFT p90 2.2 vs 0.8 s)
+                        t_cap = time.time() + 0.03
+                        while True:
+                            rest = min(max(j.t_enq for j in self.queue) + burst_wait, t_cap) - time.time()
+                            if rest <= 0:
+                                break
+                            self.cv.wait(rest)
+                    # admit the next request (shortest remaining prefill first, aged) while a
+                    # sequence slot is free and the pool has room for it
+                    admit = None
+                    i = adm.admit_next(time.time(), prefills)
+                    if i is not None:
+                        admit = self.queue.pop(i)
+                        long_ = max(prefills, key=lambda j: len(j.ids) - max(0, e.prefill_pos(j.slot))) if prefills else None
+                        if long_ is not None and (not adm.multi or len(long_.ids) - max(0, e.prefill_pos(long_.slot)) +
+                                                  admit.est > adm.join_cap()):  # a cut-in on the long prompt in progress
+                            if not any(j is not long_ for j in prefills):
+                                long_.round_tok = 0  # a new cut-in round
+                            long_.round_tok += admit.est
+                            long_.cut_at = max(0, e.prefill_pos(long_.slot))
+                            if admit.prio >= 2 and long_.prio < 2 and admit.est > pre_max:
+                                self.sched["main_cutins"] += 1
+                            print(f"[sched] {admit.est} tokens to prefill cut in on {len(long_.ids)} at "
+                                  f"{long_.cut_at}{' (main thread)' if admit.prio >= 2 else ''}", flush=True)
+                if admit is None:
+                    break
                 self.dirty = True
                 prof_last = 0.0  # QE_STEP_PROF: no gap across a prefill
                 try:
@@ -809,6 +927,14 @@ class Generator:
                     # slot: the next single-sequence step must resume its own slot first
                     self.cur_slot = -1
                     admit.fail(ex)
+                if not adm.multi:
+                    break
+            if self.stopping and prefills:  # shutdown: prompts being prefilled end now (stop_requests)
+                for j in prefills:
+                    j.fail(SequenceFault("server is shutting down"))
+                prefills = []
+            if not self.queue and not active and not prefills:
+                continue
             e.set_lookahead(not prefills)  # no step queued ahead of a prefill chunk
             if prefills:
                 # prompt chunks interleaved with decode steps of the running sequences: small
@@ -822,28 +948,50 @@ class Generator:
                 # adaptive chunk: no other slot decoding or waiting -> the larger idle chunk (Flash-Next: its
                 # 4096-row batch); decided per chunk, so a request that arrives meanwhile gets 2048 again
                 idle = self.args.prefill_chunk_idle
-                if idle > budget and not busy and len(prefills) == 1 and not self.queue:
+                # the larger idle batch when nothing decodes: one prompt and nothing waiting, or several sharing it; on
+                # 2 cards (pass_bound: a pass costs ~0.6 s of PCIe expert copies whatever its rows) also while requests
+                # wait (8 x 16K burst 3.0K -> 4.4K tok/s; 3 cards: no gain)
+                if idle > budget and not busy and ((len(prefills) == 1 and not self.queue) or
+                                                   (adm.multi and (len(prefills) >= 2 or adm.pass_bound))):
                     budget = idle
                 share = self.args.prefill_share if busy and self.args.prefill_chunk > 0 else 0.0
                 try:
+                    finished = []
                     if busy and time.time() < decode_until:  # the decoders' share of the GPU time
-                        done = False
+                        pass
                     else:
                         tc = time.time()
-                        done = e.prefill_more(budget, cur.slot)
-                        tr("prefill", tc, len(cur.ids))
-                        self.cur_slot = cur.slot
+                        ready = None
+                        if adm.multi and len(prefills) >= 2:  # one batch over the prompts in flight
+                            order = adm.batch_order(tc, prefills)
+                            ready = e.prefill_multi([j.slot for j in order], budget)
+                            if ready is not None:
+                                tr("prefill_multi", tc, len(order))
+                                finished = [j for j in order if j.slot in ready]
+                                self.sched["multi_batches"] = self.sched.get("multi_batches", 0) + 1
+                            else:
+                                cur = order[0]  # no shared batch (layout, image rows ...): the first one alone
+                        if ready is None:
+                            done = e.prefill_more(budget, cur.slot)
+                            tr("prefill", tc, len(cur.ids))
+                            self.cur_slot = cur.slot
+                            if done:
+                                finished = [cur]
                         tc = time.time() - tc
                         decode_until = time.time() + (tc * share / (1 - share) if 0 < share < 1 else 0)
-                    if done:
+                    for cur in finished:
                         tf = time.time()
-                        cur.finish_start()
-                        tr("finish_start", tf)
-                        active.append(cur)
+                        try:
+                            cur.finish_start()
+                            tr("finish_start", tf)
+                            active.append(cur)
+                        except Exception as ex:
+                            cur.fail(ex)
                         prefills.remove(cur)
                 except Exception as ex:
-                    cur.fail(ex)
-                    prefills.remove(cur)
+                    for j in list(prefills) if adm.multi and len(prefills) >= 2 else [cur]:
+                        j.fail(ex)
+                        prefills.remove(j)
             n_active = len(active)
             active = [j for j in active if not j.check_done()]
             if len(active) < n_active:
@@ -915,7 +1063,8 @@ def repetition_period(ids, max_period=200, min_span=600, min_reps=5):
     return 0
 
 
-STOP_ROLLBACK = int(os.environ.get("QE_STOP_ROLLBACK", "2"))
+STOP_ROLLBACK = env_int("QE_STOP_ROLLBACK", 2)
+MULTI_MAX = 8  # prompts in flight that share prefill batches (the engine's FLASH_MAX_PREFILLS default)
 
 
 class Job:
@@ -932,6 +1081,7 @@ class Job:
         self.finished = False
         self.t_enq, self.est, self.t_est = time.time(), None, 0.0  # scheduler: prefill-cost estimate
         self.cut_at = None  # prefill position at the last cut-in by a short request (fairness)
+        self.round_tok = 0  # prompt tokens of the cut-in round in progress on this (long) prompt
         # eviction value of the conversation (engine prio) and its scheduling class: the main agent
         # thread (server/agents.py) is kept (it returns after its subagents) and goes first; a
         # subagent that ended its turn without a tool call is finished and goes first on eviction
@@ -1147,7 +1297,8 @@ class Job:
 
     def check_done(self):
         """Release the slot and wake the caller once finished (or cancelled)."""
-        if not self.finished and self.cancelled():
+        if not self.finished and (self.cancelled() or self.gen.stopping):
+            self.shut = self.gen.stopping and not self.cancelled()  # shutdown: run() raises (error event)
             self.finished = True
         if not self.finished:
             return False
@@ -1219,7 +1370,7 @@ def prof_write(job):
            "sum": {k: _pstats(v) for k, v in cols.items() if v}}
     if gaps:
         rec["sum"]["gap"] = _pstats(gaps)
-    with open(os.environ.get("QE_STEP_PROF_FILE", "step_prof.jsonl"), "a") as f:
+    with open(env_str("QE_STEP_PROF_FILE", "step_prof.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     S = rec["sum"]
     print(f"[prof] {len(P)} steps, {job.n / len(P):.2f} tok/step | step call mean {S['step']['mean'] * 1e3:.3f} ms "
@@ -1286,13 +1437,26 @@ def log_stats(kind, st):
 # ----------------------------------------------------------------------------- request mapping
 
 
-def template_kwargs(body, default_think):
+# reasoning efforts qwen38_syssafe.jinja knows: 'high' renders as 'xhigh', 'medium' adds no instruction, and
+# any other value ('minimal', 'max', 'none', typos) renders as 'medium' (the model's own template raises instead)
+KNOWN_EFFORTS = ("xhigh", "high", "medium", "low")
+
+
+def template_kwargs(body, default_think, default_effort=None):
+    """Template variables of a request. Effort: the request's chat_template_kwargs.reasoning_effort, else its
+    top-level reasoning_effort (OpenAI field, also read on the Anthropic path), else --reasoning-effort
+    (default_effort; None = the template's own default, xhigh). A null value counts as not sent."""
     kw = dict(body.get("chat_template_kwargs") or {})
     th = body.get("thinking")
     if isinstance(th, dict) and th.get("type") == "disabled":
         kw.setdefault("enable_thinking", False)
-    if "reasoning_effort" in body:
-        kw.setdefault("reasoning_effort", body["reasoning_effort"])
+    if kw.get("reasoning_effort") is None:
+        kw.pop("reasoning_effort", None)
+        eff = body.get("reasoning_effort")
+        if eff is None:
+            eff = default_effort
+        if eff is not None:
+            kw["reasoning_effort"] = eff
     kw.setdefault("enable_thinking", default_think)
     return kw
 
@@ -1307,6 +1471,18 @@ def structured(gen, body, kw):
         raise GrammarError("structured output is not supported by this engine (no grammar C API)")
     kw["enable_thinking"] = False
     return gen.grammars.matcher(schema)
+
+
+class InputError(ValueError):
+    """A request input the server cannot use (unreadable image, unsupported content part): HTTP 400."""
+
+
+UNSUPPORTED_PARTS = {"video_url": "video", "video": "video", "input_video": "video", "input_audio": "audio",
+                     "audio_url": "audio", "audio": "audio"}
+# documents / files (e.g. a PDF an agent read): a text note instead of an error, so that a conversation that
+# carries one in its history goes on
+OMITTED_PARTS = {"file", "document", "input_file"}
+OMITTED_NOTE = "[document omitted: this server reads only text and images]"
 
 
 def image_part(p):
@@ -1330,6 +1506,12 @@ def content_parts(parts):
     """Content list -> plain string if it has no images, else [text / image parts]."""
     out = []
     for p in parts or []:
+        if isinstance(p, dict) and p.get("type") in UNSUPPORTED_PARTS:
+            raise InputError(f"{UNSUPPORTED_PARTS[p['type']]} input is not supported (content part type {p['type']!r}); "
+                             "only text and images")
+        if isinstance(p, dict) and p.get("type") in OMITTED_PARTS:
+            out.append({"type": "text", "text": OMITTED_NOTE})
+            continue
         im = image_part(p)
         if im and im["_src"]:
             out.append(im)
@@ -1435,6 +1617,11 @@ def anthropic_to_messages(body):
                     texts.append({"type": "text", "text": b.get("text", "")})
                 elif image_part(b):
                     texts.append(image_part(b))
+                elif b.get("type") in OMITTED_PARTS:
+                    texts.append({"type": "text", "text": OMITTED_NOTE})
+                elif b.get("type") in UNSUPPORTED_PARTS:
+                    raise InputError(f"{UNSUPPORTED_PARTS[b['type']]} input is not supported (content block type "
+                                     f"{b['type']!r}); only text and images")
             if texts:
                 if any(t["type"] == "image" for t in texts):  # text blocks joined by newlines
                     parts = []
@@ -1490,16 +1677,35 @@ def build_app(gen: Generator, args):
     async def health():
         return {"status": "ok"}
 
+    def limits():
+        """What a client needs to size its requests (vLLM / llama.cpp field names where they exist)."""
+        e = gen.engine
+        return {"max_model_len": e.max_t,                   # prompt + reply tokens of one conversation (vLLM)
+                "max_num_seqs": len(e.slots),               # conversations served at once: sequence slots (vLLM)
+                "max_prompt_tokens": max(e.slots) - gen.args.mtp_k - 2,  # longer prompts: 400 context_length_exceeded
+                "max_output_tokens": None,                  # no server cap: a reply may fill the rest of the context
+                "kv_pool_tokens": e.pool_tokens,            # KV pool of all slots together
+                "kv_cache": "ram" if e.kv_in_ram else "vram"}
+
     @app.get("/v1/models")
     async def models():
-        return {"object": "list", "data": [{"id": model_name, "object": "model", "owned_by": "qengine"}]}
+        return {"object": "list", "data": [{"id": model_name, "object": "model", "owned_by": "qengine",
+                                            "input_modalities": ["text", "image"] if gen.vision is not None else ["text"],
+                                            **limits()}]}
+
+    @app.get("/props")
+    async def props():  # llama.cpp-style server properties (slot count and context for tools that read /props)
+        lim = limits()
+        return {"model_alias": model_name, "total_slots": lim["max_num_seqs"],
+                "default_generation_settings": {"n_ctx": lim["max_model_len"]},
+                "modalities": {"vision": gen.vision is not None}, **lim}
 
     # ---------------- OpenAI chat completions ----------------
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
         body = await req.json()
         tools = body.get("tools")
-        kw = template_kwargs(body, args.think)
+        kw = template_kwargs(body, args.think, args.reasoning_effort)
         try:
             grammar = structured(gen, body, kw)
         except GrammarError as ex:
@@ -1510,8 +1716,12 @@ def build_app(gen: Generator, args):
         except ValueError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "steering"}}, status_code=400)
-        ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True,
-                              guard_on=body.get("loop_guard") is not False)
+        try:
+            ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True,
+                                  guard_on=body.get("loop_guard") is not False)
+        except InputError as ex:
+            return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error", "param": "messages"}},
+                                status_code=400)
         if gen.too_long(ids):
             return JSONResponse({"error": {"message": gen.too_long(ids), "type": "invalid_request_error",
                                            "code": "context_length_exceeded"}}, status_code=400)
@@ -1616,18 +1826,22 @@ def build_app(gen: Generator, args):
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(req: Request):
         body = await req.json()
-        ids, _ = gen.prompt(anthropic_to_messages(body), anthropic_tools(body.get("tools")),
-                            template_kwargs(body, args.think))
+        try:
+            ids, _ = gen.prompt(anthropic_to_messages(body), anthropic_tools(body.get("tools")),
+                                template_kwargs(body, args.think, args.reasoning_effort))
+        except InputError as ex:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
+                                status_code=400)
         return {"input_tokens": len(ids)}
 
     @app.post("/v1/messages")
     async def messages(req: Request):
         body = await req.json()
-        if os.environ.get("QE_DUMP_PROMPTS"):
-            with open(os.path.join(os.environ["QE_DUMP_PROMPTS"], f"{time.time():.3f}.json"), "w") as f:
+        if env_str("QE_DUMP_PROMPTS"):
+            with open(os.path.join(env_str("QE_DUMP_PROMPTS"), f"{time.time():.3f}.json"), "w") as f:
                 json.dump(body, f, ensure_ascii=False, indent=1)
         tools = anthropic_tools(body.get("tools"))
-        kw = template_kwargs(body, args.think)
+        kw = template_kwargs(body, args.think, args.reasoning_effort)
         try:
             grammar = structured(gen, body, kw)
         except GrammarError as ex:
@@ -1638,9 +1852,14 @@ def build_app(gen: Generator, args):
         except ValueError as ex:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
                                 status_code=400)
-        msgs = anthropic_to_messages(body)
-        prev = dict(msgs[-1]) if msgs else None  # before prompt() rewrites image parts
-        ids, aff = gen.prompt(msgs, tools, kw, body.get("metadata"), track=True, guard_on=body.get("loop_guard") is not False)
+        try:
+            msgs = anthropic_to_messages(body)
+            prev = dict(msgs[-1]) if msgs else None  # before prompt() rewrites image parts
+            ids, aff = gen.prompt(msgs, tools, kw, body.get("metadata"), track=True,
+                                  guard_on=body.get("loop_guard") is not False)
+        except InputError as ex:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
+                                status_code=400)
         if gen.too_long(ids):
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": gen.too_long(ids)}},
                                 status_code=400)
@@ -1778,7 +1997,7 @@ def resolve_model_args(args):
     for k in ("drop_empty_turns", "merge_system"):
         v = getattr(args, k)
         setattr(args, k, bool(d[k]) if v is None else bool(v))
-    if not args.engine_lib and not os.environ.get("QE_LIB"):
+    if not args.engine_lib and not env_str("QE_LIB"):
         lib = os.path.join(ROOT, d["lib"])
         args.engine_lib = lib if os.path.exists(lib) else os.path.join(ROOT, "build", "libqengine.so")
     if args.vision and not d["vision"]:
@@ -1808,6 +2027,10 @@ def parse_args(argv=None):
                     help="MTP head weights for the engine (sets $QE_MTP_FILE; default: the engine's own choice, "
                          "for 27B model_mtp_ft.safetensors when present)")
     ap.add_argument("--think", type=int, default=1, help="default enable_thinking")
+    ap.add_argument("--reasoning-effort", default=env_str("QE_REASONING_EFFORT"),
+                    help="default reasoning effort for requests that send none (xhigh, high = xhigh, medium, low; "
+                         "a request's reasoning_effort or chat_template_kwargs.reasoning_effort wins; other values "
+                         "render as medium); env QE_REASONING_EFFORT; default: unset = the template's own (xhigh)")
     ap.add_argument("--served-name", default=None,
                     help="model id in the API (default per model: qwen3.8-27b-qengine / qwen3.8-flash-next-qengine)")
     ap.add_argument("--tokenizer", default=None,
@@ -1824,7 +2047,8 @@ def parse_args(argv=None):
                     help="1: merge several leading system messages into one before the template "
                          "(default per model: Flash-Next 1, 27B 0; qwen38_syssafe.jinja merges them anyway)")
     ap.add_argument("--vision", type=int, default=0,
-                    help="1: load the vision encoder (images in prompts; ~1 GB on one GPU, less KV cache)")
+                    help="1: load the vision encoder (images in prompts; 27B: ~1.3 GB on one GPU, less KV cache; "
+                         "Flash-Next: ~0.6 GB, weights streamed from host RAM)")
     ap.add_argument("--vision-device", default="", help="torch device of the encoder (default: last GPU)")
     ap.add_argument("--max-image-pixels", type=int, default=4 * 1024 * 1024,
                     help="larger images are downscaled (1 token per 32x32 pixels)")
@@ -1846,6 +2070,9 @@ def parse_args(argv=None):
     ap.add_argument("--prefill-aging", type=float, default=4000,
                     help="queue order: least prefill work first, every second of waiting counts "
                          "as this many tokens (0 = pure shortest-first)")
+    ap.add_argument("--burst-wait", type=float, default=5.0,
+                    help="ms: on an idle server, the first request of a burst waits until none has arrived for this long "
+                         "(at most 30 ms) so the burst shares one prefill batch (0 = start at once)")
     ap.add_argument("--preempt-max", type=int, default=1024,
                     help="a queued request with at most this many tokens to prefill (a tool turn "
                          "of a cached conversation) is started between the chunks of a long "
@@ -1863,21 +2090,24 @@ def parse_args(argv=None):
     ap.add_argument("--main-agent-re", default=None,
                     help="regex for the main agent thread, searched in the system prompt and the tool names "
                          "(overrides the automatic detection; env QE_MAIN_AGENT_RE)")
+    ap.add_argument("--sort-tools", type=int, default=1,
+                    help="render the tools sorted by name with sorted JSON keys, so a client that reorders the same "
+                         "tools between turns keeps the prompt cache (0 = the client's order)")
     ap.add_argument("--loop-guard-tokens", type=int, default=600,
                     help="end a reply whose last N+ tokens are one short fragment repeated (0 = off)")
-    ap.add_argument("--presence-penalty", type=float, default=float(os.environ.get("QE_PRESENCE_PENALTY", "0")),
+    ap.add_argument("--presence-penalty", type=float, default=env_float("QE_PRESENCE_PENALTY", 0.0),
                     help="presence penalty of sampled requests that send none (Claude Code's Anthropic API never "
                          "does); env QE_PRESENCE_PENALTY")
-    ap.add_argument("--frequency-penalty", type=float, default=float(os.environ.get("QE_FREQUENCY_PENALTY", "0")),
+    ap.add_argument("--frequency-penalty", type=float, default=env_float("QE_FREQUENCY_PENALTY", 0.0),
                     help="frequency penalty of sampled requests that send none; env QE_FREQUENCY_PENALTY")
-    ap.add_argument("--loop-guard-turns", type=int, default=int(os.environ.get("QE_LOOP_GUARD_TURNS", "3")),
+    ap.add_argument("--loop-guard-turns", type=int, default=env_int("QE_LOOP_GUARD_TURNS", 3),
                     help="cross-turn loop guard: after N consecutive identical (reply, result) turns of a "
                          "conversation the next turn runs with --loop-guard-penalty on the repeated reply's tokens "
                          "and no lookup drafts (0 = off); env QE_LOOP_GUARD_TURNS")
     ap.add_argument("--loop-guard-penalty", type=float,
-                    default=float(os.environ.get("QE_LOOP_GUARD_PENALTY", "1.5")),
+                    default=env_float("QE_LOOP_GUARD_PENALTY", 1.5),
                     help="presence penalty of a guarded turn (2.0 from 2N repeated turns); env QE_LOOP_GUARD_PENALTY")
-    ap.add_argument("--loop-guard-note", type=int, default=int(os.environ.get("QE_LOOP_GUARD_NOTE", "1")),
+    ap.add_argument("--loop-guard-note", type=int, default=env_int("QE_LOOP_GUARD_NOTE", 1),
                     help="guarded turn: append a server note to the latest tool result (the same call returned the "
                          "same result N times, change the approach); 0 = off; env QE_LOOP_GUARD_NOTE")
     ap.add_argument("--metrics-port", type=int, default=9393,
@@ -1893,22 +2123,27 @@ def parse_args(argv=None):
     ap.add_argument("--disk-cache-gb", type=float, default=200)
     ap.add_argument("--persist-idle", type=float, default=120,
                     help="seconds idle before live conversations are saved to the disk cache")
-    ap.add_argument("--log-file", default=os.environ.get("QE_LOG_FILE", "auto"),
+    ap.add_argument("--log-file", default=env_str("QE_LOG_FILE", "auto"),
                     help="persistent log: the server's whole output (also the engine's) is appended to this file with "
                          "a timestamp per line and survives crashes and restarts (auto: "
-                         "~/.cache/qengine/logs/<served-name>.log; '' or 0: off); env QE_LOG_FILE")
-    ap.add_argument("--log-mb", type=float, default=float(os.environ.get("QE_LOG_MB", "64")),
+                         "~/.cache/qengine/logs/<served-name>.log; '' or 0: off); env QE_LOG_FILE (0: off, empty: unset)")
+    ap.add_argument("--log-mb", type=float, default=env_float("QE_LOG_MB", 64.0),
                     help="size of the persistent log before it is rotated (3 old files are kept); env QE_LOG_MB")
     args = ap.parse_args(argv)
     resolve_model_args(args)
     if not args.template:
         args.template = os.path.join(args.model, "chat_template.jinja")
     args.think = bool(args.think)
+    if args.reasoning_effort is not None:
+        args.reasoning_effort = args.reasoning_effort.strip().lower() or None  # '' = unset, like the env var
+    if args.reasoning_effort is not None and args.reasoning_effort not in KNOWN_EFFORTS:
+        print(f"[server] warning: --reasoning-effort {args.reasoning_effort!r} is not one of "
+              f"{', '.join(KNOWN_EFFORTS)}: the template renders it as medium", flush=True)
     # the MTP head fine-tuned on the engine's own answers: +8% accepted drafts
     ft = os.path.join(args.model, "model_mtp_ft.safetensors")
     if args.mtp_file:
         os.environ["QE_MTP_FILE"] = args.mtp_file
-    elif "QE_MTP_FILE" not in os.environ and os.path.exists(ft):
+    elif env_str("QE_MTP_FILE") is None and os.path.exists(ft):
         os.environ["QE_MTP_FILE"] = ft
     if args.disk_cache:
         os.environ["QE_DISK_CACHE"] = args.disk_cache
@@ -1945,7 +2180,13 @@ def main():
     args = parse_args()
     start_log(args)
     gen = Generator(args)
-    uvicorn.run(build_app(gen, args), host=args.host, port=args.port, log_level="warning")
+    class Server(uvicorn.Server):  # SIGTERM / SIGINT: end the requests first, then uvicorn's wait for the streams
+        def handle_exit(self, sig, frame):
+            if not gen.stopping:
+                gen.stop_requests()
+            super().handle_exit(sig, frame)
+
+    Server(uvicorn.Config(build_app(gen, args), host=args.host, port=args.port, log_level="warning")).run()
     gen.metrics.save()
     # uvicorn returns after SIGTERM / SIGINT: save the live conversations before exiting
     if args.disk_cache:

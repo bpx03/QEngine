@@ -104,6 +104,7 @@ void qe_release(void* e, int slot) { (void)e, (void)slot; }
 int qe_vocab(void* e) { (void)e; return 248320; }
 int qe_num_slots(void* e) { (void)e; return 1; }
 long long qe_pool_tokens(void* e) { return ((Mock*)e)->max_t; }
+int qe_kv_in_ram(void* e) { (void)e; const char* v = getenv("QE_MOCK_KV_RAM"); return v && *v == '1'; }
 int qe_can_admit(void* e, int n) { return n <= ((Mock*)e)->max_t; }
 void qe_set_limit(void* e, int slot, int tokens) { (void)slot; ((Mock*)e)->limit = tokens; }
 double qe_warmup(void* e, int modes) { (void)e, (void)modes; return 0.0; }

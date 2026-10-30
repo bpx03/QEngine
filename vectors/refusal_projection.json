@@ -1,0 +1,97 @@
+{
+  "name": "refusal_projection",
+  "kind": "activation-steering-vector",
+  "description": "Refusal-direction projection for Qwen3.8-Flash-Next: removes one direction per layer (layers 8-33) from the residual stream, so the model declines far fewer requests. This removes a safety behaviour; you are responsible for what the model writes with it on. It also shifts predictions slightly on ordinary text. Off by default.",
+  "mode": "project",
+  "dir": "per-layer",
+  "scale": 1.0,
+  "layer_range": [
+    8,
+    33
+  ],
+  "per_layer_strength": {
+    "8": 1.0,
+    "9": 1.0,
+    "10": 1.0,
+    "11": 1.0,
+    "12": 1.0,
+    "13": 1.0,
+    "14": 1.0,
+    "15": 1.0,
+    "16": 1.0,
+    "17": 1.0,
+    "18": 1.0,
+    "19": 1.0,
+    "20": 1.0,
+    "21": 1.0,
+    "22": 1.0,
+    "23": 1.0,
+    "24": 1.0,
+    "25": 1.0,
+    "26": 1.0,
+    "27": 1.0,
+    "28": 1.0,
+    "29": 1.0,
+    "30": 1.0,
+    "31": 1.0,
+    "32": 1.0,
+    "33": 1.0
+  },
+  "vector_file": "refusal_projection.gguf",
+  "vector_file_sha256": "63075ee1fddd523a37727d8f6ae200af00ff24eb4dbddcbd33cb90e2cd7964dc",
+  "hidden_size": 2560,
+  "dtype": "fp32",
+  "direction": "per-layer unit direction, refusal vs compliance, measured at prompt level (320 harmful / 320 harmless prompts, 7 assistant-header positions) on Qwen3.8-Flash-Next activations",
+  "provenance": "https://github.com/sergqwer/Strata-pr (commit 841f8c9), data/experimental-speed-projection; fp32 direction bytes unchanged, renamed for QEngine",
+  "credit": "Strata by Niko1221 (https://github.com/Niko1221/Strata) and its fork by sergqwer (https://github.com/sergqwer/Strata-pr, MIT), which published this vector",
+  "license": "Qwen Community License 1.0 (derived from the model's activations)",
+  "compatibility": {
+    "model": "Qwen3.8-Flash-Next-QE-INT4",
+    "hidden_size": 2560,
+    "note": "measured on another quantization of the same model; not valid for Qwen3.8-27B"
+  },
+  "modes": {
+    "add": {
+      "layer_range": [
+        8,
+        33
+      ],
+      "scale": 1.0,
+      "per_layer_strength": {
+        "8": 1.0,
+        "9": 1.0,
+        "10": 1.0,
+        "11": 1.0,
+        "12": 1.0,
+        "13": 1.0,
+        "14": 1.0,
+        "15": 1.0,
+        "16": 1.0,
+        "17": 1.0,
+        "18": 1.0,
+        "19": 1.0,
+        "20": 1.0,
+        "21": 1.0,
+        "22": 1.0,
+        "23": 1.0,
+        "24": 1.0,
+        "25": 1.0,
+        "26": 1.0,
+        "27": 1.0,
+        "28": 1.0,
+        "29": 1.0,
+        "30": 1.0,
+        "31": 1.0,
+        "32": 1.0,
+        "33": 1.0
+      }
+    }
+  },
+  "effects": {
+    "intended": "fewer refusals (refusal-direction projection)",
+    "side_effects": "slight shift of predictions on ordinary text"
+  },
+  "scores": {
+    "note": "no held-out scores (external vector)"
+  }
+}

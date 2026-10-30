@@ -12,6 +12,7 @@
 // warp (tiles, w) accumulates K slice w = groups [w*G/nw, (w+1)*G/nw) of each of its tiles
 // sequentially in the mma accumulator, nw = pick_warps(tiles, G) as in gemv_w4, and the slices
 // are added in order w = 0..nw-1 at the end. Weights are dequantized exactly as in the GEMV.
+#include "../env.h"
 #include "gemv.cuh"
 #include "gemv_h16.cuh"
 
@@ -497,8 +498,7 @@ void launch_skinny_h(const W4& w, const __half* xh, int ldx, float* y, int ldy, 
 }
 
 int skinny_env(const char* name, int def) {
-    const char* v = getenv(name);
-    return v ? atoi(v) : def;
+    return env_int(name, def);
 }
 
 

@@ -37,7 +37,7 @@ FAMILIES = {
         temperature=None,         # None: generation_config.json (1.0)
         mtp_k=3,                  # best k 2..4 at c=1 (measured)
         split="176,160,176",      # expert groups per card (the middle card, often the desktop one, less)
-        lib="build/libqflash.so", vision=False,
+        lib="build/libqflash.so", vision=True,
         prefill_chunk_idle=4096,  # a prompt alone on the server: the engine's big batch (prefill-r3)
         drop_empty_turns=True, merge_system=True,
     ),

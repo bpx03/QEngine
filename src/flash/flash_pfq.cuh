@@ -84,6 +84,47 @@ __global__ void __launch_bounds__(160) k_xh_to_q(const __half* __restrict__ xh, 
     }
 }
 
+// FLASH_MOE_AGQ (prefill, sequence-parallel HC): the MoE input rows are quantized (k_xh_to_q<64>) and routed on their
+// owner, and only the compact rows travel in the row all-gather: [XQ 2560 B][40 group scales fp32][top-10 ids][top-10
+// weights][shared gate][pad] = AGQ_ROWB bytes instead of the 5120-byte xh row. The receiver rebuilds the XQ rows +
+// scale pairs in place of its XH rows and the routing rows, so the MoE kernels see exactly what they saw before.
+constexpr int AGQ_ROWB = 2816;
+__global__ void __launch_bounds__(160) k_agq_pack(const __half* __restrict__ xh, const int* __restrict__ gsel,
+                                                  const float* __restrict__ gw, const float* __restrict__ gsh,
+                                                  char* __restrict__ out) {
+    const int r = blockIdx.x, i = threadIdx.x;
+    const int8_t* xq = reinterpret_cast<const int8_t*>(xh + (size_t)r * H);
+    const float2* xqs = reinterpret_cast<const float2*>(xq + H);
+    char* o = out + (size_t)r * AGQ_ROWB;
+    reinterpret_cast<uint4*>(o)[i] = reinterpret_cast<const uint4*>(xq)[i];
+    float* of = reinterpret_cast<float*>(o + H);
+    if (i < H / 64) of[i] = xqs[i].x;
+    int* oi = reinterpret_cast<int*>(o + H + (H / 64) * 4);
+    if (i < TOPK) {
+        oi[i] = gsel[(size_t)r * TOPK + i];
+        reinterpret_cast<float*>(oi + TOPK)[i] = gw[(size_t)r * TOPK + i];
+    }
+    if (i == 0) reinterpret_cast<float*>(oi + 2 * TOPK)[0] = gsh[r];
+}
+// rows [0, m) except [lo, hi) (this card's own rows, already in place)
+__global__ void __launch_bounds__(160) k_agq_unpack(const char* __restrict__ in, __half* __restrict__ xh, int* __restrict__ gsel,
+                                                    float* __restrict__ gw, float* __restrict__ gsh, int lo, int hi) {
+    const int r = blockIdx.x, i = threadIdx.x;
+    if (r >= lo && r < hi) return;
+    const char* c = in + (size_t)r * AGQ_ROWB;
+    int8_t* xq = reinterpret_cast<int8_t*>(xh + (size_t)r * H);
+    float2* xqs = reinterpret_cast<float2*>(xq + H);
+    reinterpret_cast<uint4*>(xq)[i] = reinterpret_cast<const uint4*>(c)[i];
+    const float* cf = reinterpret_cast<const float*>(c + H);
+    if (i < H / 64) { const float sx = cf[i]; xqs[i] = make_float2(sx, -kQMagic * sx); }
+    const int* ci = reinterpret_cast<const int*>(c + H + (H / 64) * 4);
+    if (i < TOPK) {
+        gsel[(size_t)r * TOPK + i] = ci[i];
+        gw[(size_t)r * TOPK + i] = reinterpret_cast<const float*>(ci + TOPK)[i];
+    }
+    if (i == 0) gsh[r] = reinterpret_cast<const float*>(ci + 2 * TOPK)[0];
+}
+
 // MoE prefill gate_up, W4A8: one block (8 warps) per job, one pass over K for all the job's rows (<= 64 tokens, NTT
 // token tiles of 8: the job body is instantiated per tile count, a predicated-off MMA still costs the tensor pipe);
 // warp w owns the 16-row tiles 2w, 2w + 1 (8 gate + 8 up rows each, GLU-interleaved). The tokens' XQ rows are staged
@@ -663,7 +704,7 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                                                             AttnDst dst, Plan p, Xchg xq, const int* __restrict__ sel,
                                                             const int* __restrict__ nsel, int lbmax, int m,
                                                             const int* __restrict__ rbase, bool q16, int dbg = 0,
-                                                            QpUnion qu = QpUnion(), int ngrp = 0) {
+                                                            QpUnion qu = QpUnion(), int ngrp = 0, KvMap km = KvMap()) {
     extern __shared__ __align__(16) unsigned char qp_sm[];
     constexpr int HPG = NQ / NKV, NTH = QP_W * 32;
     __half* KV = reinterpret_cast<__half*>(qp_sm);  // [buf][K | V][QP_KT][QD_SROW]
@@ -677,7 +718,8 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     __shared__ int s_rc[QP_R], s_nr[QP_R], s_ns[QP_R], s_U, s_wp[33];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     const int nw = (lbmax + 31) / 32;
-    if (rbase) { const size_t rb = rbase[0]; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
+    const size_t rb0 = rbase ? (size_t)rbase[0] : 0;
+    if (rbase && !km.pt) { const size_t rb = rb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
     // persistent (prefill-r4, qu.ctr set): a grid of one block per SM takes the (kv head, key split, row group) items
     // from a counter (wave quantization: 256 items on 82 SMs were 4 waves, the last one 10 % full); else one item per
     // block (grid NKV x groups x S)
@@ -859,7 +901,10 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                     const int key = q >> 5, kv = (q >> 4) & 1, c = q & 15;
                     int kr; unsigned msk;
                     key_of(tile * QP_KT + key, kr, msk);
-                    const uint8_t* src = (kv ? vc : kc) + ((size_t)(msk ? kr : 0) * NKV + kvh) * HD + c * 16;
+                    const uint8_t *k8, *v8;
+                    const float *s0, *s1;
+                    kv_rowp(km, kc, vc, ks, vs, rb0, msk ? kr : 0, kvh, k8, v8, s0, s1);
+                    const uint8_t* src = (kv ? v8 : k8) + c * 16;
                     const unsigned dst = (unsigned)__cvta_generic_to_shared(rb + ((size_t)kv * QP_KT + key) * HD + c * 16);
                     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(msk ? 16 : 0));
                 }
@@ -869,7 +914,10 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                 int kr; unsigned msk;
                 key_of(tile * QP_KT + key, kr, msk);
                 float* rm = rmeta + (size_t)sl * 3 * QP_KT;
-                const float* src = (kv ? vs : ks) + (size_t)(msk ? kr : 0) * NKV + kvh;
+                const uint8_t *k8, *v8;
+                const float *s0, *s1;
+                kv_rowp(km, kc, vc, ks, vs, rb0, msk ? kr : 0, kvh, k8, v8, s0, s1);
+                const float* src = kv ? s1 : s0;
                 const unsigned dst = (unsigned)__cvta_generic_to_shared(rm + kv * QP_KT + key);
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src), "r"(msk ? 4 : 0));
                 if (kv == 0) rm[2 * QP_KT + key] = __uint_as_float(msk);

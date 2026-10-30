@@ -17,7 +17,9 @@ line is left out.
 import ctypes
 import os
 
-ENABLED = os.environ.get("QE_STATS_LOG", "1") != "0"
+from qe_env import env_str
+
+ENABLED = env_str("QE_STATS_LOG", "1") != "0"
 
 
 class DraftStats:

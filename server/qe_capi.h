@@ -45,7 +45,8 @@ void qe_release(void* e, int slot);  // generation over; its tokens stay cached 
 // ======================================================= TIER 1: single functions (each optional)
 int qe_vocab(void* e);                       // logits width (248320); else config.json vocab_size
 int qe_num_slots(void* e);                   // default 1; > 1 requires tiers 2 + 3
-long long qe_pool_tokens(void* e);           // KV pool size in tokens (monitoring); default max_context
+long long qe_pool_tokens(void* e);           // KV pool size in tokens, all slots together; default max_context
+int qe_kv_in_ram(void* e);                   // 1: the KV cache lives in host RAM (Flash-Next FLASH_KV=ram); default 0 (VRAM)
 int qe_can_admit(void* e, int n);            // a new n-token sequence fits now; default: a free slot and n <= max_context
 int qe_pause_for(void* e, int n, int prio);  // pause decoding sequences of lower prio (lowest first, never a prefill) until a
                                              // new n-token sequence fits; 1: it fits now (nothing paused if it cannot)
@@ -67,6 +68,11 @@ int qe_prefill_more_slot(void* e, int slot, int budget);
 int qe_start_finish_slot(void* e, int slot);
 int qe_num_prefills(void* e);
 int qe_prefill_pos(void* e, int slot);  // prompt rows prefilled so far, -1 if none in flight
+// several prompts in flight in one batch (batched prefill; Flash-Next): rows of the prompts on slots[] (priority order)
+// up to budget rows; done[i] = 1: prompt i complete (start_finish_slot next). Returns the prompts that got rows, 0: no
+// shared batch (the caller prefills them one by one)
+int qe_prefill_multi(void* e, const int* slots, int n, int budget, int* done);
+int qe_prefill_pass_bound(void* e);  // 1: a prefill pass costs the PCIe copy of the host-backed experts (big batches pay)
 
 // ======================================================= TIER 3 "batch": concurrent sequences (all or none)
 void qe_set_concurrent(void* e, int on);  // 1: starts do not release the other slots

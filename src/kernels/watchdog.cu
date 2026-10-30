@@ -1,5 +1,6 @@
 // Host side of the collective watchdog (watchdog.cuh): the host-mapped record, per-device symbol
 // setup, the fatal-error path of CUDA_CHECK / CHECK and fault injection for tests.
+#include "../env.h"
 #include "watchdog.cuh"
 
 #include <unistd.h>
@@ -23,8 +24,7 @@ int g_wd_ngpu = 0;
 
 int budget_ms_env() {
     static const int v = [] {
-        const char* e = getenv("QE_COLL_TIMEOUT_MS");
-        return e && *e ? atoi(e) : 20000;
+        return env_int("QE_COLL_TIMEOUT_MS", 20000);
     }();
     return v;
 }
@@ -62,7 +62,7 @@ bool wd_report() {
         if (n == g_wd_ngpu) break;
         usleep(10000);
     }
-    if (getenv("QE_WD_DEBUG"))
+    if (env_str("QE_WD_DEBUG"))
         for (int r = 0; r < g_wd_ngpu; r++) {
             const volatile QeWdRec& x = g_wd->rec[r];
             fprintf(stderr, "[watchdog] abort %x rec %d: kind %u site %u peer %d want %x seen %x waited %u b %u t %u\n",
@@ -135,7 +135,7 @@ const auto g_load_time = std::chrono::steady_clock::now();
     }
     fflush(stderr);
     fflush(stdout);  // the server's persistent log (server/logtee.py) gets the last lines before the process ends
-    if (getenv("QE_FATAL_EXIT") && atoi(getenv("QE_FATAL_EXIT"))) _exit(70);  // no core dump
+    if (env_int("QE_FATAL_EXIT", 0)) _exit(70);  // no core dump
     abort();
 }
 }  // namespace
@@ -166,7 +166,7 @@ void qe_wd_init(int rank, int device) {
     d.rank = rank;
     d.claim = 0;
     for (auto f : wd_setters()) f(d);
-    if (getenv("QE_WD_DEBUG"))
+    if (env_str("QE_WD_DEBUG"))
         fprintf(stderr, "[watchdog] rank %d device %d: %zu modules, budget %u ticks\n", rank, device, wd_setters().size(), d.budget);
 }
 
@@ -203,14 +203,14 @@ void qe_fatal_begin() {
 }
 
 bool qe_fault_skip(int rank, const char* kind) {
-    static const int fr = getenv("QE_FAULT_SKIP_AR_RANK") ? atoi(getenv("QE_FAULT_SKIP_AR_RANK")) : -1;
+    static const int fr = env_int("QE_FAULT_SKIP_AR_RANK", -1);
     if (fr < 0 || rank != fr) return false;
-    static const char* fk = getenv("QE_FAULT_KIND") ? getenv("QE_FAULT_KIND") : "ar";
+    static const char* fk = env_str("QE_FAULT_KIND") ? env_str("QE_FAULT_KIND") : "ar";
     if (strcmp(fk, kind) != 0) return false;
-    static const int after = getenv("QE_FAULT_AFTER") ? atoi(getenv("QE_FAULT_AFTER")) : 1;
+    static const int after = env_int("QE_FAULT_AFTER", 1);
     // QE_FAULT_AFTER_S: the first collective at least this many seconds after the library was loaded (server tests:
     // the warm-up's collective count is not known in advance)
-    static const double after_s = getenv("QE_FAULT_AFTER_S") ? atof(getenv("QE_FAULT_AFTER_S")) : -1.0;
+    static const double after_s = env_double("QE_FAULT_AFTER_S", -1.0);
     static std::atomic<int> n{0};
     static std::atomic<bool> fired{false};
     const int i = ++n;

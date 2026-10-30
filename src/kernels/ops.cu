@@ -1,3 +1,4 @@
+#include "../env.h"
 #include <algorithm>
 #include <cfloat>
 
@@ -1246,7 +1247,7 @@ void attention(const bf16* q, const void* kc_, const void* vc_, const AttnShape&
     int G = 0;
     for (int k = 0; k < s.nkv; k++) G = std::max(G, (s.kv_qe[k] - s.kv_qb[k]) * m);
     CHECK(G <= kMaxGroup, "attention group too large");
-    static const bool use_cuda_cores = getenv("QE_ATTN_CC") && atoi(getenv("QE_ATTN_CC"));
+    static const bool use_cuda_cores = env_int("QE_ATTN_CC", 0);
     CHECK(!use_cuda_cores || s.fp8 || s.split == 0, "the CUDA-core attention has no shared-prefix path");
     const dim3 grid(s.nkv, kAttnSplits);
     for (int j = 0; j < s.nkv; j++)
@@ -1510,7 +1511,7 @@ __global__ void __launch_bounds__(128) dn_core2_seg_kernel(DnSegs g, const float
 static int g_dn_core2 = -1;
 void dn_core2_set(int lanes) { g_dn_core2 = lanes; }
 static int dn_core2_lanes(int nseg) {
-    if (g_dn_core2 < 0) g_dn_core2 = getenv("QE_DN_CORE2") ? atoi(getenv("QE_DN_CORE2")) : 0;
+    if (g_dn_core2 < 0) g_dn_core2 = env_int("QE_DN_CORE2", 0);
     return g_dn_core2 == 1 ? (nseg == 1 ? 2 : 8) : g_dn_core2;
 }
 
@@ -1531,7 +1532,7 @@ static bool dn_core2(const float* cv, int ch, const DeltaShape& s, const float* 
     // kernel test (plain / spec / pending), yet with it on
     // test_shared_prefix's alone-from-scratch agent 1 diverges after 20 tokens - unexplained,
     // (1 = spec and plain, 2 = spec only, 3 = plain only)
-    static const int single = getenv("QE_DN_CORE2_SINGLE") ? atoi(getenv("QE_DN_CORE2_SINGLE")) : 0;
+    static const int single = env_int("QE_DN_CORE2_SINGLE", 0);
     if (!single || (single == 2 && !write_all) || (single == 3 && write_all)) return false;
     switch (dn_core2_lanes(1)) {
     case 8: dn_core2_launch<8>(cv, ch, s, qk, gb, S, slot_floats, cur, m, write_all, o, slot_off, pn, pend, st); return true;
@@ -1900,7 +1901,7 @@ __global__ void __launch_bounds__(128) dn_core4_seg_kernel(DnSegs g, const float
 
 static bool dn_core4_seg(const DnSegs& g, const float* cv, int ch, const DeltaShape& s, const float* qk,
                          const float* gb, size_t slot_floats, float* o, cudaStream_t st) {
-    static const int cpt = getenv("QE_DN_CPT") ? atoi(getenv("QE_DN_CPT")) : 0;
+    static const int cpt = env_int("QE_DN_CPT", 0);
     if (cpt != 2 && cpt != 4) return false;
     int mx = 1;
     for (int i = 0; i < g.n; i++) mx = std::max(mx, g.m[i]);
@@ -1914,7 +1915,7 @@ static bool dn_core4_seg(const DnSegs& g, const float* cv, int ch, const DeltaSh
 
 static bool dn_core3_seg(const DnSegs& g, const float* cv, int ch, const DeltaShape& s, const float* qk,
                          const float* gb, size_t slot_floats, float* o, cudaStream_t st) {
-    static const int on = getenv("QE_DN_CORE3") ? atoi(getenv("QE_DN_CORE3")) : 1;
+    static const int on = env_int("QE_DN_CORE3", 1);
     static int g_bps = 0;
     if (!on || g.n < 2) return false;
     int mx = 1;
@@ -1930,7 +1931,7 @@ static bool dn_core3_seg(const DnSegs& g, const float* cv, int ch, const DeltaSh
     }
     int bps = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, dn_core3_kernel, 128, smem));
-    if (const char* e = getenv("QE_DN_CORE3_BPS")) bps = std::min(bps, atoi(e));
+    if (env_set("QE_DN_CORE3_BPS")) bps = std::min(bps, env_int("QE_DN_CORE3_BPS", bps));
     g_bps = bps;
     const int ntiles = g.n * s.nv * 8;
     const int grid = std::min(ntiles, std::max(1, bps) * nsm);
@@ -2013,7 +2014,7 @@ void dn_core_seq(const float* conv_out, int ch, const DeltaShape& s, const float
                                                   false, o, 0, nullptr, nullptr);
 }
 bool dn_fuse_on() {
-    static const bool on = !getenv("QE_DN_FUSE") || atoi(getenv("QE_DN_FUSE"));
+    static const bool on = env_int("QE_DN_FUSE", 1);
     return on;
 }
 void dn_convqk(const float* proj, int ld, int ch, const bf16* conv_w, bf16* hist, const int* pos,
@@ -2060,16 +2061,16 @@ void dn_trim(int* cur, const int* save, int* pn, int r, cudaStream_t st) {
     dn_trim_kernel<<<1, 1, 0, st>>>(cur, save, pn, r);
 }
 bool dn_defer1_on() {
-    static const bool on = getenv("QE_DN_DEFER1") && atoi(getenv("QE_DN_DEFER1"));
+    static const bool on = env_int("QE_DN_DEFER1", 0);
     return on;
 }
 bool dn_direct_on() {
-    static const bool on = !getenv("QE_DN_DIRECT") || atoi(getenv("QE_DN_DIRECT"));
+    static const bool on = env_int("QE_DN_DIRECT", 1);
     return on;
 }
 bool dn_defer_on() {
     // default OFF until the verifier case C2 (heisenbug with dn_core2 plain + defer) is explained
-    static const bool on = getenv("QE_DN_DEFER") ? atoi(getenv("QE_DN_DEFER")) != 0 : true;  // default on (night-merge gates: shared_prefix, spec, batch, archive PASS; n=1 4K/19.5K unchanged)
+    static const bool on = env_set("QE_DN_DEFER") ? env_int("QE_DN_DEFER", true) != 0 : true;  // default on (night-merge gates: shared_prefix, spec, batch, archive PASS; n=1 4K/19.5K unchanged)
     return on;
 }
 void dn_stash_seg(const DnStashSegs& r, int nlayers, int ch, const DeltaShape& s, cudaStream_t st) {

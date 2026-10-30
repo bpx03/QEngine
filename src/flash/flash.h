@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <thread>
+#include <atomic>
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
@@ -18,6 +20,7 @@
 #include "../kernels/ops.cuh"
 #include "../kernels/sample.cuh"
 #include "../safetensors.h"
+#include "graph_oom.h"
 
 namespace flash {
 struct Xchg;  // flash_kernels.cuh: a QSA exchange (receive buffers, flags, counters)
@@ -49,6 +52,8 @@ constexpr int MAXP = 17;                // rows of a deferred-commit forward (ve
 constexpr float EPS = 1e-6f;
 constexpr double THETA = 1e7;
 constexpr int EOS = 248044;
+constexpr int IMAGE_PAD = 248056;  // <|image_pad|>: what the n-gram embedding (PLE) and the lookup see of an image row
+inline int dev_tok(int t) { return t >= kImgToken ? IMAGE_PAD : t; }
 
 // per-slot state pointer tables of the batched steps: S, conv history / pending, recurrence pending, PLE history /
 // pending, indexer key ring
@@ -64,6 +69,25 @@ struct SteerArg {
     int li = -1;  // layer whose output is steered (-1: none)
 };
 
+// KV streaming (FLASH_KV_STREAM, flash_kernels.cuh k_kv_need): host rows of a layer's K / V + its page table
+struct KvMap {
+    const int* pt = nullptr;
+    uint8_t *hk = nullptr, *hv = nullptr;
+    float *hks = nullptr, *hvs = nullptr;
+};
+// a layer's block cache (VRAM) and its residency state
+struct KvPool {
+    int* pt = nullptr;                 // [logical blocks]
+    unsigned long long* st = nullptr;  // [P]
+    unsigned* ctl = nullptr;           // [0] call id, [1] clock hand, [2] finished blocks of the call, [3] misses, [4] fallbacks, [5] hits, [6] usable blocks
+    int P = 0;
+    uint8_t *kc = nullptr, *vc = nullptr;  // device block rows
+    float *ks = nullptr, *vs = nullptr;
+    KvMap m;
+};
+constexpr bool kKvRamDefault = false;  // FLASH_KV default (ram | vram)
+bool kv_ram_mode();          // FLASH_KV / FLASH_KV_STREAM
+long long kv_ram_tokens();   // FLASH_KV_RAM_TOKENS
 // ranks: 2 or 3 (every split below divides: 24 QSA q heads, 48 DeltaNet value / 16 key heads, 512-position KV
 // ownership per period of 512 x ngpu positions)
 struct Plan {
@@ -148,12 +172,14 @@ struct Layer {
     float* rec_pend = nullptr;   // [2][MAXM][vl][DREC] recurrence inputs of the last forward
     // QSA
     W8 qkv, o;             // INT8; qkv rows [q 24 heads x 256][gate local heads x 256][k 2 x 256][v 2 x 256]
+    W8 qx;                 // FLASH_QX_LOCAL: q rows of the peers' heads (owners ascending), prefill q without the exchange
     W16 idx;               // index_qk_proj [640, 2560]
     bf16 *q_norm = nullptr, *k_norm = nullptr, *iq_norm = nullptr, *ik_norm = nullptr;
     uint8_t *kc = nullptr, *vc = nullptr;  // fp8 e4m3 [rows][2][256], rows = owned positions
     float *ks = nullptr, *vs = nullptr;    // per (row, head) scales [rows][2]
     bf16* ikb = nullptr;   // indexer block keys of owned complete blocks [rows / 4][128]
     float* ik_tail = nullptr;  // raw indexer keys of the last positions [IDX_TAIL][128] by position mod IDX_TAIL (all cards)
+    KvPool kvp;                // KV streaming: block cache + host rows (kc / vc / ks / vs are then the cache's rows)
     // MoE
     W16 router;            // [528, 2560]: 512 router rows, row 512 = shared_expert_gate, zero pad (BF16; FLASH_ROUTER8=0)
     W8 router8;            // the same INT8 g128 (default: KL at the BF16 floor)
@@ -227,6 +253,8 @@ public:
     void load(const SafeTensors& st, const HostTables& ht, const SafeTensors* mtp = nullptr);
     void alloc_state();             // KV pool for max_ctx, DeltaNet states, buffers
     size_t free_bytes() const;
+    void test_hog(long long keep_mb);  // FLASH_TEST_VRAM_HOG_MB (flash.cu)
+    std::vector<void*> hog_;
     void reset();                   // new sequence
     // m rows: tokens[i] at position pos + i; ple rows (16 n-gram embeddings per row, host-gathered) in ple_host.
     // Writes the argmax token of every row to out (host), logits of the last row optionally to logits_host.
@@ -243,11 +271,44 @@ public:
     // rows of a prefill batch whose buffers never take memory from the expert cache (the rest of pf_batch() is
     // borrowed from it for the batch, prefill-r3)
     int pf_batch_base() const { return pfbn_base_; }
+    // rows of the next prefill batch with r rows left and batches of up to B rows: nominal B - PFM (a tail of <= PFM
+    // rows joins the last one); with big batches (B > pf_batch_base()) the last two are balanced when the plain split
+    // would leave a tail of <= pf_batch_base() rows and both halves can be big (FLASH_PF_BALANCE, default 1): a small
+    // batch stages only the base part of the cold groups (no ring extension) and runs the MoE over the whole batch
+    // (2 GPUs 10K: 4096 + 4096 + 2105 -> 4096 + 3584 + 2617); only with a ring extension (pfs_ext_, L1)
+    int pf_batch_rows(int r, int B) const {
+        if (r <= B) return r;
+        const int nb = B - PFM;
+        static const bool bal = env_int("FLASH_PF_BALANCE", 1);
+        if (bal && pfs_ext_ && B > pfbn_base_ && r - nb <= pfbn_base_) {  // (3 GPUs: no extension, 10K +1.5 % when balanced)
+            const int m = ((r + 1) / 2 + PFM - 1) / PFM * PFM;
+            if (m <= nb && r - m > pfbn_base_) return m;
+        }
+        return nb;
+    }
     // mtp_toks (optional): the MTP fill as a 49th layer of the batch (last: the prompt's last batch, the last row's MTP
     // token is the sampled one); *draft = the MTP draft of the last row, or -2 when the caller must run prefill_batch_mtp
     void prefill_batch(const int* tokens, int pos, int n, const bf16* ple_rows, int* out, const int* mtp_toks = nullptr,
                        bool last = false, int* draft = nullptr);
     void prefill_batch_mtp(const int* mtp_toks, int pos, int n, int* draft);  // MTP block over the batch's rows
+    // several prompts in one prefill batch (batched-prefill): segment j = rows [pos, pos + n) of slot `slot` (KV region at
+    // period `base`; `commit` pending rows of its last forward committed first; `end`: its prompt ends here, so its last
+    // row gets the head (sampled with the slot's parameters) and, with mtp_toks, the MTP draft). Rows of the segments are
+    // concatenated in tokens / ple_rows / mtp_toks; the mixer runs per segment (its own positions, KV region and recurrent
+    // state), HC and the MoE half over all rows at once (each expert group read once for every prompt). out[j] / draft[j]
+    // for the segments with end set, in segment order. The workspace keeps the bound slot's state.
+    struct PfSeg { int slot, base, pos, n, commit; bool end; };
+    static constexpr int PFSEG_MAX = 16;
+    bool pf_multi_ok(const int* segn, int nseg) const;  // the layout fits (units, collectives, buffers)
+    // host-backed (cold) expert bytes of this card: every prefill pass reads / stages them over PCIe
+    long long cold_bytes() const {
+        long long n = 0;
+        for (const Layer& L : L_) n += L.ncold;
+        return n * (long long)GRP_BYTES;
+    }
+    void prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const bf16* ple_rows, const int* mtp_toks, int* out,
+                       int* draft);
+    void rmin_load(int slot);  // the MTP chain residual of slot's prompt end (prefill_multi) into the chain input
     // MTP head over m rows at positions pos..: row i = (hidden, tokens[i]); chain = false: hidden rows of the last
     // trunk forward (rows 0..m-1), true: the MTP residual of the last row of the previous MTP call (m = 1).
     // out[i] = draft token predicted by row i.
@@ -288,6 +349,13 @@ public:
     void pen_host(const int* toks, int n, int pos);
     // per slot: lookup drafts off (device flag read by the batched lookup pick; the single path asks the host)
     void set_no_lookup(int slot, bool off);
+    // multimodal prompts (Qwen M-RoPE, see rope_freq in flash_kernels.cuh): the RoPE position shift of slot s (text
+    // after images: cache index + delta), and the (t, h, w) positions of a prefill chunk's rows [i0 - 3, i0 + m) of
+    // slot s (r3: 3 ints per prompt row; null: slot s has no table, e.g. a text prompt after an image one). The image
+    // embedding table (host-mapped, all cards): rows of ids >= kImgToken (set_image_table).
+    void set_rope_slot(int s, int delta);
+    void set_rope_chunk(int s, int i0, int m, const int* r3);
+    void set_image_table(const bf16* t);
     void set_prev_m(int n) { prev_m_ = n; }
     void set_cold(const std::vector<std::vector<int>>& c) { cold_ = c; }
     // per-token routing probability [48][512] (router trace): cold groups seed the expert cache hottest first
@@ -355,10 +423,23 @@ public:
     int period() const { return p_.period; }
     int cur_slot() const { return cur_slot_; }
     void use_slot(int s, int base);
-    void set_kv_top(int periods) { kv_top_ = (long long)periods * p_.period; }
+    void set_kv_top(int periods) { kv_top_ = (long long)periods * p_.period; kv_host_ensure(periods, false); }
+    // KV in RAM: positions of the regions of the active sequences (generating / prefilling; -1: unknown = all regions).
+    // The block cache is sized to them, not to the pool top: an idle conversation's host rows need no cache entries
+    // (a 262K conversation idle under t8 kept 1.3 GB of entries away from the expert cache)
+    void set_kv_active(long long pos) { kv_act_ = pos; }
+    // KV in RAM: periods the pool may use now (pinned + what the host can still pin, at most periods())
+    int kv_ram_periods() const;
     void reset_slot(int s);  // zero the recurrent state of slot s
-    void inst_graph(cudaGraphExec_t* e, cudaGraph_t g);  // instantiate; on OOM drop other graphs and retry
+    // instantiate (graph_oom.h): on OOM drop every cached graph and retry; false = no graph, the caller runs the
+    // captured work eagerly (it never ran)
+    bool inst_graph(cudaGraphExec_t* e, cudaGraph_t g);
+    bool launch_graph(cudaGraphExec_t& e);  // false: out of memory, every graph dropped, run eagerly (flash_seq.cu)
+    int glaunch_calls_ = 0;
+    int drop_all_graphs(const cudaGraphExec_t* keep);  // every cached graph but *keep; map entries stay (= seen)
+    bool graph_skip() { return gcool_.skip(); }        // a missing graph is not captured now (after a failed retry)
     int slot_prev_m(int s) const { return s == cur_slot_ ? prev_m_ : sprev_.at(s); }  // pending commit rows of slot s
+    int rope_shift(int s) const { return mmdel_h_.empty() ? 0 : mmdel_h_.at(s); }  // multimodal RoPE shift of slot s
     void set_slot_prev_m(int s, int v) { if (s == cur_slot_) prev_m_ = v; else sprev_.at(s) = v; }
     // KV rows of the positions [t0, t1) of the region at period `base` (kv_pieces: the current slot's region)
     void kv_pieces_at(int base, int t0, int t1, std::vector<Piece>& out);
@@ -403,6 +484,13 @@ public:
     void cap_begin();
     void cap_skip(int skip) { cap_skip_ = skip; }
     void cap_end(float* host);
+    void selwin_report();  // FLASH_SELWIN: selected blocks vs recent-position windows / a recency cache (stderr)
+    void kvs_report();  // KV streaming: block cache hits / misses / host fallbacks (stderr)
+    bool kv_stream() const { return kvs_; }
+    bool ec_enabled() const { return ec_on_; }  // dynamic expert cache on (cold groups exist, FLASH_EC != 0)
+    // KV streaming: the host rows of the region at period `base`, positions [t0, t1) changed (archive restore, moves):
+    // drop their cached blocks in every layer (stream order)
+    void kv_inval(int base, int t0, int t1);
 
 private:
     struct SlotState {
@@ -413,7 +501,7 @@ private:
         cudaGraphExec_t g[2][2][MAXM + 1] = {}, mg[2][2][MAXM + 1] = {}, sg[2][2][2][MAXM] = {};
         std::map<long long, cudaGraphExec_t> pg, pbg;
     };
-    struct KvBase { uint8_t *kc, *vc; float *ks, *vs; bf16* ikb; };
+    struct KvBase { uint8_t *kc, *vc; float *ks, *vs; bf16* ikb; const KvMap* hm; };  // hm: streamed rows (host)
     std::vector<SlotState> slots_;
     std::vector<GraphSet> gstash_;
     std::vector<int> gbase_, sprev_;
@@ -431,16 +519,20 @@ private:
     static constexpr int kPenSeedMax = 8192;
     int* pseed_d_ = nullptr;          // set_penalty's seed tokens (device, kPenSeedMax)
     bool vchain_ = false;             // trunk rows are verify rows of one sequence (penalty: rows see earlier rows)
-    void head_sample_b(int m, int* dst);
+    void head_sample_b(int m, int* dst, const int* rs = nullptr);  // rs: slot of every row (default rslot_)
     std::vector<unsigned long long> guse_;  // per slot: last use of its graph set (LRU bound FLASH_SLOT_GRAPHS)
     unsigned long long gtick_ = 0;
-    void drop_graphs(GraphSet& g);  // per slot: region base of its stashed graphs, its pending commit rows
     std::vector<KvBase> kvb_;   // slot-0 (pool start) KV pointers per layer, MTP last
     int cur_slot_ = 0, cur_base_ = 0;
-    long long ctx_off_ = 0, kv_top_ = 0;  // expert cache: positions of the current region's start / of all regions
+    long long ctx_off_ = 0, kv_top_ = 0, kv_act_ = -1;  // expert cache: positions of the current region's start / of all regions
     void alloc_slots();
     void bind_slot(int s, int base);
     int* rbcur_ = nullptr;   // [XROWS] KV region start row of the bound slot (read by the single-sequence kernels)
+    // multimodal RoPE (MmPos, flash_kernels.cuh): {bound slot, its shift}, shift per slot, chunk table (+ host copies)
+    int *mmcur_ = nullptr, *mmdel_ = nullptr, *mmtab_ = nullptr;
+    int mmtab_rows_ = 0, mmtab_slot_ = -1;
+    std::vector<int> mmdel_h_;
+    void mm_init(int ns);
     bool ws_live_ = false;   // the workspace holds the bound slot's state (else its storage does)
     SlotState ws_state() const;
     void pieces_of(const SlotState& q, bool pend, std::vector<Piece>& out) const;
@@ -519,7 +611,7 @@ private:
     unsigned long long* sp_det_ = nullptr;
     void hc_rows(const HcW& w, float* R, float* inj, bf16* x, __half* xh, int m, cudaStream_t s);
     // ch: protocol channel (one per stream); rr: [2 * rank] row range of every card (needed by the host-staged path)
-    void row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, const int* rr = nullptr);
+    void row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, const int* rr = nullptr, int rowb0 = 0);
     // staged prefill transfers (comm_.xfer != kXferP2P, comm_select_path): pinned host staging of the row all-gather
     // ([x, xh, R] regions of AG_CAP own rows) and of the QSA exchanges ([4 peers][XROWS][XPER] for q and partials), the
     // host-mapped flag words, the device outbox of the staged exchanges, and the exchange counters of the batch
@@ -528,6 +620,8 @@ private:
     unsigned* hagf_ = nullptr;          // [2 channels][data, ack][4 senders]
     char* hag_p_[4] = {};
     unsigned* hagf_p_[4] = {};
+    float* xouti_ = nullptr;  // CE: device outbox of the indexer-key exchange (FLASH_IDX_CE)
+    int xi_k_ = 0;            // indexer exchanges of the batch so far (staged slot parity)
     float *xout_ = nullptr, *xoutc_ = nullptr, *hxq_ = nullptr, *hxc_ = nullptr;  // device outboxes of q / partials
     unsigned *xsw_ = nullptr, *agw_ = nullptr;  // CE: sequence-number words copied into the peers' flags after the rows
     unsigned* hxf_ = nullptr;           // [q, partials][4 senders]
@@ -537,7 +631,11 @@ private:
     bool xstage_ = false;               // inside a prefill batch (counters aligned by k_xpar_align)
     int xq_k_ = 0, xc_k_ = 0;           // QSA exchanges of the batch so far
     void alloc_staging();
-    void xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per, cudaStream_t sx = nullptr);  // after the send kernel (into the outbox)
+    void xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per, cudaStream_t sx = nullptr,
+                   const unsigned* flagw = nullptr);  // flagw: the flag value precomputed (pipelined partials, CE)
+    cudaStream_t xcs_ = nullptr;                  // CE: copy stream of the pipelined partial exchange (FLASH_QSA_PIPE_CE)
+    cudaEvent_t xcf_ = nullptr, xce_[2] = {};     // its fork event, copy-done event per outbox parity
+    bool xce_rec_[2] = {};                        // recorded in this batch (waits / joins only on those: graph capture)  // after the send kernel (into the outbox)
     Xchg xchg_outbox(int e, const Xchg& x, int par, size_t per) const;        // the send kernel's view: outbox + dummy flags
     void trunk_batch_sp(int n, unsigned selmask);
     void trunk_batch_sp1(int n, unsigned selmask);  // per-chunk collectives (FLASH_PFU=0)
@@ -552,16 +650,30 @@ private:
     bool pfs_borrow();
     void pfs_release();
     int pfs_cap_ = 0;                   // groups per ring half (layers with more stage the first pfs_cap_, rest zero-copy)
+    // ring extension (FLASH_PF_STAGE_XMB, prefill-compute): ring positions [pfs_cap0_, pfs_cap_) of each half live in
+    // pfs_ext_, expert-cache slots between big batches (a bt region, as the big-batch buffer tails); a batch without
+    // them stages the first pfs_cap0_ groups (pfs_tab0_d_) and reads the rest zero-copy as before
+    int pfs_cap0_ = 0;
+    char* pfs_ext_ = nullptr;
+    bool pfs_ext_lent_ = false;         // the extension is cache slots outside big batches
+    bool pfs_full_ = false;             // this batch stages pfs_cap_ groups per layer (else pfs_cap0_)
+    bool pfdec_ = false;                // this prefill batch's QSA attention per row (k_qsa_dec), FLASH_ATTN_PFSEL_MAX
+    uintptr_t* pfs_tab0_d_ = nullptr;   // the table with pfs_cap0_ staged groups per layer
+    int pfs_capn() const { return pfs_full_ ? pfs_cap_ : pfs_cap0_; }
+    char* pfs_addr(int half, int p) const {
+        return p < pfs_cap0_ ? pfs_ring_ + ((size_t)half * pfs_cap0_ + p) * GRP_BYTES
+                             : pfs_ext_ + ((size_t)half * (pfs_cap_ - pfs_cap0_) + (p - pfs_cap0_)) * GRP_BYTES;
+    }
     long long pfs_resv_ = 0;            // bytes kept free for the ring by the expert budget
     uintptr_t* pfs_tab_d_ = nullptr;    // per cold group: its ring address (or host address | 1 past pfs_cap_)
     unsigned char* pfs_touch_d_ = nullptr;
     cudaStream_t dst_ = nullptr;
     cudaEvent_t pfs_cp_[2] = {}, pfs_used_[2] = {};
     bool pfs_use_ = false;              // set while a staged prefill batch is being built (moe() picks pfs_tab_d_)
-    ColdTab stab(const Layer& L) const { return ColdTab(pfs_tab_d_ + L.coff, pfs_touch_d_ + L.coff); }
+    ColdTab stab(const Layer& L) const { return ColdTab((pfs_full_ ? pfs_tab_d_ : pfs_tab0_d_) + L.coff, pfs_touch_d_ + L.coff); }
     void pfs_init();
     void pfs_copy(int li);
-    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool pf = false; bool bt = false; int prev = -1; };  // pf: lent to the prefill staging ring; bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
+    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool pf = false; bool bt = false; int prev = -1; bool ik = false; };  // ik: in the tail of an indexer-key array (KV streaming)  // pf: lent to the prefill staging ring; bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
     std::vector<float> ec_prior_;
     std::vector<EcSlot> ec_slots_;
     std::vector<int> ec_slot_of_;      // cold group -> slot or -1
@@ -616,6 +728,29 @@ private:
     int dec_split_ = 8;          // decode attention: key splits of the tensor-core kernel (scratch per split)
     float* attn_spl_ = nullptr;  // device 0 (state slot of the chunked DeltaNet)
     int* cposd_ = nullptr;  // device [chunk][pos, commit]
+    // prefill batch geometry: chunk c = rows [pf_co_[c], pf_co_[c + 1]); prefill_batch: PFM rows each, prefill_multi:
+    // every segment cut into PFM-row chunks from its first row (pf_layout)
+    int pf_nch_ = 0;
+    std::vector<int> pf_co_;
+    int chunk_off(int c, int n) const { return pfm_ ? pf_co_[c] : std::min(n, c * PFM); }
+    // multi-sequence batch being built (prefill_multi): segment of every chunk, first / last chunk of every segment,
+    // batch rows (exclusive end) of the segments that end their prompt
+    bool pfm_ = false;
+    int pfm_nseg_ = 0;
+    std::vector<int> pf_cseg_, pf_sfirst_, pf_slast_, pf_end_;
+    unsigned pf_decmask_ = 0;
+    int pf_layout(const int* segn, int nseg, std::vector<int>& co, std::vector<int>& cseg) const;  // chunk count
+    int pf_units_multi(const std::vector<int>& co, int* ub, int* cb) const;
+    void pf_swap(int li, int seg, bool load);  // segment's recurrent state of layer li <-> the workspace
+    int *rbch_d_ = nullptr, *rbch_h_ = nullptr;      // [chunk][PFM] KV region start row of the chunk's slot
+    int *segslot_d_ = nullptr, *segslot_h_ = nullptr; // [PFSEG_MAX] slot of every segment
+    int *rsl_d_ = nullptr, *rsl_h_ = nullptr;        // [pfbn_] slot of every batch row (steering)
+    int *hsl_d_ = nullptr, *hsl_h_ = nullptr;        // [PFSEG_MAX] slot of every head row (sampling)
+    int* pfmo_h_ = nullptr;                          // pinned [2][PFSEG_MAX] heads: sampled tokens, MTP drafts
+    float* mhR_ = nullptr;                           // [PFSEG_MAX][RW] residual rows of the segments' prompt ends
+    float* Rmins_ = nullptr;                         // [slots][RW] MTP chain residual of each slot's prompt end
+    std::map<long long, cudaGraphExec_t> pmgraphs_;
+    std::map<std::vector<int>, long long> pm_ids_;   // layout -> graph key
     int* cposh_ = nullptr;  // pinned staging
     std::map<long long, cudaGraphExec_t> pbgraphs_;
     void use(const Bufs& b);
@@ -652,9 +787,21 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     template <class F> void run_cached(std::map<long long, cudaGraphExec_t>& cache, long long key, F fn);
     std::map<long long, cudaGraphExec_t> pgraphs_;
     std::map<const void*, std::map<long long, unsigned long long>> graph_use_;  // LRU ticks per graph cache
+  public:
+    // FLASH_XBYTES=1 (test): bytes this card sends to its peers in prefill forwards, by exchange kind (+8: MTP block);
+    // counted when the work is enqueued, a graph's bytes counted at capture and added on every replay
+    enum { XB_RS_MIX = 0, XB_AG_MOEIN, XB_RS_MOE, XB_AG_MIXIN, XB_Q, XB_PART, XB_IDX, XB_MISC, XB_N = 16 };
+    unsigned long long xb_[XB_N] = {};
+    void xb_report(size_t ntok) const;
+  private:
+    int xb_base_ = 0;
+    std::map<std::pair<const void*, long long>, std::vector<unsigned long long>> xb_key_;
+    void xb_add(int kind, size_t bytes) { if (pf_) xb_[xb_base_ + kind] += bytes; }
     unsigned long long graph_tick_ = 0;
   public:
-    long long graphs_evicted_ = 0, graph_oom_ = 0;
+    long long graphs_evicted_ = 0, graph_oom_ = 0, graph_eager_ = 0;  // LRU evictions, instantiate OOMs, failed retries
+    graph_oom::Cool gcool_;
+    int ginst_calls_ = 0;  // instantiate calls of this card (FLASH_TEST_GRAPH_OOM)
     int graphs_live() const {
         int n = 0;
         for (auto* c : {&pgraphs_, &pbgraphs_}) for (auto& kv : *c) n += kv.second != nullptr;
@@ -684,7 +831,31 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     void ple(Layer& L, int pos, int m, const bf16* rows);
 
     Plan p_;
-    int dev_, max_ctx_, rows_ = 0;  // owned KV rows per card
+    int dev_, max_ctx_, rows_ = 0;  // owned KV rows per card (the pool: logical rows when streaming)
+    // KV streaming (FLASH_KV_STREAM): rows_ = logical pool rows (FLASH_KV_STREAM_CTX positions, host memory), srows_ =
+    // rows of one sequence of max_ctx (selection buffers, device K / V arrays: block cache + expert-cache tail),
+    // kvs_P_ = cache blocks per layer, kvs_pe_ = blocks the cache may use now (the rest lent to the expert cache)
+    bool kvs_ = false;
+    int srows_ = 0, kvs_P_ = 0, kvs_pe_ = -1;
+    size_t kvs_host_ = 0;  // pinned host bytes of the streamed rows
+    // lazy pinning: each host array is reserved address space (mmap), pinned in slabs of kvh_slab_ rows as the
+    // regions' top grows (cudaHostRegister; device pointer = host pointer), released 2 slabs above the top
+    bool kvh_lazy_ = false;
+    int kvh_slab_ = 0, kvh_pinned_ = 0, kvh_min_ = 0;  // rows (kvh_min_: pinned at start, kept)
+    struct HArr { char* p; size_t row; };
+    std::vector<HArr> kvh_arr_;
+    void kv_host_ensure(int periods, bool may_release);  // release: launch time only, after kvh_low_ calls in a row
+    int kvh_low_ = 0;
+    void kvh_pin(int r0, int r1);  // cudaHostRegister rows [r0, r1) of every host array
+    // one slab pinned ahead in a background thread (kvh_bg_ rows when it is done), joined before the rows are used
+    std::thread kvh_th_;
+    std::atomic<bool> kvh_done_{false};
+    int kvh_bg_ = 0;
+    int* psel_ = nullptr;  // KV streaming: resolved blocks of the decode rows keys [MAXM][srows_ / 4] (residency pass -> k_qsa_dec)
+    size_t ec_ibound_ = (size_t)-1;  // KV streaming: indexer-key bytes per array in use (expert-cache slots above)
+    void kv_need(Layer& L, int m, const int* pos0, const int* rpos, const int* rbase, int* psel = nullptr);  // no-selection rows
+    void kvs_set_pe(int pe);
+    KvMap kvmap(const Layer& L) const { return kvs_ ? L.kvp.m : KvMap(); }
     Comm comm_;
     CommCounters ctr_;
     cudaStream_t st_ = nullptr;
@@ -759,6 +930,14 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     unsigned *xflags_ = nullptr, *xseq_ = nullptr, *xdone_ = nullptr, *xscnt_ = nullptr, *xqscnt_ = nullptr;
     float* xpr_[4] = {};
     bool qsa_a_ = false;
+    bool agq_on_ = false;     // FLASH_MOE_AGQ: MoE input quantized + routed on the owner, compact rows gathered
+    bool moe_pre_ = false;    // this moe() call's rows are quantized and routed already (gsel_ / gw_ / gsh_ at the rows)
+    bf16* agq_x_ = nullptr;   // owner scratch [AG_CAP][H]: router input x
+    int8_t* agq_r8_ = nullptr;
+    float2* agq_r8s_ = nullptr;
+    float* agq_rlog_ = nullptr;
+    bool qx_on_ = false;      // FLASH_QX_LOCAL: prefill q of the peers' heads computed here (no q exchange)
+    float* qxb_ = nullptr;    // its fp32 projection rows [PFM][(NQ - local) x HD]
     float* xqrecv_ = nullptr;
     unsigned *xqflags_ = nullptr, *xqseq_ = nullptr, *xqdone_ = nullptr;
     float* xqpr_[4] = {};
@@ -825,7 +1004,7 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     int nf_calls_ = 0;                               // checks so far (FLASH_GUARD_TEST_AT)
     int brps_ = 1;                                   // rows per segment of the last batched step
     int *hd_ = nullptr, *hn_d_ = nullptr, *lk_ = nullptr;
-    // uniform lookup result (rc2 decode hang): every rank's lk_ gathered, rank 0's installed everywhere
+    // uniform lookup result (decode hang seen in testing): every rank's lk_ gathered, rank 0's installed everywhere
     static constexpr int kLkWords = 1 + 31;  // count + up to 31 drafts (lk_lmax_ <= MAXP - 1 = 16)
     float* lkall_ = nullptr;
     unsigned* lkdiff_ = nullptr;  // host-mapped: lookups where a rank's own result differed from rank 0's
@@ -849,6 +1028,8 @@ private:
     bool idx_gk_ = false;     // block-selection keys in global memory (k_idx_local<true>): a card's blocks exceed smem
     int *isel_ = nullptr, *insel_ = nullptr;
     unsigned long long* selst_ = nullptr;  // FLASH_SELSTAT counters
+    unsigned *sw_stamp_ = nullptr, *sw_cid_ = nullptr;  // FLASH_SELWIN (KV streaming gate)
+    unsigned long long* sw_c_ = nullptr;
     unsigned* iloc_ = nullptr;
     bool sampling_ = false;
     SampleParams* sp_ = nullptr;
@@ -860,6 +1041,10 @@ private:
     cudaEvent_t ev0_ = nullptr, ev1_ = nullptr;
     // batched prefill: all-reduces + residual updates on a second stream, overlapped with the next chunks' compute
     cudaStream_t cst_ = nullptr;
+    // CE (FLASH_AG_SPLIT): second comm stream for the part of a prefill collective after the reduce-scatter (HC read,
+    // router / quantization, row all-gather), so the next unit's reduce-scatter goes on the link meanwhile
+    cudaStream_t cst2_ = nullptr;
+    cudaEvent_t evs_ = nullptr;
     cudaStream_t pfs_ = nullptr;            // decode: L2 prefetch of the next HC weights (graph side branch)
     cudaStream_t pfs2_ = nullptr;  // side stream of the lookup chain's conditional body capture
     cudaEvent_t pfe0_ = nullptr, pfe1_ = nullptr;

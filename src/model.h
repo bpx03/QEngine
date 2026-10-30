@@ -1,4 +1,5 @@
 #pragma once
+#include "env.h"
 #include <set>
 #include <deque>
 #include <condition_variable>
@@ -402,9 +403,9 @@ private:
     AttnShape layer_shape(const Layer* L, int win = 0) const;  // ash_ + kv format/scales (nullptr = MTP)
     bool kv_fp8_ = true;
     float mtp_ks_ = 0.f, mtp_vs_ = 0.f;  // fp8 scales of the MTP layer cache (max over layers)
-    float mtp_sc_mul_ = getenv("QE_MTP_SCALE") ? atof(getenv("QE_MTP_SCALE")) : 1.f;
+    float mtp_sc_mul_ = env_double("QE_MTP_SCALE", 1.f);
     bool mtp_fp8() const {
-        static const bool on = getenv("QE_MTP_FP8") ? atoi(getenv("QE_MTP_FP8")) != 0 : true;
+        static const bool on = env_set("QE_MTP_FP8") ? env_int("QE_MTP_FP8", true) != 0 : true;
         return kv_fp8_ && on;
     }
     bool glu_ = true;  // fused silu(gate) * up in the gate_up matmul epilogue
@@ -505,7 +506,7 @@ private:
     // null) when enabled and m fits, else the bf16/fp32 path
     bf16* xn_bf16(bf16* xn, int m, const W4* next);
     static int dec_gemm_min() {
-        static const int v = getenv("QE_DEC_GEMM") ? atoi(getenv("QE_DEC_GEMM")) : 33;
+        static const int v = env_int("QE_DEC_GEMM", 33);
         return v;
     }
     bool dec_gemm_rows(int m) const { return dec_gemm_min() > 0 && m >= dec_gemm_min() && rows_cap_ > kMaxGemvW4Tokens; }

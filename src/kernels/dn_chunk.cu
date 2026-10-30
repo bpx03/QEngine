@@ -13,10 +13,13 @@
 // dn_chunk_prep: everything independent of S0, for all chunks in parallel (MMA: fp16 operands,
 // fp32 accumulation; the triangular inverse T in fp32). dn_chunk_scan: the chunks of one head in
 // order, a 64-column v slice per block, the state slice in fp32 MMA accumulators.
+#include "../env.h"
+#include <algorithm>
 #include <cfloat>
 #include <cuda_fp16.h>
 
 #include "ops.cuh"
+#include "gemv.cuh"
 
 namespace {
 
@@ -888,8 +891,14 @@ thread_local size_t tl_scr_n = 0;
 
 }  // namespace
 
+void dn_chunk_reserve(int nv, int m_max) {
+    const size_t pairs = (size_t)nv * ((m_max + C - 1) / C);
+    qe_ws_reserve("dn_scr", pairs * kPer * 2);
+    qe_ws_reserve("dn_gcs", pairs * 4);
+}
+
 int dn_chunk_min() {
-    static const int v = getenv("QE_DN_CHUNK") ? atoi(getenv("QE_DN_CHUNK")) : 64;
+    static const int v = env_int("QE_DN_CHUNK", 64);
     return v;
 }
 
@@ -919,11 +928,12 @@ void dn_core_chunked(const float* conv_out, int ch, const DeltaShape& s, const f
     const int nch = (m + C - 1) / C;
     const size_t need = (size_t)s.nv * nch * kPer;
     if (need > tl_scr_n) {  // grows during the first prefills (never inside graph capture)
-        if (tl_scr) CUDA_CHECK(cudaFree(tl_scr));
-        if (tl_gcs) CUDA_CHECK(cudaFree(tl_gcs));
-        CUDA_CHECK(cudaMalloc(&tl_scr, need * 2));
-        CUDA_CHECK(cudaMalloc(&tl_gcs, (size_t)s.nv * nch * 4));
-        tl_scr_n = need;
+        // Flash-Next reserves both at load for its largest chunk (dn_chunk_reserve), so serving takes the reserved
+        // blocks; a growth beyond them goes through the engine's out-of-memory hook (drop cached graphs, retry). The
+        // old buffers are kept, not freed: graphs captured with them may still be replayed
+        size_t nb = qe_ws_alloc((void**)&tl_scr, need * 2, "dn_scr");
+        const size_t ng = qe_ws_alloc((void**)&tl_gcs, (size_t)s.nv * nch * 4, "dn_gcs");
+        tl_scr_n = std::min(nb / 2 / kPer, ng / 4) * kPer;  // (head, chunk) pairs both buffers hold
     }
     const DnConvIn c0{};
     if (ci)

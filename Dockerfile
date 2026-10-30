@@ -45,6 +45,8 @@ COPY --from=build /src/build/libqengine.so ./build/libqengine.so
 # Qwen3.8-Flash-Next engine (preview): picked by the server when QE_MODEL points to a Flash-Next directory
 COPY --from=build /src/build/libqflash.so ./build/libqflash.so
 COPY LICENSE ./
+# included activation-steering vectors (refusal_projection, Flash-Next only); loaded only with QE_STEERING != 0 (vectors/README.md)
+COPY vectors ./vectors
 
 # Entry point: server/run.sh with the container defaults (listen on 0.0.0.0).
 # QE_GPUS = GPU ids as seen in the container (with --gpus all: the host ids), default 0,1,2;
@@ -58,6 +60,75 @@ MODEL="${QE_MODEL:-/app/models/Qwen3.8-27B-INT4}"
 if [ ! -f "$MODEL/config.json" ]; then
   echo "model not found at $MODEL: mount it (-v /path/to/models:/app/models:ro)" >&2
   exit 1
+fi
+# Activation steering (off by default). QE_STEERING=0: no vectors, the server runs as without them. QE_STEERING=1:
+# the included refusal_projection (Flash-Next only) is the default of every request; QE_STEERING=<name>: that vector
+# is the default. With any value but 0, the included vectors (/app/vectors, Flash-Next only) and the user's (*.gguf +
+# sidecar .json mounted at /vectors; a mounted vector wins over an included one of the same name) are all loaded, so a
+# request can pick one ("steering": "<name>") or turn steering off ("steering": false). QE_STEER / QE_STEER_DIR set by
+# the user win over all of this.
+if [ -n "${QE_STEERING:-}" ] && [ "${QE_STEERING}" != 0 ]; then
+  if [ -n "${QE_STEER:-}${QE_STEER_DIR:-}" ]; then
+    echo "QE_STEERING=${QE_STEERING}: QE_STEER / QE_STEER_DIR already set, using those" >&2
+  else
+    sel=$(python3 - "$MODEL" "$QE_STEERING" <<'PY'
+import json, os, sys
+model, want = sys.argv[1], sys.argv[2]
+def log(m): print("QE_STEERING=%s: %s" % (want, m), file=sys.stderr)
+cfg = json.load(open(os.path.join(model, "config.json")))
+t = cfg.get("text_config") or cfg
+flash = (cfg.get("model_type") or t.get("model_type") or "").startswith("qwen4_exp")
+def scan(d):  # name -> (gguf, sidecar); the name as the engine reads it: sidecar "name", else the file stem
+    out = {}
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not f.endswith(".gguf"):
+            continue
+        g = os.path.join(d, f)
+        side = g[:-5] + ".json" if os.path.isfile(g[:-5] + ".json") else g + ".json"
+        name = f[:-5]
+        try:
+            n = json.load(open(side)).get("name")
+            if isinstance(n, str) and n.strip() and not n.strip().startswith("<"):
+                name = n
+        except Exception:
+            pass  # missing / bad sidecar: the engine refuses it with the reason
+        if name in out or "/" in name or name.startswith("."):
+            log("vector name '%s' in %s is repeated or not a file name" % (name, d)); sys.exit(1)
+        out[name] = (g, side)
+    return out
+builtin = scan("/app/vectors") if flash else {}
+if not flash:
+    log("the included vectors are for Qwen3.8-Flash-Next and %s is not Flash-Next: not loaded" % model)
+mounted = scan("/vectors")
+for n in sorted(set(builtin) & set(mounted)):
+    log("mounted vector %s replaces the included one" % n)
+vecs = {**builtin, **mounted}
+default = "refusal_projection" if want == "1" else want
+if default not in vecs:
+    if want == "1" and not flash:
+        log("refusal_projection is for Flash-Next only: no default vector, requests are not steered")
+        default = ""
+    else:
+        log("vector '%s' is not loaded; available: %s" % (default, ", ".join(sorted(vecs)) or "(none)")); sys.exit(1)
+if not vecs:
+    sys.exit(0)
+out = "/tmp/qe-steer"
+os.makedirs(out, exist_ok=True)
+for f in os.listdir(out):
+    os.unlink(os.path.join(out, f))
+for n, (g, side) in vecs.items():
+    os.symlink(g, os.path.join(out, n + ".gguf"))
+    if os.path.exists(side):
+        os.symlink(side, os.path.join(out, n + ".json"))
+log("vectors %s, default %s" % (", ".join(sorted(vecs)), default or "(none)"))
+print(out + "\t" + default)
+PY
+) || exit 1
+    if [ -n "$sel" ]; then
+      export QE_STEER_DIR="${sel%%$'\t'*}"
+      [ -n "${sel#*$'\t'}" ] && export QE_STEER_DEFAULT="${sel#*$'\t'}"
+    fi
+  fi
 fi
 # QE_EXTRA_ARGS (env) and the container command line are both passed to server/app.py
 exec server/run.sh "${QE_PORT:-8080}" --host 0.0.0.0 \

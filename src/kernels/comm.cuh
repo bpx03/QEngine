@@ -68,7 +68,15 @@ struct Comm {
     unsigned* xsw[4] = {nullptr, nullptr, nullptr, nullptr};
     uint2* hrs[4] = {nullptr, nullptr, nullptr, nullptr};
     uint2* hag[4] = {nullptr, nullptr, nullptr, nullptr};
+    // test only (FLASH_TEST_LINK_GBPS, CE path): slow-link emulation. Every staged peer copy is followed on its stream by
+    // a spin until the card's egress "link" (one busy-until time per rank, shared by all its streams and peers) has
+    // carried the copy's bytes at lemu ns per byte; the flag copy after it lands then. lreal: ns per byte of the real copy
+    // (already elapsed when the spin starts). lemu 0: off.
+    unsigned long long* lbusy[4] = {nullptr, nullptr, nullptr, nullptr};
+    float lemu = 0.f, lreal = 0.f;
 };
+// test only: the slow-link emulation spin after `bytes` of peer copies on st (no-op unless FLASH_TEST_LINK_GBPS)
+void comm_link_emul(const Comm& c, int rank, size_t bytes, cudaStream_t st, int kind = 0);
 constexpr int kCeSlots = 16;
 constexpr int kXferP2P = 0, kXferCE = 1, kXferHost = 2;
 

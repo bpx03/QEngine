@@ -69,6 +69,9 @@ void sample_rows(const float* gathered, int ngpu, int m, SampleParams* p, int* t
 // rows of one slot are its verify rows (penalty: as sample_rows with chain)
 void sample_rows_slots(const float* gathered, int ngpu, int m, SampleParams* base, const int* rowslot,
                        const int* on, int* tokens, cudaStream_t st);
+// the largest per-thread stack (local memory) of the sampling kernels: the biggest frames of the library
+// (sample_rows_slots_kernel 1056 B, above the context's default stack limit of 1024 B; tests/kernel_stack_check.sh)
+size_t sample_stack_need();
 
 // Speculative verification with sampling (lossless for greedy drafts): row j accepts draft
 // tokens[j+1] with probability p_j(draft), otherwise samples from p_j without the draft and

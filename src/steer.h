@@ -10,6 +10,7 @@
 // Where the vector acts (each engine): at the output of layer L (llama.cpp's "l_out" / "l_last": the residual after
 // the layer's last update, before the next norm): add h += alpha v, project h -= alpha (h . v) v (Flash-Next: on each
 // of its 4 hyper-connection streams).
+#include "env.h"
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -312,7 +313,7 @@ inline SteerSpec steer_load(const std::string& spec_in, const std::string& meta_
         }
         const Json* cp = get(j, "compatibility");
         const Json* cm = cp ? get(*cp, "model") : nullptr;
-        static const bool chk = !getenv("QE_STEER_MODEL_CHECK") || atoi(getenv("QE_STEER_MODEL_CHECK"));
+        static const bool chk = env_int("QE_STEER_MODEL_CHECK", 1);
         if (chk && cm && cm->type == Json::Str && !placeholder(cm->str)) {
             std::string dn = model_dir;
             while (dn.size() > 1 && dn.back() == '/') dn.pop_back();
@@ -439,9 +440,9 @@ inline SteerSpec steer_load(const std::string& spec_in, const std::string& meta_
 inline std::vector<SteerSpec> steer_load_env(int hidden, int layers, const std::string& model_dir, int* def) {
     std::vector<SteerSpec> v;
     *def = -1;
-    const char* one = getenv("QE_STEER");
-    const char* dir = getenv("QE_STEER_DIR");
-    if (one && *one) v.push_back(steer_load(one, getenv("QE_STEER_META") ? getenv("QE_STEER_META") : "", hidden, layers, model_dir));
+    const char* one = env_str("QE_STEER");
+    const char* dir = env_str("QE_STEER_DIR");
+    if (one && *one) v.push_back(steer_load(one, env_str("QE_STEER_META") ? env_str("QE_STEER_META") : "", hidden, layers, model_dir));
     if (dir && *dir) {
         std::vector<std::string> files;
         if (DIR* d = opendir(dir)) {
@@ -461,7 +462,7 @@ inline std::vector<SteerSpec> steer_load_env(int hidden, int layers, const std::
         for (size_t b = 0; b < a; b++)
             if (v[a].name == v[b].name)
                 throw std::runtime_error("steering: two vectors named '" + v[a].name + "': " + v[b].file + " and " + v[a].file);
-    if (const char* dn = getenv("QE_STEER_DEFAULT"); dn && *dn) {
+    if (const char* dn = env_str("QE_STEER_DEFAULT"); dn && *dn) {
         for (size_t a = 0; a < v.size(); a++)
             if (v[a].name == dn) *def = (int)a;
         if (*def < 0 && strcmp(dn, "off") != 0) {

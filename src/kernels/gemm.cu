@@ -2,6 +2,7 @@
 // Weights use the same fragment-packed layouts as the GEMV path (gemv.cuh), so the A operand
 // (weights) streams straight from global memory into registers, while token activations are
 // staged through shared memory with cp.async and read as B fragments with ldmatrix.
+#include "../env.h"
 #include <cerrno>
 #include <cstring>
 #include <map>
@@ -3224,6 +3225,64 @@ static void tl_retire(void* p) {
     std::lock_guard<std::mutex> g(mu);
     keep.push_back(p);
 }
+// Lazily grown per-thread GEMM workspaces are allocated after the expert cache took the free VRAM (they live in the
+// FLASH_EC_MARGIN_MB margin, next to the cached graphs). Two guards, both per device (the engine loads a card on one
+// thread and serves it on another, so thread-local state set at load would not reach the serving thread):
+// - gemm_reserve_ws (load time, before the expert budget) allocates named blocks for the largest prefill-chunk
+//   shapes; the first growth of a buffer with that name on that device takes its block (at the block's full size), so
+//   in normal serving these buffers do not allocate at all;
+// - a growth that still runs out of memory asks the device's engine to free memory (gemm_set_oom_hook: Flash-Next
+//   drops its cached CUDA graphs, whose memory the driver then hands back) and retries once; only a second failure
+//   is fatal.
+constexpr int kTlDevs = 16;
+int (*g_oom_hook[kTlDevs])(void*) = {};
+void* g_oom_ctx[kTlDevs] = {};
+std::mutex g_tl_res_mu;
+std::map<std::pair<int, std::string>, std::pair<void*, size_t>> g_tl_res;  // (device, buffer name) -> reserved block
+int tl_dev() { int d = 0; cudaGetDevice(&d); return d; }
+void tl_set_oom_hook(int (*fn)(void*), void* ctx) {
+    const int d = tl_dev();
+    if (d >= 0 && d < kTlDevs) { g_oom_hook[d] = fn; g_oom_ctx[d] = ctx; }
+}
+// returns the bytes allocated (>= bytes: a reserved block may be larger)
+static size_t tl_alloc(void** p, size_t bytes, const char* what) {
+    const int dev = tl_dev();
+    // test hook: QE_TEST_TL_OOM=n skips the reserved blocks and makes the n-th growth of each thread (1-based) fail
+    // once as out of memory
+    static const int inj = env_int("QE_TEST_TL_OOM", 0);
+    if (inj <= 0) {
+        std::lock_guard<std::mutex> g(g_tl_res_mu);
+        auto it = g_tl_res.find({dev, what});
+        if (it != g_tl_res.end() && it->second.second >= bytes) {
+            *p = it->second.first;
+            const size_t n = it->second.second;
+            g_tl_res.erase(it);
+            return n;
+        }
+    }
+    thread_local int calls = 0;
+    const bool fake = inj > 0 && ++calls == inj;
+    cudaError_t r = fake ? cudaErrorMemoryAllocation : cudaMalloc(p, bytes);
+    if (r == cudaErrorMemoryAllocation && dev >= 0 && dev < kTlDevs && g_oom_hook[dev]) {
+        (void)cudaGetLastError();
+        const int n = g_oom_hook[dev](g_oom_ctx[dev]);
+        fprintf(stderr, "[gemm] GPU%d %s: out of memory growing to %.1f MB: %s, retrying%s\n", dev, what, bytes / 1048576.0,
+                n >= 0 ? (std::to_string(n) + " cached graphs dropped").c_str() : "inside a graph capture, nothing dropped",
+                fake ? " (QE_TEST_TL_OOM)" : "");
+        fflush(stderr);
+        r = cudaMalloc(p, bytes);
+    }
+    CUDA_CHECK(r);
+    return bytes;
+}
+static void tl_reserve(const char* what, size_t bytes) {
+    void* p = nullptr;
+    CUDA_CHECK(cudaMalloc(&p, bytes));
+    std::lock_guard<std::mutex> g(g_tl_res_mu);
+    auto& slot = g_tl_res[{tl_dev(), what}];
+    if (slot.first) CUDA_CHECK(cudaFree(slot.first));
+    slot = {p, bytes};
+}
 template <typename T>
 struct TlBuf {
     T* p = nullptr;
@@ -3241,8 +3300,7 @@ thread_local TlBuf<float> tl_xs_buf;
 #define tl_xs tl_xs_buf.p
 #define tl_xh_n tl_xh_buf.n
 bool g_gemm_h16 = [] {
-    const char* e = getenv("QE_GEMM_H16");
-    return e ? atoi(e) != 0 : true;
+    return env_int("QE_GEMM_H16", 1) != 0;
 }();
 
 // ---- W4A8 selection (QE_PREFILL_INT8: 1/all (default) | 0 | comma list of classes
@@ -3252,7 +3310,7 @@ thread_local TlBuf<int8_t> tl_xq_buf;
 thread_local TlBuf<float> tl_xqs_buf;
 enum { I8_GU = 1, I8_IN = 2, I8_OUT = 4, I8_DOWN = 8, I8_FC = 16 };
 int g_i8_mask = [] {
-    const char* e = getenv("QE_PREFILL_INT8");
+    const char* e = env_str("QE_PREFILL_INT8");
     if (!e || !*e || !strcmp(e, "1") || !strcmp(e, "all")) return 31;
     if (!strcmp(e, "0")) return 0;
     int m = 0;
@@ -3271,9 +3329,9 @@ int g_i8_mask = [] {
 // activation group per class: QE_PREFILL_INT8_G = "64" (all) or "gu=64,in=64,out=32,down=32,fc=64"
 int g_i8_group[32] = {};
 int i8_group_init = [] {
-    const char* e = getenv("QE_PREFILL_INT8_G");
+    const char* e = env_str("QE_PREFILL_INT8_G");
     auto valid = [](int g) { return (g == 64 || g == 128) ? g : 32; };
-    int all = valid(e && !strchr(e, '=') ? atoi(e) : 64);
+    int all = valid(e && !strchr(e, '=') ? env_int("QE_PREFILL_INT8_G", 64) : 64);
     for (int c = 0; c < 32; c++) g_i8_group[c] = all;
     if (e && strchr(e, '=')) {
         for (const char* p = e; *p;) {
@@ -3350,15 +3408,15 @@ __global__ void sk_reduce_kernel(const float* __restrict__ wsp, int parts, int r
     else c[(size_t)tok * ldc + row0 + o] = v;
 }
 
-int g_i8_direct = [] { const char* e = getenv("QE_PREFILL_INT8_DIRECT"); return e ? atoi(e) : 0; }();
+int g_i8_direct = [] { return env_int("QE_PREFILL_INT8_DIRECT", 0); }();
 // gemm_i8t_kernel tile order: groups of QE_I8_GRP row blocks (token blocks inside a group) so the
 // concurrently running blocks share weights and activations in L2; 0 / large = row block fastest
-int g_i8_grp = [] { const char* e = getenv("QE_I8_GRP"); const int v = e ? atoi(e) : 8; return v > 0 ? v : 1 << 20; }();
+int g_i8_grp = [] { const int v = env_int("QE_I8_GRP", 8); return v > 0 ? v : 1 << 20; }();
 // persistent grid (QE_GEMM_SK_BLOCKS, default 82 = all SMs; measured better than leaving 4 SMs
 // to the overlapped all-reduce blocks, 8K prefill 1384 vs 1406 ms) and the number of workers the
 // decomposition assumes (QE_GEMM_SK_WORKERS, default = blocks)
-int g_sk_blocks = [] { const char* e = getenv("QE_GEMM_SK_BLOCKS"); return e ? atoi(e) : 82; }();
-int g_sk_workers = [] { const char* e = getenv("QE_GEMM_SK_WORKERS"); return e ? atoi(e) : 0; }();
+int g_sk_blocks = [] { return env_int("QE_GEMM_SK_BLOCKS", 82); }();
+int g_sk_workers = [] { return env_int("QE_GEMM_SK_WORKERS", 0); }();
 thread_local TlBuf<int> tl_sk_ctr_buf;
 thread_local TlBuf<float> tl_sk_ws_buf;
 constexpr int kSkCtrs = 256;  // [0]: unit counter, [1 + r]: stream-K tickets of split tile r (SKF)
@@ -3374,7 +3432,7 @@ SkPlan sk_plan(int tiles, int nkt, int per_sm = 1, int min_nk = 1) {
     SkPlan pl{std::min(B, tiles), (tiles / P) * P, tiles % P, 1};
     if (pl.rem) {
         double best = 1e30;
-        static const int maxp_env = [] { const char* e = getenv("QE_SK_MAXPARTS"); return e ? std::max(1, atoi(e)) : 64; }();
+        static const int maxp_env = [] { return env_set("QE_SK_MAXPARTS") ? std::max(1, env_int("QE_SK_MAXPARTS", 64)) : 64; }();
         const int maxp = g_sk_maxparts_rt > 0 ? g_sk_maxparts_rt : maxp_env;
         for (int parts = 1; parts <= std::min(std::min(nkt / min_nk, 64), maxp); parts++) {
             const int waves = (pl.rem * parts + P - 1) / P;
@@ -3407,12 +3465,25 @@ __global__ void f32_to_bf16_kernel(const float* __restrict__ src, int n, int t, 
     const int r = i / n, col = i % n;
     dst[(size_t)r * ldd + col] = __float2bfloat16(src[i]);
 }
-bool g_i8_fuse = [] { const char* e = getenv("QE_PREFILL_INT8_FUSE"); return e ? atoi(e) != 0 : true; }();
+bool g_i8_fuse = [] { return env_int("QE_PREFILL_INT8_FUSE", 1) != 0; }();
 // GLU epilogue quantizes the activations for the down GEMM (gemm_i8v_kernel; QE_I8_GLUQ=0 disables)
-bool g_i8_gluq = [] { const char* e = getenv("QE_I8_GLUQ"); return e ? atoi(e) != 0 : true; }();
+bool g_i8_gluq = [] { return env_int("QE_I8_GLUQ", 1) != 0; }();
 thread_local TlBuf<int8_t> tl_gq_xq_buf;
 thread_local bool tl_gluq_var = false;  // set by gemm_i8_dispatch: only the engine variant (100) quantizes in the GLU epilogue
 thread_local TlBuf<float> tl_gq_xs_buf;
+
+// load time (before the expert budget): grow this thread's W8A8 GEMM workspaces to t_max rows of k_max inputs and the
+// stream-K workspace to skws_bytes, so serving does not allocate them later (see tl_alloc)
+void tl_reserve_ws(int t_max, int k_max, size_t skws_bytes) {
+    const size_t t16 = (size_t)(t_max + 15) / 16 * 16;
+    const size_t ns = std::max({t16 * i8v_rec_floats(k_max, 64, true), t16 * i8v_rec_floats(k_max, 64, false),
+                                (size_t)t_max * i8_rec_floats(k_max, 64), (size_t)t_max * i8_rec_floats(k_max, 128),
+                                t16 * i8v_rec_floats(k_max, 32, true), (size_t)t_max * i8_rec_floats(k_max, 32)});
+    tl_reserve("tl_xq_buf", (size_t)t_max * k_max);
+    tl_reserve("tl_xqs_buf", ns * 4);
+    tl_reserve("tl_sk_ctr_buf", kSkCtrs * sizeof(int));
+    tl_reserve("tl_sk_ws_buf", skws_bytes);
+}
 
 // VF: gemm_i8v_kernel with HM = VF - 2 (2: shifted, 3: in-place u8 + C_hi records, 4: signed in place); MBV: mbarrier pipeline
 template <int TB, int WT, int G, bool DIRECT, bool TR, int ABL = 0, int CCB = 64, int MINB = 1, int NST = STAGES, int NWB = 3, bool WREG = true, bool WS = false, int VF = 0, int MBV = 0>
@@ -3425,17 +3496,15 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
     const size_t need = (size_t)t * w.k;
     if (need > tl_xq_buf.n) {
         if (tl_xq_buf.p) tl_retire(tl_xq_buf.p);
-        CUDA_CHECK(cudaMalloc(&tl_xq_buf.p, need));
-        tl_xq_buf.n = need;
+        tl_xq_buf.n = tl_alloc((void**)&tl_xq_buf.p, need, "tl_xq_buf");
     }
     const size_t needs = VF ? (size_t)((t + 15) / 16 * 16) * i8v_rec_floats(w.k, G, VF == 3) : (size_t)t * i8_rec_floats(w.k, G);
     if (needs > tl_xqs_buf.n) {
         if (tl_xqs_buf.p) tl_retire(tl_xqs_buf.p);
-        CUDA_CHECK(cudaMalloc(&tl_xqs_buf.p, needs * 4));
-        tl_xqs_buf.n = needs;
+        tl_xqs_buf.n = tl_alloc((void**)&tl_xqs_buf.p, needs * 4, "tl_xqs_buf") / 4;
     }
     if (!tl_sk_ctr_buf.p) {
-        CUDA_CHECK(cudaMalloc(&tl_sk_ctr_buf.p, kSkCtrs * sizeof(int)));
+        tl_alloc((void**)&tl_sk_ctr_buf.p, kSkCtrs * sizeof(int), "tl_sk_ctr_buf");
         tl_sk_ctr_buf.n = kSkCtrs;
     }
     const int8_t* xq = tl_xq_buf.p;
@@ -3453,8 +3522,7 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
     const size_t needw = (size_t)pl.rem * pl.parts * block_rows<WT>() * TB;
     if (needw > tl_sk_ws_buf.n) {
         if (tl_sk_ws_buf.p) tl_retire(tl_sk_ws_buf.p);
-        CUDA_CHECK(cudaMalloc(&tl_sk_ws_buf.p, needw * sizeof(float)));
-        tl_sk_ws_buf.n = needw;
+        tl_sk_ws_buf.n = tl_alloc((void**)&tl_sk_ws_buf.p, needw * sizeof(float), "tl_sk_ws_buf") / sizeof(float);
     }
     // GLU GEMM (gemm_i8v_kernel, 256-row blocks, no split tiles): quantize the activations for the down GEMM in
     // the epilogue and hand them over like the AR-tail quantizer does (QE_I8_GLUQ=0: down runs its pre-pass)
@@ -3467,12 +3535,12 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
             const size_t nq = (size_t)t * K2, ns = (size_t)((t + 15) / 16 * 16) * i8v_rec_floats(K2, 64, false);
             if (nq > tl_gq_xq_buf.n) {
                 if (tl_gq_xq_buf.p) tl_retire(tl_gq_xq_buf.p);
-                CUDA_CHECK(cudaMalloc(&tl_gq_xq_buf.p, nq));
+                tl_alloc((void**)&tl_gq_xq_buf.p, nq, "tl_gq_xq_buf");
                 tl_gq_xq_buf.n = nq;
             }
             if (ns > tl_gq_xs_buf.n) {
                 if (tl_gq_xs_buf.p) tl_retire(tl_gq_xs_buf.p);
-                CUDA_CHECK(cudaMalloc(&tl_gq_xs_buf.p, ns * 4));
+                tl_alloc((void**)&tl_gq_xs_buf.p, ns * 4, "tl_gq_xs_buf");
                 tl_gq_xs_buf.n = ns;
             }
             gq = tl_gq_xq_buf.p;
@@ -3506,7 +3574,7 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
         attr = true;
     }
-    if (getenv("QE_GEMM_DEBUG"))
+    if (env_str("QE_GEMM_DEBUG"))
         fprintf(stderr, "gemm i8%s n=%d k=%d t=%d tb=%d wt=%d G=%d: tiles %d grid %d full %d rem %d parts %d\n",
                 TR ? "t" : "", w.n, w.k, t, TB, WT, G, rb * tb, pl.grid, pl.full, pl.rem, pl.parts);
     if constexpr (VF == 20)
@@ -3542,7 +3610,7 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
     }
 }
 // kernel variant: QE_PREFILL_INT8_KERNEL = 2 (gemm_i8v_kernel, default) | 1 (gemm_i8t_kernel) | 0 (gemm_i8_kernel)
-int g_i8_kernel = [] { const char* e = getenv("QE_PREFILL_INT8_KERNEL"); return e ? atoi(e) : 2; }();
+int g_i8_kernel = [] { return env_int("QE_PREFILL_INT8_KERNEL", 2); }();
 // bench variant (gemm_i8_dispatch) that QE_PREFILL_INT8_KERNEL=2 runs: 100 = gemm_i8v_kernel with the
 // engine configuration below (high nibbles signed in place, mbarrier pipeline), any group size
 constexpr int kI8vVar = 100;
@@ -3845,12 +3913,12 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
         const size_t need = (size_t)t * w.k;
         if (need > tl_xh_n) {
             if (tl_xh) tl_retire(tl_xh);
-            CUDA_CHECK(cudaMalloc(&tl_xh, need * 2));
+            tl_alloc((void**)&tl_xh, need * 2, "tl_xh");
             tl_xh_n = need;
         }
         if ((size_t)t > tl_xs_buf.n) {
             if (tl_xs) tl_retire(tl_xs);
-            CUDA_CHECK(cudaMalloc(&tl_xs, (size_t)t * 4));
+            tl_alloc((void**)&tl_xs, (size_t)t * 4, "tl_xs");
             tl_xs_buf.n = t;
         }
         x_to_h_kernel<<<t, 256, 0, st>>>(x, ldx, w.k, tl_xh, tl_xs);
@@ -3862,7 +3930,7 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
         const size_t zs = (size_t)t * w.n, needp = zs * ks;
         if (needp > tl_splitk_n) {
             if (tl_splitk) tl_retire(tl_splitk);
-            CUDA_CHECK(cudaMalloc(&tl_splitk, needp * sizeof(float)));
+            tl_alloc((void**)&tl_splitk, needp * sizeof(float), "tl_splitk");
             tl_splitk_n = needp;
         }
         gemm_h_kernel<WT, TB><<<dim3(rb, tb, ks), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, tl_xh, tl_xs,
@@ -3879,7 +3947,7 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
     const size_t zs = (size_t)t * w.n, need = zs * ks;
     if (need > tl_splitk_n) {
         if (tl_splitk) tl_retire(tl_splitk);
-        CUDA_CHECK(cudaMalloc(&tl_splitk, need * sizeof(float)));
+        tl_alloc((void**)&tl_splitk, need * sizeof(float), "tl_splitk");
         tl_splitk_n = need;
     }
     gemm_kernel<true, WT, TB><<<dim3(rb, tb, ks), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, x, ldx,
@@ -3916,7 +3984,7 @@ using TuneMap = std::map<TuneKey, std::pair<int, int>>;
 thread_local std::map<int, TuneMap> tl_tuned;  // device ordinal -> choices (this thread's copy)
 thread_local bool tl_tune_defer = false;       // gemm_tune_defer: save once at the end of a batch
 bool gemm_tune_on() {
-    static const bool on = !getenv("QE_GEMM_TUNE") || atoi(getenv("QE_GEMM_TUNE"));
+    static const bool on = env_int("QE_GEMM_TUNE", 1);
     return on;
 }
 
@@ -3995,7 +4063,7 @@ bool tune_read(const TuneStore& s, std::map<std::string, TuneMap>& out, bool ver
 void tune_load(TuneStore& s) {  // under s.mu
     if (s.loaded || !s.on) return;
     s.loaded = true;
-    if (getenv("QE_TUNE_RETUNE") && atoi(getenv("QE_TUNE_RETUNE"))) {  // tune again, overwrite the file
+    if (env_int("QE_TUNE_RETUNE", 0)) {  // tune again, overwrite the file
         fprintf(stderr, "gemm tune: QE_TUNE_RETUNE, ignoring %s\n", s.path.c_str());
         s.retune = true;
         return;
@@ -4094,11 +4162,15 @@ void tune_record(const TuneKey& key, std::pair<int, int> v) {
 }  // namespace
 
 void gemm_set_out_bf16(bool on) { tl_out16 = on; }
+void gemm_set_oom_hook(int (*fn)(void*), void* ctx) { tl_set_oom_hook(fn, ctx); }
+void gemm_reserve_ws(int t_max, int k_max, size_t skws_bytes) { tl_reserve_ws(t_max, k_max, skws_bytes); }
+size_t qe_ws_alloc(void** p, size_t bytes, const char* what) { return tl_alloc(p, bytes, what); }
+void qe_ws_reserve(const char* what, size_t bytes) { tl_reserve(what, bytes); }
 
 void gemm_tune_set_model(const std::string& model) {
     TuneStore& s = tune_store();
     std::lock_guard<std::mutex> l(s.mu);
-    const char* f = getenv("QE_TUNE_FILE");
+    const char* f = env_str("QE_TUNE_FILE");
     if (f && (!strcmp(f, "off") || !strcmp(f, "0") || !*f)) return;
     int rt = 0, drv = 0;
     cudaRuntimeGetVersion(&rt);
@@ -4111,14 +4183,14 @@ void gemm_tune_set_model(const std::string& model) {
     setup += "cuda runtime " + std::to_string(rt) + " driver " + std::to_string(drv) + "\n";
     setup += "model " + model + "\n";
     setup += "env";
-    for (const char* e : kTuneEnv) setup += std::string(" ") + e + "=" + (getenv(e) ? getenv(e) : "-");
+    for (const char* e : kTuneEnv) setup += std::string(" ") + e + "=" + (env_str(e) ? env_str(e) : "-");
     setup += "\n";
     // a rebuilt gemm.cu (kernels may have changed): same file, retuned
     s.header = "qengine-gemm-tune 1\nbuilt " __DATE__ " " __TIME__ "\n" + setup;
     if (f) s.path = f;
     else {
-        const char* xdg = getenv("XDG_CACHE_HOME");
-        const char* home = getenv("HOME");
+        const char* xdg = env_str("XDG_CACHE_HOME");
+        const char* home = env_str("HOME");
         if (xdg && *xdg) s.dir = std::string(xdg) + "/qengine";
         else if (home && *home) s.dir = std::string(home) + "/.cache/qengine";
         else return;
@@ -4153,7 +4225,7 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
         const size_t need = (size_t)t * w.n;
         if (need > tl_o16_buf.n) {
             if (tl_o16_buf.p) tl_retire(tl_o16_buf.p);
-            CUDA_CHECK(cudaMalloc(&tl_o16_buf.p, need * sizeof(float)));
+            tl_alloc((void**)&tl_o16_buf.p, need * sizeof(float), "tl_o16_buf");
             tl_o16_buf.n = need;
         }
         tl_out16 = false;
@@ -4178,7 +4250,7 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
             if (cst < best) { best = cst; bi = ci; bks = ks; }
         }
     }
-    if (const char* f = getenv("QE_GEMM_FORCE")) {  // "ci,ks" (experiments)
+    if (const char* f = env_str("QE_GEMM_FORCE")) {  // "ci,ks" (experiments)
         int fc = 0, fk = 1;
         if (sscanf(f, "%d,%d", &fc, &fk) >= 1) { bi = fc; bks = std::max(1, fk); }
     } else if (gemm_tune_on()) {
@@ -4257,7 +4329,7 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
                 if (med[j] < med[b1]) b1 = j;
             for (size_t j = 0; j < cl.size(); j++)
                 if ((int)j != b1 && (b2 < 0 || med[j] < med[b2])) b2 = j;
-            const bool dbg2 = getenv("QE_GEMM_DEBUG") && atoi(getenv("QE_GEMM_DEBUG")) >= 2;
+            const bool dbg2 = env_int("QE_GEMM_DEBUG", 0) >= 2;
             if (dbg2) {
                 int dev = 0;
                 cudaGetDevice(&dev);
@@ -4281,13 +4353,13 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
             restore_pq();  // for the run below
             it = tuned.emplace(key, std::make_pair(tb_i, tb_k)).first;
             tune_record(key, it->second);
-            if (getenv("QE_GEMM_DEBUG"))
+            if (env_str("QE_GEMM_DEBUG"))
                 fprintf(stderr, "gemm tune n=%d k=%d t<=%d -> cand %d ks %d (%.1f us)\n", w.n, w.k,
                         bucket, tb_i, tb_k, bt * 1e3);
         }
         if (it != tuned.end()) { bi = it->second.first; bks = it->second.second; }
     }
-    if (getenv("QE_GEMM_DEBUG"))
+    if (env_str("QE_GEMM_DEBUG"))
         fprintf(stderr, "gemm n=%d k=%d t=%d -> tb=%d wt=%d ks=%d (%.0f us est)\n", w.n, w.k, t,
                 cands[bi].tb, cands[bi].wt, bks, best * 1e6);
     gemm_run(bi, w, x, ldx, c, ldc, t, bks, st);
@@ -4327,9 +4399,9 @@ bool gemm_i8_prequant_out(const bf16* x, int t, int k, int row0, int8_t** xq, fl
     if (g != 32 && g != 64 && g != 128) return false;
     const size_t need = (size_t)kChunk * k, needs = (size_t)(kChunk + 32) * i8v_rec_floats(k, 32, false);
     if (!tl_po_xq_buf.p) {
-        CUDA_CHECK(cudaMalloc(&tl_po_xq_buf.p, need));
+        tl_alloc((void**)&tl_po_xq_buf.p, need, "tl_po_xq_buf");
         tl_po_xq_buf.n = need;
-        CUDA_CHECK(cudaMalloc(&tl_po_xs_buf.p, needs * 4));
+        tl_alloc((void**)&tl_po_xs_buf.p, needs * 4, "tl_po_xs_buf");
         tl_po_xs_buf.n = needs;
     }
     CHECK(row0 >= 0 && row0 + t <= kChunk, "prequant out rows %d + %d", row0, t);
@@ -4344,7 +4416,7 @@ bool gemm_i8_prequant_out(const bf16* x, int t, int k, int row0, int8_t** xq, fl
 }
 int* gemm_i8_sk_ctr() {
     if (!tl_sk_ctr_buf.p) {
-        CUDA_CHECK(cudaMalloc(&tl_sk_ctr_buf.p, kSkCtrs * sizeof(int)));
+        tl_alloc((void**)&tl_sk_ctr_buf.p, kSkCtrs * sizeof(int), "tl_sk_ctr_buf");
         tl_sk_ctr_buf.n = kSkCtrs;
     }
     return tl_sk_ctr_buf.p;
@@ -4362,12 +4434,12 @@ bool gemm_i8_prequant(const bf16* x, int t, int k, int row0, bool glu_next, int8
                  needs = vf ? (size_t)(kChunk + 32) * i8v_rec_floats(k, g, false) : (size_t)kChunk * i8_rec_floats(k, g);
     if (need > tl_pq_xq_buf.n) {
         if (tl_pq_xq_buf.p) tl_retire(tl_pq_xq_buf.p);
-        CUDA_CHECK(cudaMalloc(&tl_pq_xq_buf.p, need));
+        tl_alloc((void**)&tl_pq_xq_buf.p, need, "tl_pq_xq_buf");
         tl_pq_xq_buf.n = need;
     }
     if (needs > tl_pq_xs_buf.n) {
         if (tl_pq_xs_buf.p) tl_retire(tl_pq_xs_buf.p);
-        CUDA_CHECK(cudaMalloc(&tl_pq_xs_buf.p, needs * 4));
+        tl_alloc((void**)&tl_pq_xs_buf.p, needs * 4, "tl_pq_xs_buf");
         tl_pq_xs_buf.n = needs;
     }
     CHECK(row0 >= 0 && row0 + t <= kChunk, "prequant rows %d + %d", row0, t);
@@ -4377,7 +4449,7 @@ bool gemm_i8_prequant(const bf16* x, int t, int k, int row0, bool glu_next, int8
     const bool zero = ctr && env_int("QE_I8_CTR_FUSE", 1) != 0;
     if (zero) {
         if (!tl_sk_ctr_buf.p) {
-            CUDA_CHECK(cudaMalloc(&tl_sk_ctr_buf.p, kSkCtrs * sizeof(int)));
+            tl_alloc((void**)&tl_sk_ctr_buf.p, kSkCtrs * sizeof(int), "tl_sk_ctr_buf");
             tl_sk_ctr_buf.n = kSkCtrs;
         }
         *ctr = tl_sk_ctr_buf.p;

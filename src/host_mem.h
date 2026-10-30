@@ -13,6 +13,7 @@
 // QE_MEMAVAIL_GB (tests): pretend the host had this much MemAvailable at startup; the archive pools'
 // own bytes (charged()) come off it as they are allocated. QE_MEMAVAIL_GB=@<file>: the same with the startup
 // value read from the file (GB, re-read every 100 ms): another process growing, for the pressure path.
+#include "env.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -55,7 +56,7 @@ inline size_t total() {
 }
 
 inline const char* override_env() {
-    static const char* v = getenv("QE_MEMAVAIL_GB") && *getenv("QE_MEMAVAIL_GB") ? getenv("QE_MEMAVAIL_GB") : nullptr;
+    static const char* v = env_str("QE_MEMAVAIL_GB");
     return v;
 }
 
@@ -93,8 +94,10 @@ inline size_t available(bool fresh = false) {
 }
 
 inline size_t margin() {
-    static const size_t m = getenv("QE_MEM_MARGIN_GB") ? (size_t)(atof(getenv("QE_MEM_MARGIN_GB")) * 1e9)
-                                                       : std::max<size_t>((size_t)8e9, total() / 20);
+    static const size_t m = [] {
+        const double gb = env_double("QE_MEM_MARGIN_GB", -1.0);  // empty / unparsable: the default, not 0 GB
+        return gb >= 0 ? (size_t)(gb * 1e9) : std::max<size_t>((size_t)8e9, total() / 20);
+    }();
     return m;
 }
 

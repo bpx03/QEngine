@@ -1,3 +1,4 @@
+#include "env.h"
 #include <unistd.h>
 #include <chrono>
 #include "model.h"
@@ -637,7 +638,7 @@ void Worker::ce_loop() {
             ce_q_.pop_front();
         }
         if (c.stop) return;
-        static const bool dbgce = getenv("QE_CE_DEBUG") != nullptr;
+        static const bool dbgce = env_str("QE_CE_DEBUG") != nullptr;
         if (dbgce && c.seq < 4) fprintf(stderr, "ce copy thread dev %d seq %u: %zu B -> %p, %zu B -> %p\n", device, c.seq, c.cp[0].bytes, c.cp[0].dst, c.cp[1].bytes, c.cp[1].dst);
         for (int j = 0; j < 2; j++) {
             if (c.peer[j] < 0) continue;
@@ -813,8 +814,7 @@ Lin Worker::load_lin(const SafeTensors& st, const std::vector<RowSpec>& rows, in
 void Worker::load_mtp(const SafeTensors& st) {
     const int H = c_.hidden;
     const std::string a = "mtp.layers.0.self_attn.", l = "mtp.layers.0.";
-    const char* env = getenv("QE_MTP_W4");
-    const bool w4 = env ? atoi(env) != 0 : true;
+    const bool w4 = env_int("QE_MTP_W4", 1) != 0;
     mtp_.fc = load_lin(st, {{"mtp.fc.weight", 0, H}}, 16, w4, p_.fc_k.b, p_.fc_k.e);
     mtp_.qkv = load_lin(st,
                         {{a + "q_proj.weight", p_.q_heads.b * 512, p_.q_heads.e * 512},
@@ -872,8 +872,8 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     gemv_workspace_init();  // wide-GEMV scratch (also counted before slot planning)
     // ~7 MB of VRAM per decode-step graph; GPU headroom after the slots is ~1 GB on a card
     // that also drives a desktop
-    spec_graphs_.cap = getenv("QE_GRAPHS_SPEC") ? atoi(getenv("QE_GRAPHS_SPEC")) : 64;
-    batch_graphs_.cap = getenv("QE_GRAPHS_BATCH") ? atoi(getenv("QE_GRAPHS_BATCH")) : 24;
+    spec_graphs_.cap = env_int("QE_GRAPHS_SPEC", 64);
+    batch_graphs_.cap = env_int("QE_GRAPHS_BATCH", 24);
     graphs_.cap = 16;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     {
@@ -883,13 +883,13 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         CUDA_CHECK(cudaStreamCreateWithFlags(&pf_stream_, cudaStreamNonBlocking));
         // L2 prefetch of the next weights beside each decode all-reduce: default off since the RS+AG all-reduce
         // (8x19K 18,19 -> 17,86 ms/step with 0; n=1 4K 11,44 vs 11,45); QE_PF_MB=5 restores the old 5 MB
-        pf_bytes_ = (size_t)(getenv("QE_PF_MB") ? atof(getenv("QE_PF_MB")) : 0.0) * 1e6;
+        pf_bytes_ = (size_t)(env_double("QE_PF_MB", 0.0)) * 1e6;
         evs_.resize(16);
         for (auto& e : evs_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     }
     embed_ = embed_mapped;
-    if (const char* e = getenv("QE_KV_FP8")) kv_fp8_ = atoi(e) != 0;
-    if (const char* e = getenv("QE_GLU")) glu_ = atoi(e) != 0;
+    if (env_set("QE_KV_FP8")) kv_fp8_ = env_int("QE_KV_FP8", kv_fp8_) != 0;
+    if (env_set("QE_GLU")) glu_ = env_int("QE_GLU", glu_) != 0;
     attention_init();
     attention_prefill_init();
     dn_chunk_init();
@@ -914,9 +914,9 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     ash_.ob = p_.o_heads.b - p_.q_heads.b;
     ash_.no = p_.o_heads.size();
     ow_ = ash_.no * 256;
-    ash_.dchunk_min = getenv("QE_DEC_CHUNK_MIN") ? atoi(getenv("QE_DEC_CHUNK_MIN")) : -1;
-    if (const char* e = getenv("QE_KV_XDIV")) ash_.xdiv = atoi(e);
-    if (const char* e = getenv("QE_KV_XSKIP")) ash_.xskip = atoi(e);
+    ash_.dchunk_min = env_int("QE_DEC_CHUNK_MIN", -1);
+    if (env_set("QE_KV_XDIV")) ash_.xdiv = env_int("QE_KV_XDIV", ash_.xdiv);
+    if (env_set("QE_KV_XSKIP")) ash_.xskip = env_int("QE_KV_XSKIP", ash_.xskip);
     set_plan(p_);
     dsh_ = {};
     dsh_.nk = p_.k_heads.size();
@@ -1002,7 +1002,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
             L.dn.norm_w = load_bf16(st, a + "norm.weight", -1, -1);
             dn_slot_floats_ = (size_t)dsh_.nv * 128 * 128;
             // lazy state writes of single-row steps (dn_lazy_of): state written every T-th step
-            dsh_.lazy_t = getenv("QE_DN_LAZY") ? atoi(getenv("QE_DN_LAZY")) : 3;
+            dsh_.lazy_t = env_int("QE_DN_LAZY", 3);
         }
         L.gate_up = load_w4(st,
                             {{pre + "mlp.gate_proj", p_.inter.b, p_.inter.e},
@@ -1013,8 +1013,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     final_norm_ = load_bf16(st, "model.language_model.norm.weight", -1, -1);
     if (mtp_st) {
         load_mtp(*mtp_st);
-        const char* env = getenv("QE_DRAFT_HEAD_W4");
-        const bool w4 = env ? atoi(env) != 0 : true;
+        const bool w4 = env_int("QE_DRAFT_HEAD_W4", 1) != 0;
         if (draft_ids.empty()) {
             draft_head_ = load_lin(st, {{"lm_head.weight", p_.vocab.b, p_.vocab.e}}, 16, w4);
             draft_v_ = p_.vocab.size();
@@ -1055,9 +1054,8 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     }
     {
         // INT8 (group 128, like GGUF Q8_0) halves the largest per-token read; QE_HEAD_W8=0 keeps bf16
-        const char* e = getenv("QE_HEAD_W8");
         const std::vector<RowSpec> rows = {{"lm_head.weight", p_.vocab.b, p_.vocab.e}};
-        if (e && atoi(e) == 0) {
+        if (env_int("QE_HEAD_W8", 1) == 0) {
             lm_head_.f = load_w16(st, rows, 16);
         } else {
             int n, k;
@@ -1116,7 +1114,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
        // during a full-attention layer: K int8 [nkv][w][256] in dno_, V fp16 [nkv][w][256] in conv_out_
         const size_t kb = (size_t)M * dsh_.nv * 128 * 4, vb = (size_t)M * dn_ch_ * 4;
         int w = (int)std::min(kb / ((size_t)ash_.nkv * 256), vb / ((size_t)ash_.nkv * 512)) / 64 * 64;
-        static const int wmax = getenv("QE_PATTN_KVW") ? atoi(getenv("QE_PATTN_KVW")) : 1 << 30;
+        static const int wmax = env_int("QE_PATTN_KVW", 1 << 30);
         w = std::min(w, wmax);
         if (w >= 4096) {
             ash_.kvq = (uint8_t*)dno_;
@@ -1130,7 +1128,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         struct Reg { char* p; size_t cap, used; };
         const int nkv = ash_.nkv, qt_max = kChunk / 128;
         const size_t qf_b = (size_t)qt_max * ash_.nq * 8 * 8 * 32 * 16, qs_b = (size_t)qt_max * ash_.nq * 128 * 4;
-        static const int wenv = getenv("QE_PATTN_KVW2") ? atoi(getenv("QE_PATTN_KVW2")) : 32768;
+        static const int wenv = env_int("QE_PATTN_KVW2", 32768);
         for (int w = wenv / 1024 * 1024; w >= 4096; w -= 1024) {
             std::vector<Reg> regs = {{(char*)conv_out_, (size_t)M * dn_ch_ * 4, 0},
                                      {(char*)dno_, (size_t)M * dsh_.nv * 128 * 4, 0},
@@ -1209,7 +1207,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     }
     ready_ = (unsigned*)dalloc(4096 * 4, false);
     CUDA_CHECK(cudaMemset(ready_, 0, 4096 * 4));
-    if (const char* e = getenv("QE_LL")) use_ll_ = atoi(e) != 0;
+    if (env_set("QE_LL")) use_ll_ = env_int("QE_LL", use_ll_) != 0;
     CUDA_CHECK(cudaMemset(ctr_.bar, 0, 8));
     CUDA_CHECK(cudaMemset(ctr_.seq, 0, 4));
     CUDA_CHECK(cudaMemset(ctr_.done, 0, 8));
@@ -1363,7 +1361,7 @@ void Worker::dn_dump(const char* tag, int m) {
 }
 
 void Worker::run(int m, bool logits) {
-    static const bool dump = getenv("QE_DN_DUMP") && atoi(getenv("QE_DN_DUMP"));
+    static const bool dump = env_int("QE_DN_DUMP", 0);
     if (dump && rank == 0) dn_dump("before", m);
     run_(m, logits);
     if (dump && rank == 0) dn_dump("after", m);
@@ -1418,7 +1416,7 @@ void Worker::forward(int m, bool logits, bool spec) {
             mm4(L.fa.o, act_, qw, partial_, H, m, st, (m <= kMaxGemvTokens || (spec && m <= kPendRows)) ? xha : nullptr, qw);
         } else {
             const size_t abs = (size_t)kChunk * 2 * dsh_.ab_pad;
-            static const bool ab_par = !getenv("QE_AB_PAR") || atoi(getenv("QE_AB_PAR"));
+            static const bool ab_par = env_int("QE_AB_PAR", 1);
             if (early_in) {  // dn_in runs on pf_stream_ (allreduce_early): ab here, then join
                 gemv_w16h(L.dn.abh, xhx, H, ab_, 2 * dsh_.ab_pad, m, st, kAbSplits, abs);
                 early_join();
@@ -1514,7 +1512,7 @@ bf16* Worker::xn_bf16(bf16* xn, int m, const W4* next) {
 // 1 alone is read as "all" (7)
 static int early_gemv_mask() {
     static const int v = [] {
-        const int e = getenv("QE_EARLY_GEMV") ? atoi(getenv("QE_EARLY_GEMV")) : 0;
+        const int e = env_int("QE_EARLY_GEMV", 0);
         return e == 1 ? 7 : e;
     }();
     return v;
@@ -1522,12 +1520,12 @@ static int early_gemv_mask() {
 
 bool Worker::allreduce_early(int m, const bf16* norm, const W4& w, float* y, int ldy, __half* yh, int ldyh,
                              bool join, int site) {
-    static const int ll16 = getenv("QE_LL16") ? atoi(getenv("QE_LL16")) : 1;
-    static const int ranks = getenv("QE_EARLY_RANKS") ? atoi(getenv("QE_EARLY_RANKS")) : 7;  // GPUs using it
+    static const int ll16 = env_int("QE_LL16", 1);
+    static const int ranks = env_int("QE_EARLY_RANKS", 7);  // GPUs using it
     if (!(early_gemv_mask() & site) || !((ranks >> rank) & 1) || !h16_ || ngpu_ < 2 || m > 8 || !use_ll_ || ll16 <= 0 || m < ll16 || !xh_xn_)
         return false;
-    static const int depth = getenv("QE_EARLY_DEPTH") ? atoi(getenv("QE_EARLY_DEPTH")) : -1;
-    static const bool fused = getenv("QE_EARLY_FUSED") ? atoi(getenv("QE_EARLY_FUSED")) != 0 : true;
+    static const int depth = env_int("QE_EARLY_DEPTH", -1);
+    static const bool fused = env_set("QE_EARLY_FUSED") ? env_int("QE_EARLY_FUSED", true) != 0 : true;
     if (fused && !comm_.p2p) return false;
     const int ll = next_ll(m);
     if (ll < 0) return false;
@@ -1865,7 +1863,7 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         std::vector<SpecState> v(n);
         // acceptance of all sequences in one launch (QE_SPEC_BATCH=0: one launch per sequence; same
         // arithmetic): 32 serial single-thread launches cost 0.3 ms per step at n = 32
-        static const bool sb = !getenv("QE_SPEC_BATCH") || atoi(getenv("QE_SPEC_BATCH"));
+        static const bool sb = env_int("QE_SPEC_BATCH", 1);
         AcceptBatch ab;
         ab.n = sb ? n : 0;
         ab.m = M;
@@ -1969,7 +1967,7 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         tcap_tot += std::chrono::duration<double, std::milli>(tcap1 - tcap0).count();
         CUDA_CHECK(cudaGraphDestroy(g));
         batch_graphs_.put(key, bge);
-        static const bool stats = getenv("QE_GRAPH_STATS") && atoi(getenv("QE_GRAPH_STATS"));
+        static const bool stats = env_int("QE_GRAPH_STATS", 0);
         if (stats) {  // capture + instantiate cost of batch graphs (rank 0)
             static int cnt = 0;
             static double tot = 0;
@@ -2004,7 +2002,7 @@ static std::string batch_skey(const std::string& key) {
 }
 
 bool Worker::batch_update(const std::string& key, cudaGraph_t g, cudaGraphExec_t* out) {
-    static const bool on = !getenv("QE_GRAPH_UPDATE") || atoi(getenv("QE_GRAPH_UPDATE"));
+    static const bool on = env_int("QE_GRAPH_UPDATE", 1);
     if (!on) return false;
     const std::string sk = batch_skey(key);
     // the least recently used cached graph of the same structure that is not (maybe) in flight
@@ -2036,7 +2034,7 @@ void Worker::head_topk(const Lin& w, const bf16* x, int m) {
 }
 
 int dec38_max() {
-    static const int v = getenv("QE_DEC38_MAX") ? atoi(getenv("QE_DEC38_MAX")) : kD8RsMax;
+    static const int v = env_int("QE_DEC38_MAX", kD8RsMax);
     return v;
 }
 
@@ -2053,7 +2051,7 @@ AttnShape Worker::layer_shape(const Layer* L, int win) const {
     if (!L && a.fp8) a.win = win;
     // QE_DEC_CHUNK_MIN: fp8 decode split rule (default -1 = ~38 splits up to 52K keys; 0 = old L/82; N > 0 = old
     // rule with >= N keys per split). Length-only, so it never breaks MTP == greedy / batched == alone.
-    static const int dcm = getenv("QE_DEC_CHUNK_MIN") ? atoi(getenv("QE_DEC_CHUNK_MIN")) : -1;
+    static const int dcm = env_int("QE_DEC_CHUNK_MIN", -1);
     a.dchunk_min = dcm;
     a.d38max = dec38_max();
     a.d8rs = L && attn_rs_ ? 1 : 0;
@@ -2302,7 +2300,7 @@ void Worker::forward_prefill(int m, bool logits) {
         ready[b] = ev();
         CUDA_CHECK(cudaEventRecord(ready[b], cs));
     };
-    static const bool nowait = getenv("QE_DBG_NOWAIT") != nullptr;
+    static const bool nowait = env_str("QE_DBG_NOWAIT") != nullptr;
     auto wait = [&](int b) {
         if (ready[b] && !nowait && !(dbg_skip() & 32)) CUDA_CHECK(cudaStreamWaitEvent(st, ready[b], 0));
         if (pending[b] && of_on) {  // the owners wrote the rows into this GPU's receive buffers
@@ -2386,8 +2384,7 @@ void Worker::head(const Lin& w, const bf16* x, int m, int* out, bool draft) {
 // they only affect which tokens are proposed, never the output. QE_MTP_WINDOW sets it (default:
 // the dec8_first rule, i.e. 32K beyond 144K); QE_MTP_WINDOW2 overrides it for these passes only.
 static int mtp_draft_win() {
-    static const int w = getenv("QE_MTP_WINDOW2") ? atoi(getenv("QE_MTP_WINDOW2"))
-                       : getenv("QE_MTP_WINDOW")  ? atoi(getenv("QE_MTP_WINDOW"))  : -1;
+    static const int w = env_int("QE_MTP_WINDOW2", env_int("QE_MTP_WINDOW", -1));
     return w;
 }
 
@@ -2545,7 +2542,7 @@ void Worker::mtp_forward_prefill(int m, bool logits) {
 }
 
 static int overlap_min() {
-    static const int v = getenv("QE_OVERLAP_MIN") ? atoi(getenv("QE_OVERLAP_MIN")) : kOverlapMin;
+    static const int v = env_int("QE_OVERLAP_MIN", kOverlapMin);
     return v;
 }
 
@@ -2647,7 +2644,7 @@ void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const in
         std::copy(rope3 + 3 * (size_t)i0, rope3 + 3 * (size_t)(i0 + m), r3.begin() + 2);
         CUDA_CHECK(cudaMemcpyAsync(rope3_, r3.data(), r3.size() * 4, cudaMemcpyHostToDevice, stream));
     }
-    static const bool overlap = !getenv("QE_PREFILL_OVERLAP") || atoi(getenv("QE_PREFILL_OVERLAP"));
+    static const bool overlap = env_int("QE_PREFILL_OVERLAP", 1);
     // a short pass without a cached graph, first use since the slot's graphs were dropped (the
     // prompt-end token of a long prompt: the graphs go whenever the slot's region moves, so nearly
     // every new prompt captured and instantiated a whole-model graph for a single launch): launch
@@ -2704,7 +2701,7 @@ void Worker::lk_init(int cap, int mmin, int lmax) {
     CUDA_CHECK(cudaMemset(lk_dev_.lk, 0, 32 * 4));
     CUDA_CHECK(cudaStreamCreateWithFlags(&lk_cst_, cudaStreamNonBlocking));
     // batched steps: a history per slot (QE_LKB=0: off)
-    if (!getenv("QE_LKB") || atoi(getenv("QE_LKB"))) {
+    if (env_int("QE_LKB", 1)) {
         lkb_cap_ = cap;
         for (auto& sl : slots_) lkb_alloc(sl);
     }

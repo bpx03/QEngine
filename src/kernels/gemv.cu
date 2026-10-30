@@ -1,3 +1,4 @@
+#include "../env.h"
 #include "gemv.cuh"
 #include "gemv_h16.cuh"
 #include "ar_fused.cuh"
@@ -1117,8 +1118,7 @@ int pick_warps(int tiles, int units, bool w4) {
     // (QE_GEMV_NW_SMALL, e.g. 4): the m <= 8 GEMV is as fast and the skinny kernel benefits.
     // fp16-accumulate path (QE_GEMV_H16): 5 slices measured best for its kernels over m = 1..32 (7: m = 24/32
     // 20-25% slower on these matrices; 4: m = 12/16 7% slower); the bf16 path keeps its default
-    static const int nw_small = getenv("QE_GEMV_NW_SMALL") ? atoi(getenv("QE_GEMV_NW_SMALL"))
-                              : gemv_h16_on() ? 5 : 0;
+    static const int nw_small = env_int("QE_GEMV_NW_SMALL", gemv_h16_on() ? 5 : 0);
     int wpt = (2048 + tiles - 1) / tiles;
     if (w4 && nw_small > 0 && tiles <= 512 && wpt > nw_small) wpt = nw_small;
     if (wpt > kMaxWarps) wpt = kMaxWarps;
@@ -1139,7 +1139,7 @@ void prefetch_l2(const void* p, size_t bytes, cudaStream_t st) {
 
 void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
     CHECK(w.n % 16 == 0 && w.k % 128 == 0 && m >= 1 && m <= kMaxBatchRows, "gemv_w8");
-    static const bool s_on = !getenv("QE_W8S") || atoi(getenv("QE_W8S"));
+    static const bool s_on = env_int("QE_W8S", 1);
     if (m > 32 && !(s_on && pick_warps(w.n / 16, w.k / 128, true) == 1)) {  // two calls (rows independent)
         gemv_w8(w, x, ldx, y, ldy, 32, st);
         gemv_w8(w, x + (size_t)32 * ldx, ldx, y + (size_t)32 * ldy, ldy, m - 32, st);
@@ -1165,7 +1165,7 @@ void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cuda
         constexpr int WB = 8;
         const int blocks = (tiles + WB - 1) / WB;
         // 33..64 rows (batched steps with one draft per sequence beyond 16 sequences): same kernel, NT 5..8
-        static const int wb_hi = getenv("QE_W8S_WB") ? atoi(getenv("QE_W8S_WB")) : 8;  // warps per block, 33..64 rows
+        static const int wb_hi = env_int("QE_W8S_WB", 8);  // warps per block, 33..64 rows
         if (ntiles > 4 && wb_hi == 4) {
             const int b4 = (tiles + 3) / 4;
             if (ntiles == 5) gemv_w8s_kernel<5, 4, 1, 3><<<b4, 128, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m, tiles);
@@ -1216,7 +1216,7 @@ void gemv_workspace_init() {
         // SMs holding ab blocks until they drain (engine pattern, 24 rows 25 -> 42 us/call, 32 rows 45 ->
         // 59). One carveout for both (50 % -> 64 KB on w16h; 64 %+ on w4hw costs it L1) removes that, bit
         // for bit the same results. QE_W16H_CARVE=-1: driver default
-        static const int carve = getenv("QE_W16H_CARVE") ? atoi(getenv("QE_W16H_CARVE")) : 50;
+        static const int carve = env_int("QE_W16H_CARVE", 50);
         if (carve >= 0) gemv_set_carveout(carve, 1);
     }
 }
@@ -1233,7 +1233,7 @@ static int sm_count() {
 }
 
 bool gemv_h16_on() {
-    static const bool on = !getenv("QE_GEMV_H16") || atoi(getenv("QE_GEMV_H16"));  // default on, 0 disables
+    static const bool on = env_int("QE_GEMV_H16", 1);  // default on, 0 disables
     return on;
 }
 
@@ -1257,7 +1257,7 @@ void gemv_w4h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, 
     const int ntt = (m + 7) / 8;
     // 25..32 rows on matrices of >= 352 tiles (gate_up, DeltaNet in, qkv): tile pairs per warp (gemv_x.cu), the
     // B fragments feed twice the mma: 32 rows gate_up 66 -> 56 us, dn_in 47 -> 37, qkv 45 -> 36 (QE_W4HP=0 off)
-    static const bool hp_on = !getenv("QE_W4HP") || atoi(getenv("QE_W4HP"));
+    static const bool hp_on = env_int("QE_W4HP", 1);
     if (hp_on && m >= 25 && tiles >= 352 && gemv_w4hx(w, xh, ldx, y, ldy, m, st, yh, ldyh)) return;
     if (ntt > 1 && skinny_use(w.n, m) && skinny_w4h(w, xh, ldx, y, ldy, m, st, yh, ldyh)) return;
     CHECK(ntt == 1 || nw <= kW4hwMaxWarps, "gemv_w4hw slices %d", nw);
@@ -1297,7 +1297,7 @@ void gemv_w4(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m, cuda
     const int ntt = (m + 7) / 8, ntiles = ntt <= 2 ? 2 : ntt;
     const int items = ntiles * (w.k / 32) * 32;
     xpack_kernel<<<(items + 255) / 256, 256, 0, st>>>(x, ldx, w.k, m, ntiles, xp, false);
-    static const int rt_env = getenv("QE_GEMV_RT") ? atoi(getenv("QE_GEMV_RT")) : 1;
+    static const int rt_env = env_int("QE_GEMV_RT", 1);
     const int rt = tiles % rt_env == 0 ? rt_env : 1;
     const int nwr = pick_warps(tiles / rt, w.k / 128, true);
 #define QE_W4P(NT_, RT_) gemv_w4p_kernel<NT_, RT_><<<tiles / RT_, nwr * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m, w.glu)

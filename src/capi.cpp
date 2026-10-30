@@ -1,3 +1,4 @@
+#include "env.h"
 #include "gpu_guard.h"
 #include <cstring>
 #include <vector>
@@ -206,6 +207,7 @@ int qe_num_slots(void* e) { return ((Engine*)e)->num_slots(); }
 int qe_slot_capacity(void* e, int i) { return ((Engine*)e)->slot_capacity(i); }
 int qe_max_context(void* e) { return ((Engine*)e)->max_context(); }
 long long qe_pool_tokens(void* e) { return (long long)((Engine*)e)->pool_tokens(); }
+int qe_kv_in_ram(void*) { return 0; }  // the 27B KV pool is always in VRAM
 int qe_can_admit(void* e, int n) { return ((Engine*)e)->can_admit(n); }
 int qe_pause_for(void* e, int n, int prio) { return ((Engine*)e)->pause_for(n, prio) ? 1 : 0; }
 void qe_set_prio(void* e, int slot, int prio) { ((Engine*)e)->set_prio(slot, prio); }
@@ -303,8 +305,8 @@ extern "C" double qe_bench_allreduce2(const char* devices, int n, int iters, int
             CUDA_CHECK(cudaMemset(nw, 0, 5120 * 2));
             CUDA_CHECK(cudaMemset(part, 0, n * 4));
             __half* xh = nullptr;   // QE_BENCH_XH=1: also write the XH copy (gemv_h16.cuh) like the engine
-            if (getenv("QE_BENCH_XH") && atoi(getenv("QE_BENCH_XH"))) CUDA_CHECK(cudaMalloc(&xh, n * 2));
-            const int xhmode = getenv("QE_BENCH_XH") ? atoi(getenv("QE_BENCH_XH")) : 0;  // 2: XH only (no bf16 xn)
+            if (env_int("QE_BENCH_XH", 0)) CUDA_CHECK(cudaMalloc(&xh, n * 2));
+            const int xhmode = env_int("QE_BENCH_XH", 0);  // 2: XH only (no bf16 xn)
             // capture 100 back-to-back collectives in a graph to remove launch overhead
             cudaGraph_t g;
             cudaGraphExec_t ge;
@@ -338,7 +340,7 @@ extern "C" double qe_bench_attn(int ctx, int m, int iters, int fp8) {
     s.nq = 8; s.nkv = 2;
     // the real per-GPU grouping: 6 + 2 q heads (24 q heads / 4 kv heads split over 3 GPUs)
     // QE_BENCH_G0=4: GPU1's 4 + 4
-    const int g0 = getenv("QE_BENCH_G0") ? atoi(getenv("QE_BENCH_G0")) : 6;
+    const int g0 = env_int("QE_BENCH_G0", 6);
     s.kv_qb[0] = 0; s.kv_qe[0] = g0; s.kv_qb[1] = g0; s.kv_qe[1] = 8;
     for (int h = 0; h < 8; h++) s.q2kv[h] = h < g0 ? 0 : 1;
     s.max_t = ctx + 64; s.fp8 = fp8; s.ks = 0.02f; s.vs = 0.02f;
@@ -381,7 +383,7 @@ extern "C" double qe_bench_attn(int ctx, int m, int iters, int fp8) {
 extern "C" double qe_bench_attn_seg(int nseg, int ctx, int m, int iters, int cmin, double* us_attn) {
     AttnShape s{};
     s.nq = 8; s.nkv = 2;
-    const int g0 = getenv("QE_BENCH_G0") ? atoi(getenv("QE_BENCH_G0")) : 6;
+    const int g0 = env_int("QE_BENCH_G0", 6);
     s.kv_qb[0] = 0; s.kv_qe[0] = g0; s.kv_qb[1] = g0; s.kv_qe[1] = 8;
     for (int h = 0; h < 8; h++) s.q2kv[h] = h < g0 ? 0 : 1;
     s.max_t = ctx + 64; s.fp8 = 1; s.ks = 0.02f; s.vs = 0.02f; s.dchunk_min = cmin;
@@ -483,7 +485,7 @@ extern "C" double qe_test_dn_chunk(int m, int seed, double* serr) {
         for (float v : x) { if (std::isnan(v)) nan++; else mx = std::max(mx, (double)std::fabs(v)); }
         return std::make_pair(mx, nan);
     };
-    if (getenv("QE_DN_DEBUG")) {
+    if (env_str("QE_DN_DEBUG")) {
         auto p1 = amax(a), p2 = amax(b), p3 = amax(sa), p4 = amax(sb);
         fprintf(stderr, "o seq max %g nan %zu | o chunk max %g nan %zu | S seq %g/%zu chunk %g/%zu\n",
                 p1.first, p1.second, p2.first, p2.second, p3.first, p3.second, p4.first, p4.second);
@@ -519,7 +521,7 @@ extern "C" double qe_bench_dn(int m, int iters, int chunked) {
     CUDA_CHECK(cudaMemset(dt, 0, 64 * 4));
     CUDA_CHECK(cudaMemset(S, 0, 2 * slot * 4));
     CUDA_CHECK(cudaMemset(cur, 0, 4));
-    if (chunked) { dn_chunk_init(); setenv("QE_DN_CHUNK", "1", 0); }
+    if (chunked) { dn_chunk_init(); if (!env_set("QE_DN_CHUNK")) setenv("QE_DN_CHUNK", "1", 1); }
     for (int i = 0; i < 2; i++)
         dn_core(cv, ch, s, ab, A, dt, S, slot, cur, m, false, qk, gb, o, 0, 0);
     cudaEvent_t a, b;
@@ -854,12 +856,12 @@ extern "C" int qe_pattn_real(int ctx, int m, int layout, int iters, float q_sd, 
     CUDA_CHECK(cudaMalloc(&pos, 4));
     CUDA_CHECK(cudaMemcpy(pos, &ctx, 4, cudaMemcpyHostToDevice));
     uint2* ksc = nullptr;  // per-key int8 K scale scratch as in the engine (QE_PATTN_KSC=0: computed in-kernel)
-    if (!getenv("QE_PATTN_KSC") || atoi(getenv("QE_PATTN_KSC"))) {
+    if (env_int("QE_PATTN_KSC", 1)) {
         CUDA_CHECK(cudaMalloc(&ksc, (size_t)s.nkv * kPattnKscRows * sizeof(uint2)));
         s.ksc = ksc;
         s.ksc_ld = kPattnKscRows;
         CUDA_CHECK(cudaMalloc(&s.kmu, (size_t)s.nkv * 256 * sizeof(float)));
-        s.kvw = getenv("QE_PATTN_KVW") ? atoi(getenv("QE_PATTN_KVW")) : 32768;
+        s.kvw = env_int("QE_PATTN_KVW", 32768);
         CUDA_CHECK(cudaMalloc(&s.kvq, (size_t)s.nkv * s.kvw * 256));
         CUDA_CHECK(cudaMalloc(&s.kvh, (size_t)s.nkv * s.kvw * 512));
     }
@@ -867,7 +869,7 @@ extern "C" int qe_pattn_real(int ctx, int m, int layout, int iters, float q_sd, 
     std::vector<void*> pfree;
     if (ksc) {
         ps = PattnScratch{};
-        ps.w = getenv("QE_PATTN_KVW2") ? atoi(getenv("QE_PATTN_KVW2")) : 16384;
+        ps.w = env_int("QE_PATTN_KVW2", 16384);
         for (int b = 0; b < 2; b++)
             for (int j = 0; j < s.nkv; j++) {
                 CUDA_CHECK(cudaMalloc(&ps.kq[b][j], (size_t)ps.w * 256));
@@ -876,7 +878,7 @@ extern "C" int qe_pattn_real(int ctx, int m, int layout, int iters, float q_sd, 
                 pfree.push_back(ps.vh[b][j]);
             }
         ps.qt_max = (m + 127) / 128;
-        if (!getenv("QE_PATTN_QF") || atoi(getenv("QE_PATTN_QF"))) {
+        if (env_int("QE_PATTN_QF", 1)) {
             CUDA_CHECK(cudaMalloc(&ps.qf, (size_t)ps.qt_max * s.nq * 8 * 8 * 32 * 16));
             CUDA_CHECK(cudaMalloc(&ps.qsq, (size_t)ps.qt_max * s.nq * 128 * 4));
             pfree.push_back(ps.qf);
@@ -887,7 +889,7 @@ extern "C" int qe_pattn_real(int ctx, int m, int layout, int iters, float q_sd, 
         s.pscr = &ps;
     }
     unsigned long long* trace = nullptr;
-    if (getenv("QE_PKP_TRACE")) {
+    if (env_str("QE_PKP_TRACE")) {
         CUDA_CHECK(cudaMalloc(&trace, 65536 * 128));
         CUDA_CHECK(cudaMemset(trace, 0, 65536 * 128));
         qe_pkp_trace(trace);
@@ -940,7 +942,7 @@ extern "C" int qe_pattn_real(int ctx, int m, int layout, int iters, float q_sd, 
                     dot += o * rv; n1 += (double)o * o; n2 += rv * rv;
                 }
                 mincos = std::min(mincos, dot / std::sqrt(n1 * n2 + 1e-300));
-                if (getenv("QE_PCHK_V") && h < 2) {
+                if (env_str("QE_PCHK_V") && h < 2) {
                     printf("row %d head %d cos %.6f |o| %.4f |ref| %.4f  o[0..3] ", r, h, dot / std::sqrt(n1 * n2 + 1e-300), std::sqrt(n1), std::sqrt(n2));
                     for (int d = 0; d < 4; d++) {
                         const uint32_t bits = (uint32_t)oh[((size_t)r * s.nq + h) * 256 + d] << 16;
@@ -958,7 +960,7 @@ extern "C" int qe_pattn_real(int ctx, int m, int layout, int iters, float q_sd, 
     if (trace) {  // the last call's items -> QE_PKP_TRACE file
         std::vector<unsigned long long> th(65536 * 16);
         CUDA_CHECK(cudaMemcpy(th.data(), trace, th.size() * 8, cudaMemcpyDeviceToHost));
-        FILE* f = fopen(getenv("QE_PKP_TRACE"), "wb");
+        FILE* f = fopen(env_str("QE_PKP_TRACE"), "wb");
         fwrite(th.data(), 8, th.size(), f);
         fclose(f);
         qe_pkp_trace(nullptr);
@@ -1062,10 +1064,10 @@ extern "C" double qe_bench_kvsplit(const char* devices, int ctx, int nseq, int r
             }
             s.xepoch = ctr.epoch;
             s.xdone = xdone;
-            s.xdiv = getenv("KVB_XDIV") ? atoi(getenv("KVB_XDIV")) : 0;
+            s.xdiv = env_int("KVB_XDIV", 0);
             double2* rtab = nullptr;
             CUDA_CHECK(cudaMalloc(&rtab, (size_t)M * 32 * sizeof(double2)));
-            if (!getenv("KVB_NOTAB")) s.rtab = rtab;
+            if (!env_str("KVB_NOTAB")) s.rtab = rtab;
             // ---- per-sequence buffers ----
             const int cap = ctx + 64;
             s.max_t = cap;

@@ -3,6 +3,7 @@
 // (KV segments + recurrent states, FLASH_KV_ARCHIVE_GB) and come back without a re-prefill; a new prompt starts from
 // the longest cached prefix (the live sequence, an archived end state, or a checkpoint of the committed state at the
 // system end / every FLASH_CKPT tokens / the prompt end - 1). Built as libqflash.so.
+#include "../env.h"
 #include <dirent.h>
 #include <cuda_profiler_api.h>
 #include <sys/mman.h>
@@ -30,6 +31,7 @@
 #include "../json.h"
 #include "flash.h"
 #include "flash_steer.h"
+#include "guard_rule.h"
 #include "../host_mem.h"
 #include "../gpu_guard.h"
 
@@ -51,10 +53,11 @@ void ngram_row(const HostTables& ht, const std::vector<int>& h, int t, bf16* out
     // shifted token s is used iff no EOS sits in [t - s, t - 1] (the previous EOS ends the segment): only the two
     // previous positions decide (prefill-r4: the scan back to the last EOS was O(t) per token, O(n^2) per prompt:
     // 100K prompt 14 -> 60 ms of host time per 4K batch, serial with the GPU)
+    // image rows (content ids >= kImgToken) hash as <|image_pad|>, like the HF / vLLM PLE input ids
     long long sh[3];
-    sh[0] = h[t];
-    sh[1] = (t >= 1 && h[t - 1] != EOS) ? h[t - 1] : EOS;
-    sh[2] = (t >= 2 && h[t - 1] != EOS && h[t - 2] != EOS) ? h[t - 2] : EOS;
+    sh[0] = dev_tok(h[t]);
+    sh[1] = (t >= 1 && h[t - 1] != EOS) ? dev_tok(h[t - 1]) : EOS;
+    sh[2] = (t >= 2 && h[t - 1] != EOS && h[t - 2] != EOS) ? dev_tok(h[t - 2]) : EOS;
     auto mul = [](long long a, long long b) { return (long long)((unsigned long long)a * (unsigned long long)b); };
     const long long big = mul(sh[0], ht.mult[0]) ^ mul(sh[1], ht.mult[1]);
     const long long tri = big ^ mul(sh[2], ht.mult[2]);
@@ -120,7 +123,7 @@ public:
                 const auto t0 = std::chrono::steady_clock::now();
                 void* p = nullptr;
                 if (posix_memalign(&p, 1 << 21, sz) != 0 || !p) break;
-                static const bool thp = !getenv("FLASH_ARCHIVE_THP") || atoi(getenv("FLASH_ARCHIVE_THP"));
+                static const bool thp = env_int("FLASH_ARCHIVE_THP", 1);
                 if (thp) madvise(p, sz, MADV_HUGEPAGE);
                 memset(p, 0, sz);  // fault the pages in without the driver
                 if (stop_ || cudaHostRegister(p, sz, cudaHostRegisterPortable) != cudaSuccess) {
@@ -137,7 +140,7 @@ public:
                 slabs_.push_back(Slab{(char*)p, sz, {{0, sz}}});
                 pinned_ += sz;
                 qe_hostmem::charged() += sz;
-                if (getenv("FLASH_SLOT_LOG") && atoi(getenv("FLASH_SLOT_LOG")))
+                if (env_int("FLASH_SLOT_LOG", 0))
                     fprintf(stderr, "[qflash] archive pool: %.1f GB pinned (%.1f s), %.2f GB used\n", pinned_ / 1e9, secs, used_ / 1e9);
             }
         });
@@ -290,6 +293,7 @@ struct Slot {
     bool nolk = false;        // lookup drafts off for this reply (qe_set_no_lookup: the server's loop guard)
     bool fault = false;       // the NaN guard failed this reply (FE::fault): its conversation is dropped, qe_release frees it
     unsigned long long used = 0;
+    double idle_ms = 0;       // when its last reply ended (qe_release; 0: never released)
     // draft statistics since the slot was created (qe_draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
     long long ds[5] = {0, 0, 0, 0, 0};
     void count_step(bool lookup, int drafted, int emitted) {
@@ -361,7 +365,7 @@ struct FE {
         q.rb_pos = -1;  // the dropped step committed the rows of the step before it: no undo
         // the end state stays reusable: the next turn after a dropped step is bit-identical to one after a reply that
         // never launched ahead; FLASH_REUSE_DIRTY=0: not reused, as before
-        static const bool reuse_dirty = !getenv("FLASH_REUSE_DIRTY") || atoi(getenv("FLASH_REUSE_DIRTY"));
+        static const bool reuse_dirty = env_int("FLASH_REUSE_DIRTY", 1);
         q.dirty = !reuse_dirty;
         // the dropped step advanced the speculative state on the devices: back to the host's (its own rows are not
         // committed, the ones before it are; drafts are guesses, the pending token repeated)
@@ -423,13 +427,21 @@ struct FE {
         bool from_archive = false;  // (qe_last_* after its finish: another start may have run in between)
         std::vector<int> cks;     // checkpoint positions still ahead (ascending)
         std::vector<int> drafts;
+        // image prompt: device-side ids (image rows -> kImgToken + their row of the image table), the (t, h, w) RoPE
+        // positions of every row, its rows [img0, img0 + img_n) of the image table
+        std::vector<int> dev, r3;
+        int img0 = 0, img_n = 0;
         double t_begin = 0, ms_sync = 0, ms_restore = 0, ms_pool = 0;
+        bool multi_end = false;   // its last rows ran in a batch with other prompts (qe_prefill_multi): MTP chain row per slot
+        int n_multi = 0;          // batches it shared with other prompts (log)
     };
     // prompts in flight (FLASH_MAX_PREFILLS, default 2): each on its own slot, prefilled chunk by chunk in any order
     // (a short prompt may run between the chunks of a long one); the slot's committed state lives in its storage
     // between chunks (bind switches the workspace)
     std::list<Pf> pfs;
     int max_pf = 2, last_pf_slot = 0;
+    bf16* img = nullptr;          // image embedding table (pinned, mapped on every card): rows of the image prompts in flight
+    size_t img_cap = 0;           // rows
     Pf* pf_of(int slot) {  // the prompt in flight on slot (slot < 0 or one exposed slot: the newest)
         if (pfs.empty()) return nullptr;
         if (slot < 0 || !batch_api) return &pfs.back();
@@ -490,10 +502,27 @@ struct FE {
 
     // ---- KV pool regions (periods of 1536 positions = 512 rows on every card)
     int periods_for(int tokens) const { return std::max(1, (tokens + period - 1) / period); }
-    void update_top() {
+    // KV in RAM (lazy pinning): the pool may grow to what the host can still pin; never below the regions in use
+    void refresh_np() {
         int top = 0;
         for (auto& q : sl) if (q.cap) top = std::max(top, q.base + q.cap);
-        job = [&](int r) { W[r]->set_kv_top(top); W[r]->kv_claim(0); };  // expert-cache slots below the top -> KV
+        int v = W[0]->periods();
+        for (int r = 0; r < ng; r++) v = std::min(v, W[r]->kv_ram_periods());
+        np = std::max(top, v);
+    }
+    void update_top() {
+        int top = 0;
+        long long act = 0;
+        for (auto& q : sl) {
+            if (q.cap) top = std::max(top, q.base + q.cap);
+            if (q.cap && q.active) act += (long long)q.cap * period;
+        }
+        const bool ram = W[0]->kv_stream();
+        job = [&](int r) {
+            if (ram) W[r]->set_kv_active(act);
+            W[r]->set_kv_top(top);
+            W[r]->kv_claim(0);  // expert-cache slots below the top -> KV (KV in RAM: block-cache entries of the active ones)
+        };
         run();
     }
     // valid KV positions of a slot (its tokens + the rows of a step past them)
@@ -536,6 +565,7 @@ struct FE {
     // region of slot s holds `tokens` positions (+ reserve): grows in place, moves to a gap, packs the others or
     // evicts idle slots (not `protect`); the slot bound to the single-sequence path is re-bound after any move
     bool ensure_region(int s, int tokens, const std::vector<int>& protect = {}) {
+        refresh_np();
         Slot& q = sl[s];
         if (tokens > np * period) return false;
         const int need = std::min(np, periods_for(tokens + reserve));
@@ -649,10 +679,12 @@ struct FE {
     // ---- NaN guard (Worker::nf_check, FLASH_GUARD=1): a reply whose forward produced non-finite values fails alone
     // (the server returns an error for that request), its conversation and its archive are dropped (never reused,
     // the next turn recomputes it) and the other sequences go on. Repeated faults (more than FLASH_GUARD_MAX, default
-    // 4, within 5 minutes) point at shared state (weights / expert cache): then the process ends as before.
+    // 4, within 5 minutes) point at shared state (weights / expert cache): then the process ends as before. A repeat
+    // of the same fault (same token history, position and step kind: one prompt re-sent, issue #2) counts once
+    // (guard_rule.h).
     long long n_fault = 0;
     std::vector<std::string> fault_msg;  // per slot, until qe_slot_fault reads it
-    std::vector<double> fault_t;
+    std::vector<GuardEvent> fault_ev;
     unsigned take_nf() {
         unsigned m = 0;
         for (int r = 0; r < ng; r++) m |= W[r]->take_nf();
@@ -671,13 +703,17 @@ struct FE {
                 env.c_str());
         fflush(stderr);
         n_fault++;
-        const double t = now_ms();
-        fault_t.push_back(t);
-        fault_t.erase(std::remove_if(fault_t.begin(), fault_t.end(), [&](double x) { return x < t - 300e3; }), fault_t.end());
-        static const int fmax = getenv("FLASH_GUARD_MAX") ? atoi(getenv("FLASH_GUARD_MAX")) : 4;
-        if ((int)fault_t.size() > fmax) {
-            fprintf(stderr, "[flash] FATAL: %zu non-finite faults within 5 minutes (FLASH_GUARD_MAX %d): shared state is "
-                            "likely corrupt; exiting\n", fault_t.size(), fmax);
+        static const int fmax = env_int("FLASH_GUARD_MAX", 4);
+        const size_t nk = std::min(q.hist.size(), (size_t)std::max(0, pos));
+        const uint64_t key = guard_key(q.hist.data(), nk, pos, what);
+        const GuardVerdict v = guard_note(fault_ev, now_ms(), key, fmax);
+        if (v.repeat)
+            fprintf(stderr, "[qflash] GUARD: the same fault again (key %016llx: same %zu tokens, position %d, %s; %d times "
+                            "within 5 minutes): counted once toward FLASH_GUARD_MAX (%d distinct of %d)\n",
+                    (unsigned long long)key, nk, pos, what, v.hits, v.distinct, fmax);
+        if (v.abort) {
+            fprintf(stderr, "[flash] FATAL: %d distinct non-finite faults within 5 minutes (FLASH_GUARD_MAX %d): shared "
+                            "state is likely corrupt; exiting\n", v.distinct, fmax);
             fflush(stderr);
             fflush(stdout);
             abort();
@@ -703,6 +739,43 @@ struct FE {
         n_slot_evict++;
         q = Slot{};
     }
+    // ---- KV in VRAM: the expert cache lives in the pool above the highest region (update_top), so an idle
+    // conversation's region takes expert-cache slots from the sequences decoding next to it (2 GPUs, c=8 after 4 x 90K
+    // bench prompts: 2,926 of 9,010 live slots, cold-group hit rate 27 vs 50 %, -15 % tok/s). While others decode
+    // (batched steps), a conversation idle for FLASH_EC_RECLAIM_S seconds (default 30, 0 = off) leaves VRAM: only with
+    // an archive (FLASH_KV_ARCHIVE_GB > 0), only once the archive holds all its rows and its end state (a later turn
+    // restores it from host memory, never a new prefill), never the main thread (prio 2). The other regions are then
+    // packed down and the expert cache takes the freed rows. At most one check per second.
+    double reclaim_last = 0;
+    long long n_reclaim = 0;
+    void reclaim_idle() {
+        static const double T = env_double("FLASH_EC_RECLAIM_S", 30.0);
+        if (T <= 0 || !budget || !batch_api || !pfs.empty() || W[0]->kv_stream() || !W[0]->ec_enabled()) return;
+        const double t = now_ms();
+        if (t - reclaim_last < 1000.0) return;
+        reclaim_last = t;
+        int top0 = 0, n = 0, toks = 0;
+        for (auto& q : sl) if (q.cap) top0 = std::max(top0, q.base + q.cap);
+        for (int i = 0; i < (int)sl.size(); i++) {
+            Slot& q = sl[i];
+            if (!q.conv || !q.cap || q.active || q.paused || prio_of(i) >= 2 || q.idle_ms <= 0 || t - q.idle_ms < T * 1000.0) continue;
+            if (!q.synced && !sync(i)) continue;  // the archive cannot take it: it stays resident
+            if (!q.synced || !q.conv || !q.conv->end || q.conv->toks.size() != q.hist.size()) continue;  // no end state
+            toks += (int)q.hist.size();
+            evict_slot(i);
+            n++;
+        }
+        if (!n) return;
+        compact(-1);
+        update_top();
+        rebind();
+        n_reclaim += n;
+        int top1 = 0;
+        for (auto& q : sl) if (q.cap) top1 = std::max(top1, q.base + q.cap);
+        fprintf(stderr, "[qflash] pool: %d idle conversation%s (%d tokens, idle >= %.0f s) left VRAM for the expert cache "
+                "(archived), pool top %d -> %d of %d periods (%.1f ms)\n", n, n > 1 ? "s" : "", toks, T, top0, top1, np,
+                now_ms() - t);
+    }
     void forget(Conv* c) {
         if (c->slot >= 0) { sl[c->slot].conv = nullptr; }
         for (auto it = convs.begin(); it != convs.end(); ++it)
@@ -710,6 +783,11 @@ struct FE {
     }
 
     // ---- archive plumbing
+    static bool host_ptr(const void* p) {
+        cudaPointerAttributes a{};
+        if (cudaPointerGetAttributes(&a, p) != cudaSuccess) { cudaGetLastError(); return true; }
+        return a.type != cudaMemoryTypeDevice && a.type != cudaMemoryTypeManaged;
+    }
     static size_t bytes_of(const std::vector<Worker::Piece>& ps) {
         size_t s = 0;
         for (auto& p : ps) s += p.n;
@@ -724,8 +802,15 @@ struct FE {
             size_t off = 0;
             const cudaStream_t s = W[r]->stream();
             for (auto& q : ps) {
-                if (to_host) CUDA_CHECK(cudaMemcpyAsync(b.p[r] + off, q.p, q.n, cudaMemcpyDeviceToHost, s));
-                else CUDA_CHECK(cudaMemcpyAsync(q.p, b.p[r] + off, q.n, cudaMemcpyHostToDevice, s));
+                // (cudaMemcpyDefault: with KV streaming the K / V pieces are host rows)
+                // KV in RAM: the K / V pieces are host rows: host copies after the stream's work (a pageable archive
+                // blob next to registered rows is not a valid async copy)
+                if (host_ptr(q.p)) {
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    if (to_host) memcpy(b.p[r] + off, q.p, q.n);
+                    else memcpy(q.p, b.p[r] + off, q.n);
+                } else if (to_host) CUDA_CHECK(cudaMemcpyAsync(b.p[r] + off, q.p, q.n, cudaMemcpyDefault, s));
+                else CUDA_CHECK(cudaMemcpyAsync(q.p, b.p[r] + off, q.n, cudaMemcpyDefault, s));
                 off += q.n;
             }
             CHECK(off == b.n[r], "flash archive: blob size mismatch (%zu vs %zu)", off, b.n[r]);
@@ -748,9 +833,11 @@ struct FE {
             const cudaStream_t s = W[r]->stream();
             for (size_t i = 0; i < part.size(); i++) {
                 CHECK(part[i].p == full[i].p && part[i].n <= full[i].n, "flash archive: segment piece %zu", i);
-                CUDA_CHECK(cudaMemcpyAsync(part[i].p, g.p[r] + off, part[i].n, cudaMemcpyHostToDevice, s));
+                if (host_ptr(part[i].p)) { CUDA_CHECK(cudaStreamSynchronize(s)); memcpy(part[i].p, g.p[r] + off, part[i].n); }
+                else CUDA_CHECK(cudaMemcpyAsync(part[i].p, g.p[r] + off, part[i].n, cudaMemcpyDefault, s));
                 off += full[i].n;
             }
+            W[r]->kv_inval(b, a, z2);  // KV streaming: cached copies of the restored rows are stale
             CHECK(off == g.n[r] || part.empty(), "flash archive: blob size mismatch (%zu vs %zu)", off, g.n[r]);
             CUDA_CHECK(cudaStreamSynchronize(s));
         };
@@ -1068,7 +1155,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         if (!busy.empty()) { fprintf(stderr, "qflash: %s\n", busy.c_str()); delete e; return nullptr; }
     }
     e->ctx = max_t > 0 ? std::min(max_t, 262144) : 262144;
-    e->kmax = getenv("FLASH_MTP_K") ? atoi(getenv("FLASH_MTP_K")) : 3;
+    e->kmax = env_int("FLASH_MTP_K", 3);
     // QE_STEER / QE_STEER_DIR (flash_steer.h): checked first, a refused vector stops the start
     try {
         e->steer = steer_load_env(H, LAYERS, model, &e->steer_def);
@@ -1104,7 +1191,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     // the INT8 n-gram table (ngram_int8.safetensors, tools/convert_ngram_int8.py) is pinned instead of the BF16 one when
     // the model directory has it (51.8 instead of 102.4 GB of host memory; KL vs BF16 below the run-to-run noise,
     // see the README); FLASH_NGRAM=bf16 keeps the BF16 table, FLASH_NGRAM=int8 requires the INT8 one
-    const char* ngv = getenv("FLASH_NGRAM");
+    const char* ngv = env_str("FLASH_NGRAM");
     const bool ng8 = ngv ? !strcmp(ngv, "int8") : e->st.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_0");
     {
         const TensorInfo& emb = e->st.get("model.language_model.embed_tokens.weight");
@@ -1155,14 +1242,14 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         const std::string fpath = e->st.file_of((const void*)lo, &foff);
         // FLASH_NGRAM_PIN=0: the table stays in the file mapping (pageable, read from the page cache / disk on demand):
         // the GPU gathers read it through HMM (pageable memory access, open kernel modules), no host RAM is pinned
-        const bool pinned = !getenv("FLASH_NGRAM_PIN") || atoi(getenv("FLASH_NGRAM_PIN"));
+        const bool pinned = env_int("FLASH_NGRAM_PIN", 1);
         if (!pinned) {
             int pma = 0;
             CUDA_CHECK(cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess, e->devs[0]));
             CHECK(pma, "FLASH_NGRAM_PIN=0 needs GPU access to pageable host memory (HMM, NVIDIA open kernel modules)");
             // row reads are random: no read-around on faults (with part of the file cached the kernel keeps
             // read-around on and each 162-byte row miss reads 128 KB: 48 GB read in a 4-minute run)
-            if (!getenv("FLASH_NGRAM_RANDOM") || atoi(getenv("FLASH_NGRAM_RANDOM")))
+            if (env_int("FLASH_NGRAM_RANDOM", 1))
                 madvise((void*)(lo & ~(uintptr_t)4095), hi - (lo & ~(uintptr_t)4095), MADV_RANDOM);
         }
         char* pin = !pinned ? (char*)lo
@@ -1192,7 +1279,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         fclose(f);
     }
     std::vector<std::vector<int>> cold;
-    const std::string cf = getenv("FLASH_COLD") ? getenv("FLASH_COLD") : model + "/cold_experts.json";
+    const std::string cf = env_str("FLASH_COLD") ? env_str("FLASH_COLD") : model + "/cold_experts.json";
     if (FILE* f = fopen(cf.c_str(), "r")) {
         std::string js;
         char buf[65536];
@@ -1208,7 +1295,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     }
     std::vector<float> prior;  // expert-cache seed: per-token routing probabilities [48][512] (tools/flash_expert_prior.py)
     {
-        const std::string pf = getenv("FLASH_EC_PRIOR") ? getenv("FLASH_EC_PRIOR") : model + "/expert_prior.bin";
+        const std::string pf = env_str("FLASH_EC_PRIOR") ? env_str("FLASH_EC_PRIOR") : model + "/expert_prior.bin";
         if (FILE* f = fopen(pf.c_str(), "rb")) {
             prior.resize((size_t)LAYERS * NE);
             if (fread(prior.data(), 4, prior.size(), f) != prior.size()) prior.clear();
@@ -1260,7 +1347,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     memcpy(e->ngd.vsz, e->ht.vsz, sizeof(e->ngd.vsz));
     memcpy(e->ngd.voff, e->ht.voff, sizeof(e->ngd.voff));
     fprintf(stderr, "[qflash %.0fs] n-gram table %s %s (%.1f GB, %.1f s, overlapped with the weight load)\n", secs(),
-            ng8 ? "INT8" : "BF16", getenv("FLASH_NGRAM_PIN") && !atoi(getenv("FLASH_NGRAM_PIN")) ? "mapped, not pinned" : "pinned",
+            ng8 ? "INT8" : "BF16", !env_int("FLASH_NGRAM_PIN", 1) ? "mapped, not pinned" : "pinned",
             ng_bytes / 1e9, ng_secs);
     for (int r = 0; r < e->ng; r++) {
         for (int g = 0; g < e->ng; g++) {
@@ -1270,11 +1357,13 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             e->W[r]->set_agpeer(g, e->W[g]);
         }
         e->W[r]->set_ngram(e->ngd);
-        if (getenv("FLASH_NGRAM_PIN") && !atoi(getenv("FLASH_NGRAM_PIN")) && !(getenv("FLASH_NGRAM_HMM") && atoi(getenv("FLASH_NGRAM_HMM"))))
+        if (!env_int("FLASH_NGRAM_PIN", 1) && !(env_int("FLASH_NGRAM_HMM", 0)))
             e->W[r]->start_ngram_stage(&e->ht);  // rows staged by a host thread (FLASH_NGRAM_HMM=1: the GPU reads the mapping)
         fprintf(stderr, "[qflash] GPU%d: %.2f GB weights+state, %.2f GB cold experts in host memory, %.2f GiB free\n", e->devs[r],
                 e->W[r]->weight_gb(), e->W[r]->host_gb(), e->W[r]->free_bytes() / 1073741824.0);
     }
+    if (env_set("FLASH_TEST_VRAM_HOG_MB"))
+        for (int r = 0; r < e->ng; r++) e->W[r]->test_hog(env_ll("FLASH_TEST_VRAM_HOG_MB", 0));
     for (int r = 1; r < e->ng; r++)
         e->pool.emplace_back([e, r] {
             int seen = 0;
@@ -1291,21 +1380,21 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     e->outs.resize(MAXM);
     for (int r = 0; r < e->ng; r++) e->W[r]->reset();
     {  // host-RAM archive of the conversations (0: off, only the live sequence is reused)
-        const double gb = getenv("FLASH_KV_ARCHIVE_GB") ? atof(getenv("FLASH_KV_ARCHIVE_GB")) : 48.0;
+        const double gb = env_double("FLASH_KV_ARCHIVE_GB", 48.0);
         e->budget = gb > 0 ? (size_t)(gb * 1e9) : 0;
-        if (getenv("FLASH_CKPT")) e->ckpt_every = atoi(getenv("FLASH_CKPT"));
-        if (getenv("FLASH_CKPT_MIN")) e->ckpt_min = atoi(getenv("FLASH_CKPT_MIN"));
-        if (getenv("FLASH_END_CUT")) e->end_cut = atoi(getenv("FLASH_END_CUT"));
-        if (getenv("FLASH_SLOT_RESERVE")) e->reserve = atoi(getenv("FLASH_SLOT_RESERVE"));
+        e->ckpt_every = env_int("FLASH_CKPT", e->ckpt_every);
+        e->ckpt_min = env_int("FLASH_CKPT_MIN", e->ckpt_min);
+        e->end_cut = env_int("FLASH_END_CUT", e->end_cut);
+        e->reserve = env_int("FLASH_SLOT_RESERVE", e->reserve);
         e->sl.assign(e->W[0]->num_slots(), Slot{});
         e->np = e->W[0]->periods();
         e->period = e->W[0]->period();
-        if (getenv("FLASH_CKPT_KEEP")) e->ckpt_keep = std::max(1, atoi(getenv("FLASH_CKPT_KEEP")));
-        e->log = getenv("FLASH_SLOT_LOG") && atoi(getenv("FLASH_SLOT_LOG"));
-        e->batch_api = !getenv("FLASH_BATCH") || atoi(getenv("FLASH_BATCH"));
-        e->max_pf = e->batch_api ? std::max(1, getenv("FLASH_MAX_PREFILLS") ? atoi(getenv("FLASH_MAX_PREFILLS")) : 2) : 1;
-        const bool pin = !getenv("FLASH_ARCHIVE_PINNED") || atoi(getenv("FLASH_ARCHIVE_PINNED"));
-        const double head = getenv("FLASH_ARCHIVE_HEADROOM_GB") ? atof(getenv("FLASH_ARCHIVE_HEADROOM_GB")) : 4.0;
+        if (env_set("FLASH_CKPT_KEEP")) e->ckpt_keep = std::max(1, env_int("FLASH_CKPT_KEEP", e->ckpt_keep));
+        e->log = env_int("FLASH_SLOT_LOG", 0);
+        e->batch_api = env_int("FLASH_BATCH", 1);
+        e->max_pf = e->batch_api ? std::max(1, std::min(Worker::PFSEG_MAX, env_int("FLASH_MAX_PREFILLS", 8))) : 1;
+        const bool pin = env_int("FLASH_ARCHIVE_PINNED", 1);
+        const double head = env_double("FLASH_ARCHIVE_HEADROOM_GB", 4.0);
         if (e->budget && pin) e->hpool.start(e->budget, (size_t)1 << 30, (size_t)(head * 1e9));
         fprintf(stderr, "[qflash] %zu sequence slots over a pool of %d periods; archive: %.1f GB host budget%s, checkpoints every %d tokens\n",
                 e->sl.size(), e->np, e->budget / 1e9, pin ? " (pinning in the background)" : " (pageable)", e->ckpt_every);
@@ -1398,15 +1487,21 @@ static int acquire_slot(FE* e, int n, const std::vector<int>& protect) {
 // Prompt start, phase 1: pick the cached start (the live end of a resident sequence, a checkpoint of any
 // conversation, an archived end state), get a slot + KV region for it, copy / restore what is not in place, plan
 // the prefill of the rest. Returns the slot (0 with one exposed slot) or -1 (no room / vision).
-int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long affinity, int hint, const void* img, int,
-                   const int*, int) {
+int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long affinity, int hint, const void* img,
+                   int img_rows, const int* rope3, int delta) {
     FE* e = (FE*)p;
     if ((int)e->pfs.size() >= e->max_pf) return -1;  // prompts in flight
+    int img_cnt = 0;
+    for (int i = 0; i < n; i++) img_cnt += ids[i] >= kImgToken;
+    if (img_cnt != img_rows || (img_cnt && (!img || !rope3))) {
+        fprintf(stderr, "[qflash] start: %d image rows in the prompt, %d embeddings%s\n", img_cnt, img_rows,
+                img_cnt && !rope3 ? ", no positions" : "");
+        return -1;
+    }
     e->drain();
     e->no_ahead = false;
-    if (img) return -1;
     {  // expert cache: per-request summary of the previous generation (server log), then fresh counters
-        static const bool lg = !getenv("FLASH_EC_LOG") || atoi(getenv("FLASH_EC_LOG"));
+        static const bool lg = env_int("FLASH_EC_LOG", 1);
         if (lg && e->W[0]->ec_stats().dec_steps > 0) fprintf(stderr, "[qflash] %s\n", ec_summary(e->W).c_str());
         for (int r = 0; r < e->ng; r++) e->W[r]->ec_reset_stats();
     }
@@ -1572,11 +1667,42 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     e->run();
     q.active = true;  // taken (not evicted by another start) until released
     q.paused = false;
+    if (e->W[0]->kv_stream()) e->update_top();  // KV in RAM: block-cache entries sized to the active regions
     q.admit = ++e->admit_tick;
     pf.ids.assign(ids, ids + n);
     pf.n = n;
     pf.i = L;
     pf.hint = hint;
+    // multimodal prompt: image rows into the image table (after the rows of other image prompts in flight), device
+    // ids, positions; the slot's RoPE shift (0: text) and no chunk table of an earlier prompt
+    if (img_cnt) {
+        int base = 0;
+        for (auto& x : e->pfs)
+            if (x.img_n) base = std::max(base, x.img0 + x.img_n);
+        if ((size_t)(base + img_cnt) > e->img_cap) {
+            const size_t cap = std::max<size_t>(base + img_cnt, 2 * e->img_cap);
+            bf16* t = nullptr;
+            CUDA_CHECK(cudaSetDevice(e->devs[0]));
+            CUDA_CHECK(cudaHostAlloc((void**)&t, cap * H * sizeof(bf16), cudaHostAllocMapped | cudaHostAllocPortable));
+            if (base) memcpy(t, e->img, (size_t)base * H * sizeof(bf16));
+            e->job = [&](int r) { e->W[r]->set_image_table(t); };
+            e->run();
+            if (e->img) CUDA_CHECK(cudaFreeHost(e->img));
+            e->img = t;
+            e->img_cap = cap;
+        }
+        memcpy(e->img + (size_t)base * H, img, (size_t)img_cnt * H * sizeof(bf16));
+        pf.dev.assign(ids, ids + n);
+        for (int i = 0, j = 0; i < n; i++)
+            if (ids[i] >= kImgToken) pf.dev[i] = kImgToken + base + j++;
+        pf.r3.assign(rope3, rope3 + 3 * (size_t)n);
+        pf.img0 = base;
+        pf.img_n = img_cnt;
+    } else {
+        delta = 0;
+    }
+    e->job = [&](int r) { e->W[r]->set_rope_slot(y, delta); e->W[r]->set_rope_chunk(y, 0, 0, nullptr); };
+    e->run();
     if (e->budget) {  // checkpoints of the committed state: the system end (hint), every ckpt_every, the prompt end - 1
         std::vector<int> c;
         if (hint > L && hint < n && hint >= e->ckpt_min) c.push_back(hint);
@@ -1596,7 +1722,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
 
 static void take_ck(FE* e, const FE::Pf& pf, int pos) {
     const int kind = pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : pos % e->ckpt_every ? 5 : 3;  // 5: divergence point
-    e->add_ck(e->S().conv, e->save_state(e->cs, false, kind));
+    e->add_ck(e->sl[pf.slot].conv, e->save_state(pf.slot, false, kind));  // (the prompt's slot: qe_prefill_multi)
 }
 
 // Prompt start, phase 2: prefill up to `budget` more tokens (batches); 1 when the prompt is done
@@ -1613,8 +1739,11 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
     }
     const int n = pf.n;
     const int* ids = pf.ids.data();
+    const int* dids = pf.dev.empty() ? ids : pf.dev.data();  // what the devices embed (image rows: table rows)
+    const int* r3 = pf.r3.empty() ? nullptr : pf.r3.data();
+    const int pslot = pf.slot;
     auto& hist = e->S().hist;
-    static const bool pfb = !(getenv("FLASH_PFB") && atoi(getenv("FLASH_PFB")) == 0);
+    static const bool pfb = !(env_int("FLASH_PFB", 1) == 0);
     // big batches (past pf_batch_base(), buffers borrowed from the expert cache) only when the chunk budget asks for
     // them: the server's 2048-token chunks keep the base batch
     const int B = pfb ? (budget > e->W[0]->pf_batch_base() - PFM ? e->W[0]->pf_batch() : e->W[0]->pf_batch_base()) : 0;
@@ -1622,7 +1751,7 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
     while (pf.i < n && done_tok < budget) {
         const int i = pf.i;
         int m;
-        if (pfb) m = n - i <= B ? n - i : B - PFM;  // nominal batch B - PFM; a tail of <= PFM rows joins the last one
+        if (pfb) m = e->W[0]->pf_batch_rows(n - i, B);  // nominal batch B - PFM; a tail of <= PFM rows joins the last one
         else m = std::min(PFM, n - i);
         while (!pf.cks.empty() && pf.cks.front() <= i) pf.cks.erase(pf.cks.begin());
         if (!pf.cks.empty() && pf.cks.front() < i + m) m = pf.cks.front() - i;  // a batch ends at the next checkpoint
@@ -1634,10 +1763,11 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
         if (pfb) {  // batched prefill (MoE half over the whole batch), then the MTP fill
             std::vector<int> mt;
             if (e->k > 0)
-                for (int j = 0; j < m; j++) mt.push_back(i + j + 1 < n ? ids[i + j + 1] : -1);  // last: the sampled token (device)
+                for (int j = 0; j < m; j++) mt.push_back(i + j + 1 < n ? dids[i + j + 1] : -1);  // last: the sampled token (device)
             e->job = [&](int r) {
                 int oo, dd = -2;
-                e->W[r]->prefill_batch(ids + i, i, m, rows.data(), &oo, e->k > 0 ? mt.data() : nullptr, lastb, &dd);
+                if (r3) e->W[r]->set_rope_chunk(pslot, i, m, r3);
+                e->W[r]->prefill_batch(dids + i, i, m, rows.data(), &oo, e->k > 0 ? mt.data() : nullptr, lastb, &dd);
                 if (r == 0) { o = oo; d = dd; }
             };
             e->run();
@@ -1650,14 +1780,14 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
                 if (lastb) pf.drafts = {d};
             }
         } else {  // prefill chunks (rows committed at once), MTP KV in the same pass
-            std::vector<int> ch(ids + i, ids + i + m);
+            std::vector<int> ch(dids + i, dids + i + m);
             std::vector<int> mt;
-            for (int j = 0; j < m; j++) mt.push_back(i + j + 1 < n ? ids[i + j + 1] : -1);
+            for (int j = 0; j < m; j++) mt.push_back(i + j + 1 < n ? dids[i + j + 1] : -1);
             if (e->k > 0 && !lastb) {
-                e->job = [&](int r) { int oo, dd; e->W[r]->prefill(ch.data(), i, m, rows.data(), &oo, mt.data(), &dd); if (r == 0) { o = oo; d = dd; } };
+                e->job = [&](int r) { if (r3) e->W[r]->set_rope_chunk(pslot, i, m, r3); int oo, dd; e->W[r]->prefill(ch.data(), i, m, rows.data(), &oo, mt.data(), &dd); if (r == 0) { o = oo; d = dd; } };
                 e->run();
             } else {
-                e->job = [&](int r) { int oo; e->W[r]->prefill(ch.data(), i, m, rows.data(), &oo, nullptr, nullptr); if (r == 0) o = oo; };
+                e->job = [&](int r) { if (r3) e->W[r]->set_rope_chunk(pslot, i, m, r3); int oo; e->W[r]->prefill(ch.data(), i, m, rows.data(), &oo, nullptr, nullptr); if (r == 0) o = oo; };
                 e->run();
                 if (e->k > 0) {  // the last row's MTP token is the first generated one
                     mt[m - 1] = o;
@@ -1678,6 +1808,127 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
     return pf.i >= n ? 1 : 0;
 }
 int qe_prefill_more(void* p, int budget) { return qe_prefill_more_slot(p, -1, budget); }  // the newest prompt
+
+// Several prompts in flight, one batch (batched-prefill): rows of the prompts on `slots` (in that order: the first get their
+// rows first) up to `budget` rows (big batches as qe_prefill_more_slot when the budget asks for them). Each prompt's rows
+// end at its next checkpoint, as on its own; a long prompt takes whole PFM chunks of what is left. The mixer runs per
+// prompt, the MoE half once for all (each expert group read once per batch instead of once per prompt). Text prompts
+// only (image rows / a RoPE shift, constrained requests: their own batches). done[i] = 1: prompt i is complete
+// (qe_start_finish_slot next). Returns how many prompts got rows; 0 = no shared batch (fewer than 2 prompts fit, or
+// FLASH_PF_MULTI=0): the caller prefills them one by one.
+// 1: prefill passes are bound by copying the host-backed experts (the copies of one pass take longer than a base batch
+// computes: > ~8 GB per card at ~25 GB/s, 2 cards; 3 cards hold <= ~5 GB host-backed): the server then runs the large
+// batch whenever nothing decodes, also while requests wait (2 GPUs, 8 x 16K burst: +45 %; 3 GPUs: -2 % on average)
+int qe_prefill_pass_bound(void* p) {
+    FE* e = (FE*)p;
+    long long mx = 0;
+    for (int r = 0; r < e->ng; r++) mx = std::max(mx, e->W[r]->cold_bytes());
+    return mx > (8LL << 30) ? 1 : 0;
+}
+
+int qe_prefill_multi(void* p, const int* slots, int nslots, int budget, int* done) {
+    FE* e = (FE*)p;
+    for (int i = 0; i < nslots; i++) done[i] = 0;
+    static const bool on = env_int("FLASH_PF_MULTI", 1) != 0;
+    static const bool pfb = !(env_int("FLASH_PFB", 1) == 0);
+    if (!on || !pfb || !e->batch_api || nslots < 2) return 0;
+    Worker& w0 = *e->W[0];
+    const int B = budget > w0.pf_batch_base() - PFM ? w0.pf_batch() : w0.pf_batch_base();
+    const int T = std::min(budget, B - PFM);  // nominal rows; a prompt that ends within B may take its tail too
+    static const bool bound = qe_prefill_pass_bound(p) != 0;
+    struct Pick { FE::Pf* pf; int idx, m; };
+    std::vector<Pick> pk;
+    int used = 0;
+    for (int i = 0; i < nslots && (int)pk.size() < Worker::PFSEG_MAX; i++) {
+        FE::Pf* pf = e->pf_of(slots[i]);
+        if (!pf || pf->i >= pf->n || !pf->r3.empty() || pf->img_n || w0.rope_shift(pf->slot) || e->sl[pf->slot].con) continue;
+        while (!pf->cks.empty() && pf->cks.front() <= pf->i) pf->cks.erase(pf->cks.begin());
+        int want = pf->n - pf->i;
+        if (!pf->cks.empty() && pf->cks.front() < pf->i + want) want = pf->cks.front() - pf->i;  // ends at the checkpoint
+        const bool ends = pf->i + want >= pf->n;
+        int m;
+        if (used + want <= T || (ends && used + want <= B && want <= PFM + std::max(0, T - used))) m = want;
+        else m = std::min(want, (T - used) / PFM * PFM);  // a part of a long prompt: whole chunks
+        // a long prompt cut by the batch budget joins others only where passes are copy-bound (2 cards: packing saves
+        // a whole pass); elsewhere it runs alone on its graph-cached batch (a shared batch with a cut part has a new
+        // layout almost every time and runs eagerly: 3 GPUs 8 x 4K bursts -5..-9 %)
+        if (m < want && !pk.empty() && !bound) continue;
+        if (m <= 0) continue;
+        pk.push_back({pf, i, m});
+        used += m;
+        if (used >= T) break;
+    }
+    // the layout must suit the collectives (units of >= 3 x cards rows ...): drop prompts from the end until it does
+    while (pk.size() >= 2) {
+        std::vector<int> sn;
+        for (auto& x : pk) sn.push_back(x.m);
+        if (w0.pf_multi_ok(sn.data(), (int)sn.size())) break;
+        if (env_int("FLASH_PF_MULTI_LOG", 0)) {
+            std::string d;
+            for (int x : sn) d += " " + std::to_string(x);
+            fprintf(stderr, "[qflash] prefill batch layout refused:%s\n", d.c_str());
+        }
+        pk.pop_back();
+    }
+    static const bool lg = env_int("FLASH_PF_MULTI_LOG", 0) != 0;
+    if (pk.size() < 2) {
+        if (lg) fprintf(stderr, "[qflash] prefill batch: %zu of %d prompts fit (budget %d, B %d)\n", pk.size(), nslots, budget, B);
+        return 0;
+    }
+    e->drain();
+    e->no_ahead = false;
+    const int ns = (int)pk.size();
+    int n = 0;
+    for (auto& x : pk) n += x.m;
+    std::vector<Worker::PfSeg> sg(ns);
+    std::vector<int> toks(n), mt;
+    std::vector<bf16> rows((size_t)n * H);
+    if (e->k > 0) mt.resize(n);
+    int r0 = 0;
+    for (int j = 0; j < ns; j++) {
+        FE::Pf& pf = *pk[j].pf;
+        const int i = pf.i, m = pk[j].m;
+        auto& hist = e->sl[pf.slot].hist;
+        for (int t = 0; t < m; t++) hist.push_back(pf.ids[i + t]);
+        ngram_rows(e->ht, hist, (int)hist.size() - m, m, rows.data() + (size_t)r0 * H);
+        for (int t = 0; t < m; t++) {
+            toks[r0 + t] = pf.ids[i + t];
+            if (e->k > 0) mt[r0 + t] = i + t + 1 < pf.n ? pf.ids[i + t + 1] : -1;  // last: the sampled token (device)
+        }
+        sg[j] = {pf.slot, e->sl[pf.slot].base, i, m, e->W[0]->slot_prev_m(pf.slot), i + m >= pf.n};
+        r0 += m;
+    }
+    std::vector<int> outs(ns, -1), drs(ns, -1);
+    e->job = [&](int r) {
+        std::vector<int> o(ns), d(ns);
+        e->W[r]->prefill_multi(sg.data(), ns, toks.data(), rows.data(), e->k > 0 ? mt.data() : nullptr, o.data(), d.data());
+        if (r == 0) { outs = o; drs = d; }
+    };
+    e->run();
+    int k = 0;
+    for (int j = 0; j < ns; j++) {
+        FE::Pf& pf = *pk[j].pf;
+        pf.i += pk[j].m;
+        pf.n_multi++;
+        if (sg[j].end) {
+            pf.nxt = outs[k];
+            if (e->k > 0) pf.drafts = {drs[k]};
+            pf.multi_end = true;
+            k++;
+            done[pk[j].idx] = 1;
+        }
+        if (!pf.cks.empty() && pf.cks.front() == pf.i) {
+            take_ck(e, pf, pf.i);
+            pf.cks.erase(pf.cks.begin());
+        }
+    }
+    if (lg) {
+        std::string d;
+        for (auto& x : pk) d += " " + std::to_string(x.pf->slot) + ":" + std::to_string(x.m);
+        fprintf(stderr, "[qflash] prefill batch of %d prompts, %d rows (slot:rows%s)\n", ns, n, d.c_str());
+    }
+    return ns;
+}
 
 // device speculative state of the bound slot from its host state (after a prefill: nothing pending)
 static void spec_start(FE* e, int nxt, const std::vector<int>& first_drafts, const int* ids, int n) {
@@ -1717,6 +1968,10 @@ int qe_start_finish_slot(void* p, int slot) {
             if (&*it == pp) { e->pfs.erase(it); break; }
         return -2;
     }
+    if (pf.multi_end && e->k > 0) {  // the MTP chain continues from its prompt end (kept per slot by the shared batch)
+        e->job = [&](int r) { e->W[r]->rmin_load(pf.slot); };
+        e->run();
+    }
     spec_start(e, pf.nxt, pf.drafts, pf.ids.data(), n);
     Slot& q = e->S();
     q.pending = pf.nxt;
@@ -1735,7 +1990,7 @@ int qe_start_finish_slot(void* p, int slot) {
     }
     q.lk_stale = false;
     q.synced = false;
-    static const bool pft = getenv("FLASH_PFT") || (getenv("FLASH_SLOT_LOG") && atoi(getenv("FLASH_SLOT_LOG")));
+    static const bool pft = env_str("FLASH_PFT") || (env_int("FLASH_SLOT_LOG", 0));
     if (pft)
         fprintf(stderr, "[qflash] start: %d tokens (reused %d, %s) in %.1f ms (pool %.1f, restore %.1f), slot %d [%d, %d), conversation %d, %zu known, %.2f GB host\n",
                 n, pf.reused, pf.from_archive ? "archive" : pf.copied ? "checkpoint" : pf.reused ? "live" : "none",
@@ -1754,6 +2009,15 @@ int qe_start_finish(void* p) { return qe_start_finish_slot(p, -1); }
 int qe_num_prefills(void* p) { return (int)((FE*)p)->pfs.size(); }
 int qe_prefill_pos(void* p, int slot) { FE* e = (FE*)p; const FE::Pf* x = e->pf_of(slot); return x ? x->i : -1; }
 
+// a prompt with image rows (qe_start_begin + qe_start_finish): ids >= kImgToken are image rows (content-derived ids:
+// the prefix cache / archive tell images apart), img their embeddings [img_rows][2560] bf16 in prompt order, rope3 the
+// (t, h, w) M-RoPE position of every prompt row, delta the position shift of the text after the prompt
+int qe_start_mm(void* p, const int* ids, int n, int k, unsigned long long affinity, int hint, const void* img, int img_rows,
+                const int* rope3, int delta) {
+    const int y = qe_start_begin(p, ids, n, k, affinity, hint, img, img_rows, rope3, delta);
+    if (y < 0) return -1;
+    return qe_start_finish_slot(p, y);
+}
 int qe_start3(void* p, const int* ids, int n, int k, unsigned long long affinity, int hint) {
     const int y = qe_start_begin(p, ids, n, k, affinity, hint, nullptr, 0, nullptr, 0);
     if (y < 0) return -1;
@@ -1891,7 +2155,7 @@ static int spec_step_impl(void* p, int* out) {
     // end token, past the reply's limit, near a stop string (qe_set_no_ahead) or while a prefill waits.
     bool eos = false;
     for (int i = 0; i < cnt; i++) eos |= em[i] == EOS || em[i] == EOS + 2;
-    static const bool la_env = !getenv("FLASH_LOOKAHEAD") || atoi(getenv("FLASH_LOOKAHEAD"));
+    static const bool la_env = env_int("FLASH_LOOKAHEAD", 1);
     if (la_env && e->lookahead && !e->no_ahead && !eos && q.remain != 0) {
         int ks2;
         bool lk2;
@@ -1918,7 +2182,7 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
     e->drain();
     CHECK(n >= 1 && n <= MAXM, "flash step_batch: %d slots", n);
     // drafts per sequence: as the single path, at most MAXM rows in all (FLASH_BATCH_K caps them)
-    static const int kcap = getenv("FLASH_BATCH_K") ? atoi(getenv("FLASH_BATCH_K")) : 64;
+    static const int kcap = env_int("FLASH_BATCH_K", 64);
     const int kb = e->k > 0 ? std::max(0, std::min({e->k, MAXM / n - 1, kcap})) : 0;
     std::vector<int> run, lims, idx;
     for (int i = 0; i < n; i++)  // grammar-constrained slots step alone (their masks / drafts are per step)
@@ -1928,6 +2192,7 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
             if (cnt[i] == 0 && !e->sl[slots[i]].fault) { out[i * 64] = EOS; cnt[i] = 1; }
         }
     e->resume_paused(slots, n);
+    e->reclaim_idle();  // idle conversations out of VRAM for the expert cache (KV in VRAM, archive on)
     for (int i = 0; i < n; i++) {
         Slot& q = e->sl.at(slots[i]);
         if (q.con) continue;
@@ -1937,7 +2202,7 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
         if (hn + kb + 2 > e->ctx || !e->room_or_pause(slots[i], hn + kb + 2, std::vector<int>(slots, slots + n))) {
             if (q.paused) continue;  // paused for a sequence worth more: no tokens until it resumes
             // the room is held by prompts being prefilled (never paused): wait for them (no tokens yet)
-            if (!e->pfs.empty() && hn + kb + 2 <= e->ctx && e->periods_for(hn + kb + 2 + e->reserve) <= e->np) continue;
+            if (!e->pfs.empty() && hn + kb + 2 <= e->ctx && hn + kb + 2 <= e->np * e->period) continue;  // fits the pool alone (ensure_region caps the reserve)
             out[i * 64] = EOS;  // no room even alone (longer than the pool / the context): the sequence ends
             cnt[i] = 1;
             continue;
@@ -1968,7 +2233,7 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
     {  // FLASH_PROF_STEPS=a,b: cudaProfilerStart before batched step a, Stop before step b (nsys capture range)
         static long long bstep = 0, pa = -1, pb = -1;
         static bool init = false;
-        if (!init) { init = true; if (const char* v = getenv("FLASH_PROF_STEPS")) sscanf(v, "%lld,%lld", &pa, &pb); }
+        if (!init) { init = true; if (const char* v = env_str("FLASH_PROF_STEPS")) sscanf(v, "%lld,%lld", &pa, &pb); }
         if (bstep == pa || bstep == pb) {
             if (bstep == pa) cudaProfilerStart(); else cudaProfilerStop();
         }
@@ -2065,6 +2330,8 @@ void qe_release(void* p, int slot) {
         return;
     }
     q.active = false;
+    q.idle_ms = FE::now_ms();
+    if (e->W[0]->kv_stream()) e->update_top();  // KV in RAM: its block-cache entries back to the expert cache
     q.remain = -1;
     q.want_drafts = false;
     if (q.con) {
@@ -2236,22 +2503,33 @@ void qe_reset(void* p) {
 
 // ---- slots: FLASH_MAX_SEQS resident sequences share the KV pool; the server sees one (no batched steps yet)
 int qe_num_slots(void* p) { FE* e = (FE*)p; return e->batch_api ? (int)e->sl.size() : 1; }
-long long qe_pool_tokens(void* p) { return ((FE*)p)->ctx; }
+// KV pool of all slots together in positions (VRAM: max_context rounded up to a period; KV in RAM: the RAM pool,
+// FLASH_KV_RAM_TOKENS as far as the host could pin it)
+long long qe_pool_tokens(void* p) {
+    FE* e = (FE*)p;
+    return std::max<long long>(e->ctx, (long long)e->W[0]->periods() * e->period);
+}
+int qe_kv_in_ram(void* p) { return ((FE*)p)->W[0]->kv_stream() ? 1 : 0; }  // FLASH_KV=ram
 int qe_can_admit(void* p, int n) {
     FE* e = (FE*)p;
+    e->refresh_np();
     if ((int)e->pfs.size() >= e->max_pf || n > e->ctx) return 0;
     int act = 0, used = 0;
     for (auto& q : e->sl)
         if (q.active) { act++; used += q.paused ? e->floor_of(q) : q.cap; }
     if (!e->batch_api) return act == 0;
     // a slot that is not generating, and room next to the generating ones (idle ones can be evicted)
-    return act < (int)e->sl.size() && used + e->periods_for(n + e->reserve) <= e->np;
+    // the region a start gets (ensure_region): n + reserve, at most the whole pool. Uncapped, a prompt within
+    // max_prompt_tokens but within `reserve` of the pool size (2 GPUs, KV in VRAM: pool = context = 262144) never fit
+    // and waited in the queue forever
+    return act < (int)e->sl.size() && used + std::min(e->np, e->periods_for(n + e->reserve)) <= e->np;
 }
 // room for a new n-token sequence of value `prio` (the main thread): pause decoding sequences worth less (lowest prio,
 // the most recently admitted first; never a prompt being prefilled, never one of the same or a higher prio), only as
 // many as needed and only when that makes it fit (paused ones count as out: they resume when room frees). 1: fits now
 int qe_pause_for(void* p, int n, int prio) {
     FE* e = (FE*)p;
+    e->refresh_np();
     if (!e->batch_api || !e->budget || (int)e->pfs.size() >= e->max_pf || n > e->ctx) return 0;
     int act = 0, used = 0;
     std::vector<int> vs;
@@ -2264,7 +2542,7 @@ int qe_pause_for(void* p, int n, int prio) {
         if (q.conv && q.cap && q.pending >= 0 && !e->prefilling(i) && e->prio_of(i) < prio) vs.push_back(i);
     }
     if (act >= (int)e->sl.size()) return 0;  // every slot is taken: pausing frees no slot
-    const int need = e->periods_for(n + e->reserve);
+    const int need = std::min(e->np, e->periods_for(n + e->reserve));  // as qe_can_admit / ensure_region
     if (used + need <= e->np) return 1;
     std::stable_sort(vs.begin(), vs.end(), [&](int a, int b) {
         return e->prio_of(a) != e->prio_of(b) ? e->prio_of(a) < e->prio_of(b) : e->sl[a].admit > e->sl[b].admit;

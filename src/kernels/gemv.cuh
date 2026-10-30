@@ -94,6 +94,15 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
 // on: following non-GLU gemm_w4 calls of this thread (device) write bf16 outputs (round to nearest, as
 // __floats2bfloat162_rn) to c reinterpreted as bf16 [t][ldc]; GLU calls are unaffected. Default off.
 void gemm_set_out_bf16(bool on);
+// lazily grown GEMM workspaces (gemm.cu tl_alloc): on an out-of-memory growth fn(ctx) is called once (it frees device
+// memory, returns a count for the log) and the allocation retried; reserve grows them at load time
+void gemm_set_oom_hook(int (*fn)(void*), void* ctx);
+void gemm_reserve_ws(int t_max, int k_max, size_t skws_bytes);
+// the same for other lazily grown device workspaces (named blocks per device): qe_ws_reserve at load, qe_ws_alloc
+// for a growth (takes the reserved block of that name if it is big enough; else cudaMalloc, out of memory: the oom
+// hook + one retry). Returns the bytes of the block (>= bytes)
+size_t qe_ws_alloc(void** p, size_t bytes, const char* what);
+void qe_ws_reserve(const char* what, size_t bytes);
 void gemm_set_sk_maxparts(int n);  // (bench) cap of the stream-K split count, 0 = default
 // Persisted GEMM tuning table (gemm.cu TuneStore): model = fingerprint of the weights; enables it
 // (QE_TUNE_FILE=path / off). defer on: this thread's new choices are saved once, when it is turned off.

@@ -80,7 +80,17 @@ def run(tier0):
     gen = app.Generator(args)
     c = TestClient(app.build_app(gen, args))
     name = "qwen3.8-flash-next-qengine" if args.profile.is_flash else "qwen3.8-27b-qengine"
-    assert c.get("/v1/models").json()["data"][0]["id"] == name
+    m = c.get("/v1/models").json()["data"][0]
+    assert m["id"] == name
+    # limits a client needs (club-3090#1846): context, slots, prompt cap, KV pool and where it lives
+    mt = gen.engine.max_t
+    assert m["max_model_len"] == mt and m["max_num_seqs"] == 1, m
+    assert m["max_prompt_tokens"] == mt - args.mtp_k - 2 and m["max_output_tokens"] is None, m
+    assert m["kv_pool_tokens"] == mt, m  # tier 0: no qe_pool_tokens -> max_context; mock tier 1: max_t
+    assert m["kv_cache"] == ("ram" if os.environ.get("QE_MOCK_KV_RAM") == "1" and gen.engine.has("qe_kv_in_ram")
+                             else "vram"), m
+    p = c.get("/props").json()
+    assert p["total_slots"] == 1 and p["default_generation_settings"]["n_ctx"] == mt and p["max_num_seqs"] == 1, p
 
     def prompts():
         out = []
@@ -174,6 +184,7 @@ def run(tier0):
 def main():
     for tier0 in (True, False):
         print(f"mock engine {'TIER 0 only' if tier0 else 'TIER 0 + 1'} ({FLASH}):")
+        os.environ["QE_MOCK_KV_RAM"] = "0" if tier0 else "1"  # tier 1: /v1/models reports kv_cache "ram"
         run(tier0)
     print("ok")
 
