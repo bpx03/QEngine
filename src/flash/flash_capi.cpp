@@ -2,7 +2,10 @@
 // and the single functions). One sequence is resident on the GPUs; the other conversations wait in a host-RAM archive
 // (KV segments + recurrent states, FLASH_KV_ARCHIVE_GB) and come back without a re-prefill; a new prompt starts from
 // the longest cached prefix (the live sequence, an archived end state, or a checkpoint of the committed state at the
-// system end / every FLASH_CKPT tokens / the prompt end - 1). Built as libqflash.so.
+// system end / every FLASH_CKPT tokens / the prompt end - 1, or a pinned system-prompt prefix). The system-end
+// checkpoint of every agent kind is also pinned (KV [0, system end) + its state) outside the archive's LRU, in its own
+// host budget FLASH_PREFIX_GB: a full archive never makes the next agent of a known kind prefill its system prompt
+// again (27B QE_PREFIX_GB). Built as libqflash.so.
 #include "../env.h"
 #include <dirent.h>
 #include <cuda_profiler_api.h>
@@ -268,6 +271,24 @@ struct Conv {
     long long steer = -1;                     // steering key it was computed with (FE::steer_key): KV / states never serve another
 };
 
+// A pinned prefix (FLASH_PREFIX_GB): the KV rows [0, n) and the committed state at n of a system end (the server's
+// hint: system prompt + tools of one agent kind), outside the archive LRU. Conversations started from it share its
+// segment (their archives hold only the rows past n).
+struct Pin {
+    std::vector<int> toks;
+    long long steer = -1;
+    std::shared_ptr<Seg> kv;
+    std::shared_ptr<State> st;
+    size_t bytes = 0;         // host bytes of kv + st (counted in the pin budget, not the archive's)
+    int prio = 1;
+    unsigned long long used = 0;
+};
+static size_t blob_bytes(const HBlob& b) {
+    size_t t = 0;
+    for (size_t x : b.n) t += (x + 4095) / 4096 * 4096;
+    return t;
+}
+
 // A sequence slot: its recurrent state on the GPUs (Worker slot s) and a region of the KV pool in periods.
 struct Slot {
     Conv* conv = nullptr;     // resident conversation (null: free)
@@ -412,6 +433,11 @@ struct FE {
     std::list<Conv> convs;
     HostPool hpool;
     size_t budget = 0;            // FLASH_KV_ARCHIVE_GB (host bytes of all archives)
+    std::list<Pin> pins;          // pinned system-end prefixes (FLASH_PREFIX_GB; needs the archive)
+    size_t pin_budget = 0, pin_used = 0;
+    long long n_pin = 0, n_pin_hit = 0, n_pin_drop = 0;
+    // archive bytes in use: the host pool minus the pinned prefixes (their own budget)
+    size_t aused() const { const size_t u = hpool.used(); return u > pin_used ? u - pin_used : 0; }
     int next_id = 1, ckpt_every = 8192, ckpt_min = 512, ckpt_keep = 6, end_cut = 4096;
     unsigned long long tick = 0;
     const Conv* hold = nullptr;   // the conversation a start is restoring from (never evicted meanwhile)
@@ -858,7 +884,7 @@ struct FE {
     // pinned bytes + MemAvailable - margin on top of what it holds); logged while it caps the budget
     qe_hostmem::CapLog cap_log;
     size_t eff_budget() {
-        const size_t used = hpool.used(), cap = std::min(budget, used + hpool.pinned_free() + qe_hostmem::headroom());
+        const size_t used = aused(), cap = std::min(budget, used + hpool.pinned_free() + qe_hostmem::headroom());
         if (cap < budget) {
             if (cap_log.due(cap / 1e9))
                 fprintf(stderr, "[qflash] archive: host memory low, budget capped at %.1f of %.1f GB (%.1f GB used, "
@@ -882,9 +908,10 @@ struct FE {
         size_t got = hpool.release(d);
         if (got < d) {
             const size_t target = u0 > d - got ? u0 - (d - got) : 0;
-            make_room(0, nullptr, target);
+            make_room(0, nullptr, target > pin_used ? target - pin_used : 0);
             got += hpool.release(d - got);
         }
+        while (got < d && drop_pin("host memory low")) got += hpool.release(d - got);  // pinned prefixes go last
         static double last_log = -1e18;  // a persistent deficit (nothing left to give) is logged once a minute
         const double tnow = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
         if (got == 0 && hpool.used() == u0 && tnow - last_log < 60) return;
@@ -895,7 +922,7 @@ struct FE {
     }
     bool make_room(size_t need, const Conv* keep, size_t limit = (size_t)-1) {
         if (limit == (size_t)-1) limit = eff_budget();
-        while (hpool.used() + need > limit) {
+        while (aused() + need > limit) {
             auto victim = convs.end();
             for (auto it = convs.begin(); it != convs.end(); ++it) {
                 if (&*it == keep || &*it == hold || it->slot >= 0) continue;
@@ -995,10 +1022,75 @@ struct FE {
                          c->id, s, hn, now_ms() - t0, hpool.used() / 1e9, hpool.pinned() / 1e9);
         return true;
     }
+    // ---- pinned prefixes (FLASH_PREFIX_GB)
+    // drop the pinned prefix worth least (lowest prio, least recently used); false: none
+    bool drop_pin(const char* why) {
+        auto v = pins.end();
+        for (auto it = pins.begin(); it != pins.end(); ++it)
+            if (v == pins.end() || it->prio < v->prio || (it->prio == v->prio && it->used < v->used)) v = it;
+        if (v == pins.end()) return false;
+        fprintf(stderr, "[qflash] archive: pinned prefix %zu tokens dropped (%s; %.2f GB, pinned %.2f of %.2f GB)\n",
+                v->toks.size(), why, v->bytes / 1e9, (pin_used - v->bytes) / 1e9, pin_budget / 1e9);
+        pin_used -= v->bytes;
+        pins.erase(v);
+        n_pin_drop++;
+        return true;
+    }
+    Pin* find_pin(const int* ids, int pos, long long sk) {
+        for (auto& x : pins)
+            if (x.steer == sk && (int)x.toks.size() == pos && std::equal(x.toks.begin(), x.toks.end(), ids)) return &x;
+        return nullptr;
+    }
+    // pin the system end of slot s at pos (its rows [0, pos) are in its region, st = its committed state at pos)
+    void pin_prefix(int s, int pos, const std::shared_ptr<State>& st) {
+        Slot& q = sl[s];
+        Conv* c = q.conv;
+        if (!pin_budget || !budget || !c || pos < ckpt_min || (int)q.hist.size() < pos) return;
+        if (Pin* x = find_pin(q.hist.data(), pos, c->steer)) {
+            x->used = ++tick;
+            x->prio = std::max(x->prio, c->prio);
+            return;
+        }
+        if (!st || st->pos != pos || st->pend) return;
+        const double t0 = now_ms();
+        const int b = q.base;
+        auto pc = [&](int r, std::vector<Worker::Piece>& ps) { W[r]->kv_pieces_at(b, 0, pos, ps); };
+        const std::vector<size_t> sizes = sizes_of(pc);
+        size_t need = blob_bytes(*st);
+        for (size_t x : sizes) need += (x + 4095) / 4096 * 4096;
+        if (need > pin_budget) {
+            fprintf(stderr, "[qflash] archive: system prefix %d tokens not pinned (%.2f GB > FLASH_PREFIX_GB %.2f)\n", pos,
+                    need / 1e9, pin_budget / 1e9);
+            return;
+        }
+        while (pin_used + need > pin_budget)
+            if (!drop_pin("pin budget")) return;
+        mem_guard();
+        if (qe_hostmem::headroom() < need) return;  // the host is short of memory
+        auto kv = std::make_shared<Seg>();
+        if (!kv->alloc(&hpool, sizes)) return;
+        xfer(*kv, pc, true);
+        kv->t0 = 0;
+        kv->t1 = pos;
+        Pin p;
+        p.toks.assign(q.hist.begin(), q.hist.begin() + pos);
+        p.steer = c->steer;
+        p.kv = kv;
+        p.st = st;
+        p.bytes = need;
+        p.prio = c->prio;
+        p.used = ++tick;
+        pins.push_back(std::move(p));
+        pin_used += need;
+        n_pin++;
+        fprintf(stderr, "[qflash] archive: pinned system prefix %d tokens of slot %d (%.2f GB: KV %.2f + state %.2f; "
+                        "pinned %.2f of %.2f GB, %zu prefixes, %.1f ms)\n", pos, s, need / 1e9, (need - blob_bytes(*st)) / 1e9,
+                blob_bytes(*st) / 1e9, pin_used / 1e9, pin_budget / 1e9, pins.size(), now_ms() - t0);
+    }
     // best cached start for ids[0, n): conversation, positions reused, state to load (null: the live end of a slot)
     // best cached start for ids[0, n): conversation, positions reused, state to load (null: the live end of a slot);
     // maxm: the longest common prefix with any known sequence (a divergence point worth a checkpoint)
-    struct Src { Conv* c = nullptr; int L = 0; std::shared_ptr<State> st; bool live = false; int maxm = 0; };
+    struct Src { Conv* c = nullptr; int L = 0; std::shared_ptr<State> st; bool live = false; int maxm = 0; Pin* pin = nullptr; };
     Src best(const int* ids, int n, bool any_slot) {
         const long long sk = steer_key();
         Src b;
@@ -1029,6 +1121,16 @@ struct FE {
                     b = Src{&c, s->pos, s, false};
                     brank = res ? 2 : 0;
                 }
+        }
+        // a pinned prefix (host copy, like an archived checkpoint): only when no conversation offers as much
+        for (auto& x : pins) {
+            const int P = x.toks.size();
+            if (x.steer != sk || P >= n || P < b.L || (P == b.L && b.c)) continue;
+            if (!std::equal(x.toks.begin(), x.toks.end(), ids)) continue;
+            maxm = std::max(maxm, P);
+            b = Src{nullptr, P, x.st, false};
+            b.pin = &x;
+            brank = -1;
         }
         b.maxm = maxm;
         return b;
@@ -1154,7 +1256,20 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         const std::string busy = qe_gpu_guard::acquire(e->devs);
         if (!busy.empty()) { fprintf(stderr, "qflash: %s\n", busy.c_str()); delete e; return nullptr; }
     }
-    e->ctx = max_t > 0 ? std::min(max_t, 262144) : 262144;
+    // above the native 262,144 only as the YaRN opt-in with the KV pool in host RAM (FLASH_KV=ram): up to
+    // 262,144 x the YaRN factor (FLASH_YARN, else context / 262,144), at most 4M
+    if (max_t > NATIVE_CTX) {
+        if (!kv_ram_mode()) {
+            fprintf(stderr, "qflash: context %d > 262144 (YaRN) needs FLASH_KV=ram: context 262144 used\n", max_t);
+            max_t = NATIVE_CTX;
+        } else {
+            max_t = std::min(max_t, 4 * 1024 * 1024);
+            if (!env_set("FLASH_YARN")) set_yarn_factor((double)max_t / NATIVE_CTX);
+            if (yarn_factor() > 0) max_t = std::min<long long>(max_t, (long long)(yarn_factor() * NATIVE_CTX));
+            else fprintf(stderr, "qflash: context %d with FLASH_YARN off: positions above 262144 are outside the trained range\n", max_t);
+        }
+    }
+    e->ctx = max_t > 0 ? max_t : NATIVE_CTX;
     e->kmax = env_int("FLASH_MTP_K", 3);
     // QE_STEER / QE_STEER_DIR (flash_steer.h): checked first, a refused vector stops the start
     try {
@@ -1395,9 +1510,13 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         e->max_pf = e->batch_api ? std::max(1, std::min(Worker::PFSEG_MAX, env_int("FLASH_MAX_PREFILLS", 8))) : 1;
         const bool pin = env_int("FLASH_ARCHIVE_PINNED", 1);
         const double head = env_double("FLASH_ARCHIVE_HEADROOM_GB", 4.0);
-        if (e->budget && pin) e->hpool.start(e->budget, (size_t)1 << 30, (size_t)(head * 1e9));
-        fprintf(stderr, "[qflash] %zu sequence slots over a pool of %d periods; archive: %.1f GB host budget%s, checkpoints every %d tokens\n",
-                e->sl.size(), e->np, e->budget / 1e9, pin ? " (pinning in the background)" : " (pageable)", e->ckpt_every);
+        // pinned system prefixes: their own host budget next to the archive's (0: off)
+        const double pgb = env_double("FLASH_PREFIX_GB", 8.0);
+        e->pin_budget = e->budget && pgb > 0 ? (size_t)(pgb * 1e9) : 0;
+        if (e->budget && pin) e->hpool.start(e->budget + e->pin_budget, (size_t)1 << 30, (size_t)(head * 1e9));
+        fprintf(stderr, "[qflash] %zu sequence slots over a pool of %d periods; archive: %.1f GB host budget%s, checkpoints every %d tokens, "
+                "pinned system prefixes %.1f GB\n", e->sl.size(), e->np, e->budget / 1e9, pin ? " (pinning in the background)" : " (pageable)",
+                e->ckpt_every, e->pin_budget / 1e9);
     }
     fprintf(stderr, "[qflash %.0fs] ready, context %d\n", secs(), e->ctx);
     return e;
@@ -1620,6 +1739,32 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         e->last_from_archive = true;
         e->n_restore++;
         pf.ms_restore = FE::now_ms() - t0 - pf.ms_pool;
+    } else if (s.pin) {  // a pinned system prefix: its KV rows + state from host memory, a new conversation shares them
+        const double t0 = FE::now_ms();
+        y = acquire_slot(e, n, {});
+        if (y < 0) return e->hold = nullptr, -1;
+        pf.ms_pool = FE::now_ms() - t0;
+        Pin& pn = *s.pin;
+        L = s.L;
+        e->bind(y);
+        e->job = [&](int r) { e->W[r]->kv_claim(L); };
+        e->run();
+        e->xfer_part(*pn.kv, e->sl[y].base, 0, L, L);
+        e->xfer(*pn.st, [&](int r, std::vector<Worker::Piece>& ps) { e->W[r]->state_pieces_of(y, false, ps); }, false);
+        for (int r = 0; r < e->ng; r++) e->W[r]->set_slot_prev_m(y, 0);
+        e->sl[y].hist.assign(pn.toks.begin(), pn.toks.end());
+        target = new_conv(nullptr);
+        target->segs.push_back(pn.kv);
+        target->kv_n = L;
+        target->ck.push_back(pn.st);
+        pn.used = ++e->tick;
+        e->n_pin_hit++;
+        e->last_copied = L;
+        e->last_from_archive = true;
+        e->n_restore++;
+        pf.ms_restore = FE::now_ms() - t0 - pf.ms_pool;
+        if (e->log) fprintf(stderr, "[qflash] archive: slot %d starts from the pinned system prefix (%d tokens, %.1f ms)\n", y, L,
+                            pf.ms_restore);
     } else {
         y = acquire_slot(e, n, {});
         if (y < 0) return e->hold = nullptr, -1;
@@ -1644,6 +1789,9 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
             it = it->slot < 0 ? e->convs.erase(it) : std::next(it);
         target->ck.clear();
     }
+    // a start resumed exactly at its system end from a conversation's checkpoint: that prefix is pinned if it is not yet
+    // (the pin was dropped, or the checkpoint predates it)
+    if (e->pin_budget && hint == L && L > 0 && !s.pin && !s.live && s.st && !s.st->pend) e->pin_prefix(y, L, s.st);
     e->last_reused = L;
     pf.reused = L;
     pf.copied = e->last_copied;
@@ -1722,7 +1870,9 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
 
 static void take_ck(FE* e, const FE::Pf& pf, int pos) {
     const int kind = pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : pos % e->ckpt_every ? 5 : 3;  // 5: divergence point
-    e->add_ck(e->sl[pf.slot].conv, e->save_state(pf.slot, false, kind));  // (the prompt's slot: qe_prefill_multi)
+    auto st = e->save_state(pf.slot, false, kind);
+    e->add_ck(e->sl[pf.slot].conv, st);  // (the prompt's slot: qe_prefill_multi)
+    if (kind == 1) e->pin_prefix(pf.slot, pos, st);  // the system end of an agent kind: pinned outside the LRU
 }
 
 // Prompt start, phase 2: prefill up to `budget` more tokens (batches); 1 when the prompt is done
@@ -2496,6 +2646,8 @@ void qe_reset(void* p) {
         e->sl[s] = Slot{};
     }
     e->convs.clear();
+    e->pins.clear();
+    e->pin_used = 0;
     e->update_top();
     e->rebind();
     e->pfs.clear();
@@ -2570,7 +2722,7 @@ void qe_set_prio(void* p, int slot, int prio) {
     Slot& q = e->sl.at(e->batch_api ? slot : e->cs);
     if (q.conv) q.conv->prio = prio;
 }
-int qe_num_pinned(void*) { return 0; }
+int qe_num_pinned(void* p) { return (int)((FE*)p)->pins.size(); }
 int qe_last_copied(void* p) { return ((FE*)p)->last_copied; }
 int qe_last_from_archive(void* p) { return ((FE*)p)->last_from_archive ? 1 : 0; }
 

@@ -88,6 +88,12 @@ struct KvPool {
 constexpr bool kKvRamDefault = false;  // FLASH_KV default (ram | vram)
 bool kv_ram_mode();          // FLASH_KV / FLASH_KV_STREAM
 long long kv_ram_tokens();   // FLASH_KV_RAM_TOKENS
+// YaRN RoPE scaling (opt-in; model card: rope_type yarn, factor 4.0, original_max_position_embeddings 262144):
+// FLASH_YARN=<factor> (0 / 1: off), else the factor the caller set for a context above the native one (context /
+// 262,144; set_yarn_factor before the Workers are made). Contexts above 262,144 need FLASH_KV=ram.
+constexpr int NATIVE_CTX = 262144;
+void set_yarn_factor(double f);
+double yarn_factor();        // 0: off
 // ranks: 2 or 3 (every split below divides: 24 QSA q heads, 48 DeltaNet value / 16 key heads, 512-position KV
 // ownership per period of 512 x ngpu positions)
 struct Plan {
@@ -267,20 +273,21 @@ public:
     void prefill_mtp(const int* mtp_toks, int pos, int m, int* draft);  // MTP block over the last prefill chunk's rows
     // batched prefill of n <= pf_batch() rows: layer by layer, the mixer (attention / DeltaNet) in chunks of PFM rows,
     // the MoE half over all n rows at once (each expert group read once per batch); argmax/sample of the last row
-    int pf_batch() const { return pfbn_; }
+    // ctx_end: the absolute context end of the coming batches (0: the sequence regions, kv_top_); rows past
+    // pfbn_mid_ live in the tails of the KV arrays (al_*), usable while the KV rows in use stay below them
+    int pf_batch(long long ctx_end = 0) const { return pfbn_ > pfbn_mid_ && !al_room(ctx_end) ? pfbn_mid_ : pfbn_; }
     // rows of a prefill batch whose buffers never take memory from the expert cache (the rest of pf_batch() is
     // borrowed from it for the batch, prefill-r3)
     int pf_batch_base() const { return pfbn_base_; }
     // rows of the next prefill batch with r rows left and batches of up to B rows: nominal B - PFM (a tail of <= PFM
     // rows joins the last one); with big batches (B > pf_batch_base()) the last two are balanced when the plain split
-    // would leave a tail of <= pf_batch_base() rows and both halves can be big (FLASH_PF_BALANCE, default 1): a small
+    // would leave a tail of <= pf_batch_base() rows and both halves can be big: a small
     // batch stages only the base part of the cold groups (no ring extension) and runs the MoE over the whole batch
     // (2 GPUs 10K: 4096 + 4096 + 2105 -> 4096 + 3584 + 2617); only with a ring extension (pfs_ext_, L1)
     int pf_batch_rows(int r, int B) const {
         if (r <= B) return r;
         const int nb = B - PFM;
-        static const bool bal = env_int("FLASH_PF_BALANCE", 1);
-        if (bal && pfs_ext_ && B > pfbn_base_ && r - nb <= pfbn_base_) {  // (3 GPUs: no extension, 10K +1.5 % when balanced)
+        if (pfs_ext_ && B > pfbn_base_ && r - nb <= pfbn_base_) {  // (3 GPUs: no extension, 10K +1.5 % when balanced)
             const int m = ((r + 1) / 2 + PFM - 1) / PFM * PFM;
             if (m <= nb && r - m > pfbn_base_) return m;
         }
@@ -598,10 +605,9 @@ private:
     void ec_tick(int ctx_end, int kind);  // before every launch: kind 0 decode step, 1 prefill / other
     void ec_collect();
     ColdTab ctab(const Layer& L) const { return ColdTab(ec_tab_d_ ? ec_tab_d_ + L.coff : nullptr, ec_touch_d_ ? ec_touch_d_ + L.coff : nullptr); }
-    // prefill staging of cold groups (FLASH_PF_STAGE): the copy engine copies a layer's host-backed groups into one half
+    // prefill staging of cold groups (own ring pfs_ring_): the copy engine copies a layer's host-backed groups into one half
     // of a device ring two layers ahead; the prefill MoE of that layer reads them through pfs_tab_d_ (ring addresses)
-    int pfs_mode_ = 0;                  // 0 off, 1 own ring (allocated, default), 2 ring lent by the expert cache
-    // sequence-parallel HC in prefill (FLASH_HCSP): each card runs the hyper-connection reads only on its own rows of
+    // sequence-parallel HC in prefill (hcsp_ok): each card runs the hyper-connection reads only on its own rows of
     // every chunk (the rows its all-reduce reduces) and all-gathers x / xh, instead of HC on all rows on every card
     char* agdst_[3][4] = {};      // [x, xh, R][rank] batch-row arrays of every card
     unsigned *agflags_ = nullptr, *agseq_ = nullptr, *agscnt_ = nullptr;  // [2 channels][4 senders], [2], [2][4]
@@ -620,7 +626,7 @@ private:
     unsigned* hagf_ = nullptr;          // [2 channels][data, ack][4 senders]
     char* hag_p_[4] = {};
     unsigned* hagf_p_[4] = {};
-    float* xouti_ = nullptr;  // CE: device outbox of the indexer-key exchange (FLASH_IDX_CE)
+    float* xouti_ = nullptr;  // CE: device outbox of the indexer-key exchange
     int xi_k_ = 0;            // indexer exchanges of the batch so far (staged slot parity)
     float *xout_ = nullptr, *xoutc_ = nullptr, *hxq_ = nullptr, *hxc_ = nullptr;  // device outboxes of q / partials
     unsigned *xsw_ = nullptr, *agw_ = nullptr;  // CE: sequence-number words copied into the peers' flags after the rows
@@ -638,17 +644,12 @@ private:
     bool xce_rec_[2] = {};                        // recorded in this batch (waits / joins only on those: graph capture)  // after the send kernel (into the outbox)
     Xchg xchg_outbox(int e, const Xchg& x, int par, size_t per) const;        // the send kernel's view: outbox + dummy flags
     void trunk_batch_sp(int n, unsigned selmask);
-    void trunk_batch_sp1(int n, unsigned selmask);  // per-chunk collectives (FLASH_PFU=0)
     int pf_units(int n, int* ub, int* cb) const;
     bool hcsp_ok(int n) const;
-    char* pfs_ring_ = nullptr;          // mode 1: [2][pfs_cap_] groups
-    std::vector<int> pfs_slots_;        // mode 2: the expert-cache slots of the ring (highest KV offsets)
+    char* pfs_ring_ = nullptr;          // [2][pfs_cap_] groups (null: no staging)
     struct PfsRun { int p0, n; char* addr; };
     std::vector<PfsRun> pfs_runs_[2];   // contiguous slot runs of each ring half (one copy per run)
-    bool pfs_borrowed_ = false, pfs_now_ = false;
-    int pfs_idle_ = 0;
-    bool pfs_borrow();
-    void pfs_release();
+    bool pfs_now_ = false;
     int pfs_cap_ = 0;                   // groups per ring half (layers with more stage the first pfs_cap_, rest zero-copy)
     // ring extension (FLASH_PF_STAGE_XMB, prefill-compute): ring positions [pfs_cap0_, pfs_cap_) of each half live in
     // pfs_ext_, expert-cache slots between big batches (a bt region, as the big-batch buffer tails); a batch without
@@ -657,7 +658,9 @@ private:
     char* pfs_ext_ = nullptr;
     bool pfs_ext_lent_ = false;         // the extension is cache slots outside big batches
     bool pfs_full_ = false;             // this batch stages pfs_cap_ groups per layer (else pfs_cap0_)
-    bool pfdec_ = false;                // this prefill batch's QSA attention per row (k_qsa_dec), FLASH_ATTN_PFSEL_MAX
+    // prefill batches from this position on run the QSA attention per row (k_qsa_dec) instead of k_qsa_pfsel
+    static constexpr long long kPfselMax = 8192;
+    bool pfdec_ = false;                // this prefill batch's QSA attention per row (k_qsa_dec), kPfselMax
     uintptr_t* pfs_tab0_d_ = nullptr;   // the table with pfs_cap0_ staged groups per layer
     int pfs_capn() const { return pfs_full_ ? pfs_cap_ : pfs_cap0_; }
     char* pfs_addr(int half, int p) const {
@@ -673,7 +676,7 @@ private:
     ColdTab stab(const Layer& L) const { return ColdTab((pfs_full_ ? pfs_tab_d_ : pfs_tab0_d_) + L.coff, pfs_touch_d_ + L.coff); }
     void pfs_init();
     void pfs_copy(int li);
-    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool pf = false; bool bt = false; int prev = -1; bool ik = false; };  // ik: in the tail of an indexer-key array (KV streaming)  // pf: lent to the prefill staging ring; bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
+    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool bt = false; int prev = -1; bool ik = false; bool al = false; };  // al: a KV-array tail that is also mapped as big-batch rows (al_*)  // ik: in the tail of an indexer-key array (KV streaming)  // bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
     std::vector<float> ec_prior_;
     std::vector<EcSlot> ec_slots_;
     std::vector<int> ec_slot_of_;      // cold group -> slot or -1
@@ -703,7 +706,9 @@ private:
         int* gsel;
         float *Rm = nullptr, *Rm2 = nullptr, *Rsave = nullptr, *mtp_fe = nullptr, *mtp_fh = nullptr;
     };
-    void alloc_rows(int n, Bufs& b, int nb = 0);  // nb > n: the buffers of the batched MoE half get nb rows
+    void alloc_rows(int n, Bufs& b, int nb = 0);
+    static std::vector<size_t> bt_row_bytes();
+    void* bt_buf(int n, size_t rb);  // nb > n: the buffers of the batched MoE half get nb rows
     void trunk_batch(int n, unsigned selmask);
     unsigned batch_sel(int pos, int n);  // chunks with block selection -> bits; also stages the chunk positions
     int pfbn_ = PFM;
@@ -717,6 +722,20 @@ private:
     int pfbn_base_ = PFM;
     std::vector<std::pair<char*, size_t>> bt_regs_;
     bool bt_want_ = false, bt_taken_ = false;
+    // Big-batch rows past pfbn_mid_ (FLASH_PFB_ALIAS, default on with KV in VRAM): their buffer tails are mapped
+    // (CUDA VMM) onto the same physical memory as the last al_arr_ bytes of every KV K / V array. Those bytes are
+    // expert-cache slots (al) until a batch of more than pfbn_mid_ rows takes them (evicted, refilled after it, as the
+    // bt slots) and KV only once the pool is nearly full; such a batch runs only while the KV rows in use end below
+    // al_off_ (al_room; else pf_batch() gives pfbn_mid_). So the bigger batch costs no static expert residency.
+    int pfbn_mid_ = PFM;
+    size_t al_gran_ = 0, al_arr_ = 0, al_off_ = 0;   // VMM granularity, alias bytes per KV array, its offset there
+    std::vector<unsigned long long> al_pool_;         // physical chunks (al_gran_ each) of the KV tails, in order
+    size_t al_next_ = 0;                              // next unused chunk of al_pool_
+    int al_ndev_ = 0, al_devs_[8] = {};               // devices granted access to the mappings (own + P2P peers)
+    bool al_want_ = false, al_taken_ = false;
+    bool al_room(long long ctx_end) const;            // the KV rows of the pool up to ctx_end (or kv_top_) end below al_off_
+    size_t kv_bound_rows(long long ctx_abs) const;    // KV rows in use for an absolute context end (as ec_tick)
+    char* vmm_map(size_t own_bytes, size_t al_chunks, bool to_pool);  // own head + al chunks (from / into al_pool_)
     void bt_clear_y(int n);  // big batch: its borrowed rows of the y accumulator zeroed (rows [pfbn_base_, n))
     int* pfinv_ = nullptr;         // slot of every (row, k) of the batch's routing
     bool mtpb_ = false, mtpb_last_ = false;  // prefill_batch with the MTP layer
@@ -826,7 +845,7 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     QsaBack qpend_[2];
     int qsa_split_ = 0, qsa_buf_ = 0, qsa_ahead_ = 0;
     float *projB_ = nullptr, *attnB_ = nullptr;  // slot 1 copies of proj_ / attn_x_ (in the MoE activation buffer)
-    // prefill row GEMM of a W8 matrix: W8A8 (k_rows_q, FLASH_ROWS_Q) for m >= 64 prefill rows, else gemv_w8_rows
+    // prefill row GEMM of a W8 matrix: W8A8 (k_rows_q) for m >= 64 prefill rows, else gemv_w8_rows
     void rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st);
     void ple(Layer& L, int pos, int m, const bf16* rows);
 
@@ -868,6 +887,15 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     float *gw_ = nullptr, *gsh_ = nullptr;
     int* lmap_ = nullptr;
     std::vector<std::pair<void*, size_t>> allocs_;
+    // debug FLASH_LEND_CHECK=1 (lend_audit, flash.cu): memory lent to the expert cache vs buffers written meanwhile.
+    // lend_own_: allocations that contain lent memory -> their bytes that are never lent (0: lent / reclaimed by the
+    // KV bound at run time); lend_sub_: own regions outside allocs_ (VMM heads) and sub-buffers carved out of them
+    std::vector<std::pair<uintptr_t, size_t>> lend_own_;
+    std::vector<std::tuple<uintptr_t, size_t, const char*>> lend_sub_;
+    std::vector<std::pair<uintptr_t, int>> lend_slots_;  // sorted slot addresses -> ec_slots_ index (lend_use)
+    bool lend_done_ = false;
+    void lend_audit();
+    void lend_use(const void* p, size_t bytes, const char* what);
     std::vector<Layer> L_;
     HcW mixer_;
     // MTP head
@@ -927,10 +955,10 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     float *pairs_ = nullptr, *pairs_all_ = nullptr;
     int* otok_ = nullptr;
     float* xrecv_ = nullptr;
-    unsigned *xflags_ = nullptr, *xseq_ = nullptr, *xdone_ = nullptr, *xscnt_ = nullptr, *xqscnt_ = nullptr;
+    unsigned *xflags_ = nullptr, *xseq_ = nullptr, *xdone_ = nullptr, *xscnt_ = nullptr, *xqscnt_ = nullptr, *xiscnt_ = nullptr;
     float* xpr_[4] = {};
     bool qsa_a_ = false;
-    bool agq_on_ = false;     // FLASH_MOE_AGQ: MoE input quantized + routed on the owner, compact rows gathered
+    bool agq_on_ = false;     // MoE input quantized + routed on the owner, compact rows gathered
     bool moe_pre_ = false;    // this moe() call's rows are quantized and routed already (gsel_ / gw_ / gsh_ at the rows)
     bf16* agq_x_ = nullptr;   // owner scratch [AG_CAP][H]: router input x
     int8_t* agq_r8_ = nullptr;
@@ -1041,7 +1069,7 @@ private:
     cudaEvent_t ev0_ = nullptr, ev1_ = nullptr;
     // batched prefill: all-reduces + residual updates on a second stream, overlapped with the next chunks' compute
     cudaStream_t cst_ = nullptr;
-    // CE (FLASH_AG_SPLIT): second comm stream for the part of a prefill collective after the reduce-scatter (HC read,
+    // CE: second comm stream for the part of a prefill collective after the reduce-scatter (HC read,
     // router / quantization, row all-gather), so the next unit's reduce-scatter goes on the link meanwhile
     cudaStream_t cst2_ = nullptr;
     cudaEvent_t evs_ = nullptr;

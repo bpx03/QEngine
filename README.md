@@ -8,8 +8,9 @@ with tensor parallelism 3 over PCIe.
 in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
 in our quick tests.
 
-> **QEngine 1.3.1: Qwen3.8-Flash-Next.** QEngine 1.3.1 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s, now with
-> image input, an opt-in KV cache in host RAM and faster prefill on 2 cards: see [Qwen3.8-Flash-Next](#qwen38-flash-next)
+> **QEngine 1.3.2: Qwen3.8-Flash-Next.** QEngine 1.3.2 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s with
+> image input, an optional KV cache in host RAM, an opt-in context of up to 1M tokens, pinned system prompts for
+> agents and faster prefill on 2 cards: see [Qwen3.8-Flash-Next](#qwen38-flash-next)
 > and the ready-to-run model on [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine); the `latest`
 > Docker image runs both models.
 
@@ -423,7 +424,7 @@ is not steered (drafts are verified by the steered model).
 
 ### Included vector (Flash-Next)
 
-QEngine 1.3.1 ships one vector for Qwen3.8-Flash-Next, **off by default**: `vectors/refusal_projection.gguf` with its
+Since 1.3.1, QEngine ships one vector for Qwen3.8-Flash-Next, **off by default**: `vectors/refusal_projection.gguf` with its
 sidecar `vectors/refusal_projection.json` (`project` mode, layers 8-33). It projects a refusal direction out of the
 residual stream, so the model declines far fewer requests.
 
@@ -530,13 +531,14 @@ with top-10 + a shared expert, 4-stream hyper-connections, a per-layer n-gram em
 - **2 cards**: about half of the expert groups do not fit in VRAM and stay in pinned host memory, about 15 GB per card
   (30 GB together), read over PCIe or copied into the expert cache when hot. Host RAM with 2 cards: about 85 GB
   with the archive off, about 130 GB with the defaults. On 2 cards long prompts are copied in large batches through a
-  staging ring, so the host-backed experts cost little prefill speed (a 90K prompt at about 5.2K tok/s); decode with
+  staging ring, so the host-backed experts cost little prefill speed (a 90K prompt at about 5.4K tok/s); decode with
   many concurrent requests reads more of them over PCIe. Numbers: see [Numbers](#numbers-131-october-30-2026).
   Next-token KL against the 3-card engine 9.1e-5 (within its run-to-run noise).
 - **Host RAM**: by default the n-gram embedding table is pinned in host memory, 51.8 GB in its INT8 form (102.4 GB as
   BF16); together with the host-resident expert groups and the embeddings that is **about 64 GB with the archive
   off** (`FLASH_KV_ARCHIVE_GB=0`). The conversation archive (default `FLASH_KV_ARCHIVE_GB=48`) adds up to its size, so
-  plan for **about 110 GB** with the defaults, or about 80 GB with `FLASH_KV_ARCHIVE_GB=16`. The archive is pinned
+  plan for **about 110 GB** with the defaults (plus up to 8 GB of pinned system prompts, `FLASH_PREFIX_GB`, as
+  agent kinds appear), or about 80 GB with `FLASH_KV_ARCHIVE_GB=16`. The archive is pinned
   host memory: set `FLASH_KV_ARCHIVE_GB` to what is free after about 64 GB for the engine itself (a tmpfs `/tmp`
   also takes RAM). A budget larger than that is safe but not used: the archive stops at `MemAvailable` minus a
   margin and gives memory back when other programs need it (see Host RAM safety).
@@ -564,7 +566,8 @@ K/V rows of the 12 sparse-attention layers and the MTP layer live in pinned host
 indexer keys of every position plus a cache of recently used KV blocks. The blocks the indexer selects that are not
 in the cache are copied from host RAM inside the step (the selection changes little from step to step). Output is
 bit-identical to the VRAM pool. The pool then holds as many tokens as you give it RAM, so many long conversations
-stay resident at once; one conversation is still limited to the model context (262,144 tokens).
+stay resident at once; one conversation is limited to the model context (262,144 tokens) unless you turn on the
+[1M-token context](docs/advanced.md#context-up-to-1m-tokens-yarn-opt-in) (`--max-ctx 1M`, YaRN).
 
 Turn it on with `FLASH_KV=ram`; `FLASH_KV_RAM_TOKENS` (default `1M`, accepts `K` / `M` / `G`, e.g. `10M`) sizes the
 pool of all conversations together (see the [settings table](#settings)). The VRAM block cache follows the running conversations:
@@ -682,12 +685,13 @@ The settings a Flash-Next setup usually needs; everything else has a measured de
 | `--vision 1` | off | image input (encoder on the last GPU, ~0.6 GB of VRAM there; Docker: the `vision` image), see [Image input](#image-input-flash-next) |
 | `FLASH_KV` | `vram` | where the attention KV of all conversations lives: `vram` (one pool of 262,144 tokens) or `ram` (pinned host RAM, bit-identical output; for many long conversations at once), see [KV cache in host RAM](#kv-cache-in-host-ram-opt-in) |
 | `FLASH_KV_RAM_TOKENS` | `1M` | with `FLASH_KV=ram`: tokens of all conversations together; about 74K tokens per GB of host RAM (1M = 13.5 GB); accepts `K` / `M` / `G` |
+| `--max-ctx` | `262144` | tokens per conversation. Flash-Next above 262,144 (`512K`, `1M` = 1,048,576) turns on YaRN RoPE scaling (the model card's long-context setting) and needs `FLASH_KV=ram`; the default stays the native RoPE. See [docs/advanced.md](docs/advanced.md#context-up-to-1m-tokens-yarn-opt-in) |
 | `FLASH_MAX_SEQS` | 16 | sequence slots (conversations served at once, 1..16); lower it to free VRAM for the expert cache on a single-user setup |
 | `FLASH_KV_ARCHIVE_GB` | 48 | host-RAM archive of conversations (0 = off). When it is full, finished and normal conversations go first (least recently used); the main agent thread gives back its newest part first and keeps a prefix it resumes from. Capped at what the host can spare (see Host RAM safety) |
 | `FLASH_EC_MARGIN_MB` | 256 | VRAM per card left free next to the expert cache; a list sets it per card, e.g. `256,2048,256` when GPU1 drives a desktop. CUDA graphs of new conversation shapes grow into it; when one does not fit, the engine drops its cached graphs and retries, and if that fails runs the step without a graph instead of stopping, so the default works for few-slot setups too |
 | `FLASH_COMM` | `auto` | prefill transfers between the cards: `auto` (startup probe, see [Interconnect probe](#hardware-requirements-and-limitations)), `p2p`, `pull` / `push` (P2P with SM loads by the receiver / SM stores by the sender on every pair), `ce` (copy engine), `host` (through pinned host memory); decode unchanged |
 | `QE_STEERING` (Docker) | 0 | `1`: the [included steering vector](#included-vector-flash-next) `refusal_projection` is the default of every request; `<name>`: that vector (included or mounted at `/vectors`) is the default; any value but 0 loads all of them (a request picks one with `"steering": "<name>"` or sends `"steering": false`); 0 loads nothing |
-| `FLASH_PFB_BIG` | 4096 | rows of a large prefill batch (used when nothing else decodes). `8192` makes long prompts faster on 2 cards (10K -21 %, 90K -7 % prefill time) at -0.8 % decode; no gain on 3 cards. See [docs/advanced.md](docs/advanced.md#large-prefill-batches-flash_pfb_big) |
+| `FLASH_PFB_BIG` | 8192 on 2 cards, 4096 on 3 | rows of a large prefill batch (used when nothing else decodes). On 2 cards the rows past 4096 share memory with the unused end of the KV cache, so decode keeps its expert residency: long prompts prefill faster (server 10K +5 %, 90K +4 %) at unchanged decode. `4096` is the old default, `0` turns large batches off. See [docs/advanced.md](docs/advanced.md#large-prefill-batches-flash_pfb_big) |
 
 More settings (KV block cache, prefill sharing, n-gram table, lookup drafts, deterministic runs, image encoder) and a
 troubleshooting table (P2P data check, non-finite output guard, out-of-memory log lines):
@@ -756,8 +760,8 @@ With 8 concurrent agents on 2 GPUs the median time to first token went from 1.10
 same decode speed.
 
 **Slow links between the cards.** Two cards whose link carries only 3.3 GB/s per direction (PCIe Gen2 x8 class,
-emulated on our cards with the copy-engine path): prefill 4.1K tok/s at 10K and at 90K tokens, against 2.7K / 2.6K
-before the 1.3.1 link and prefill work.
+emulated on our cards with the copy-engine path): prefill 4.1K tok/s at 10K and 4.5K tok/s at 90K tokens, against
+2.7K / 2.6K before the 1.3.1 link and prefill work.
 
 ### Known limitations
 
@@ -797,7 +801,7 @@ docker pull ghcr.io/bpx03/qengine:latest          # ~0.3 GB, no image input
 docker pull ghcr.io/bpx03/qengine:vision          # ~3 GB, with the vision encoder (torch)
 ```
 
-Tags: `latest` / `1.3.1` and `vision` / `1.3.1-vision`, built from `main` (1.3.1; both engine libraries, so the same
+Tags: `latest` / `1.3.2` and `vision` / `1.3.2-vision`, built from `main` (1.3.2; both engine libraries, so the same
 image serves Qwen3.8-27B and Qwen3.8-Flash-Next). Earlier releases stay available under their version tags (e.g.
 `1.3` / `1.3-vision`).
 Use `ghcr.io/bpx03/qengine:latest` in place of `qengine` in the commands below, or build the image yourself.
@@ -847,8 +851,8 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Performance in the container matches bare metal (single-user decode, same GPUs).
 
-**Flash-Next** runs in the same image (`latest` or `1.3.1`; image input with `--vision 1` needs the `vision` or
-`1.3.1-vision` image).
+**Flash-Next** runs in the same image (`latest` or `1.3.2`; image input with `--vision 1` needs the `vision` or
+`1.3.2-vision` image).
 Point `QE_MODEL` at the
 Flash-Next model directory and pass the `FLASH_*` variables with `-e`:
 

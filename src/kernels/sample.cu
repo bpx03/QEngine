@@ -79,8 +79,11 @@ __device__ __forceinline__ float uniform(const SampleParams& p, int row, int sal
 // Penalty (pen_active): all kTopK merged candidates get logit -= frequency * c + presence * (c > 0), c = the slot's
 // count + occurrences in ext[0..next) (earlier verify rows), re-sorted, then the top-k of them as without it. A token
 // outside the merged top-kTopK cannot enter (the penalty only lowers logits; 64 >> top_k of the profiles).
+// rs != nullptr (rows of several sequences): only the ext[j] with rs[j] == slot count, the first kTopK of them (read in
+// place: no local copy of the slot's rows, which put sample_rows_slots_kernel's frame above the 1024 B default stack)
 __device__ int row_probs(const float* gathered, int ngpu, int m, int mi, const SampleParams& p,
-                         float* prob, int* tok, const int* ext = nullptr, int next = 0) {
+                         float* prob, int* tok, const int* ext = nullptr, int next = 0, const int* rs = nullptr,
+                         int slot = -1) {
     int head[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const int K = max(1, min(p.top_k, kTopK));
     const bool pen = pen_active(p);
@@ -104,7 +107,11 @@ __device__ int row_probs(const float* gathered, int ngpu, int m, int mi, const S
         const unsigned char* cnt = p.pen->cnt;
         for (int i = 0; i < n; i++) {
             int c = cnt[tok[i]];
-            for (int j = 0; j < next; j++) c += ext[j] == tok[i];
+            if (rs) {
+                for (int j = 0, q = 0; j < next && q < kTopK; j++)
+                    if (rs[j] == slot) { q++; c += ext[j] == tok[i]; }
+            } else
+                for (int j = 0; j < next; j++) c += ext[j] == tok[i];
             if (c > 0) lg[i] -= p.frequency * (float)c + p.presence;
         }
         for (int i = 1; i < n; i++) {  // stable insertion sort, descending (ties keep the merge order)
@@ -187,11 +194,8 @@ __global__ void sample_rows_slots_kernel(const float* gathered, int ngpu, int m,
             tokens[mi] = tok[0];
             continue;
         }
-        int ext[kTopK], next = 0;  // penalty: the slot's earlier (verify) rows of this step
-        if (pen_active(p))
-            for (int j = 0; j < mi && next < kTopK; j++)
-                if (rowslot[j] == s) ext[next++] = tokens[j];
-        const int n = row_probs(gathered, ngpu, m, mi, p, prob, tok, ext, next);
+        // penalty: the slot's earlier (verify) rows of this step (tokens[j] of the rows j < mi with rowslot[j] == s)
+        const int n = row_probs(gathered, ngpu, m, mi, p, prob, tok, tokens, mi, rowslot, s);
         tokens[mi] = draw(prob, tok, n, uniform(p, mi, 0), -1, 0.f);
         touched |= 1ull << (s & 63);
     }

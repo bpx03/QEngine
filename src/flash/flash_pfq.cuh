@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(160) k_xh_to_q(const __half* __restrict__ xh, 
     }
 }
 
-// FLASH_MOE_AGQ (prefill, sequence-parallel HC): the MoE input rows are quantized (k_xh_to_q<64>) and routed on their
+// AGQ (prefill, sequence-parallel HC): the MoE input rows are quantized (k_xh_to_q<64>) and routed on their
 // owner, and only the compact rows travel in the row all-gather: [XQ 2560 B][40 group scales fp32][top-10 ids][top-10
 // weights][shared gate][pad] = AGQ_ROWB bytes instead of the 5120-byte xh row. The receiver rebuilds the XQ rows +
 // scale pairs in place of its XH rows and the routing rows, so the MoE kernels see exactly what they saw before.
@@ -635,10 +635,10 @@ __global__ void k_qpf_qwait(Xchg xq, Plan p) {
     __threadfence_system();
 }
 __host__ __device__ inline size_t qpf_smem(int lbmax) {
-    return qpf_kv_bytes() + qpf_raw_bytes() + (size_t)2 * 3 * QP_KT * 4 + (size_t)QP_UMAX * 4 + QP_UMAX + (size_t)((lbmax + 31) / 32) * 4;
+    return qpf_kv_bytes() + qpf_raw_bytes() + (size_t)2 * 3 * QP_KT * 4 + (size_t)QP_UMAX * 4 + QP_UMAX;
 }
 // The union of the selected blocks of QP_R consecutive rows (ascending list + each row's bit per entry), once per row
-// group (prefill-r4): k_qsa_pfsel built it in every block, i.e. 2 kv heads x S key splits times, ~30 % of its time.
+// group (prefill-r4; built in every k_qsa_pfsel block it was 2 kv heads x S key splits times, ~30 % of its time).
 // grid ceil(m / QP_R), 256 threads, smem (lbmax + 31) / 32 words; out: U[g], ublk[g][QP_UMAX], um[g][QP_UMAX]
 __global__ void __launch_bounds__(256) k_qpf_union(const int* __restrict__ sel, const int* __restrict__ nsel, int m, int lbmax,
                                                    QpUnion qu) {
@@ -713,11 +713,9 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     float* kmeta = reinterpret_cast<float*>(qp_sm + qpf_kv_bytes() + qpf_raw_bytes());  // [buf][kscale | vscale | mask bits][QP_KT]
     int* ublk = reinterpret_cast<int*>(kmeta + 2 * 3 * QP_KT);
     unsigned char* um = reinterpret_cast<unsigned char*>(ublk + QP_UMAX);
-    unsigned* bm = reinterpret_cast<unsigned*>(um + QP_UMAX);
     __shared__ unsigned s_s;
-    __shared__ int s_rc[QP_R], s_nr[QP_R], s_ns[QP_R], s_U, s_wp[33];
+    __shared__ int s_rc[QP_R], s_nr[QP_R], s_U;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
-    const int nw = (lbmax + 31) / 32;
     const size_t rb0 = rbase ? (size_t)rbase[0] : 0;
     if (rbase && !km.pt) { const size_t rb = rb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
     // persistent (prefill-r4, qu.ctr set): a grid of one block per SM takes the (kv head, key split, row group) items
@@ -742,7 +740,6 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     }
     const int gy = t0 / QP_R;
     __syncthreads();
-    for (int i = threadIdx.x; i < nw; i += NTH) bm[i] = 0;
     if (threadIdx.x < QP_R) {
         const int r = threadIdx.x, t = t0 + r;
         if (t < m) {
@@ -750,11 +747,10 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
             const int ns = nsel[t];
             const int nra = owned_upto(p, pos);
             s_nr[r] = nra;
-            s_rc[r] = ns < 0 ? nra : owned_upto(p, IDX_R * ((pos + 1) / IDX_R) - 1);
-            s_ns[r] = ns;  // -1: no selection (every visible key: rows < nra as "tail")
-            if (ns < 0) s_rc[r] = 0;
+            // ns < 0: no selection (every visible key: rows < nra as "tail")
+            s_rc[r] = ns < 0 ? 0 : owned_upto(p, IDX_R * ((pos + 1) / IDX_R) - 1);
         } else {
-            s_nr[r] = 0; s_rc[r] = 0; s_ns[r] = 0;
+            s_nr[r] = 0; s_rc[r] = 0;
         }
     }
     if (threadIdx.x == 0 && dbg == 3) s_s = *xq.seq;  // shadow run after k_qsa_dec consumed the exchange (debug)
@@ -777,9 +773,9 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
         }
         continue;
     }
-    // union of the rows' selected blocks (bitmap -> ascending list), then each row's bit per union entry: precomputed
-    // per row group by k_qpf_union (qu.U set), else built here
-    if (qu.U) {
+    // the union of the rows' selected blocks (ascending list) and each row's bit per union entry, precomputed per row
+    // group by k_qpf_union (qu.U must be set)
+    {
         if (threadIdx.x == 0) s_U = __ldcg(qu.U + gy);
         __syncthreads();
         const int U0 = s_U;
@@ -789,52 +785,6 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
         for (int u = threadIdx.x; u < (U0 + 3) / 4; u += NTH)
             reinterpret_cast<unsigned*>(um)[u] = __ldcg(reinterpret_cast<const unsigned*>(gm) + u);
         __syncthreads();
-    } else {
-    // union of the rows' selected blocks (bitmap -> ascending list), then each row's bit per union entry
-        for (int r = 0; r < QP_R; r++) {
-            const int ns = s_ns[r];
-            for (int j = threadIdx.x; j < ns; j += NTH) {
-                const int b = sel[(size_t)(t0 + r) * lbmax + j];
-                atomicOr(&bm[b >> 5], 1u << (b & 31));
-            }
-        }
-        __syncthreads();
-        if (warp == 0) {  // word prefix counts (32 words per lane step)
-            int run = 0;
-            for (int w0 = 0; w0 < nw; w0 += 32) {
-                const int w = w0 + lane;
-                const int c = w < nw ? __popc(bm[w]) : 0;
-                int x = c;
-#pragma unroll
-                for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }
-                // exclusive prefix of word w: run + x - c; store into the list by expanding the word's bits
-                int base = run + x - c;
-                if (w < nw) {
-                    unsigned bits = bm[w];
-                    while (bits) {
-                        const int bb = __ffs(bits) - 1;
-                        bits &= bits - 1;
-                        ublk[base++] = w * 32 + bb;
-                    }
-                }
-                run += __shfl_sync(0xffffffffu, x, 31);
-            }
-            if (lane == 0) s_U = run;
-        }
-        __syncthreads();
-        const int Ub = s_U;
-        for (int u = threadIdx.x; u < Ub; u += NTH) um[u] = 0;
-        __syncthreads();
-        for (int r = 0; r < QP_R; r++) {  // rank of each selected block in the union list (binary search)
-            const int ns = s_ns[r];
-            for (int j = threadIdx.x; j < ns; j += NTH) {
-                const int b = sel[(size_t)(t0 + r) * lbmax + j];
-                int lo = 0, hi = Ub - 1;
-                while (lo < hi) { const int mid = (lo + hi) >> 1; if (ublk[mid] < b) lo = mid + 1; else hi = mid; }
-                um[lo] |= (unsigned char)(1u << r);
-            }
-            __syncthreads();
-        }
     }
     const int U = s_U;
     int tmin = 1 << 30, tmax = 0;

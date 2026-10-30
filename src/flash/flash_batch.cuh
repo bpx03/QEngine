@@ -278,7 +278,7 @@ __global__ void k_idx_prep_b(const float* __restrict__ ip, int ld, const bf16* _
             const int i = d & 31;
             const float f = rope_freq(pos, i, sl);
             float sn, cs;
-            sincosf(f, &sn, &cs);
+            rope_sc(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
         }
         return x;

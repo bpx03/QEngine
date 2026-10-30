@@ -1661,7 +1661,7 @@ static void allreduce_hc_staged(float* R, const float* inj, const float* partial
 __device__ __forceinline__ bool pull_pair(const Comm& c, int reader, int owner) { return (c.pullm >> (4 * reader + owner)) & 1u; }
 __global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restrict__ R, const float* __restrict__ partial,
                                                                  int m, int h, Comm c, int rank, CommCounters ctr,
-                                                                 const float* __restrict__ inj, bool own_rows) {
+                                                                 const float* __restrict__ inj, bool own_rows, bool flat) {
     __shared__ unsigned s_seq;
     if (threadIdx.x == 0) s_seq = *ctr.seq + 1;
     __syncthreads();
@@ -1682,6 +1682,51 @@ __global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restric
     }
     exchange(c, rank, ctr, s1, true, kWdArRowsExchange);
     uint2* const sums = c.prs2[rank];
+    // own rows (sequence-parallel HC, perf F.3): (row, column) items over all threads of the grid, 2 items per thread
+    // with every peer's load issued before the sums (one row per block left 128 of 512 threads busy in its second pass
+    // and one load pair in flight per thread); the same values and summation order per element (bit-identical)
+    static constexpr int kU = 2;
+    if (flat && own_rows && c.ngpu <= 4 && (h & 3) == 0) {
+        const long ne = (long)(oe - ob) * h4, stride = (long)gridDim.x * blockDim.x;
+        for (long e0 = (long)blockIdx.x * blockDim.x + threadIdx.x; e0 < ne; e0 += stride * kU) {
+            uint2 pv[kU][4];
+#pragma unroll
+            for (int u = 0; u < kU; u++) {
+                const long e = e0 + u * stride;
+                if (e >= ne) continue;
+                const int r = ob + (int)(e / h4), i = (int)(e % h4);
+                const size_t idx = (size_t)r * h4 + i;
+#pragma unroll
+                for (int g = 0; g < 4; g++)
+                    if (g < c.ngpu)
+                        pv[u][g] = g == rank ? pack_bf16x4(p4[idx])
+                                             : __ldcv(pull_pair(c, rank, g) ? c.pstage[g] + idx
+                                                                            : c.prs1[rank] + ((size_t)g * c.rs_own + (r - ob)) * h4 + i);
+            }
+#pragma unroll
+            for (int u = 0; u < kU; u++) {
+                const long e = e0 + u * stride;
+                if (e >= ne) continue;
+                const int r = ob + (int)(e / h4), i = (int)(e % h4);
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+                for (int g = 0; g < 4; g++)
+                    if (g < c.ngpu) {
+                        const float4 x = unpack_bf16x4(pv[u][g]);
+                        v.x += x.x; v.y += x.y; v.z += x.z; v.w += x.w;
+                    }
+                const float4 vb = unpack_bf16x4(pack_bf16x4(v));
+                float4* rr = r4 + (size_t)r * 4 * h4 + i;
+#pragma unroll
+                for (int s4 = 0; s4 < 4; s4++) {
+                    const float jj = inj[r * 4 + s4];
+                    float4 x = rr[s4 * h4];
+                    x.x += jj * vb.x; x.y += jj * vb.y; x.z += jj * vb.z; x.w += jj * vb.w;
+                    rr[s4 * h4] = x;
+                }
+            }
+        }
+    } else
     for (int r = ob + blockIdx.x; r < oe; r += gridDim.x) {
         const float jj[4] = {inj[r * 4], inj[r * 4 + 1], inj[r * 4 + 2], inj[r * 4 + 3]};
         for (int i = threadIdx.x; i < h4; i += blockDim.x) {
@@ -1750,7 +1795,8 @@ bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, i
     bool stg = c.pullm != 0 && c.ngpu <= 4;
     for (int g = 0; g < c.ngpu; g++) stg = stg && c.pstage[g] && c.prs2[g];
     if (stg) {
-        allreduce_hc_pull_kernel<<<std::min(m, blocks), 512, 0, st>>>(R, partial, m, h, c, rank, ctr, inj, own_rows);
+        static const bool flat = env_int("FLASH_AR_FLAT", 1);  // perf F.3 (0: one row per block in the pull phase)
+        allreduce_hc_pull_kernel<<<std::min(m, blocks), 512, 0, st>>>(R, partial, m, h, c, rank, ctr, inj, own_rows, flat);
         return true;
     }
     const int nb = std::min(m, blocks);

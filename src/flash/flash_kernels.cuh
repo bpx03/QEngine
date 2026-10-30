@@ -65,6 +65,14 @@ struct MmPos {
     const int* tab = nullptr;  // [3 + 3 * rows]: rows, first cache index, slot (-1: none), then (t, h, w) per row
 };
 __device__ MmPos g_mm;
+// YaRN RoPE scaling (opt-in, Worker::set_yarn): per-frequency inverse frequencies (NTK-by-parts blend of the
+// interpolated / extrapolated ones) and the attention factor; on = 0 keeps the native RoPE
+struct YarnTab {
+    int on = 0;
+    float m = 1.f;
+    float inv[ROT / 2] = {};
+};
+__device__ YarnTab g_yarn;
 // angle of rotary frequency i (of ROT / 2) at cache index pos of slot `slot` (-1: the bound slot). Interleaved
 // sections 11/11/10: frequency i uses the h position if i % 3 == 1, w if i % 3 == 2 (i < 30), else t
 __device__ __forceinline__ float rope_freq(int pos, int i, int slot = -1) {
@@ -76,7 +84,21 @@ __device__ __forceinline__ float rope_freq(int pos, int i, int slot = -1) {
         if (m.tab[2] == s && r >= 0 && r < m.tab[0]) rp = m.tab[3 + 3 * r + (i % 3 == 1 ? 1 : (i % 3 == 2 && i < 30 ? 2 : 0))];
         else rp = pos + (slot < 0 ? m.cur[1] : m.del[slot]);
     }
+    if (g_yarn.on) return (float)rp * g_yarn.inv[i];
     return (float)rp * powf((float)THETA, -2.f * i / ROT);
+}
+// sin / cos of a RoPE angle. YaRN (opt-in, FLASH_YARN / a context above 262,144): the fp32 angle reduced in double
+// (the fast-math sincosf loses the phase of the high-frequency dims at 1M positions), times the attention factor
+// (mscale) on both q and k as the reference applies it to cos / sin; off: the plain sincosf (bit-identical)
+__device__ __forceinline__ void rope_sc(float f, float* sn, float* cs) {
+    if (g_yarn.on) {
+        double s, c;
+        sincos((double)f, &s, &c);
+        *sn = (float)s * g_yarn.m;
+        *cs = (float)c * g_yarn.m;
+        return;
+    }
+    sincosf(f, sn, cs);
 }
 
 // ------------------------------------------------------------------ embedding
@@ -1211,7 +1233,7 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
             const int i = d & 31;
             const float f = rope_freq(pos, i, rsl ? rsl[t] : -1);
             float sn, cs;
-            sincosf(f, &sn, &cs);
+            rope_sc(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
         }
     }
@@ -1259,7 +1281,7 @@ __global__ void k_idx_prep(const float* __restrict__ ip, int ld, const bf16* __r
             const int i = d & 31;
             const float f = rope_freq(pos, i);
             float sn, cs;
-            sincosf(f, &sn, &cs);
+            rope_sc(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
         }
         return x;
@@ -1302,7 +1324,7 @@ __global__ void k_idx_prep_rows(const float* __restrict__ ip, int ld, const bf16
             const int i = d & 31;
             const float f = rope_freq(ps, i);
             float sn, cs;
-            sincosf(f, &sn, &cs);
+            rope_sc(f, &sn, &cs);
             x = d < 32 ? xs[d] * cs - xs[d + 32] * sn : xs[d] * cs + xs[d - 32] * sn;
         }
         return x;
@@ -2079,6 +2101,17 @@ __global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Pla
         __threadfence_system();
         qe_st_release_sys(xc.flags[peer] + p.rank, s);
     }
+}
+// k_idx_send over gridDim.y blocks per peer with 16-byte stores (perf F.2: the single 256-thread block per peer moved
+// the 2 MB of a 512-row chunk at ~7 GB/s); the last block of a peer raises its flag (xsend_done, scnt counters)
+__global__ void k_idx_send16(const unsigned* __restrict__ loc, int m, Xchg xc, Plan p) {
+    const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
+    const unsigned s = *xc.seq + 1;
+    uint4* dst = reinterpret_cast<uint4*>(reinterpret_cast<unsigned*>(xc.recv[peer]) +
+                                          ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * IDX_TOPB);
+    const uint4* src = reinterpret_cast<const uint4*>(loc);
+    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * IDX_TOPB / 4; idx += gridDim.y * blockDim.x) dst[idx] = src[idx];
+    xsend_done(xc, peer, s, p);
 }
 // global threshold = IDX_TOPB-th largest of the 3 x IDX_TOPB gathered keys; compact this card's selected blocks
 // (score key >= threshold) into sel[t][0..nsel[t]). One block per row; the last block bumps the exchange.
@@ -5231,84 +5264,10 @@ __global__ void __launch_bounds__(512) k_jobs_pf(int C, const int* __restrict__ 
         *njobs = j;
     }
 }
-// gate_up of a prefill job over its rows (gathered from x XH), 32-row groups; act[off + i][128] = silu(g) * u * w
-__global__ void __launch_bounds__(128) k_moe_gu_pf(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
-                                                   const int* __restrict__ tl, const float* __restrict__ wl,
-                                                   const __half* __restrict__ x, __half* __restrict__ act) {
-    constexpr int NT = 4;
-    const int job = blockIdx.y;
-    if (job >= *njobs) return;
-    const PfJob pj = jobs[job];
-    const int r = blockIdx.x;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = 4;
-    const int g = lane >> 2, t4 = lane & 3;
-    constexpr int groups = H >> 7, chunks = H >> 6;
-    const int gb = warp * groups / nwarps, ge = (warp + 1) * groups / nwarps;
-    const uint4* qp = pj.w.gq + (size_t)r * chunks * 32 + lane;
-    const __half* sp = pj.w.gs + (size_t)r * groups * 16;
-    __shared__ float red[4][NT][32][4];
-    for (int t0 = 0; t0 < pj.n; t0 += 8 * NT) {
-        const int m = min(8 * NT, pj.n - t0);
-        const uint4* xr[NT];
-#pragma unroll
-        for (int j = 0; j < NT; j++) {
-            const int li = 8 * j + g < m ? 8 * j + g : 0;
-            xr[j] = reinterpret_cast<const uint4*>(x + (size_t)tl[pj.off + t0 + li] * H + t4 * 16);
-        }
-        float acc[NT][4];
-#pragma unroll
-        for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
-        for (int gi = gb; gi < ge; gi++) {
-            const float sg = __half2float(sp[gi * 16 + g]) * kXhScale, sg8 = __half2float(sp[gi * 16 + g + 8]) * kXhScale;
-            const uint4 w0 = __ldg(qp + (size_t)(2 * gi) * 32), w1 = __ldg(qp + (size_t)(2 * gi + 1) * 32);
-#pragma unroll
-            for (int c = 0; c < 2; c++) {
-                const int ch = 2 * gi + c;
-                const uint4 wc = c ? w1 : w0;
-                uint32_t hacc[NT][2];
-                uint4 b0[NT], b1[NT];
-#pragma unroll
-                for (int j = 0; j < NT; j++) { hacc[j][0] = hacc[j][1] = 0u; b0[j] = xr[j][(size_t)ch * 8]; b1[j] = xr[j][(size_t)ch * 8 + 1]; }
-                const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-#pragma unroll
-                for (int q = 0; q < 4; q++) {
-                    uint32_t a[4];
-                    xh_dequant(words[q], a);
-#pragma unroll
-                    for (int j = 0; j < NT; j++) {
-                        if (8 * j >= m) break;  // empty 8-row tiles of the last group (warp-uniform)
-                        const uint4& bb = (q >> 1) ? b1[j] : b0[j];
-                        xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
-                    }
-                }
-#pragma unroll
-                for (int j = 0; j < NT; j++) xh_flush(acc[j], hacc[j], sg, sg8);
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < NT; j++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) red[warp][j][lane][i] = acc[j][i];
-        __syncthreads();
-        if (warp == 0) {
-            const int col = r * 8 + g;
-#pragma unroll
-            for (int j = 0; j < NT; j++) {
-                for (int w2 = 1; w2 < nwarps; w2++)
-#pragma unroll
-                    for (int i = 0; i < 4; i++) acc[j][i] += red[w2][j][lane][i];
-                const int n0 = 8 * j + 2 * t4, n1 = n0 + 1;
-                if (n0 < m) store_xh(act + (size_t)(pj.aoff + t0 + n0) * GRP, col, silu(acc[j][0]) * acc[j][2] * wl[pj.off + t0 + n0]);
-                if (n1 < m) store_xh(act + (size_t)(pj.aoff + t0 + n1) * GRP, col, silu(acc[j][1]) * acc[j][3] * wl[pj.off + t0 + n1]);
-            }
-        }
-        __syncthreads();
-    }
-}
-// v2 (FLASH_MOE_GU2): one block per job covers all 256 gate_up rows (8 warps x 2 16-row tiles) for 32-token tiles;
-// the tokens' x K-slices (64 columns) are staged once per block in shared memory by cp.async (double buffer) instead
-// of every 16-row block reading the rows from L2 (16 x the x bytes). Per element: the same 64-column fp16 chunks
-// flushed with the group scale, the K order sequential (v1 summed 4 K-quarters at the end).
+// fp16 gate_up of a prefill job (the engine runs W4A8 k_moe_gu_q; kept as the fp16 reference of tools/mb/mb_moe.cu):
+// act[off + i][128] = silu(g) * u * w. One block per job covers all 256 gate_up rows (8 warps x 2 16-row tiles) for
+// 32-token tiles; the tokens' x K-slices (64 columns) are staged once per block in shared memory by cp.async (double
+// buffer). Per element: 64-column fp16 chunks flushed with the group scale, the K order sequential.
 __global__ void __launch_bounds__(256) k_moe_gu_pf2(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                     const int* __restrict__ tl, const float* __restrict__ wl,
                                                     const __half* __restrict__ x, __half* __restrict__ act) {
@@ -5511,7 +5470,8 @@ __global__ void __launch_bounds__(128) k_moe_dn_pf(const PfJob* __restrict__ job
         }
     }
 }
-// down of a prefill job into the slot buffer (FLASH_MOE_SLOT): the expert output of every (row, expert) slot of the
+// down of a prefill job into the slot buffer (fp16 act; the engine runs W4A8 k_moe_dn_q, this stays the reference of
+// tools/mb/mb_moe.cu): the expert output of every (row, expert) slot of the
 // token lists is stored (fp16, x 1/16) instead of added to the row's partial by fp32 atomics (the atomics bound the
 // kernel: ~28K per row); k_moe_sum adds a row's 11 slots in a fixed order. Same tiles and arithmetic as k_moe_dn_pf.
 constexpr float kSlotScale = 16.f;

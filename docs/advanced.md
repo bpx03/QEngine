@@ -12,6 +12,7 @@ and uses the default too.
   - [Qwen3.8-Flash-Next](#qwen38-flash-next)
   - [Large prefill batches: `FLASH_PFB_BIG`](#large-prefill-batches-flash_pfb_big)
   - [Image input](#image-input)
+  - [Context up to 1M tokens (YaRN, opt-in)](#context-up-to-1m-tokens-yarn-opt-in)
   - [Qwen3.8-27B](#qwen38-27b)
   - [How `FLASH_COMM=auto` / `QE_COMM=auto` choose a path](#how-flash_commauto--qe_commauto-choose-a-path)
 - [Troubleshooting](#troubleshooting)
@@ -32,6 +33,7 @@ and uses the default too.
 | `FLASH_NGRAM` | auto | n-gram embedding table: `int8` when `ngram_int8.safetensors` exists in the model directory, else `bf16`. | Set `bf16` to force the BF16 table (needs the original shard and 102 GB of pinned RAM). |
 | `FLASH_NGRAM_PIN` | `1` | `0`: disk mode, the INT8 n-gram table is read through the file mapping instead of being pinned (see Hardware and host memory in the README). | `0` on a machine with too little RAM to pin 52 GB. |
 | `FLASH_LOOKUP` | `1` | Lookup drafts: when the recent tokens repeat an earlier part of the conversation, drafts are copied from there. | `0` turns them off (with `FLASH_DETERMINISTIC=1` for reproducible runs). |
+| `FLASH_PREFIX_GB` | `8` | Host RAM for pinned system prompts: the KV and state at the end of each agent kind's system prompt (and tools) are kept outside the conversation archive, so a new agent of that kind starts after its system prompt even when the archive is full (a 20K-token system prompt takes about 0.4 GB). Used only as prefixes appear; the least recently used one gives way when it is full. Needs the archive (`FLASH_KV_ARCHIVE_GB` > 0). | Lower it on a machine short of RAM; `0` turns it off. |
 | `FLASH_CKPT_MIN` | `512` | A conversation gets a checkpoint where it diverges from a cached one at least this many tokens in (prefix reuse across conversations). | Rarely. |
 | `FLASH_DETERMINISTIC` | `0` | `1`: fixed-order reductions in prefill, so a run repeats exactly. Slower. | For reproducible runs of one conversation, together with `FLASH_LOOKUP=0`. |
 
@@ -40,22 +42,32 @@ Server-side: `--prefill-chunk` (2048) is the prefill chunk while other requests 
 
 ### Large prefill batches: `FLASH_PFB_BIG`
 
-`FLASH_PFB_BIG` (default `4096`) is the number of rows of a large prefill batch, used for a prompt when no other
-request is decoding. `8192` halves the number of batches of a long prompt, so on 2 cards the host-backed expert groups
-are copied to the GPUs half as often. The larger batch buffers are lent to the expert cache outside prefill, but
-fewer expert groups stay resident, so decode gets slightly slower.
+`FLASH_PFB_BIG` is the number of rows of a large prefill batch, used for a prompt when no other request is decoding.
+The default is `8192` on 2 cards and `4096` on 3 cards. A larger batch means fewer batches for a long prompt, so on
+2 cards the host-backed expert groups are copied to the GPUs less often.
 
-Measured with `flash_run` on 1.3.1 (October 30, 2026), `8192` against the default `4096`:
+The batch buffers above the always-present 2048 rows are lent to the expert cache outside prefill. On 2 cards the rows
+past 4096 are mapped onto the end of the KV cache arrays, the part that holds expert-cache slots while the
+conversations are shorter than the pool. So the large batch takes no memory from the experts that stay on the GPU,
+and decode is as fast as with `4096`. A batch uses those rows only while the KV cache in use ends below them (the
+first 75 % of the pool, about 196K tokens on 2 cards with the default 256K context); past that, batches of 4096 rows
+are used. `FLASH_PFB_ALIAS=0` turns the mapping off; then `8192` costs about 880 resident expert groups per card
+(agent throughput at 8 concurrent requests about 1 % lower). The mapping needs the KV cache in VRAM; with
+`FLASH_KV=ram` the default stays `4096`.
 
-| setup | 10K prompt | 90K prompt | single-stream decode |
-|---|---|---|---|
-| 3× RTX 3090 | no change | no change (+0.3 % time) | -0.2 % |
-| 2× RTX 3090, PCIe 4.0 x16 | -21 % prefill time | -7 % prefill time | -0.8 % |
-| 2× RTX 3090, slow link between the cards (3.3 GB/s, emulated) | -10 % prefill time | -2 % prefill time | -0.5 % |
+Measured on 2× RTX 3090 (PCIe 4.0 x16), October 30, 2026, `8192` (default) against `4096`:
 
-**Who should turn it on:** 2-card setups where most of the work is long prompts (RAG, large documents, agents that
-resend big contexts) and a slightly slower decode is acceptable. Leave the default on 3 cards and for chat-style
-use. `0` turns the large batches off (2048-row batches only).
+| measurement | 4096 | 8192 |
+|---|---|---|
+| server prefill, 10K prompt | 3,958 tok/s | 4,163 tok/s (+5 %) |
+| server prefill, 90K prompt | 5,180 tok/s | 5,362 tok/s (+4 %) |
+| `flash_run` 90K prompt | 16.6 s | 15.1 s (-9 % time) |
+| agent, 8 concurrent requests | 452.6 tok/s | 450.9 tok/s (same within noise) |
+| single-stream decode (narrative / code) | 218 / 235 tok/s | 218 / 234 tok/s |
+
+On 3 cards `8192` gives no gain (`flash_run` 10K and 90K unchanged): the prefill staging ring already holds a whole
+layer's host-backed groups, so the host copies are not the bottleneck. `0` turns the large batches off (2048-row
+batches only).
 
 ### Image input
 
@@ -70,6 +82,51 @@ With `--vision 1` (both models):
 
 `--vision-device` picks the GPU of the encoder (default: the last one), `--max-image-pixels` the largest image
 (default 4.2 MPix = 4,096 image tokens).
+
+### Context up to 1M tokens (YaRN, opt-in)
+
+Qwen3.8-Flash-Next is trained for 262,144 tokens. Its model card extends that to about 1M with YaRN RoPE scaling
+(factor 4, original context 262,144). QEngine applies it only on request:
+
+```bash
+FLASH_KV=ram server/run.sh 8080 --model models/Qwen3.8-Flash-Next-QE-INT4 --max-ctx 1M
+```
+
+- A `--max-ctx` above 262,144 turns YaRN on with factor `context / 262,144`: 4 for `1M` (1,048,576 tokens), 2 for
+  `512K`. The model card suggests a factor that fits your typical length. `FLASH_YARN=<factor>` sets it directly,
+  and `FLASH_YARN=0` turns it off.
+- It needs `FLASH_KV=ram`, because the VRAM pool holds 262,144 tokens. Without it the server stays at 262,144 and
+  logs a line.
+- YaRN is static: it applies to every request of that server, short ones too. The card warns that this can lower
+  quality on short texts. In our checks at 16K the answers stayed the same (a needle, a 160-token continuation, a
+  coding answer that was worded differently but just as good). Still, use it only on a server that is meant for
+  long documents. The default (262,144, native RoPE) is unchanged, bit for bit.
+- YaRN changes the 12 sparse-attention layers, their indexer and the MTP layer. The DeltaNet layers have no
+  positions.
+
+Measured on RTX 3090 cards (October 30, 2026) with `flash_run`, `--ctx 1048576` (factor 4), needle in the middle of
+source-code text:
+
+| cards | prompt | needle found | prompt time | decode, single stream |
+|---:|---:|---|---:|---:|
+| 3 | 524,288 tokens | yes | 114 s (4.6K tok/s) | 175 tok/s |
+| 3 | 1,040,000 tokens | yes | 278 s (3.7K tok/s) | 140 tok/s |
+| 2 | 1,040,000 tokens | yes | 547 s (1.9K tok/s) | 79 tok/s |
+
+On 2 cards, decode at 1M is limited by the expert cache: with its smaller budget about half of the cold expert
+groups a step needs come from host memory.
+
+Memory for one 1M-token conversation:
+
+- **Host RAM:** 13,520 bytes per token, so about **14.2 GB per 1M tokens**. This is the `FLASH_KV=ram` pool
+  (`FLASH_KV_RAM_TOKENS`, at least the context), pinned at start. It comes on top of the usual host memory (the
+  52 GB n-gram table and the archive).
+- **VRAM per card (3 cards):** 291 MB of indexer keys, plus a block cache of up to 886 MB while the long context
+  runs. The per-position buffers sized for 1M also cut the expert cache by about 3.5 GB per card, though their
+  unused part is lent back to it. Short-request decode on such a server was about 1 % slower (347 vs 351 tok/s).
+- **VRAM per card (2 cards):** each card holds half of the positions, so it needs 436 MB of indexer keys plus the
+  same block cache, and the expert cache shrinks by about 5.6 GB per card (from 15.8 to 10.1 GB). Short-request
+  decode on such a server was about 2 % slower (283 vs 289 tok/s).
 
 ### Qwen3.8-27B
 

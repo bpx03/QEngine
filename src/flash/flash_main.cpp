@@ -246,6 +246,8 @@ int main(int argc, char** argv) {
             fclose(f);
         }
     }
+    // a context above the native 262,144: YaRN with factor context / 262,144 (FLASH_YARN overrides)
+    if (ctx > NATIVE_CTX) set_yarn_factor((double)ctx / NATIVE_CTX);
     std::vector<Worker*> W(ng);
     std::vector<int> nw(ng);
     {
@@ -577,7 +579,7 @@ int main(int argc, char** argv) {
     const bool pfp = env_int("FLASH_PF", 1);
     const bool pfb = pfp && !(env_int("FLASH_PFB", 1) == 0);
     if (pfb) {  // batched prefill: n <= pf_batch() rows per call (MoE half over the whole batch), then the MTP fill
-        const int B = W[0]->pf_batch();
+        const int B = W[0]->pf_batch((long long)np + gen + 8);  // (rows past pfbn_mid_ only while the KV stays below the alias)
         std::vector<int> cuts;  // FLASH_RUN_CUTS=p,q,...: a batch also ends at these positions (the server's checkpoints)
         if (const char* c = env_str("FLASH_RUN_CUTS")) for (auto& x : split(c, ',')) if (!x.empty()) cuts.push_back(std::stoi(x));
         for (int i = 0, m = 0; i < np; i += m) {

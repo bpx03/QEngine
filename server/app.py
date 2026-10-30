@@ -2015,7 +2015,14 @@ def parse_args(argv=None):
     ap.add_argument("--devices", default=None,
                     help="GPU indices within CUDA_VISIBLE_DEVICES (default: every visible GPU, else 0,1,2); "
                          "Flash-Next runs on 2 or 3")
-    ap.add_argument("--max-ctx", type=int, default=262144)
+    def ctx_arg(v):  # 262144, 256K, 1M (K = 1024 tokens)
+        m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*", v)
+        if not m:
+            raise argparse.ArgumentTypeError("a token count (262144, 512K, 1M)")
+        return int(float(m.group(1)) * {"": 1, "k": 1024, "m": 1024 * 1024}[m.group(2).lower()])
+    ap.add_argument("--max-ctx", type=ctx_arg, default=262144,
+                    help="context per conversation (default 262144); Flash-Next above 262144 (up to 1M) turns on "
+                         "YaRN RoPE scaling and needs FLASH_KV=ram")
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
     ap.add_argument("--temperature", type=float, default=None,
