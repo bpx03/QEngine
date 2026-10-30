@@ -516,6 +516,262 @@ void launch_skinny(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m
                                                               w.glu, tiles, TPB, nw, wt, L);
 }
 
+// ---------------------------------------------------------------- INT8 (W8) variant
+// skinny_w4_kernel's block / warp / K-slice structure and activation staging for W8 weights, with
+// gemv_w8_kernel's arithmetic so that every row count gives bit-identical rows (batch == alone): a 64-k
+// chunk is two 16-byte lane loads of the W8 layout (two k-steps each), weights enter the fp16 MMA as exact
+// integers, activations as bf16 -> fp16 (the staged bf16 rows are converted after ldmatrix, as
+// load_x2_f16 / xpack do), each 128-k group accumulates in a fresh fp32 MMA accumulator that is added to
+// acc times the group scales (rows g / g + 8) when the group ends, and the slices are reduced in order.
+__device__ __forceinline__ uint32_t s8x2_to_f16x2_sk(uint32_t t) {  // = gemv.cu s8x2_to_f16x2
+    uint32_t v = ((t ^ 0x00800080u) & 0x00FF00FFu) | 0x64006400u;
+    __half2 h = __hsub2(*reinterpret_cast<__half2*>(&v), __float2half2_rn(1152.f));
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+__device__ __forceinline__ uint32_t bf2_to_f16x2(uint32_t v) {  // bf16 pair -> fp16 pair (round to nearest)
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const bf162*>(&v));
+    const __half2 h = __floats2half2_rn(f.x, f.y);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+__device__ __forceinline__ void mma_f16_sk(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+        "{%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// TW: tiles per warp (same slice); TW = 1 halves the per-warp state (acc, group accumulators, weight ring)
+// so NT = 4 fits the 128 registers of 16-warp blocks without spills, at the price of more, smaller blocks
+template <int NT, int S, int TW>
+__global__ void __launch_bounds__(kMaxThreads) skinny_w8_kernel(
+    const uint4* __restrict__ q, const bf16* __restrict__ s, int K, const bf16* __restrict__ x,
+    int ldx, float* __restrict__ y, int ldy, int m, int tiles, int TPB, int nw, SkinnyWarps wt, int L) {
+    constexpr int kRing = 2;                    // chunks in flight per tile (two uint4 each)
+    extern __shared__ __align__(16) unsigned char smem[];
+    __shared__ int slice_c0[kMaxSlices], slice_len[kMaxSlices];
+    const unsigned smem_u = (unsigned)__cvta_generic_to_shared(smem);
+    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int nthreads = blockDim.x;
+    const int g = lane >> 2;
+    const int groups = K >> 7, kps = K >> 5;
+    const int rows = 8 * NT;
+    const int slice_bytes = rows * kRowBytes;
+    const int stage_bytes = nw * slice_bytes;
+
+    if (tid < nw) {
+        slice_c0[tid] = 2 * (tid * groups / nw);
+        slice_len[tid] = 2 * ((tid + 1) * groups / nw - tid * groups / nw);
+    }
+    for (int i = tid * 16; i < S * stage_bytes; i += nthreads * 16)
+        *reinterpret_cast<uint4*>(smem + i) = make_uint4(0, 0, 0, 0);
+    __syncthreads();
+
+    const int per_slice = m * 8;
+    const int nsets = nthreads / per_slice;
+    const int myset = tid / per_slice, r = tid - myset * per_slice;
+    const bool loader = myset < nsets;
+    const bf16* xsrc = x + (size_t)(r >> 3) * ldx + (r & 7) * 8;
+    const unsigned xdst = smem_u + (r >> 3) * kRowBytes + (r & 7) * 16;
+    auto issue_stage = [&](int i, unsigned stage_off) {
+        if (!loader) return;
+        for (int sw = myset; sw < nw; sw += nsets)
+            if (i < slice_len[sw])
+                cp_async16(xdst + stage_off + sw * slice_bytes, xsrc + (slice_c0[sw] + i) * kChunkK);
+    };
+    unsigned issue_off = 0;
+    for (int i = 0; i < S - 1; i++) {
+        if (i < L) issue_stage(i, issue_off);
+        cp_async_commit();
+        issue_off = issue_off + stage_bytes == S * stage_bytes ? 0u : issue_off + stage_bytes;
+    }
+
+    const int w = wt.w[wid], tl0 = wt.tile0[wid], cnt = wt.cnt[wid];
+    const int gb = w * groups / nw, ge = (w + 1) * groups / nw;
+    const int len = cnt > 0 ? 2 * (ge - gb) : 0;    // chunks of this slice
+    const int nload = len - kRing;
+    const int ngroup = ge - gb - 1;
+    const unsigned xoff = w * slice_bytes + (lane & 7) * kRowBytes + (lane >> 3) * 16;
+    bool valid[TW];
+    const uint4* qp[TW];
+    const bf16* sp[TW];
+    uint4 wbuf[TW][kRing][2];
+    float sg[TW], sg8[TW], ns[TW], ns8[TW];
+    float acc[TW][NT][4], c[TW][NT][4];
+#pragma unroll
+    for (int tw = 0; tw < TW; tw++) {
+        const int tile = blockIdx.x * TPB + tl0 + tw;
+        valid[tw] = tw < cnt && tile < tiles;
+        const int tt = valid[tw] ? tile : 0;
+        qp[tw] = q + ((size_t)tt * kps + 4 * gb) * 32 + lane;
+        sp[tw] = s + ((size_t)tt * groups + gb) * 16 + g;
+#pragma unroll
+        for (int d = 0; d < kRing; d++) {
+            wbuf[tw][d][0] = wbuf[tw][d][1] = make_uint4(0, 0, 0, 0);
+            if (valid[tw] && d < len) {
+                wbuf[tw][d][0] = ldg_stream(qp[tw] + (2 * d) * 32);
+                wbuf[tw][d][1] = ldg_stream(qp[tw] + (2 * d + 1) * 32);
+            }
+        }
+        qp[tw] += 2 * kRing * 32;
+        sg[tw] = sg8[tw] = ns[tw] = ns8[tw] = 0.f;
+        if (valid[tw] && len > 0) {
+            ns[tw] = __bfloat162float(sp[tw][0]);
+            ns8[tw] = __bfloat162float(sp[tw][8]);
+        }
+        sp[tw] += 16;
+#pragma unroll
+        for (int j = 0; j < NT; j++) acc[tw][j][0] = acc[tw][j][1] = acc[tw][j][2] = acc[tw][j][3] = 0.f;
+    }
+    const bool work = valid[0];
+    unsigned use_off = 0;
+
+    for (int i0 = 0; i0 < L; i0 += kRing) {
+#pragma unroll
+        for (int d = 0; d < kRing; d++) {
+            const int i = i0 + d;
+            if (i >= L) break;
+            cp_async_wait<S - 2>();
+            __syncthreads();
+            if (i + S - 1 < L) issue_stage(i + S - 1, issue_off);
+            cp_async_commit();
+            issue_off = issue_off + stage_bytes == S * stage_bytes ? 0u : issue_off + stage_bytes;
+            const unsigned xs = smem_u + use_off + xoff;
+            use_off = use_off + stage_bytes == S * stage_bytes ? 0u : use_off + stage_bytes;
+            if (!work || i >= len) continue;
+            uint4 wv[TW][2];
+#pragma unroll
+            for (int tw = 0; tw < TW; tw++) {
+                wv[tw][0] = wbuf[tw][d][0];
+                wv[tw][1] = wbuf[tw][d][1];
+                if (valid[tw] && i < nload) {
+                    wbuf[tw][d][0] = ldg_stream(qp[tw]);
+                    wbuf[tw][d][1] = ldg_stream(qp[tw] + 32);
+                }
+                qp[tw] += 64;
+            }
+            if ((i & 1) == 0) {  // group start: fresh accumulators, this group's scales, prefetch the next
+#pragma unroll
+                for (int tw = 0; tw < TW; tw++) {
+                    sg[tw] = ns[tw];
+                    sg8[tw] = ns8[tw];
+                    if (valid[tw] && (i >> 1) < ngroup) {
+                        ns[tw] = __bfloat162float(sp[tw][0]);
+                        ns8[tw] = __bfloat162float(sp[tw][8]);
+                    }
+                    sp[tw] += 16;
+#pragma unroll
+                    for (int j = 0; j < NT; j++) c[tw][j][0] = c[tw][j][1] = c[tw][j][2] = c[tw][j][3] = 0.f;
+                }
+            }
+#pragma unroll
+            for (int hp = 0; hp < 2; hp++) {  // 32-k halves of the chunk = one uint4 of weights each
+                uint32_t bq[NT][4];
+#pragma unroll
+                for (int nt = 0; nt < NT; nt++) {
+                    ldmatrix_x4(bq[nt], xs + nt * 8 * kRowBytes + hp * 64);
+#pragma unroll
+                    for (int e = 0; e < 4; e++) bq[nt][e] = bf2_to_f16x2(bq[nt][e]);
+                }
+#pragma unroll
+                for (int h = 0; h < 2; h++) {  // k-steps of the half (gemv_w8_kernel's h)
+#pragma unroll
+                    for (int tw = 0; tw < TW; tw++) {
+                        if (!valid[tw]) continue;
+                        const uint32_t lo = h ? wv[tw][hp].z : wv[tw][hp].x, hi = h ? wv[tw][hp].w : wv[tw][hp].y;
+                        uint32_t a[4];
+                        a[0] = s8x2_to_f16x2_sk(__byte_perm(lo, 0, 0x4140));
+                        a[1] = s8x2_to_f16x2_sk(__byte_perm(lo, 0, 0x4342));
+                        a[2] = s8x2_to_f16x2_sk(__byte_perm(hi, 0, 0x4140));
+                        a[3] = s8x2_to_f16x2_sk(__byte_perm(hi, 0, 0x4342));
+#pragma unroll
+                        for (int nt = 0; nt < NT; nt++) mma_f16_sk(c[tw][nt], a, bq[nt][2 * h], bq[nt][2 * h + 1]);
+                    }
+                }
+            }
+            if (i & 1) {  // group end: acc += c * scale (gemv_w8_kernel's expression)
+#pragma unroll
+                for (int tw = 0; tw < TW; tw++)
+#pragma unroll
+                    for (int j = 0; j < NT; j++) {
+                        acc[tw][j][0] += c[tw][j][0] * sg[tw];
+                        acc[tw][j][1] += c[tw][j][1] * sg[tw];
+                        acc[tw][j][2] += c[tw][j][2] * sg8[tw];
+                        acc[tw][j][3] += c[tw][j][3] * sg8[tw];
+                    }
+            }
+        }
+    }
+    cp_async_wait<0>();
+    __syncthreads();
+
+    // slice reduction in order w = 0..nw-1 (as reduce_store / reduce_store_nt)
+    float* red = reinterpret_cast<float*>(smem);   // [nw][TPB][NT][4][32]
+    if (w != 0) {
+#pragma unroll
+        for (int tw = 0; tw < TW; tw++)
+            if (valid[tw])
+#pragma unroll
+                for (int j = 0; j < NT; j++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++)
+                        red[((((size_t)w * TPB + tl0 + tw) * NT + j) * 4 + e) * 32 + lane] = acc[tw][j][e];
+    }
+    __syncthreads();
+    if (w != 0) return;
+    const int t = lane & 3;
+#pragma unroll
+    for (int tw = 0; tw < TW; tw++) {
+        if (!valid[tw]) continue;
+        for (int ww = 1; ww < nw; ww++)
+#pragma unroll
+            for (int j = 0; j < NT; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++)
+                    acc[tw][j][e] += red[((((size_t)ww * TPB + tl0 + tw) * NT + j) * 4 + e) * 32 + lane];
+        const int row0 = (blockIdx.x * TPB + tl0 + tw) * 16;
+#pragma unroll
+        for (int j = 0; j < NT; j++) {
+            const int n0 = 8 * j + 2 * t, n1 = n0 + 1;
+            if (n0 < m) {
+                y[(size_t)n0 * ldy + row0 + g] = acc[tw][j][0];
+                y[(size_t)n0 * ldy + row0 + g + 8] = acc[tw][j][2];
+            }
+            if (n1 < m) {
+                y[(size_t)n1 * ldy + row0 + g] = acc[tw][j][1];
+                y[(size_t)n1 * ldy + row0 + g + 8] = acc[tw][j][3];
+            }
+        }
+    }
+}
+
+template <int NT, int S>
+void set_attr8() {
+    CUDA_CHECK(cudaFuncSetAttribute(skinny_w8_kernel<NT, S, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxSmem));
+    CUDA_CHECK(cudaFuncSetAttribute(skinny_w8_kernel<NT, S, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxSmem));
+}
+template <int NT, int S>
+void launch_skinny8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, int tiles, int TPB, int nw,
+                    int warps, const SkinnyWarps& wt, int L, size_t smem, cudaStream_t st, int TW) {
+    const int blocks = (tiles + TPB - 1) / TPB;
+    if (TW == 1) skinny_w8_kernel<NT, S, 1><<<blocks, warps * 32, smem, st>>>(w.q, w.s, w.k, x, ldx, y, ldy, m, tiles, TPB, nw, wt, L);
+    else skinny_w8_kernel<NT, S, 2><<<blocks, warps * 32, smem, st>>>(w.q, w.s, w.k, x, ldx, y, ldy, m, tiles, TPB, nw, wt, L);
+}
+// one tile per warp: TPB x nw single tasks, padded to a multiple of 4 warps (<= 16); 0 if it does not fit
+int build_warps1(int TPB, int nw, SkinnyWarps& wt) {
+    const int ntasks = TPB * nw, warps = (ntasks + 3) / 4 * 4;
+    if (warps > 16) return 0;
+    int k = 0;
+    for (int w = 0; w < nw; w++)
+        for (int tl = 0; tl < TPB; tl++, k++) {
+            wt.w[k] = (unsigned char)w;
+            wt.tile0[k] = (unsigned char)tl;
+            wt.cnt[k] = 1;
+        }
+    for (; k < warps; k++) wt.w[k] = 0, wt.tile0[k] = 0, wt.cnt[k] = 0;  // padding warps: no work
+    return warps;
+}
+
 // Warp table: pairs of tiles within a slice, singles to pad the warp count to a multiple of 4
 // (at most 16 warps). Returns the warp count or 0 if the work does not fit.
 int build_warps(int TPB, int nw, SkinnyWarps& wt) {
@@ -558,6 +814,10 @@ void skinny_init() {
     set_attr_h<2, 3>(); set_attr_h<2, 4>(); set_attr_h<2, 6>();
     set_attr_h<3, 3>(); set_attr_h<3, 4>(); set_attr_h<3, 6>();
     set_attr_h<4, 3>(); set_attr_h<4, 4>(); set_attr_h<4, 6>();
+    set_attr8<1, 3>(); set_attr8<1, 4>(); set_attr8<1, 6>();
+    set_attr8<2, 3>(); set_attr8<2, 4>(); set_attr8<2, 6>();
+    set_attr8<3, 3>(); set_attr8<3, 4>(); set_attr8<3, 6>();
+    set_attr8<4, 3>(); set_attr8<4, 4>(); set_attr8<4, 6>();
 }
 
 // Engine policy: on by default (QE_SKINNY=0 disables) for m >= QE_SKINNY_MIN_M (17) rows on matrices
@@ -635,5 +895,52 @@ bool skinny_w4h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m
     }
 #undef QE_SKHS
 #undef QE_SKH
+    return true;
+}
+
+// INT8 layers: skinny_w8_kernel for 1..32 rows (bit-identical to gemv_w8). Engine policy: QE_SKINNY8 (default on)
+// for m >= QE_SKINNY8_MIN_M rows on matrices with >= QE_SKINNY8_MIN_TILES 16-row tiles
+bool skinny_w8_use(int n, int m) {
+    static const int on = skinny_env("QE_SKINNY8", 1);
+    static const int min_m = skinny_env("QE_SKINNY8_MIN_M", 9);
+    static const int min_tiles = skinny_env("QE_SKINNY8_MIN_TILES", 0);
+    return on && m >= min_m && n / 16 >= min_tiles;
+}
+
+bool skinny_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
+    if (m < 1 || m > 32 || w.n % 16 || w.k % 128 || ldx % 8 || w.glu) return false;
+    const int tiles = w.n / 16, groups = w.k / 128;
+    const int nw = pick_warps(tiles, groups, true);  // gemv_w8's K slices
+    const int NT = (m + 7) / 8;
+    static const int blocks_env = skinny_env("QE_SKINNY8_BLOCKS", kSMs);
+    static const int s_env = skinny_env("QE_SKINNY8_S", 0);
+    static const int tw_env = skinny_env("QE_SKINNY8_TW", 1);
+    const int TW = tw_env == 2 ? 2 : 1;
+    // TW = 1: at most 16 tasks per block, so more blocks than SMs when tiles x nw needs it
+    const int TPB = TW == 2 ? (tiles + blocks_env - 1) / blocks_env
+                            : std::max(1, std::min(16 / nw, (tiles + blocks_env - 1) / blocks_env));
+    if (TPB < 1 || TPB > 255) return false;
+    SkinnyWarps wt = {};
+    const int warps = TW == 2 ? build_warps(TPB, nw, wt) : build_warps1(TPB, nw, wt);
+    if (warps == 0 || warps * 32 > kMaxThreads || warps * 32 < 8 * m) return false;
+    int L = 0;
+    for (int ww = 0; ww < nw; ww++) L = std::max(L, 2 * ((ww + 1) * groups / nw - ww * groups / nw));
+    const size_t stage = (size_t)nw * 8 * NT * kRowBytes;
+    const size_t red = (size_t)nw * TPB * NT * 4 * 32 * sizeof(float);
+    int S = s_env ? std::min(6, std::max(3, s_env)) : 4;
+    while (S > 3 && S * stage > kMaxSmem) S = S == 6 ? 4 : 3;
+    const size_t smem = std::max(S * stage, red);
+    if (smem > kMaxSmem) return false;
+#define QE_SK8(NT_, S_) launch_skinny8<NT_, S_>(w, x, ldx, y, ldy, m, tiles, TPB, nw, warps, wt, L, smem, st, TW)
+#define QE_SK8S(NT_) if (S == 6) QE_SK8(NT_, 6); else if (S == 4) QE_SK8(NT_, 4); else QE_SK8(NT_, 3)
+    switch (NT) {
+        case 1: QE_SK8S(1); break;
+        case 2: QE_SK8S(2); break;
+        case 3: QE_SK8S(3); break;
+        case 4: QE_SK8S(4); break;
+        default: return false;
+    }
+#undef QE_SK8S
+#undef QE_SK8
     return true;
 }

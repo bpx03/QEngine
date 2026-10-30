@@ -133,6 +133,10 @@ public:
     // MTP training data: the next start() copies every prompt row's final normed hidden state
     // (bf16, [n][hidden]) to host memory `out` (nullptr: off)
     void set_dump_hidden(uint16_t* out) { for (auto& w : workers_) w->dump_hidden = out; }
+    // KV scale calibration (QE_KV_AMAX=1): max |k|, |v| written to each layer's cache since the last
+    // reset, over all cards ([layers + 1][2], last = MTP; 0 = no full attention / no data). Returns
+    // false when calibration is off.
+    bool kv_amax(float* out, bool reset);
     // Full logits of the last forward ([m][vocab]).
     void logits(float* out, int m);
     // Activation steering (QE_STEER / QE_STEER_DIR / QE_STEER_DEFAULT, src/steer.h; vectors loaded at construction):
@@ -512,6 +516,7 @@ private:
     void disk_wait_idle();
     void disk_writer();
     std::string model_dir_, fingerprint_, disk_dir_;
+    std::string kv_scales_file_;  // side file of fp8 KV scales in use (QE_KV_SCALES), empty: none
     size_t disk_budget_ = 0, disk_used_ = 0;
     struct DiskJob {
         std::shared_ptr<Bufs> ram;
@@ -546,6 +551,9 @@ private:
     std::vector<CardPlan> plan_;
     SafeTensors st_;
     std::unique_ptr<SafeTensors> mtp_st_;
+    std::unique_ptr<SafeTensors> w4_st_;  // QE_W4_FROM: INT4 source of the QE_W4_LAYERS classes (mixed precision)
+    int w4_mask_ = 0;
+    std::string w4_key_;  // fingerprint part of the mixed-precision setup (empty: none)
     int k_ = 0;        // max drafts per step (0 = plain decoding)
     SampleParams samp_{1.f, 1.f, kTopK, 0.f, 0, 0};
     bool samp_on_ = false;

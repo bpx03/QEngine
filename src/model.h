@@ -20,7 +20,7 @@
 #include "safetensors.h"
 
 struct FullAttnLayer {
-    W4 qkv, o;
+    QW qkv, o;
     bf16 *q_norm = nullptr, *k_norm = nullptr;
     void *kc = nullptr, *vc = nullptr;  // [nkv][max_t][256] bf16 or e4m3
     const void *kc2 = nullptr, *vc2 = nullptr;  // shared prefix region of the selected slot
@@ -28,7 +28,7 @@ struct FullAttnLayer {
 };
 
 struct DeltaLayer {
-    W4 in, out;  // in rows: [q kl*128][k kl*128][v vl*128][z vl*128]
+    QW in, out;  // in rows: [q kl*128][k kl*128][v vl*128][z vl*128]
     W16 ab;      // rows: [b vl..pad][a vl..pad]
     W16 abh;     // fp16 copy of ab for the XH path (QE_GEMV_H16), else empty
     bf16* conv_w = nullptr;  // [ch][4]
@@ -51,7 +51,7 @@ struct Layer {
     bf16 *in_norm = nullptr, *post_norm = nullptr;
     FullAttnLayer fa;
     DeltaLayer dn;
-    W4 gate_up, down;
+    QW gate_up, down;
 };
 
 // Per-sequence state of one GPU for one sequence slot (KV caches, delta-net state ring,
@@ -308,6 +308,14 @@ public:
     // optional per-layer residual dump (host pointer, [layers][m][hidden] floats), debug only
     float* debug_hidden = nullptr;
     uint16_t* dump_hidden = nullptr;  // host: final normed hidden (MTP input) of every prompt row
+    // KV scale calibration (QE_KV_AMAX=1): device [layers + 1][2] max |k|, |v| written to the cache
+    // (index = layer, last = MTP), raw floats before the fp8 cast; null: off
+    float* kv_amax = nullptr;
+    // mixed precision (QE_W4_FROM / QE_W4_LAYERS): the layer matrices of the classes in w4_mask come from
+    // w4_st (an INT4 checkpoint with the same tensor names) instead of the main checkpoint
+    enum { W4C_QKV = 1, W4C_O = 2, W4C_IN = 4, W4C_OUT = 8, W4C_GU = 16, W4C_DOWN = 32 };
+    const SafeTensors* w4_st = nullptr;
+    int w4_mask = 0;
 
     int rank, device;
     cudaStream_t stream = nullptr;
@@ -320,6 +328,12 @@ private:
     struct RowSpec { std::string name; int r0, r1; };
     W4 load_w4(const SafeTensors& st, const std::vector<RowSpec>& rows, int c0, int c1,
                bool glu = false);
+    W8 load_w8(const SafeTensors& st, const std::vector<RowSpec>& rows, int c0, int c1,
+               bool glu = false);
+    // a layer matrix at the checkpoint's bit width (weight_shape vs weight_packed: 4 or 8 bits); INT8
+    // matrices set w8_any_ (gate_up keeps the GLU interleave unless QE_W8_GLU=0)
+    QW load_qw(const SafeTensors& st, const std::vector<RowSpec>& rows, int c0, int c1, bool glu, int cls);
+    bool w8_any_ = false;  // some layer matrix is INT8: H16 / early GEMV / W4A8 / bf16 partials off
     W16 load_w16(const SafeTensors& st, const std::vector<RowSpec>& rows, int pad_to, int c0 = -1,
                  int c1 = -1);
     // BF16 checkpoint tensor kept as BF16, or RTN-quantized to INT4 (draft-only weights)
@@ -338,6 +352,7 @@ private:
     // attention / delta-net part of layer i for rows [r0, r0 + mb), ending in partial_
     void mixer_rows(int i, int r0, int mb, const int* pos, int slot_off, bool pb = false);
     void matmul_part(const W4& w, const bf16* x, int ldx, int m, size_t row0, bool pb);
+    void matmul_part(const QW& w, const bf16* x, int ldx, int m, size_t row0, bool pb);
     // Copy-engine prefill all-reduce (comm.cuh ce_*): a copy thread per GPU issues the DMA copies
     // and peer flags on two copy streams (one per peer). The worker thread only enqueues: it never
     // blocks on the copy thread (a host thread blocked in cudaMemcpyAsync while peers spin on its
@@ -372,7 +387,7 @@ private:
     cudaStream_t pf_stream_ = nullptr;   // L2 prefetch side stream (decode graphs)
     // all-reduce that overlaps an L2 prefetch of the next matmul's weights (decode, m <= 8); sa: the layer output's
     // steering (steer.cuh)
-    void allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const W4* next, const SteerArg* sa = nullptr);
+    void allreduce_pf(float* resid, int m, const bf16* norm, bf16* xn, const QW* next, const SteerArg* sa = nullptr);
     // steering (set_steer): vectors, per-slot {vector, mode, lo, hi} [slots][4] and scale [slots] on the device, the
     // host mirrors, the union of the vectors' file layers
     float *steer_w_ = nullptr, *steer_sc_d_ = nullptr;
@@ -390,7 +405,7 @@ private:
     // launched together; the GEMV runs on pf_stream_, stages weights while the all-reduce is in flight
     // and waits for its tag. join = false leaves the join to the caller (early_join()). False: not
     // applicable, nothing launched (caller uses allreduce_pf + mm4).
-    bool allreduce_early(int m, const bf16* norm, const W4& w, float* y, int ldy, __half* yh, int ldyh,
+    bool allreduce_early(int m, const bf16* norm, const QW& w, float* y, int ldy, __half* yh, int ldyh,
                          bool join = true, int site = 7);
     void early_join();
     unsigned* ready_ = nullptr;   // [4096]: tags, arrival counters, guard timeouts, fused-AR scratch
@@ -504,7 +519,7 @@ private:
     int xh_act_ld_ = 0;
     // INT4 matmul of a decode input: the fp16-accumulate kernel on the XH copy (packed here when xh is
     // null) when enabled and m fits, else the bf16/fp32 path
-    bf16* xn_bf16(bf16* xn, int m, const W4* next);
+    bf16* xn_bf16(bf16* xn, int m, const QW* next);
     static int dec_gemm_min() {
         static const int v = env_int("QE_DEC_GEMM", 33);
         return v;
@@ -527,6 +542,8 @@ private:
                 ldxh = w.k;
             }
             gemv_w4h(w, xh, ldxh, y, ldy, m, st, yh, ldyh);
+        } else if (m <= rows_cap_) {  // decode rows without H16 (INT8 setups: the MTP head): the bf16 GEMV up
+            gemv_w4(w, x, ldx, y, ldy, m, st);  // to kMaxBatchRows, never the GEMM (no buffers inside graph capture)
         } else {
             matmul(w, x, ldx, y, ldy, m, st);
         }
@@ -535,6 +552,20 @@ private:
              const __half* xh = nullptr, int ldxh = 0, __half* yh = nullptr, int ldyh = 0) {
         if (w.is4) mm4(w.q, x, ldx, y, ldy, m, st, xh, ldxh, yh, ldyh);
         else matmul(w, x, ldx, y, ldy, m, st);
+    }
+    // a layer matrix: INT4 as above; INT8 reads the bf16 input (h16_ is off whenever w8_any_). Batched decode
+    // passes of >= QE_DEC_GEMM rows take the W8A8 GEMM on matrices with K >= QE_DEC_GEMM8_MINK (4096: the
+    // GEMM reads the weights once, 1.2-1.9x the two 32-row GEMV passes at 33..64 rows; the K = 3072 o / out
+    // projections are ~10 % faster on the GEMV)
+    static bool dec_gemm8(const W8& w) {
+        static const int mink = env_int("QE_DEC_GEMM8_MINK", 4096);
+        return w.k >= mink;
+    }
+    void mm4(const QW& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st,
+             const __half* xh = nullptr, int ldxh = 0, __half* yh = nullptr, int ldyh = 0) {
+        if (w.is8 && dec_gemm_rows(m) && dec_gemm8(w.q8)) gemm_w8(w.q8, x, ldx, y, ldy, m, st);
+        else if (w.is8) matmul(w.q8, x, ldx, y, ldy, m, st);
+        else mm4(w.q4, x, ldx, y, ldy, m, st, xh, ldxh, yh, ldyh);
     }
     int proj_ld_ = 0;
     int ll_idx_ = 0;      // LL collective counter within the current launch unit

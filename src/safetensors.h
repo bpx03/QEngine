@@ -10,8 +10,12 @@ struct TensorInfo {
     std::vector<long long> shape;
     const char* data = nullptr;
     size_t nbytes = 0;
-    size_t elem_size() const { return dtype == "BF16" ? 2 : dtype == "I64" ? 8 : 4; }
+    size_t elem_size() const;
 };
+
+// Weight files of a checkpoint directory: model.safetensors if present, else the shards named in
+// model.safetensors.index.json (sorted, without model_mtp.safetensors, which is opened separately).
+std::vector<std::string> safetensors_files(const std::string& dir);
 
 // mmap()s one or more .safetensors files and indexes tensors by name.
 class SafeTensors {

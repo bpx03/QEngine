@@ -164,6 +164,7 @@ struct AttnShape {
     const void* vc2 = nullptr;
     int fp8 = 0;          // cache holds e4m3 values x / scale (else bf16)
     float ks = 1.f, vs = 1.f;  // per-tensor k / v scales (fp8 only)
+    float* amax = nullptr;     // KV scale calibration (QE_KV_AMAX): max |k| at [0], |v| at [1] before the cast
     int dchunk_min = -1;  // QE_DEC_CHUNK_MIN: fp8 decode split rule (-1 = 38 splits up to 52K, 0 = old L/82)
     // attn_dec8d row split: 1 = one 16-row tile per block (decode of one sequence below
     // kD8RsMax keys, set by the engine from the host-side length); results are bit-identical either way

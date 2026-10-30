@@ -122,7 +122,52 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     }
     plan_ = make_plan(cfg_, devices.size(), weights, kvs_);
     print_plan(cfg_, plan_);
-    st_.open(model_dir + "/model.safetensors");
+    const std::vector<std::string> weight_files = safetensors_files(model_dir);
+    for (const std::string& f : weight_files) st_.open(f);
+    {   // QE_KV_SCALES: fp8 KV scales (<layer>.self_attn.k_scale / v_scale scalars, e.g. from
+        // tools/kv_scales.py) that override the checkpoint's; default <model>/kv_scales.safetensors
+        // if present, "off" = none
+        const char* e = env_str("QE_KV_SCALES");
+        const std::string f = e ? e : model_dir + "/kv_scales.safetensors";
+        struct stat stt;
+        if (f != "off" && (e || stat(f.c_str(), &stt) == 0)) {
+            st_.open(f);
+            kv_scales_file_ = f;
+            fprintf(stderr, "KV scales: %s\n", f.c_str());
+        }
+    }
+    // mixed precision: QE_W4_FROM=<INT4 checkpoint dir> supplies the layer matrices of the QE_W4_LAYERS classes
+    // (comma list of qkv, o, attn = qkv + o, in, out, dn = in + out, mlp = gate_up + down; default mlp); the
+    // rest come from model_dir (e.g. INT8). Same tensor names in both checkpoints; the norms an AWQ checkpoint
+    // folded its smoothing into come along (Worker::load).
+    if (const char* w4dir = env_str("QE_W4_FROM")) {
+        const std::string spec = env_str("QE_W4_LAYERS") ? env_str("QE_W4_LAYERS") : "mlp";
+        std::stringstream ss(spec);
+        for (std::string t; std::getline(ss, t, ',');) {
+            if (t == "qkv") w4_mask_ |= Worker::W4C_QKV;
+            else if (t == "o") w4_mask_ |= Worker::W4C_O;
+            else if (t == "attn") w4_mask_ |= Worker::W4C_QKV | Worker::W4C_O;
+            else if (t == "in") w4_mask_ |= Worker::W4C_IN;
+            else if (t == "out") w4_mask_ |= Worker::W4C_OUT;
+            else if (t == "dn") w4_mask_ |= Worker::W4C_IN | Worker::W4C_OUT;
+            else if (t == "gate_up") w4_mask_ |= Worker::W4C_GU;
+            else if (t == "down") w4_mask_ |= Worker::W4C_DOWN;
+            else if (t == "mlp") w4_mask_ |= Worker::W4C_GU | Worker::W4C_DOWN;
+            else CHECK(false, "QE_W4_LAYERS: unknown class %s", t.c_str());
+        }
+        // AWQ couples up_proj and down_proj (up carries down's smoothing): gate_up and down only together
+        CHECK(!(w4_mask_ & Worker::W4C_GU) == !(w4_mask_ & Worker::W4C_DOWN),
+              "QE_W4_LAYERS: gate_up and down must come from the same checkpoint (AWQ smoothing up -> down): use mlp");
+        w4_st_.reset(new SafeTensors);
+        std::string key = std::string("|w4:") + w4dir + ":" + spec;
+        for (const std::string& f : safetensors_files(w4dir)) {
+            w4_st_->open(f);
+            struct stat stt;
+            if (stat(f.c_str(), &stt) == 0) key += ":" + std::to_string(stt.st_size) + ":" + std::to_string(stt.st_mtime);
+        }
+        w4_key_ = key;
+        fprintf(stderr, "mixed precision: %s layers from %s\n", spec.c_str(), w4dir);
+    }
     // QE_MTP_FILE: another MTP head (e.g. a fine-tuned one), same tensor names
     const std::string mtp_file = env_str("QE_MTP_FILE") ? env_str("QE_MTP_FILE") : model_dir + "/model_mtp.safetensors";
     if (FILE* f = fopen(mtp_file.c_str(), "rb")) {
@@ -135,10 +180,13 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         std::ostringstream fp;
         char rp[PATH_MAX];
         fp << (realpath(model_dir_.c_str(), rp) ? rp : model_dir_.c_str());
-        for (const std::string& f : {model_dir_ + "/model.safetensors", mtp_file}) {
+        std::vector<std::string> files = weight_files;  // single-file checkpoints keep their old key
+        files.push_back(mtp_file);
+        for (const std::string& f : files) {
             struct stat stt;
             if (stat(f.c_str(), &stt) == 0) fp << "|" << f.substr(f.rfind('/') + 1) << ":" << stt.st_size << ":" << stt.st_mtime;
         }
+        fp << w4_key_;
         gemm_tune_set_model(fp.str());
     }
     if (env_set("QE_MTP_ADAPT")) adapt_ = env_int("QE_MTP_ADAPT", adapt_);
@@ -215,10 +263,19 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             for (size_t r = 0; r < devices.size(); r++)
                 workers_[r]->draft_ids.assign(rank.begin() + r * per, rank.begin() + (r + 1) * per);
             printf("MTP draft vocabulary: %d most frequent tokens\n", nd);
+        } else if (!f && nd > 0 && mtp_st_) {
+            // the full-vocabulary draft head is ~4x the bytes per draft (INT8 setups: ~0.3 ms of each ~0.7 ms draft)
+            fprintf(stderr, "MTP draft vocabulary: no %s/token_rank.bin, drafting over the full vocabulary "
+                            "(slower; copy it from the INT4 checkpoint, it depends only on the tokenizer)\n",
+                    model_dir.c_str());
         }
         if (f) fclose(f);
     }
     pool_.reset(new GpuPool(devices));
+    for (auto& w : workers_) {
+        w->w4_st = w4_st_.get();
+        w->w4_mask = w4_mask_;
+    }
     pool_->run([&](int r) { workers_[r]->load(st_, mtp_st_.get(), embed_); });
     // the stats exchange of a position-split head: each card writes into its peer's rows / flags
     for (size_t r = 0; r < workers_.size(); r++)
@@ -1066,6 +1123,10 @@ double Engine::warmup(int modes) {
     pool_->run([&](int r) { workers_[r]->tune_gemm(); });  // prefill GEMM configurations
     if (!has_mtp()) return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const int keep = cur_;
+    // the decode attention row split is part of the graph key, and launch_step turns it on while a sequence is
+    // below the ~38-split length (every short conversation): warm those graphs (they were warmed with it off,
+    // and the first steps of the first reply captured them again, ~25 ms each)
+    for (auto& w : workers_) w->attn_rs_ = true;
     for (int sl = 0; sl < 1; sl++) {  // the first slot (where the first conversation lands)
         use_slot(sl);
         for (int smp = 0; smp < 2; smp++) {
@@ -1879,10 +1940,18 @@ void Engine::disk_init() {
     // v3: archives written before the KV-pool compaction fix (23781c9) may hold overwritten rows
     fp << "v3|" << (realpath(model_dir_.c_str(), rp) ? rp : model_dir_.c_str());
     if (env_str("QE_MTP_FILE")) fp << "|mtp:" << env_str("QE_MTP_FILE");
-    for (const char* f : {"/model.safetensors", "/model_mtp.safetensors"}) {
+    std::vector<std::string> files = safetensors_files(model_dir_);  // single-file: same key as before
+    files.push_back(model_dir_ + "/model_mtp.safetensors");
+    for (const std::string& f : files) {
         struct stat stt;
-        if (stat((model_dir_ + f).c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;
+        if (stat(f.c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;
     }
+    if (!kv_scales_file_.empty()) {  // archives hold fp8 KV encoded with these scales
+        struct stat stt;
+        fp << "|kvs:" << (realpath(kv_scales_file_.c_str(), rp) ? rp : kv_scales_file_.c_str());
+        if (stat(kv_scales_file_.c_str(), &stt) == 0) fp << ":" << stt.st_size << ":" << stt.st_mtime;
+    }
+    fp << w4_key_;  // mixed precision: other weights
     fp << "|g" << workers_.size() << "|" << (env_str("QE_SPLIT") ? env_str("QE_SPLIT") : "");
     if (kvs_.on()) fp << "|kvsplit" << kvs_.period << "," << kvs_.a01 << "," << kvs_.a12;
     for (auto& w : workers_) fp << "|" << w->archive_bytes(0, 1) << "," << w->archive_bytes(0, 2) << "," << w->snapshot_bytes();
@@ -2725,6 +2794,10 @@ void Engine::launch_step(int buf, int base, int lk) {
     const bool rs = seqs_[cur_].pos + 2 * (kMaxSpecK + 1) + 8 <= dec38_max();
     for (auto& wp : workers_) wp->attn_rs_ = rs;
     buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look);
+    static const bool log_cap = env_int("QE_LOG_CAPTURE", 0);  // which step shapes miss the graph cache
+    if (log_cap && buf_captured_[buf])
+        fprintf(stderr, "spec graph capture: kv %d kd %d lookup %d slot %d pos %d row-split %d\n", kv, kd, look,
+                cur_, seqs_[cur_].pos, rs);
     pool_->run([&](int r) {
         Worker& w = *workers_[r];
         if (io) {
@@ -3331,6 +3404,21 @@ void Engine::debug_hidden(const int* ids, int n, float* out) {
         workers_[r]->debug_hidden = nullptr;
         cudaFreeHost(bufs[r]);
     }
+}
+
+bool Engine::kv_amax(float* out, bool reset) {
+    const size_t n = (size_t)(cfg_.layers + 1) * 2;
+    std::fill(out, out + n, 0.f);
+    std::vector<float> h(n);
+    for (auto& w : workers_) {
+        if (!w->kv_amax) return false;
+        CUDA_CHECK(cudaSetDevice(w->device));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h.data(), w->kv_amax, n * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < n; i++) out[i] = std::max(out[i], h[i]);
+        if (reset) CUDA_CHECK(cudaMemset(w->kv_amax, 0, n * 4));
+    }
+    return true;
 }
 
 void Engine::logits(float* out, int m) {

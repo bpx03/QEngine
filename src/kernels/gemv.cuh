@@ -33,11 +33,17 @@ struct W8 {
     const uint4* q = nullptr;
     const bf16* s = nullptr;
     int n = 0, k = 0;
+    bool glu = false;  // GLU row order as in W4 (gate_up): gemv_w8 / gemm_w8 write silu(gate) * up (bf16)
 };
 void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st);
+void gemv_w8_set_p1_min(int m);  // (bench) run-time QE_W8P1_MIN, 0 = environment / default
 // RTN INT8 (group 128) quantization of a row-major bf16 matrix straight into the W8 layout.
 void quantize_w8(const bf16* src, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st);
 inline size_t w8_qbytes(int n, int k) { return (size_t)n * k; }
+// Repack a row-major compressed-tensors INT8 matrix (int32 [N][K/4], bytes LSB-first, stored value
+// u = w+128, so each row is K plain bytes) plus bf16 scales [N][K/128] into the W8 layout.
+void repack_w8(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst_q, bf16* dst_s,
+               cudaStream_t st);
 
 // y[m][n] = sum_k x[m][k] * W[n][k]   (fp32 out, row stride ldy; x bf16 with row stride ldx)
 // For a GLU matrix y is a bf16 activation buffer [m][ldy] (ldy >= n / 2).
@@ -78,6 +84,9 @@ void gemv_x_init();            // once per device (workspace), before any stream
 // QE_GEMV_NW_SMALL rule applies only to them, not to the split-K W16 projections)
 int pick_warps(int tiles, int units, bool w4 = false);
 bool skinny_use(int n, int m); // engine policy (QE_SKINNY, QE_SKINNY_MIN_M, QE_SKINNY_MIN_TILES)
+// skinny GEMM for INT8 layers, 1..32 rows (bit-identical to gemv_w8 for every m); false when unsupported
+bool skinny_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st);
+bool skinny_w8_use(int n, int m);  // engine policy (QE_SKINNY8, QE_SKINNY8_MIN_M, QE_SKINNY8_MIN_TILES)
 // ksplit > 1 splits K across blocks (for tiny N); partial sums go to y + s * ystride and the
 // consumer adds the ksplit slices.
 void gemv_w16(const W16& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st,
@@ -115,6 +124,11 @@ void gemm_w16(const W16& w, const bf16* x, int ldx, float* c, int ldc, int t, cu
 // var (0: gemm_i8_kernel, 1: gemm_i8t_kernel).
 void gemm_w4_i8(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st,
                 int G, int ci, int var);
+// W8A8 prefill GEMM (int8 activations per token and G-group, default 32, W8 weights): c[t][n] fp32 (GLU: bf16
+// activations [t][n / 2]); gemm_w8_cfg picks the activation group G (32 / 64 / 128) and tile ci (0..2)
+void gemm_w8(const W8& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st);
+void gemm_w8_cfg(const W8& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st, int G, int ci);
+void gemm_w8_set_kernel(int v);  // (bench) 1 = gemm_w8v_kernel (tiles ci 0..3), 0 = the first gemm_w8a8_kernel (0..2)
 // A producer of x (t rows, k = hidden) may quantize it for the W4A8 GEMM that consumes it next
 // (glu_next: the MLP gate_up, else the mixer qkv / in_proj): returns the int8 and scale
 // buffers to fill (layouts of x_to_i8_kernel, group *G) and registers them for the next
@@ -122,6 +136,8 @@ void gemm_w4_i8(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, c
 bool gemm_i8_prequant(const bf16* x, int t, int k, int row0, bool glu_next, int8_t** xq, float** xsc, int* G,
                       int** ctr = nullptr);  // ctr: the producer zeroes the GEMM's stream-K counter (no memset)
 int gemm_i8_prequant_group(int k, bool glu_next);
+// W4A8 off for every class (as QE_PREFILL_INT8=0): INT8 layers need bf16 inputs, no int8 prequant
+void gemm_i8_disable();
 void gemm_i8_prequant_ext(const bf16* x, int t, int k, int G, int8_t* xq, float* xsc);
 int* gemm_i8_sk_ctr();
 // dn_out writes the int8 input of the next W4A8 out_proj (k = 2048) itself (QE_DNO_I8=0: off)
@@ -141,10 +157,10 @@ void repack_w4(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst
 // Round-to-nearest symmetric INT4 (group 128) quantization of a row-major bf16 matrix into the
 // compressed-tensors layout consumed by repack_w4 (used for draft-only weights).
 void quantize_w4_rtn(const bf16* src, int n, int k, int32_t* dst_q, bf16* dst_s, cudaStream_t st);
-// Reorder rows [gate 0..I) [up 0..I) of a compressed-tensors int4 matrix (+ scales) into the
-// GLU tile order (8 gate rows, 8 up rows, ...), in place via the scratch copies.
+// Reorder rows [gate 0..I) [up 0..I) of a compressed-tensors int4 (bits 4) or int8 (bits 8) matrix
+// (+ scales) into the GLU tile order (8 gate rows, 8 up rows, ...), in place via the scratch copies.
 void glu_interleave_rows(const int32_t* src_q, const bf16* src_s, int n, int k, int32_t* dst_q,
-                         bf16* dst_s, cudaStream_t st);
+                         bf16* dst_s, cudaStream_t st, int bits = 4);
 // Repack a row-major bf16 matrix [N][K] into the W16 layout.
 void repack_w16(const bf16* src, int n, int k, uint4* dst, cudaStream_t st);
 
@@ -175,6 +191,36 @@ inline void matmul(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m
 inline void matmul(const W16& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
     if (m <= kMaxBatchRows) gemv_w16(w, x, ldx, y, ldy, m, st);
     else gemm_w16(w, x, ldx, y, ldy, m, st);
+}
+// One of the six per-layer matrices: INT4 (W4) or INT8 (W8, loaded from an 8-bit checkpoint). An INT8
+// layer runs the bf16-input W8 GEMV up to kMaxBatchRows rows (decode) and the W8A8 GEMM above that
+// (prefill; QE_W8_GEMM=0: the GEMV in kMaxBatchRows-row pieces); both have the GLU epilogue; no H16 / early path.
+struct QW {
+    W4 q4;
+    W8 q8;
+    bool is8 = false;
+    int n() const { return is8 ? q8.n : q4.n; }
+    int k() const { return is8 ? q8.k : q4.k; }
+    bool glu() const { return is8 ? q8.glu : q4.glu; }
+};
+inline void matmul(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
+    static const bool gemm = env_int("QE_W8_GEMM", 1) != 0;
+    if (gemm && m > kMaxBatchRows) {
+        gemm_w8(w, x, ldx, y, ldy, m, st);
+        return;
+    }
+    for (int r = 0; r < m; r += kMaxBatchRows) {  // (GLU: y is the bf16 activation buffer, ldy in bf16 elements)
+        float* yr = w.glu ? reinterpret_cast<float*>(reinterpret_cast<bf16*>(y) + (size_t)r * ldy) : y + (size_t)r * ldy;
+        gemv_w8(w, x + (size_t)r * ldx, ldx, yr, ldy, std::min(kMaxBatchRows, m - r), st);
+    }
+}
+inline void matmul(const QW& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
+    if (w.is8) matmul(w.q8, x, ldx, y, ldy, m, st);
+    else matmul(w.q4, x, ldx, y, ldy, m, st);
+}
+inline void prefetch_l2(const QW& w, size_t cap, cudaStream_t st) {
+    if (w.is8) prefetch_l2(w.q8.q, std::min(cap, w8_qbytes(w.q8.n, w.q8.k)), st);
+    else prefetch_l2(w.q4, cap, st);
 }
 inline void matmul(const Lin& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
     CHECK(!w.is8 || m <= kMaxBatchRows, "W8 layers are decode-only");

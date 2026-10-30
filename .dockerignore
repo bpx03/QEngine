@@ -1,10 +1,11 @@
-# only what the image needs: CMakeLists.txt, src/, server/, vectors/, requirements.txt, LICENSE
+# only what the images need: CMakeLists.txt, src/, server/, vectors/, requirements*.txt (dev image), LICENSE
 *
 !CMakeLists.txt
 !src/
 !server/
 !vectors/
 !requirements.txt
+!requirements-dev.txt
 !LICENSE
 **/__pycache__
 **/*.pyc

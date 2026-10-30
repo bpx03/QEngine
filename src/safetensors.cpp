@@ -6,7 +6,36 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <fstream>
+#include <set>
+#include <sstream>
 #include <stdexcept>
+
+size_t TensorInfo::elem_size() const {
+    static const std::map<std::string, size_t> sizes = {
+        {"F64", 8}, {"I64", 8}, {"U64", 8}, {"F32", 4}, {"I32", 4}, {"U32", 4},
+        {"BF16", 2}, {"F16", 2}, {"I16", 2}, {"U16", 2},
+        {"I8", 1}, {"U8", 1}, {"BOOL", 1}, {"F8_E4M3", 1}, {"F8_E5M2", 1}};
+    auto it = sizes.find(dtype);
+    if (it == sizes.end()) throw std::runtime_error("unknown safetensors dtype " + dtype);
+    return it->second;
+}
+
+std::vector<std::string> safetensors_files(const std::string& dir) {
+    struct stat st;
+    if (stat((dir + "/model.safetensors").c_str(), &st) == 0) return {dir + "/model.safetensors"};
+    std::ifstream f(dir + "/model.safetensors.index.json");
+    if (!f) throw std::runtime_error("no model.safetensors or model.safetensors.index.json in " + dir);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::set<std::string> names;
+    const Json index = Json::parse(ss.str());  // named: a range-for does not keep a temporary's member alive
+    for (auto& [tensor, file] : index["weight_map"].obj)
+        if (file.str != "model_mtp.safetensors") names.insert(file.str);
+    std::vector<std::string> out;
+    for (auto& n : names) out.push_back(dir + "/" + n);
+    return out;
+}
 
 void SafeTensors::open(const std::string& path) {
     int fd = ::open(path.c_str(), O_RDONLY);
