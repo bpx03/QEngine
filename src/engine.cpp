@@ -199,10 +199,13 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     for (size_t r = 0; r < devices.size(); r++)
         workers_.emplace_back(new Worker(cfg_, plan_, r, devices[r], comm_));
     // MTP drafts only over the most frequent tokens (tools/draft_vocab.py ranking), split
-    // across GPUs; QE_DRAFT_VOCAB=0 uses the full vocabulary
+    // across GPUs; QE_DRAFT_VOCAB=0 uses the full vocabulary; QE_TOKEN_RANK_FILE: the ranking file
+    // (default <model_dir>/token_rank.bin; the server sets it to its cached download)
     {
         int nd = env_int("QE_DRAFT_VOCAB", 65536);
-        FILE* f = fopen((model_dir + "/token_rank.bin").c_str(), "rb");
+        const std::string rank_file = env_str("QE_TOKEN_RANK_FILE") ? env_str("QE_TOKEN_RANK_FILE")
+                                                                    : model_dir + "/token_rank.bin";
+        FILE* f = fopen(rank_file.c_str(), "rb");
         if (f && nd > 0 && mtp_st_) {
             nd = std::min(nd, cfg_.vocab) / (16 * (int)devices.size()) * 16 * devices.size();
             std::vector<int> rank(nd);

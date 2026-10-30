@@ -206,8 +206,13 @@ hf download RedHatAI/Qwen3.8-27B-INT4 --local-dir models/Qwen3.8-27B-INT4
 ```
 
 Two additional files are published as **release assets** of this repository (not in git), attached to the
-[latest release](https://github.com/bpx03/QEngine/releases/latest) (unchanged since v1.0). Put both into
-`models/Qwen3.8-27B-INT4/`:
+[latest release](https://github.com/bpx03/QEngine/releases/latest) (unchanged since v1.0). The server
+**downloads them automatically on the first start** when the model directory lacks them: into
+`~/.cache/qengine/assets` (in Docker the `qengine-cache` volume; the model directory is never written, it may be
+mounted read-only), checked against the release's `SHA256SUMS` (a mismatch is refused), and reused on later starts
+without network. The start waits at most 2 minutes for the download (`QE_FETCH_WAIT_S`); on a slower link the server
+starts with the stock head and uses the files from the next start. `QE_FETCH_ASSETS=0` turns the download off. Without network the server logs a warning and starts
+without them. For offline machines, put both into `models/Qwen3.8-27B-INT4/` by hand:
 
 ```bash
 cd models/Qwen3.8-27B-INT4
@@ -834,8 +839,8 @@ docker compose logs -f
 - `QE_GPUS` selects the GPUs (ids as the host numbers them with `--gpus all`), default `0,1,2`.
   `-e QE_GPUS=0,2` runs tensor parallel 2 on GPUs 0 and 2. Three GPUs is the tuned configuration; both
   models also run on two (Flash-Next: see its hardware notes); other counts start with a warning.
-- The `qengine-cache` volume keeps the GEMM tune table, the KV split and the stats between
-  restarts. Without it every start tunes the GEMMs again.
+- The `qengine-cache` volume keeps the GEMM tune table, the KV split, the stats and the downloaded 27B release
+  assets between restarts. Without it every start tunes the GEMMs again (and downloads the assets again).
 - `--ipc=host` and `--ulimit memlock=-1`: the engine pins a large host-memory KV archive.
 - SELinux hosts (Fedora, RHEL): add `--security-opt label=disable` (Compose does) so the container
   can read the bind-mounted model without relabelling it.

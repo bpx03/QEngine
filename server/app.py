@@ -2032,7 +2032,8 @@ def parse_args(argv=None):
     ap.add_argument("--min-p", type=float, default=None, help="default when request has none (generation_config)")
     ap.add_argument("--mtp-file", default=None,
                     help="MTP head weights for the engine (sets $QE_MTP_FILE; default: the engine's own choice, "
-                         "for 27B model_mtp_ft.safetensors when present)")
+                         "for 27B model_mtp_ft.safetensors when present, else downloaded once from the latest "
+                         "release into ~/.cache/qengine/assets; QE_FETCH_ASSETS=0: no download)")
     ap.add_argument("--think", type=int, default=1, help="default enable_thinking")
     ap.add_argument("--reasoning-effort", default=env_str("QE_REASONING_EFFORT"),
                     help="default reasoning effort for requests that send none (xhigh, high = xhigh, medium, low; "
@@ -2186,6 +2187,9 @@ def start_log(args):
 def main():
     args = parse_args()
     start_log(args)
+    if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
+        import assets
+        assets.ensure(args.model)
     gen = Generator(args)
     class Server(uvicorn.Server):  # SIGTERM / SIGINT: end the requests first, then uvicorn's wait for the streams
         def handle_exit(self, sig, frame):

@@ -136,7 +136,10 @@ Memory for one 1M-token conversation:
 | `QE_POOL_MIN_HEAD` | `2048` | Least headroom in tokens a conversation's KV region grows by when the pool is tight (or 1/16 of the conversation, if larger). |
 | `QE_ADMIT_HEADROOM` | `8192` | KV tokens reserved per running sequence when admitting a new one. |
 | `QE_P2P` | auto | `0` forces the host-memory communication path (every collective through pinned host memory). |
-| `QE_MTP_FILE` | auto | MTP head file (default: `model_mtp_ft.safetensors` if present). |
+| `QE_MTP_FILE` | auto | MTP head file (default: `model_mtp_ft.safetensors` from the model directory, else the copy the server downloaded into `~/.cache/qengine/assets`). |
+| `QE_TOKEN_RANK_FILE` | auto | Token ranking of the MTP draft vocabulary (default: `<model dir>/token_rank.bin`, else the server's downloaded copy in `~/.cache/qengine/assets`). |
+| `QE_FETCH_ASSETS` | `1` | `0`: the server does not download missing `model_mtp_ft.safetensors` / `token_rank.bin` from the latest release (it only logs a warning). |
+| `QE_FETCH_WAIT_S` | `120` | Seconds the server start waits for the asset download; after that it starts with the stock head and the download finishes in the background for the next start. | Raise it to always start with the tuned files on a slow link; `0` = never wait. |
 | `QE_DRAFT_VOCAB` | `65536` | MTP draft vocabulary size (`0` = full vocabulary). |
 | `QE_DEC_GEMM` | `33` | Batched decode passes of at least this many rows use the W4A8 GEMM instead of the GEMV (`0` = off). |
 | `QE_LOOKUP` | `1` | Lookup drafts from the token history (`0` = off). |
