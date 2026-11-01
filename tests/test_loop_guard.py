@@ -1,4 +1,5 @@
 """CPU test of the cross-turn loop guard detection (server/loop_guard.py)."""
+import json
 import os
 import sys
 
@@ -26,11 +27,63 @@ def test_identical_tool_call():
 
 
 def test_near_identical_probes():
+    # tool calls repeat only exactly (1.3.4): near-copies with changing arguments are not a streak
     m = list(SYS)
     for i in range(69, 74):
         script = f"cat > /tmp/probe{i}.sh <<'EOF'\nls {'../' * (i - 60)}build/lib/libqflash.so && echo found\nEOF\nbash /tmp/probe{i}.sh"
         m += [call(script), tool(f"ls: cannot access '{'../' * (i - 60)}build/lib/libqflash.so': No such file or directory")]
-    assert lg.streak(m) >= 3
+    assert lg.streak(m) == 1
+
+
+def mem(action, text, said=""):
+    a = json.dumps({"action": action, "target": "memory", "old_text": text})  # a JSON string, as clients send it
+    return {"role": "assistant", "content": said,
+            "tool_calls": [{"id": f"call_{abs(hash(text)) % 10**8}", "type": "function",
+                            "function": {"name": "memory", "arguments": a}}]}
+
+
+def test_batch_of_ids_is_no_loop():
+    # HA-02 (1.3.4-rc gate): 29 removes of "Legacy note N: ..." that differ only in N, results only in numbers
+    m = [{"role": "system", "content": "You are Hermes."},
+         {"role": "user", "content": "Memory is near capacity: drop the 29 legacy notes, then add the deployment facts."}]
+    used = 1960
+    for n in range(1, 30):
+        note = f"Legacy note {n}: keep deployment observations concise and current."
+        used -= len(note) + 3
+        m += [mem("remove", note, "Removing the next legacy note."),
+              tool(json.dumps({"success": True, "message": "Entry removed.", "usage": f"{used:,}/2,200 chars",
+                               "entries": 30 - n}))]
+        assert lg.streak(m) == 1, n
+
+
+def test_exact_repeat_with_same_result():
+    note = "Legacy note 7: keep deployment observations concise and current."
+    res = tool(json.dumps({"success": False, "error": "No entry matched 'Legacy note 7'."}))
+    m = SYS + [mem("remove", note), res] * 4
+    assert lg.streak(m) == 4
+    # the same exact call, the result differs only in numbers: still a loop (results compare normalised)
+    m = SYS + sum(([mem("remove", note), tool(f"No entry matched (attempt {i}, {1424 + i} chars used)")]
+                   for i in range(4)), [])
+    assert lg.streak(m) == 4
+    # different text around the same call does not hide the loop
+    m = SYS + sum(([mem("remove", note, f"Attempt {w}: removing it again."), res] for w in "abcd"), [])
+    assert lg.streak(m) == 4
+
+
+def test_same_call_new_output_is_no_loop():
+    m = SYS + sum(([call("squeue -u kris"), tool(f"JOB {i}: {'RUNNING' if i % 2 else 'PENDING'} step {chr(97 + i) * 6}")]
+                   for i in range(5)), [])
+    assert lg.streak(m) <= 1
+
+
+def test_text_reply_repeat():
+    txt = "I could not find the configuration file 42 times; please check the path /etc/app/conf.d."
+    m = SYS + [{"role": "assistant", "content": txt}, {"role": "tool", "content": "error 7"}] * 4
+    assert lg.streak(m) == 4
+    # digit-normalised text and results still match
+    m = SYS + sum(([{"role": "assistant", "content": txt.replace("42", str(40 + i))},
+                    {"role": "tool", "content": f"error {i}"}] for i in range(4)), [])
+    assert lg.streak(m) == 4
 
 
 def test_short_replies_never():

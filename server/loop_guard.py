@@ -1,14 +1,18 @@
 """Cross-turn loop guard: a conversation whose last assistant turns are the same reply getting the same result.
 
 Agents at long contexts sometimes repeat one turn forever: the identical tool call after the tool keeps returning
-the same error, or a run of near-copies (probe69, probe70, ... one path segment more each time). Sampling within a
-reply does not help there: the loop is the model copying its previous turn from the context.
+the same error, or near-copy text replies. Sampling within a reply does not help there: the loop is the model
+copying its previous turn from the context. Tool calls whose arguments change each turn (probe69, probe70, ...) are
+not caught since 1.3.4: they look the same as a legitimate batch over ids.
 
 Detection works on the request's own history (so it follows the conversation, whichever slot or session serves it):
 the trailing assistant turns are compared pairwise, each as (reply, result that came back). A turn joins the streak
-when both its reply and its result match the next turn's, either exactly after normalising (whitespace collapsed,
-digit runs -> 0) or nearly (difflib ratio >= `near`, both at least `min_chars` long). A request is guarded when the
-streak reaches `turns`. Conservative on purpose:
+when its tool calls equal the next turn's exactly (name + canonical arguments, no normalisation: a batch of calls that
+differ only in an id, e.g. 29 memory removes of "Legacy note N", is work, not a loop; the text around a call is not
+compared), or, for a reply without a call, its text matches; and its result must match too. Text and results match
+either exactly after normalising (whitespace collapsed, digit runs -> 0) or nearly (difflib ratio >= `near`, both at
+least `min_chars` long). A request is guarded when the streak reaches `turns`.
+Conservative on purpose:
   - a reply counts only with a tool call or at least `min_chars` characters of text: "ok", "Done." never trigger;
   - the results must repeat too: a repeated command that gets new output (polling a job) is no loop;
   - a new user message (not a tool result) after the last assistant turn ends the streak: the human stepped in.
@@ -38,7 +42,8 @@ def _norm(s, cap=4000):
 
 
 def _reply_sig(m):
-    """(normalised reply, has a tool call): visible text + tool calls (name, canonical arguments); no reasoning."""
+    """(normalised visible text, exact tool calls): the text without reasoning, digit runs -> 0; the calls as
+    name:canonical arguments, NOT normalised ("" without a call)."""
     txt = _text(m.get("content"))
     if "</think>" in txt:
         txt = txt.split("</think>", 1)[1]
@@ -52,7 +57,7 @@ def _reply_sig(m):
             except Exception:
                 pass
         calls.append(f"{f.get('name')}:{json.dumps(a, sort_keys=True, ensure_ascii=False, default=str)}")
-    return _norm(txt + " | " + " | ".join(calls)), bool(calls)
+    return _norm(txt), " | ".join(calls)
 
 
 def _similar(a, b, near, min_chars):
@@ -65,8 +70,8 @@ def _similar(a, b, near, min_chars):
 
 
 def turns_of(messages):
-    """Assistant turns at the end of the history as [(reply sig, has call, result sig)], oldest first, and whether a
-    human message (not a tool result) follows the last one."""
+    """Assistant turns of the history as [(text sig, exact calls, result sig, human)], oldest first; human: a human
+    message (not a tool result) follows the turn."""
     out, i, n = [], 0, len(messages)
     while i < n:
         m = messages[i]
@@ -105,7 +110,11 @@ def streak(messages, near=0.92, min_chars=24):
         s2, c2, r2, h2 = t[j]
         if h2:  # the human spoke between these turns: the streak starts after it
             break
-        if c2 != call or not _similar(s2, sig, near, min_chars) or not _similar(r2, res, near, min_chars):
+        if c2 != call:  # tool calls repeat only exactly (same ids, paths, numbers)
+            break
+        if not call and not _similar(s2, sig, near, min_chars):  # a text reply: normalised / near copy
+            break
+        if not _similar(r2, res, near, min_chars):  # the result: normalised / near (secondary to the exact call)
             break
         k += 1
         sig, res = s2, r2

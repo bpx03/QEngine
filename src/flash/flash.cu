@@ -1,7 +1,9 @@
 // Qwen3.8-Flash-Next worker: loading of one card's slice and the decode forward (see flash.h).
 #include "../env.h"
 #include "flash.h"
+#include "pp_plan.h"
 #include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cerrno>
 #include <atomic>
 #include <cstring>
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <thread>
+#include <mutex>
 #include <chrono>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -219,10 +222,122 @@ void Worker::rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m
 static const bool g_kchk = env_int("FLASH_KCHK", 0);
 #define KCHK(name) do { if (g_kchk) { cudaError_t e_ = cudaDeviceSynchronize(); if (e_ != cudaSuccess) { fprintf(stderr, "kernel %s: %s\n", name, cudaGetErrorString(e_)); exit(1); } } } while (0)
 
+// Several workers whose kernels wait on each other on one card (TP ranks sharing a card: a TP4 test on 3 cards,
+// devices 0,1,2,2): a spin-waiting kernel of one rank can hold every SM while the peer rank's producer kernel waits for
+// one (seen: deadlock in the first all-reduce). Each such worker gets a green context with its share of the SMs and
+// creates its streams in it (set_card_ranks before the workers; workers take the partitions in construction order).
+// The green-context API is resolved from the driver at run time (cudaGetDriverEntryPointByVersion), never linked: a
+// CUDA 13.0 runtime loaded first in the process (torch cu130 under --vision 1) has no cudaGreenCtx* symbols and a
+// link-time reference made libqflash fail to load. Only the shared-card layout needs it; without it that layout is
+// refused (FLASH_GREEN_SPLIT=0 runs it without green contexts, at the risk of the spin-wait deadlock above).
+static std::mutex g_green_mu;
+static std::map<int, int> g_green_k, g_green_next;
+static std::map<int, std::vector<CUgreenCtx>> g_green_ctx;
+struct GreenApi {
+    PFN_cuDeviceGetDevResource_v12040 dev_res = nullptr;
+    PFN_cuDevSmResourceSplitByCount_v12040 split = nullptr;
+    PFN_cuDevResourceGenerateDesc_v12040 desc = nullptr;
+    PFN_cuGreenCtxCreate_v12040 create = nullptr;
+    PFN_cuGreenCtxGetDevResource_v12040 ctx_res = nullptr;
+    PFN_cuGreenCtxStreamCreate_v12050 stream = nullptr;
+    std::string err;
+};
+static const GreenApi& green_api() {
+    static const GreenApi a = [] {
+        GreenApi g;
+        auto get = [&g](const char* name, void** fn) {
+            if (!g.err.empty()) return;
+            cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+            const cudaError_t e = cudaGetDriverEntryPointByVersion(name, fn, 12050, cudaEnableDefault, &q);
+            if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || !*fn) {
+                g.err = std::string(name) + " not available (" + cudaGetErrorString(e) + ", query " + std::to_string((int)q) + ")";
+                *fn = nullptr;
+                (void)cudaGetLastError();
+            }
+        };
+        get("cuDeviceGetDevResource", reinterpret_cast<void**>(&g.dev_res));
+        get("cuDevSmResourceSplitByCount", reinterpret_cast<void**>(&g.split));
+        get("cuDevResourceGenerateDesc", reinterpret_cast<void**>(&g.desc));
+        get("cuGreenCtxCreate", reinterpret_cast<void**>(&g.create));
+        get("cuGreenCtxGetDevResource", reinterpret_cast<void**>(&g.ctx_res));
+        get("cuGreenCtxStreamCreate", reinterpret_cast<void**>(&g.stream));
+        return g;
+    }();
+    return a;
+}
+#define CU_GREEN(call) do { const CUresult r_ = (call); if (r_ != CUDA_SUCCESS) { const char* n_ = nullptr; cuGetErrorName_fn(r_, &n_); \
+    throw std::runtime_error(std::string("flash: green contexts: ") + #call + ": " + (n_ ? n_ : std::to_string((int)r_))); } } while (0)
+static void cuGetErrorName_fn(CUresult r, const char** n) {
+    static PFN_cuGetErrorName_v6000 f = [] {
+        void* fn = nullptr;
+        cudaDriverEntryPointQueryResult q;
+        if (cudaGetDriverEntryPointByVersion("cuGetErrorName", &fn, 6000, cudaEnableDefault, &q) != cudaSuccess) { (void)cudaGetLastError(); fn = nullptr; }
+        return reinterpret_cast<PFN_cuGetErrorName_v6000>(fn);
+    }();
+    if (f) f(r, n);
+}
+void set_card_ranks(const std::vector<int>& devs) {
+    std::lock_guard<std::mutex> lk(g_green_mu);
+    g_green_k.clear();
+    for (int d : devs) g_green_k[d]++;
+}
+static CUgreenCtx green_ctx_for(int dev, int* sms) {
+    std::lock_guard<std::mutex> lk(g_green_mu);
+    const int k = g_green_k.count(dev) ? g_green_k[dev] : 1;
+    if (k < 2 || !env_int("FLASH_GREEN_SPLIT", 1)) return nullptr;
+    const GreenApi& api = green_api();
+    if (!api.err.empty())
+        throw std::runtime_error("flash: GPU" + std::to_string(dev) + " holds " + std::to_string(k) +
+                                 " TP ranks (a card listed twice), which needs green contexts (driver >= 12.5): " + api.err +
+                                 ". List each card once, or set FLASH_GREEN_SPLIT=0 to run without them (may deadlock).");
+    std::vector<CUgreenCtx>& v = g_green_ctx[dev];
+    if (v.empty()) {
+        CUdevice cd;
+        CU_GREEN(cuDeviceGet(&cd, dev));
+        CUdevResource in{};
+        CU_GREEN(api.dev_res(cd, &in, CU_DEV_RESOURCE_TYPE_SM));
+        const unsigned per = (in.sm.smCount / k) & ~1u;
+        std::vector<CUdevResource> res(k);
+        unsigned ng = k;
+        CUdevResource rem{};
+        CU_GREEN(api.split(res.data(), &ng, &in, &rem, 0, per));
+        CHECK((int)ng == k, "flash: green contexts: %u of %d SM partitions on GPU%d", ng, k, dev);
+        for (int i = 0; i < k; i++) {
+            CUdevResourceDesc desc;
+            CU_GREEN(api.desc(&desc, &res[i], 1));
+            CUgreenCtx c;
+            CU_GREEN(api.create(&c, desc, cd, CU_GREEN_CTX_DEFAULT_STREAM));
+            v.push_back(c);
+        }
+        fprintf(stderr, "[flash] GPU%d holds %d TP ranks: green contexts of %u SMs each (FLASH_GREEN_SPLIT=0: off)\n", dev, k, per);
+    }
+    if (sms) {
+        CUdevResource r{};
+        CU_GREEN(api.ctx_res(v[g_green_next[dev] % k], &r, CU_DEV_RESOURCE_TYPE_SM));
+        *sms = (int)r.sm.smCount;
+    }
+    return v[g_green_next[dev]++ % k];
+}
+void Worker::mkstream(cudaStream_t* s, unsigned flags, int prio) {
+    if (gctx_) {
+        CUstream cs;
+        CU_GREEN(green_api().stream(&cs, static_cast<CUgreenCtx>(gctx_), flags, prio));
+        *s = cs;
+    } else CUDA_CHECK(cudaStreamCreateWithPriority(s, flags, prio));
+}
+
+// FLASH_NF_LAYERS=1: flag a layer whose residual rows hold a non-finite value (debug; one tiny kernel per layer)
+__global__ void k_nf_rows(const float* __restrict__ r, size_t n, unsigned* __restrict__ flag) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        if (!isfinite(r[i])) { *flag = 1u; return; }
+}
 std::vector<Plan> make_plan(int ngpu, const std::vector<double>& wts) {
-    if ((ngpu != 2 && ngpu != 3) || (int)wts.size() != ngpu)
-        throw std::runtime_error("flash: 2 or 3 GPUs and as many expert-group weights expected");
+    // 1 rank: a pipeline stage (whole layers, make_stage_plans); TP: 2 to kMaxTp (4) ranks (the comm / exchange buffers
+    // hold 4 ranks, k_idx_select gathers kMaxTp ranks' keys)
+    if (ngpu < 1 || ngpu > kMaxTp || (int)wts.size() != ngpu)
+        throw std::runtime_error("flash: 1 (pipeline stage), 2 to 4 tensor-parallel ranks and as many expert-group weights expected");
     static_assert(NQ % 6 == 0 && LNV % 6 == 0 && LNV % LNK == 0, "head splits over 2 and 3 cards");
+    static_assert(NQ % 4 == 0 && LNV % 4 == 0 && (LNV / 4) % (LNV / LNK) == 0, "head splits over 4 cards (whole key heads per card)");
     // expert groups (e * 5 + g, e = 0..512 with 512 the shared expert) spread by a largest-deficit interleave in
     // proportion to the weights: consecutive groups of one expert land on different cards (per-token balance)
     const int ng = (NE + 1) * NGRP;
@@ -259,6 +374,50 @@ std::vector<Plan> make_plan(int ngpu, const std::vector<double>& wts) {
         p.period = 512 * ngpu;
         p.own0 = 512 * r;
         p.own = 512;
+    }
+    return v;
+}
+
+static void pp_link_emul(size_t bytes, cudaStream_t st);
+// FLASH_TEST_LINK_HOST=1 (test, with FLASH_TEST_LINK_GBPS): the host link is slowed too: the staging ring's expert copies
+// wait for the emulated rate like the pipeline hop (zero-copy reads inside kernels cannot be slowed: reported, not
+// emulated). Off by default: the earlier TP emulation rows (registry) slowed only the card-to-card exchanges.
+static bool link_host_emul() {
+    static const bool on = env_int("FLASH_TEST_LINK_HOST", 0) && env_double("FLASH_TEST_LINK_GBPS", 0.0) > 0;
+    return on;
+}
+static_assert(flash_pp::kLayers == LAYERS && flash_pp::kPleLayer == PLE_LAYER && flash_pp::kRW == RW, "pp_plan.h model shape");
+std::vector<Plan> make_stage_plans(const std::vector<int>& b, const std::vector<int>& tps) {
+    const int n = (int)b.size() - 1;
+    if (n < 1 || b.front() != 0 || b.back() != LAYERS)
+        throw std::runtime_error("flash: pipeline stage bounds must start at 0 and end at the layer count");
+    if (!tps.empty() && (int)tps.size() != n) throw std::runtime_error("flash: one rank count per pipeline stage expected");
+    // PP x TP: one KV period for every stage (the server's pool regions are counted in periods): 512 x T positions with
+    // T the TP group size; a 1-rank stage owns the whole period (own = period). Groups of two different sizes > 1 would
+    // need another ownership layout: refused (review H2)
+    int T = 1;
+    for (int t : tps) T = std::max(T, t);
+    for (int t : tps)
+        if (t != 1 && t != T) throw std::runtime_error("flash: PP x TP stages must be TP groups of one size (or single cards)");
+    std::vector<Plan> v;
+    for (int s = 0; s < n; s++) {
+        if (b[s + 1] <= b[s]) throw std::runtime_error("flash: every pipeline stage needs at least one layer");
+        const int t = tps.empty() ? 1 : tps[s];
+        // (PP x TP groups: equal expert-group weights; the desktop card's 176,160,176 is a 3-card TP-only default)
+        for (const Plan& q : make_plan(t, std::vector<double>(t, 1.0))) {
+            Plan p = q;
+            p.l0 = b[s];
+            p.l1 = b[s + 1];
+            p.stage = s;
+            p.nstage = n;
+            p.wid = (int)v.size();
+            if (t == 1 && T > 1) {
+                p.period = 512 * T;
+                p.own = p.period;
+                p.own0 = 0;
+            }
+            v.push_back(p);
+        }
     }
     return v;
 }
@@ -430,6 +589,40 @@ static double g_yarn_req = 0;
 void set_yarn_factor(double f) { g_yarn_req = f; }
 static double g_host_reg_plan = 0;
 void set_host_reg_plan(double bytes) { g_host_reg_plan = bytes; }
+static double g_host_link_gbps = 0;  // 0: not measured
+void set_host_link_gbps(double gbps) { g_host_link_gbps = gbps; }
+double host_link_gbps() { return g_host_link_gbps; }
+double probe_host_link(const std::vector<int>& devs) {
+    const size_t n = (size_t)64 << 20;
+    double lo = 0;
+    void* h = nullptr;
+    if (cudaHostAlloc(&h, n, cudaHostAllocPortable) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    memset(h, 1, n);
+    for (int d : devs) {
+        void* p = nullptr;
+        CUDA_CHECK(cudaSetDevice(d));
+        if (cudaMalloc(&p, n) != cudaSuccess) { (void)cudaGetLastError(); continue; }
+        cudaEvent_t a, b;
+        CUDA_CHECK(cudaEventCreate(&a));
+        CUDA_CHECK(cudaEventCreate(&b));
+        CUDA_CHECK(cudaMemcpy(p, h, n, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(a, 0));
+        for (int i = 0; i < 4; i++) CUDA_CHECK(cudaMemcpyAsync(p, h, n, cudaMemcpyHostToDevice, 0));
+        CUDA_CHECK(cudaEventRecord(b, 0));
+        CUDA_CHECK(cudaEventSynchronize(b));
+        float ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+        const double g = ms > 0 ? 4.0 * n / (ms * 1e6) : 0;
+        lo = lo > 0 ? std::min(lo, g) : g;
+        CUDA_CHECK(cudaEventDestroy(a));
+        CUDA_CHECK(cudaEventDestroy(b));
+        CUDA_CHECK(cudaFree(p));
+    }
+    cudaFreeHost(h);
+    if (env_int("FLASH_TEST_LINK_HOST", 0) && env_double("FLASH_TEST_LINK_GBPS", 0.0) > 0)
+        lo = std::min(lo > 0 ? lo : 1e9, env_double("FLASH_TEST_LINK_GBPS", 0.0));
+    return lo;
+}
 double yarn_factor() {
     const double f = env_set("FLASH_YARN") ? env_double("FLASH_YARN", 0) : g_yarn_req;
     return f > 1 ? f : 0;
@@ -461,7 +654,8 @@ Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p)
     // process: pinned unless QE_GEMM_TUNE is set explicitly
     if (!env_set("QE_GEMM_TUNE")) setenv("QE_GEMM_TUNE", "0", 1);
     CUDA_CHECK(cudaSetDevice(dev_));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&st_, cudaStreamNonBlocking));
+    gctx_ = green_ctx_for(dev_, &gsms_);  // (TP ranks sharing this card: its SM share; else null)
+    mkstream(&st_, cudaStreamNonBlocking, 0);
     if (const double yf = yarn_factor(); yf > 0) {
         const YarnTab yt = yarn_table(yf);
         CUDA_CHECK(cudaMemcpyToSymbol(g_yarn, &yt, sizeof yt));
@@ -475,14 +669,27 @@ Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p)
     // receiving them: the q exchange (6 / 8 KB per token and QSA layer) is gone. Same W8 rows, same row GEMM, same fp16
     // format in the receive slot: bit-identical. Default: on with copy-engine transfers (FLASH_COMM=ce or auto -> CE)
     {
-        const int e = env_set("FLASH_QX_LOCAL") ? env_int("FLASH_QX_LOCAL", 0) : (comm_.xfer == kXferCE ? 1 : 0);
+        // (host staging, no peer access: on too, the q exchange's D2H -> flags -> H2D round trip per chunk is gone)
+        const int e = env_set("FLASH_QX_LOCAL") ? env_int("FLASH_QX_LOCAL", 0) : (comm_.xfer == kXferCE || comm_.xfer == kXferHost ? 1 : 0);
         qx_on_ = e && p_.ngpu > 1 && !qsa_a_;
     }
     // MoE input quantized + routed on the owner (see k_agq_pack); off with the debug paths that read the MoE input rows
     agq_on_ = p_.ngpu > 1 && env_int("FLASH_ROUTER8", 1) &&
               !env_str("FLASH_STATS") && !(env_int("FLASH_PFX", 0) & 2) && !env_int("FLASH_DBGHASH", 0) &&
               !env_int("FLASH_DBG_XQCHK", 0) && !env_int("FLASH_DBG_GU2X", 0);
-    qe_wd_init(p_.rank, dev_);  // collective watchdog (budget QE_COLL_TIMEOUT_MS; uninitialized it trips on long waits)
+    {  // per-card registrations (collective watchdog identity, the GEMM out-of-memory hook in load_deferred_groups) belong
+       // to the first worker on the card: a pipeline stage next to a TP rank (FLASH_PAR=pp_prefill) leaves them to it;
+       // stages register with their stage index as the rank (distinct cards in FLASH_PAR=pp)
+        static std::mutex mu;
+        static std::vector<int> devs;
+        std::lock_guard<std::mutex> lk(mu);
+        dev_first_ = std::find(devs.begin(), devs.end(), dev_) == devs.end();
+        devs.push_back(dev_);
+    }
+    // collective watchdog (budget QE_COLL_TIMEOUT_MS; uninitialized it trips on long waits)
+    wdid_ = p_.pp() ? (p_.wid >= 0 ? p_.wid : p_.stage) : p_.rank;  // (pipelines: the worker index)
+    if (!p_.pp() || dev_first_) qe_wd_init(wdid_, dev_);
+    qe_wd_stream(wdid_, dev_, (void*)st_);
     gemv_workspace_init();
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TA_SMEM));
     CUDA_CHECK(cudaFuncSetAttribute(k_qsa_attn_tc2<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TB_SMEM));
@@ -776,7 +983,11 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             L.router = load_w16(528, H, {{B(st, pre + "mlp.gate.weight"), H, NE, H, 0, 0},
                                          {B(st, pre + "mlp.shared_expert_gate.weight"), H, 1, H, NE, 0}},
                                 this, A, st_);
-        if (li >= 0 && ec_defer_) {
+        if (views() && li >= 0) {
+            // mode A shared expert views: no trunk expert weights of its own (the MTP block keeps its own groups: the
+            // expert-cache table covers the trunk layers only)
+            view_groups(L, li);
+        } else if (li >= 0 && ec_defer_) {
             // trunk expert groups are loaded last (Worker::load_deferred_groups, from alloc_state): the groups that fit
             // the memory left after every other allocation stay on the device, the rest is host-backed
             ec_defer_l_.push_back({&st, pre, li});
@@ -797,9 +1008,12 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         }
     };
     L_.resize(LAYERS);
-    for (int li = 0; li < LAYERS; li++) load_layer(st, L_[li], P + "layers." + std::to_string(li) + ".", li);
-    mixer_ = hc_from(st, P + "hyper_connection_mixer.", false);
-    if (mst) {  // MTP block: one QSA layer + MoE + hyper-connections, its own head mixer; embed / lm_head shared
+    for (int li = 0; li < LAYERS; li++) {
+        if (!layer_here(li)) { L_[li].here = false; continue; }  // pipeline stage: another stage's layer
+        load_layer(st, L_[li], P + "layers." + std::to_string(li) + ".", li);
+    }
+    if (p_.last()) mixer_ = hc_from(st, P + "hyper_connection_mixer.", false);
+    if (mst && p_.last()) {  // MTP block: one QSA layer + MoE + hyper-connections, its own head mixer; embed / lm_head shared
         const SafeTensors& ms = *mst;
         load_layer(ms, mtp_, "mtp.layers.0.", -1);
         mtp_mixer_ = hc_from(ms, "mtp.hyper_connection_mixer.", false);
@@ -809,7 +1023,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         mtp_pre_h_ = bf_dev(B(ms, "mtp.pre_fc_norm_hidden.weight"), RW);
         has_mtp_ = true;
     }
-    {
+    if (p_.last()) {  // (pipeline: the head lives on the last stage only)
         const bf16* lm = B(st, "lm_head.weight");
         const int nv = p_.voc1 - p_.voc0;
         // rows permuted: the draft vocabulary of this slice first (its first ndraft_ rows are the draft head), map_ =
@@ -865,6 +1079,100 @@ static void prefetch_experts(const SafeTensors& st, const std::string& pre, bool
         const uintptr_t a = (uintptr_t)t.data & ~(uintptr_t)4095, e = (uintptr_t)t.data + t.nbytes;
         madvise((void*)a, e - a, sync ? MADV_POPULATE_READ : MADV_WILLNEED);
     }
+}
+
+// Shared expert views (mode A stage on the card of TP rank vown_, flash.h set_views): the stage's layer li (-1: the MTP
+// block) uses the TP rank's resident groups in place (its groups array, ndev and gmap indices), and every other group
+// as a cold group of the stage: the TP ranks' cold groups from their pinned host copies (in each rank's cold order:
+// contiguous sources, few large ring copies), then the other ranks' resident groups (in their order) from peer VRAM when
+// this card has peer access to theirs, else from one pinned host copy per (rank, layer) shared by every stage.
+void Worker::view_groups(Layer& L, int li) {
+    const int LI = li < 0 ? LAYERS : li, nt = (int)vtp_.size(), own = vown_;
+    CHECK(own >= 0 && own < nt && vtp_[own]->device() == dev_, "flash: shared expert views: TP rank %d is not on GPU%d", own, dev_);
+    std::vector<std::vector<int>> gm(nt, std::vector<int>((NE + 1) * NGRP, -1));
+    for (int r = 0; r < nt; r++) {
+        const Layer* T = vtp_[r]->layer_ptr(LI);
+        CHECK(T->gmap, "flash: shared expert views: TP rank %d has no expert map of layer %d", r, LI);
+        CUDA_CHECK(cudaMemcpy(gm[r].data(), T->gmap, gm[r].size() * 4, cudaMemcpyDeviceToHost));
+    }
+    const Layer& O = *vtp_[own]->layer_ptr(LI);
+    L.groups = O.groups;
+    L.ndev = O.ndev;
+    std::vector<int> g((NE + 1) * NGRP, -1);
+    for (int k = 0; k < (NE + 1) * NGRP; k++)
+        if (gm[own][k] >= 0 && gm[own][k] < O.ndev) g[k] = gm[own][k];
+    L.csrc.clear();
+    L.csrc_h.clear();
+    L.cdev.clear();
+    L.cexp.clear();
+    L.hgroups = L.hgroups_h = nullptr;
+    // peer access to the TP ranks' cards (kernels read peer groups zero-copy, the ring copies them peer-to-peer)
+    static const bool peer_ok = env_int("FLASH_PP_VIEW_PEER", 1) != 0;
+    static std::mutex hmu;
+    static std::map<const char*, char*> hcopy;  // a TP rank's resident groups of a layer -> their shared host copy
+    std::vector<int> order = {own};
+    for (int r = 0; r < nt; r++) if (r != own) order.push_back(r);
+    int nc = 0;
+    for (int r : order) {
+        const Layer& T = *vtp_[r]->layer_ptr(LI);
+        std::vector<std::pair<int, int>> cold, res;  // (rank's local index, group)
+        for (int k = 0; k < (NE + 1) * NGRP; k++) {
+            const int x = gm[r][k];
+            if (x < 0) continue;
+            if (x >= T.ndev) cold.push_back({x, k});
+            else if (r != own) res.push_back({x, k});
+        }
+        std::sort(cold.begin(), cold.end());
+        std::sort(res.begin(), res.end());
+        for (auto& [x, k] : cold) {
+            const int j = x - T.ndev;
+            g[k] = O.ndev + nc++;
+            L.csrc.push_back(T.csrc.empty() ? T.hgroups + (size_t)j * GRP_BYTES : T.csrc[j]);
+            L.csrc_h.push_back(T.csrc_h.empty() ? T.hgroups_h + (size_t)j * GRP_BYTES : T.csrc_h[j]);
+            L.cdev.push_back(0);
+            L.cexp.push_back(k / NGRP);
+        }
+        if (res.empty()) continue;
+        const int rd = vtp_[r]->device();
+        int can = 0;
+        bool peer = peer_ok && cudaDeviceCanAccessPeer(&can, dev_, rd) == cudaSuccess && can;
+        if (peer) {
+            const cudaError_t e = cudaDeviceEnablePeerAccess(rd, 0);
+            peer = e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled;
+            (void)cudaGetLastError();
+        }
+        const char* hbase = nullptr;
+        if (!peer) {
+            std::lock_guard<std::mutex> lk(hmu);
+            char*& h = hcopy[T.groups];
+            if (!h) {
+                const size_t b = (size_t)T.ndev * GRP_BYTES;
+                // (no peer access: these copies are new pinned host memory, ~2/3 of the TP experts on 3 cards; never past
+                // the host's margin: the archive and the page cache need the rest)
+                CHECK(qe_hostmem::headroom(true) >= b + ((size_t)4 << 30),
+                      "flash: mode A shared expert views without peer access need a pinned host copy of the other cards' resident "
+                      "experts (%.1f GB more for GPU%d's layer %d), MemAvailable %.1f GB, margin %.1f GB: not enough host memory. "
+                      "Use FLASH_PAR=tp, or enable P2P", b / 1e9, rd, LI, qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9);
+                h = pin_host(nullptr, b, 4, false, {gpu_numa_node(rd)});
+                CUDA_CHECK(cudaMemcpy(h, T.groups, b, cudaMemcpyDeviceToHost));
+                host_bytes_ += b;
+            }
+            hbase = h;
+        }
+        for (auto& [x, k] : res) {
+            g[k] = O.ndev + nc++;
+            const char* a = peer ? T.groups + (size_t)x * GRP_BYTES : hbase + (size_t)x * GRP_BYTES;
+            L.csrc.push_back(a);
+            L.csrc_h.push_back(a);
+            L.cdev.push_back(peer);
+            L.cexp.push_back(k / NGRP);
+        }
+    }
+    for (int k = 0; k < (NE + 1) * NGRP; k++)
+        CHECK(g[k] >= 0, "flash: shared expert views: group %d of layer %d is on no TP rank", k, LI);
+    L.ncold = nc;
+    L.gmap = (int*)dalloc(g.size() * 4);
+    CUDA_CHECK(cudaMemcpy(L.gmap, g.data(), g.size() * 4, cudaMemcpyHostToDevice));
 }
 
 void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre, const std::vector<char>& isc) {
@@ -1118,7 +1426,11 @@ void Worker::alloc_rows(int n, Bufs& b, int nb) {
     }
     {  // the mixer chunk's scratch in one block (gates, proj, proj2, yd, qbuf): the MoE half of a batch runs after every
        // mixer chunk of the layer, so its slot buffer (k_moe_dn_q) lives in the same block (moe_slots_)
-        const size_t sg = (size_t)n0 * RW * 4, sp = (size_t)n0 * projw_ * 4, sq = (size_t)n0 * (NQ + 4) * HD * 4;
+        // qbuf: QSA q / k rows ((NQ + 4) x HD) or the DeltaNet conv output of this card's heads (2 kl DK + vl DV
+        // channels: 10240 on a 1-rank pipeline stage, more than the QSA rows' 7168)
+        const int dch = 2 * (p_.k1 - p_.k0) * DK + (p_.v1 - p_.v0) * DV;
+        const size_t sg = (size_t)n0 * RW * 4, sp = (size_t)n0 * projw_ * 4,
+                     sq = (size_t)n0 * std::max((NQ + 4) * HD, dch) * 4;
         char* blk = (char*)dalloc(3 * sg + sp + sq);
         b.gates = (float*)blk;
         b.proj = (float*)(blk + sg);
@@ -1167,6 +1479,9 @@ void Worker::alloc_state() {
     // KV streaming (FLASH_KV_STREAM=1): the pool of FLASH_KV_STREAM_CTX positions (default 1M) lives in host memory,
     // VRAM keeps the indexer keys of the pool + a block cache of FLASH_KV_CACHE_BLOCKS blocks of 4 rows per layer
     kvs_ = kv_ram_mode();
+    // (the RAM pool's lazy pinning, block cache and expert-cache tails are sized per card for all 13 KV layers; a stage
+    // holds a few of them: not validated yet)
+    CHECK(!(kvs_ && p_.pp()), "flash: FLASH_KV=ram is not supported with pipeline stages (FLASH_PAR=pp / pp_prefill) yet; use FLASH_KV=vram");
     if (kvs_) {
         // the pool (all conversations together) in host RAM: FLASH_KV_RAM_TOKENS (e.g. 10M), at most what the host can
         // pin next to the margin (host_mem.h; shared by the cards, 3/4 of the headroom at start: the archive keeps room)
@@ -1205,7 +1520,9 @@ void Worker::alloc_state() {
         // holds a layer's cold groups, no gain from 8192). FLASH_PFB_ALIAS=0: the old own-memory tails (8192 on 2 cards
         // then cost ~880 static groups per card, agent c=8 -1.2 %)
         const int v = env_int("FLASH_PFB", 2048);
-        auto rows_of = [](int r) { return std::max(PFM, std::min(32 * PFM, (r + PFM - 1) / PFM * PFM)) + PFM; };  // + one chunk: a short tail joins the last batch
+        // + one chunk: a short tail joins the last batch. At most 32 chunks in all: the per-chunk masks (block selection,
+        // per-row attention) are 32-bit (a 33-chunk batch shifted by 32: undefined)
+        auto rows_of = [](int r) { return std::max(PFM, std::min(31 * PFM, (r + PFM - 1) / PFM * PFM)) + PFM; };
         bool al = !kvs_ && env_int("FLASH_PFB_ALIAS", 1) != 0;
         if (al) {
             CUdevice cd;
@@ -1220,7 +1537,14 @@ void Worker::alloc_state() {
             al = al && cuMemGetAllocationGranularity(&g, &pr, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS && g > 0;
             al_gran_ = al ? g : 0;
         }
-        const int vb = env_int("FLASH_PFB_BIG", p_.ngpu == 2 && al ? 8192 : 4096);
+        // (pipeline stages: 8192 too; the driver picks the micro-batch up to it, pp_plan.h pick_microbatch)
+        // slow host link (probe_host_link), 2 cards: 16384 (each pass restages ~15 GB of host-backed experts per card; at
+        // 3.3 GB/s one pass ~4.9 s whatever its rows: 10K 10.0 -> 5.2 s)
+        const double slow = env_double("FLASH_PFB_SLOW_GBPS", 8.0);
+        const bool slow_link = p_.ngpu == 2 && g_host_link_gbps > 0 && g_host_link_gbps < slow;
+        const int vb = env_int("FLASH_PFB_BIG", slow_link ? 16384 : (p_.ngpu == 2 || p_.pp()) && al ? 8192 : 4096);
+        if (slow_link && p_.rank == 0 && !env_set("FLASH_PFB_BIG"))
+            fprintf(stderr, "[flash] slow host link (%.1f GB/s < FLASH_PFB_SLOW_GBPS %.1f): prefill batches up to 16384 rows\n", g_host_link_gbps, slow);
         pfbn_base_ = rows_of(v);
         pfbn_ = vb > v ? rows_of(vb) : pfbn_base_;
         pfbn_mid_ = al ? std::min(pfbn_, std::max(pfbn_base_, rows_of(4096))) : pfbn_;
@@ -1245,12 +1569,23 @@ void Worker::alloc_state() {
                     if (comm_.dev[r] != dev_ && cudaDeviceCanAccessPeer(&can, comm_.dev[r], dev_) == cudaSuccess && can)
                         al_devs_[al_ndev_++] = comm_.dev[r];
                 }
-            if (!narr || 2 * al_arr_ > vasz) { al_arr_ = 0; pfbn_ = pfbn_mid_; }  // a small pool: no alias, no rows past mid
+            // a small pool: no alias, no rows past mid. FLASH_PFB_ALIAS_FRAC (default 0.5): the share of each K / V array the
+            // big-batch tails may take (more: bigger batches, usable only while the KV rows end below the rest; the slow-link
+            // case wants fewer, bigger passes: 2 cards at 3.3 GB/s restage 14-16 GB per pass)
+            static const double afrac = std::clamp(env_double("FLASH_PFB_ALIAS_FRAC", 0.5), 0.05, 0.95);
+            if (!narr || (double)al_arr_ > afrac * (double)vasz) {
+                if (narr && p_.rank == 0)
+                    fprintf(stderr, "[flash] big prefill batches of %d rows need %.0f MB of each K / V array's %.0f MB tail (more than "
+                            "FLASH_PFB_ALIAS_FRAC %.2f): %d rows\n", pfbn_, al_arr_ / 1048576.0, vasz / 1048576.0, afrac, pfbn_mid_);
+                al_arr_ = 0;
+                pfbn_ = pfbn_mid_;
+            }
         }
     }
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV;
     for (auto& L : L_) {
+        if (!L.here) continue;
         if (L.full) {
             alloc_full(L);
         } else {
@@ -1265,6 +1600,29 @@ void Worker::alloc_state() {
         }
     }
     stepc_ = (unsigned*)dalloc(4);
+    if (p_.pp()) {  // pipeline stage: the decode rows' hand-off staging (prefill rows go straight into the batch R)
+        pp_din_ = (float*)dalloc((size_t)MAXM * RW * 4);   // (batched steps: up to MAXM rows of a sequence group)
+        pp_dout_ = (float*)dalloc((size_t)MAXM * RW * 4);
+        const size_t rows = (size_t)std::max(pfbn_, MAXM);
+        // P2P receive buffers (the previous stage copies its rows straight here), before the expert budget takes the card
+        // (FLASH_PP_RX_ROWS, default 4608 = 4096 + one chunk: 2 x 189 MB fp32 instead of 2 x 356 MB at the 8704-row
+        // batch buffers; the driver keeps P2P micro-batches within it)
+        // 2 stages: 8192 + 512 rows (2 x 356 MB), so the big micro-batches the 2-card stages want (host-backed experts
+        // re-read per batch) go peer-to-peer too; more stages hold few host-backed groups and keep 4096 + 512 (the extra
+        // 334 MB per stage cost 3 cards 5 % at 10K in resident experts)
+        pp_rx_rows_ = std::min<int>((int)rows, std::max(PFM + MAXM, env_int("FLASH_PP_RX_ROWS", (p_.nstage <= 2 ? 8192 : 4096) + PFM)));
+        if (pp_rx_want_ && !p_.first())
+            for (auto& b : pp_rx_) b = dalloc((size_t)pp_rx_rows_ * pp_rowb());
+        if (pp_hop16()) {
+            if (!p_.first()) pp_wire_in_ = (bf16*)dalloc(rows * RW * 2);
+            if (!p_.last()) pp_wire_out_ = (bf16*)dalloc(rows * RW * 2);
+        }
+        mkstream(&hopst_, cudaStreamNonBlocking, 0);
+        CUDA_CHECK(cudaEventCreateWithFlags(&hev_fork_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&hev_join_, cudaEventDisableTiming));
+        hev_in_.resize(pfbn_ / PFM + PFSEG_MAX);
+        for (auto& e : hev_in_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
     if (env_int("FLASH_SELWIN", 0)) {  // KV streaming gate counters (k_sel_win)
         const size_t lb = srows_ / IDX_R;
         sw_stamp_ = (unsigned*)dalloc((size_t)(LAYERS + 1) * lb * 4);
@@ -1279,7 +1637,7 @@ void Worker::alloc_state() {
     rfpart_ = (float*)dalloc((size_t)RF_SPLIT * RF_TILES * 32 * 4 * 4);
 
     if (env_str("FLASH_STATS")) {
-        for (auto& L : L_) L.stats = (int*)dalloc(NE * 4);
+        for (auto& L : L_) if (L.here) L.stats = (int*)dalloc(NE * 4);
         if (has_mtp_) mtp_.stats = (int*)dalloc(NE * 4);
     }
     if (has_mtp_) {
@@ -1308,10 +1666,11 @@ void Worker::alloc_state() {
         static const bool prio = env_int("FLASH_CST_PRIO", 1);
         int lo = 0, hi = 0;
         CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
-        CUDA_CHECK(cudaStreamCreateWithPriority(&cst_, cudaStreamNonBlocking, prio ? hi : 0));
+        mkstream(&cst_, cudaStreamNonBlocking, prio ? hi : 0);
+        qe_wd_stream(wdid_, dev_, (void*)cst_);
         // the copy-engine path: a second comm stream for the part of a collective after the reduce-scatter
         if (p_.ngpu > 1 && comm_.xfer == kXferCE) {
-            CUDA_CHECK(cudaStreamCreateWithPriority(&cst2_, cudaStreamNonBlocking, prio ? hi : 0));
+            mkstream(&cst2_, cudaStreamNonBlocking, prio ? hi : 0);
             CUDA_CHECK(cudaEventCreateWithFlags(&evs_, cudaEventDisableTiming));
         }
     }
@@ -1320,7 +1679,7 @@ void Worker::alloc_state() {
     for (auto& e : evp_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     for (auto& e : evd_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&evm_, cudaEventDisableTiming));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&pfs_, cudaStreamNonBlocking));
+    mkstream(&pfs_, cudaStreamNonBlocking, 0);
     CUDA_CHECK(cudaEventCreateWithFlags(&pfe0_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&pfe1_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&pfq0_, cudaEventDisableTiming));
@@ -1501,7 +1860,7 @@ void Worker::alloc_state() {
             lkrp_ = (int*)dalloc(8 * 4);
             CUDA_CHECK(cudaMemcpy(lkrp_, rp, 32, cudaMemcpyHostToDevice));
         }
-        CUDA_CHECK(cudaStreamCreateWithFlags(&lkst_, cudaStreamNonBlocking));
+        mkstream(&lkst_, cudaStreamNonBlocking, 0);
         // FLASH_CORPUS=1048576 (tokens) turns it on: server measurements were inconclusive
         ccap_ = env_int("FLASH_CORPUS", 0);
         if (ccap_ > 0) {
@@ -1514,6 +1873,11 @@ void Worker::alloc_state() {
         }
     }
     CUDA_CHECK(cudaHostGetDevicePointer((void**)&em_, em_h_, 0));
+    if (env_int("FLASH_NF_LAYERS", 0)) {
+        CUDA_CHECK(cudaHostAlloc((void**)&nfl_h_, (LAYERS + 1) * 4, cudaHostAllocMapped | cudaHostAllocPortable));
+        memset(nfl_h_, 0, (LAYERS + 1) * 4);
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&nfl_d_, nfl_h_, 0));
+    }
     if (env_int("FLASH_GUARD", 1)) {
         CUDA_CHECK(cudaHostAlloc((void**)&nf_h_, 4, cudaHostAllocMapped | cudaHostAllocPortable));
         *nf_h_ = 0;
@@ -1543,6 +1907,28 @@ void Worker::alloc_state() {
     xseq_ = (unsigned*)dalloc(4);
     xdone_ = (unsigned*)dalloc(4);
     xqrecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4);
+    // (the test switch QE_HOST_DEVSLOT=0, host-mapped receive slots, is gone: host -> host copy nodes in the prefill
+    // graphs ended in launch failures, and xchg_send requires device slots; review comm F5)
+    if (env_set("QE_HOST_DEVSLOT") && !env_int("QE_HOST_DEVSLOT", 1) && p_.rank == 0) {
+        static std::atomic<int> once{0};
+        if (!once.exchange(1))
+            fprintf(stderr, "[flash] QE_HOST_DEVSLOT=0 is no longer supported (host-mapped receive slots failed in the "
+                            "prefill graphs): ignored\n");
+    }
+    if (!comm_.p2p && p_.ngpu > 1 && comm_.xfer == kXferHost && env_int("QE_HOST_STAGED", 1)) {
+        xrecvd_ = (float*)dalloc((size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
+        xqrecvd_ = (float*)dalloc((size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4);
+        if (env_int("QE_HOST_DEVFLAG", 1)) {
+            xflagd_ = (unsigned*)dalloc(4 * 4);
+            xqflagd_ = (unsigned*)dalloc(4 * 4);
+            CUDA_CHECK(cudaMemset(xflagd_, 0, 4 * 4));
+            CUDA_CHECK(cudaMemset(xqflagd_, 0, 4 * 4));
+            xiflagd_ = (unsigned*)dalloc(4 * 4);
+            CUDA_CHECK(cudaMemset(xiflagd_, 0, 4 * 4));
+            xpcnt_ = (unsigned*)dalloc(12 * 4);
+            CUDA_CHECK(cudaMemset(xpcnt_, 0, 12 * 4));
+        }
+    }
     xqflags_ = (unsigned*)palloc(4 * 4);
     xqseq_ = (unsigned*)dalloc(4);
     xqdone_ = (unsigned*)dalloc(4);
@@ -1606,12 +1992,28 @@ void Worker::load_deferred_groups() {
     // lazily grown GEMM workspaces (gemm.cu tl_alloc): reserved here per device, before the budget, for the largest
     // prefill chunk; a later growth that runs out of memory drops this card's cached graphs and retries (not while
     // capturing). Both are per device: this runs on the loader thread, the card is served from another one
-    gemm_set_oom_hook([](void* w) -> int {
-        Worker* k = static_cast<Worker*>(w);
-        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(k->st_, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) return -1;
-        return k->drop_all_graphs(nullptr);
-    }, this);
+    // every worker of the card in one list (mode A: a TP rank and a pipeline stage share a card): a growth that runs out
+    // of memory drops the cached graphs of all of them that are not capturing (the memory may be any worker's)
+    {
+        static std::mutex mu;
+        static std::map<int, std::vector<Worker*>> card;
+        std::lock_guard<std::mutex> lk(mu);
+        card[dev_].push_back(this);
+        // (flash_run drives a card's workers one phase at a time: mode A's stage workers prefill, then the TP ranks
+        // decode, so a hook never drops graphs another thread is launching; the server refuses PP modes)
+        gemm_set_oom_hook([](void* c) -> int {
+            std::lock_guard<std::mutex> lk(mu);
+            int n = 0;
+            bool any = false;
+            for (Worker* k : *static_cast<std::vector<Worker*>*>(c)) {
+                cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(k->st_, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) continue;
+                n += k->drop_all_graphs(nullptr);
+                any = true;
+            }
+            return any ? n : -1;
+        }, &card[dev_]);
+    }
     // per-thread stack (local memory) for the largest kernel frame, reserved here before the budget. The context
     // starts with a 1024 B limit and grows it at the first launch of a kernel with a bigger frame
     // (was sample_rows_slots_kernel, 1056 B, until perf G cut it to 800 B; kept as a safety net for any later frame
@@ -1637,6 +2039,34 @@ void Worker::load_deferred_groups() {
         dn_chunk_reserve(p_.v1 - p_.v0, PFM);  // the chunked delta rule's scratch (gdn prefill, chunks of <= PFM rows)
         if (p_.rank == 0) fprintf(stderr, "[flash] GEMM + DeltaNet workspaces reserved at load: %.1f MB per card\n", (f0 - free_bytes()) / 1048576.0);
     }
+    if (views()) {  // shared expert views: no budget (no own groups); the ring holds a layer's cold groups (capped)
+        int mx = 0;
+        for (const Layer& L : L_) if (L.here) mx = std::max(mx, L.ncold);
+        const int pfs_mb = env_int("FLASH_PF_STAGE_MB", 512), pfs_xmb = env_int("FLASH_PF_STAGE_XMB", 2048);
+        if (pfs_mb > 0 && mx > 0) {
+            const long long cap_b = std::max<long long>((long long)pfs_mb, (long long)pfs_xmb) * 1048576 / GRP_BYTES;
+            const long long ring = std::min<long long>(2LL * mx, cap_b);
+            const long long ring0 = std::min<long long>(ring, (long long)pfs_mb * 1048576 / GRP_BYTES);
+            pfs_cap_ = (int)(ring / 2);
+            pfs_cap0_ = (int)(ring0 / 2);
+            pfs_resv_ = ring * (long long)GRP_BYTES;
+            pfs_ring_ = (char*)dalloc((size_t)2 * pfs_cap0_ * GRP_BYTES);
+            if (pfs_cap_ > pfs_cap0_) {
+                const size_t xb = (size_t)2 * (pfs_cap_ - pfs_cap0_) * GRP_BYTES;
+                pfs_ext_ = (char*)dalloc(xb);
+                bt_regs_.push_back({pfs_ext_, xb});
+                lend_own_.push_back({(uintptr_t)pfs_ext_, 0});
+            }
+        }
+        long long npeer = 0, nhost = 0;
+        for (const Layer& L : L_)
+            for (char d : L.cdev) (d ? npeer : nhost)++;
+        fprintf(stderr, "[flash] GPU%d stage expert views (TP rank %d): %d layers, cold groups per layer <= %d (%.2f GB from host, "
+                "%.2f GB from peer VRAM), staging ring 2 x %d groups\n", dev_, vown_, p_.l1 - p_.l0, mx, nhost * (double)GRP_BYTES / 1e9,
+                npeer * (double)GRP_BYTES / 1e9, pfs_cap_);
+        ec_defer_l_.clear();
+        return;
+    }
     if (ec_defer_l_.empty()) return;
     std::vector<char> incold((size_t)LAYERS * NE, 0);
     for (int li = 0; li < LAYERS && li < (int)cold_.size(); li++)
@@ -1659,7 +2089,10 @@ void Worker::load_deferred_groups() {
     if (const char* e = env_str("FLASH_EC_MARGIN_MB")) {
         std::stringstream ss(e);
         int i = 0;
-        for (std::string x; std::getline(ss, x, ',') && i <= p_.rank; i++) margin_mb = atof(x.c_str());
+        // TP: one value per rank, as in 1.3.3 (= per card in --devices order); the pipeline modes index by the card
+        // (CUDA ordinal): every stage is rank 0 there, and the desktop card's margin must follow the card (review comm F7)
+        const int at = p_.pp() ? dev_ : p_.rank;
+        for (std::string x; std::getline(ss, x, ',') && i <= at; i++) margin_mb = atof(x.c_str());
     }
     const long long fr = (long long)free_bytes();
     // host memory registered after load (archive slabs + pinned prefixes, in the background): its GPU page tables
@@ -1670,9 +2103,13 @@ void Worker::load_deferred_groups() {
         fprintf(stderr, "[flash] expert budget: %.0f MB per card kept for the GPU mappings of %.1f GB of host memory registered "
                 "after load (archive + pinned prefixes)\n", hostreg_mb, g_host_reg_plan / 1e9);
     margin_mb += hostreg_mb;
+    // the emergency graph reserve (oom_reserve_take, after the budget) comes out of the host-registration share when
+    // there is one; without it (archive off, little host RAM) it is added here, so the runtime allocations keep the
+    // full margin of 1.3.2 (review 2026-11-01 #4)
+    if (hostreg_mb <= 0) margin_mb += (double)oom_reserve_mb();
     // + per layer: gmap, allocation rounding (2 MiB), the cache table (8 B per group)
     const long long other = (long long)nshared * GRP_BYTES + (long long)ec_defer_l_.size() * (2 << 20) + (long long)gs.size() * 8;
-    long long nres = (fr - (long long)(margin_mb * 1048576.0) - other) / (long long)GRP_BYTES;
+    long long nres = (long long)((fr - (long long)(margin_mb * 1048576.0) - other) * card_share_) / (long long)GRP_BYTES;
     nres = std::max(0LL, std::min<long long>(nres, gs.size()));
     // prefill staging ring (2 x the most cold groups of a layer, capped by FLASH_PF_STAGE_MB): its groups come out of the
     // resident budget (the budget, the per-layer cold counts and the ring size settle in a few rounds)
@@ -1681,7 +2118,9 @@ void Worker::load_deferred_groups() {
     // the part past FLASH_PF_STAGE_MB is lent to the expert cache between big batches (2 GPUs: ~620 cold groups per
     // layer vs 529 in a 512 MB ring; the rest was read zero-copy, ~2x per batch, over the PCIe link the ring copies
     // already keep busy, and those layers fell back to whole-batch MoE with the atomics down: 90K 22.1 -> 17.4 s)
-    static const int pfs_xmb = env_int("FLASH_PF_STAGE_XMB", 1024);
+    // pipeline stages (1 rank: a layer's ~1,070+ cold groups on 2 cards): up to 2048 MB, so the ring holds every cold
+    // group of a layer (mode B 2 cards 90K 16.67 -> 14.49 s at 4096-row batches); TP keeps 1024
+    const int pfs_xmb = env_int("FLASH_PF_STAGE_XMB", p_.pp() ? 2048 : 1024);
     long long ring0 = 0;
     if (pfs_mb > 0) {  // own ring: its groups come out of the resident budget
         const long long nres0 = nres;
@@ -1768,7 +2207,7 @@ void Worker::pfs_init() {
             const Layer& L = L_[li];
             for (int j = 0; j < L.ncold; j++)
                 t[L.coff + j] = j < cap ? (uintptr_t)ring[(size_t)(li & 1) * pfs_cap_ + j]
-                                        : ((uintptr_t)(L.hgroups + (size_t)j * GRP_BYTES) | 1);
+                                        : ((uintptr_t)cold_d(L, j) | 1);
         }
         uintptr_t* d = (uintptr_t*)dalloc((size_t)ec_n_ * sizeof(uintptr_t));
         CUDA_CHECK(cudaMemcpy(d, t.data(), t.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice));
@@ -1777,7 +2216,7 @@ void Worker::pfs_init() {
     pfs_tab_d_ = table(pfs_cap_);
     pfs_tab0_d_ = pfs_cap0_ < pfs_cap_ ? table(pfs_cap0_) : pfs_tab_d_;
     pfs_touch_d_ = (unsigned char*)dalloc(ec_n_);
-    CUDA_CHECK(cudaStreamCreateWithFlags(&dst_, cudaStreamNonBlocking));
+    mkstream(&dst_, cudaStreamNonBlocking, 0);
     for (int i = 0; i < 2; i++) {
         CUDA_CHECK(cudaEventCreateWithFlags(&pfs_cp_[i], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&pfs_used_[i], cudaEventDisableTiming));
@@ -1796,7 +2235,19 @@ void Worker::pfs_copy(int li) {
     for (const PfsRun& r : pfs_runs_[li & 1]) {
         const int k = std::min(r.n, n - r.p0);
         if (k <= 0) break;
-        CUDA_CHECK(cudaMemcpyAsync(r.addr, L.hgroups_h + (size_t)r.p0 * GRP_BYTES, (size_t)k * GRP_BYTES, cudaMemcpyHostToDevice, dst_));
+        if (L.csrc_h.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(r.addr, L.hgroups_h + (size_t)r.p0 * GRP_BYTES, (size_t)k * GRP_BYTES, cudaMemcpyHostToDevice, dst_));
+            if (link_host_emul()) pp_link_emul((size_t)k * GRP_BYTES, dst_);
+            continue;
+        }
+        // shared expert views: one copy per run of contiguous sources (host copies of a TP rank, a peer's resident groups)
+        for (int a = 0; a < k;) {
+            int e = a + 1;
+            while (e < k && L.csrc_h[r.p0 + e] == L.csrc_h[r.p0 + e - 1] + GRP_BYTES && L.cdev[r.p0 + e] == L.cdev[r.p0 + a]) e++;
+            CUDA_CHECK(cudaMemcpyAsync(r.addr + (size_t)a * GRP_BYTES, L.csrc_h[r.p0 + a], (size_t)(e - a) * GRP_BYTES, cudaMemcpyDefault, dst_));
+            if (link_host_emul()) pp_link_emul((size_t)(e - a) * GRP_BYTES, dst_);
+            a = e;
+        }
     }
     CUDA_CHECK(cudaEventRecord(pfs_cp_[li & 1], dst_));
 }
@@ -1826,8 +2277,8 @@ void Worker::ec_init() {
         const Layer& L = L_[li];
         for (int j = 0; j < L.ncold; j++) {
             const int ci = L.coff + j;
-            ec_host_[ci] = (uintptr_t)(L.hgroups + (size_t)j * GRP_BYTES);
-            ec_src_[ci] = L.hgroups_h + (size_t)j * GRP_BYTES;
+            ec_host_[ci] = (uintptr_t)cold_d(L, j);
+            ec_src_[ci] = cold_h(L, j);
             if ((int)ec_prior_.size() == LAYERS * NE) prior[ci] = ec_prior_[(size_t)li * NE + L.cexp[j]];
         }
     }
@@ -1899,7 +2350,7 @@ void Worker::ec_init() {
                 ec_st_.bt_slots++;
             }
         }
-        CUDA_CHECK(cudaStreamCreateWithFlags(&ec_cs_, cudaStreamNonBlocking));
+        mkstream(&ec_cs_, cudaStreamNonBlocking, 0);
         CUDA_CHECK(cudaEventCreateWithFlags(&ec_evt_, cudaEventDisableTiming));
         // seed: the hottest cold groups by the router-trace prior (ties by index) into the slots, synchronously
         std::vector<int> ord(n);
@@ -1913,7 +2364,7 @@ void Worker::ec_init() {
         CUDA_CHECK(cudaEventRecord(a, ec_cs_));
         for (int i = 0; i < ns; i++) {
             const int ci = ord[i];
-            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[i].addr, ec_src_[ci], GRP_BYTES, cudaMemcpyHostToDevice, ec_cs_));
+            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[i].addr, ec_src_[ci], GRP_BYTES, cold_kind(), ec_cs_));
             ec_slots_[i].ci = ci;
             ec_slot_of_[ci] = i;
             ec_tab_h_[ci] = (uintptr_t)ec_slots_[i].addr;
@@ -2097,7 +2548,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
         static const unsigned delay = (unsigned)env_int("FLASH_EC_DELAY", 0u);
         if (delay) k_spin<<<1, 1, 0, ec_cs_>>>(delay);
         for (auto& [s2, ci] : copies) {
-            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[s2].addr, ec_src_[ci], GRP_BYTES, cudaMemcpyHostToDevice, ec_cs_));
+            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[s2].addr, ec_src_[ci], GRP_BYTES, cold_kind(), ec_cs_));
             CUDA_CHECK(cudaEventRecord(ec_slots_[s2].ev, ec_cs_));
         }
         ec_st_.copies += copies.size();
@@ -2212,13 +2663,14 @@ int Worker::ec_verify(const char* where) {
         const EcSlot& sl = ec_slots_[s2];
         if (!sl.live || sl.ci < 0 || ec_pend_[sl.ci]) continue;
         if (ec_tab_h_[sl.ci] != (uintptr_t)sl.addr) continue;  // the table does not point here (yet)
+        if (views()) { const int li = layer_of(sl.ci); if (li >= 0 && L_[li].cdev[sl.ci - L_[li].coff]) continue; }  // (peer VRAM source)
         it.push_back({sl.addr, ec_src_[sl.ci], sl.ci, s2, layer_of(sl.ci), sl.bt ? "cache(bt tail)" : "cache"});
     }
     if (pfs_ring_)
         for (int li = LAYERS - 2; li < LAYERS; li++) {
             const Layer& L = L_[li];
             for (int j = 0; j < std::min(L.ncold, pfs_capn()); j++)
-                it.push_back({pfs_addr(li & 1, j), L.hgroups_h + (size_t)j * GRP_BYTES, -1, j, li, "staging ring"});
+                if (L.cdev.empty() || !L.cdev[j]) it.push_back({pfs_addr(li & 1, j), cold_h(L, j), -1, j, li, "staging ring"});
         }
     if (it.empty()) return 0;
     if (!ec_vsum_d_) ec_vsum_d_ = (unsigned long long*)dalloc((ec_slots_.size() + 2 * (size_t)std::max(1, pfs_cap_)) * 8);
@@ -2304,7 +2756,7 @@ void Worker::gsum(int nw, unsigned long long* experts, unsigned long long* other
         for (int t = 0; t < 8; t++)
             th.emplace_back([&, t] {
                 for (size_t q = t; q < cold.size(); q += 8)
-                    hs[q] = host_csum(L.hgroups_h + (size_t)(gm[cold[q]] - nd) * GRP_BYTES, GRP_BYTES);
+                    hs[q] = !L.cdev.empty() && L.cdev[gm[cold[q]] - nd] ? 0ull : host_csum(cold_h(L, gm[cold[q]] - nd), GRP_BYTES);
             });
         for (auto& x : th) x.join();
         size_t ci = 0;
@@ -2614,7 +3066,15 @@ void Worker::hc_write(int m) {
         prefetch_l2(next_hc_->fd.q, (size_t)next_hc_->fd.n * next_hc_->fd.k, pfs_);
         CUDA_CHECK(cudaEventRecord(pfe1_, pfs_));
     }
-    allreduce_add(y_, part_, m, H, comm_, p_.rank, ctr_, st_, nullptr, 0.f, nullptr, ll && m <= kMaxBatchRows ? ll_idx_++ : -1);
+    if (p_.ngpu == 1) {
+        // a 1-rank pipeline stage: no all-reduce. The partial IS the sum: the buffers swap roles, so the pending update
+        // (R_i += inj_i * y, which clears y) reads the partial directly; the cleared buffer is the next producer's part_.
+        // Two hc_write per layer (and per MTP block): the pointers are back in place at the end of every forward, also
+        // for captured graphs.
+        std::swap(y_, part_);
+    } else {
+        allreduce_add(y_, part_, m, H, comm_, p_.rank, ctr_, st_, nullptr, 0.f, nullptr, ll && m <= kMaxBatchRows ? ll_idx_++ : -1);
+    }
     if (l2d) CUDA_CHECK(cudaStreamWaitEvent(st_, pfe1_, 0));
     next_hc_ = nullptr;
     KCHK("AR");
@@ -2628,12 +3088,15 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
     static const int pfx = env_int("FLASH_PFX", 0);  // debug: bit0 GDN, bit1 MoE pf paths off
     if (pf_ && !(pfx & 1)) {  // prefill: tensor-core GEMMs, rows committed at once
         gemm_w4(L.dn_in, x_, H, proj_, ld, m, st_);
+        KCHK("dn pf in");
         gemv_w16_rows(L.dn_ab, x_, H, proj2_, 2 * vl, m, st_);
+        KCHK("dn pf ab");
         float* cv = qbuf_;
         if (m >= 16) {  // rows in parallel, then the new history
             k_dn_conv_par<<<dim3((ch + 255) / 256, (m + 15) / 16), 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend,
                                                                              posd_ + 1, cv, m);
             k_dn_conv_hist<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_hist, L.conv_pend, posd_ + 1, m);
+            KCHK("dn pf conv");
         } else
         k_dn_conv_d<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend, posd_ + 1, cv, m, true);
         float* o = gates_;
@@ -2642,6 +3105,7 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
             // rows of a previous forward still pending: commit them first (m = 0: commit + state write only)
             k_dn_rec_d<<<dim3(vl, 16), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, L.S, L.rec_pend,
                                                        posd_ + 1, stepc_, o, 0, true);
+            KCHK("dn pf commit");
             ::DeltaShape s{};
             s.nk = kl;
             s.nv = vl;
@@ -2651,7 +3115,9 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
             s.ab_rows = m;
             s.lazy_t = 0;
             k_dn_qk<<<dim3(m, kl + 1), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, dnqk_, dngb_);
+            KCHK("dn pf qk");
             ::dn_core_chunked(cv, ch, s, dnqk_, dngb_, L.S, 0, zero_d_, m, o, st_, 0);
+            KCHK("dn pf core");
         } else
         k_dn_rec_d<<<dim3(vl, 16), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, L.S, L.rec_pend,
                                                    posd_ + 1, stepc_, o, m, true);
@@ -2750,6 +3216,10 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         } else {
             Xchg xq;
             for (int g = 0; g < p_.ngpu; g++) { xq.recv[g] = xqpr_[g]; xq.flags[g] = xqpf_[g]; }
+            if (xqrecvd_ && xstage_ && xout_ && mr > 8) {  // staged without peer access: device slots (and flags)
+                xq.recv[p_.rank] = xqrecvd_;
+                if (xqflagd_) xq.flags[p_.rank] = xqflagd_;
+            }
             xq.seq = xqseq_;
             xq.done = xqdone_;
             xq.scnt = xqscnt_;
@@ -2791,7 +3261,8 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 KCHK("q local");
             } else {
             xb_add(XB_Q, (size_t)mr * qper(p_) * (q16 ? 2 : 4) * (p_.ngpu - 1));
-            if (q16) k_qxsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_);
+            if (p_.ngpu < 2) {}  // pipeline stage (1 rank): every head is local, nothing to send
+            else if (q16) k_qxsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_);
             else k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_);
             KCHK("k_qxsend");
             if (qstg) xchg_send(0, xq, qpar, mr, (size_t)qper(p_) * (q16 ? 2 : 4), qper(p_), qs);
@@ -2824,15 +3295,21 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 const float ipace = !istg && xstage_ && comm_.lemu > 0.f && !((env_int("FLASH_TEST_LINK_SKIP", 0) >> 4) & 1) ? comm_.lemu : 0.f;
                 // P2P: several blocks per peer, 16-byte stores (FLASH_IDX_SB blocks per peer, 0 = one block, perf F.2)
                 static const int isb = env_int("FLASH_IDX_SB", 16);
-                if (isb > 0 && !istg && ipace == 0.f && xiscnt_) {
+                if (p_.ngpu < 2) {
+                    // pipeline stage: the local top keys are all the keys (k_idx_select reads them from iloc_)
+                } else if (isb > 0 && !istg && ipace == 0.f && xiscnt_) {
                     Xchg xs = xis;
                     xs.scnt = xiscnt_;
                     k_idx_send16<<<dim3(p_.ngpu - 1, std::min(isb, (mr + 3) / 4)), 256, 0, st_>>>(iloc_, mr, xs, p_);
                 } else
                 k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, mr, xis, p_, ipace, comm_.lbusy[p_.rank]);
-                if (istg) xchg_send(2, xi, ipar, mr, (size_t)IDX_TOPB * 4, IDX_TOPB, st_);
+                if (istg) {
+                    xchg_send(2, xi, ipar, mr, (size_t)IDX_TOPB * 4, IDX_TOPB, st_);
+                    ce_prewait(xi);  // (k_idx_select waits for the peers' keys)
+                }
                 xb_add(XB_IDX, ib * (p_.ngpu - 1));
                 // (KV streaming: the rows' keys made resident by the same blocks, kv_need below skipped)
+                if (!istg) xpull(xi, 2, mr, 0, IDX_TOPB);  // (no peer access: the flags into device memory)
                 k_idx_select<<<mr, 1024, 0, st_>>>(iscore_, iloc_, pp, p_, lbmax, xi, isel_, insel_, nullptr, idx_gk_,
                                                    kvs_ ? L.kvp : KvPool(), rbcur_, mr <= MAXM ? psel_ : nullptr);
                 KCHK("k_idx_select");
@@ -2850,6 +3327,8 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 }
             }
             if (qside) CUDA_CHECK(cudaStreamWaitEvent(st_, pfq1_, 0));  // join the q exchange
+            if (qstg && !qloc && comm_.xfer == kXferCE) ce_prewait(xq);  // (the attention kernels below wait for the q flags)
+            if (!qstg && !qloc && !qsa_a_ && xq.recv[p_.rank] != xqrecvd_) xpull(xq, 0, mr, (size_t)qper(p_) * (q16 ? 2 : 4), qper(p_));
             if (!sel_on_) kv_need(L, mr, pp, nullptr, rbcur_, mr <= MAXM ? psel_ : nullptr);  // streaming: every visible key resident (no selection)
             static const bool rows_k = env_int("FLASH_ATTN_ROWS", 1);
             static const bool tc_k = env_int("FLASH_ATTN_TC", 1);
@@ -2911,7 +3390,15 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     if (qps && qpu_.ctr) {
                         qu.ctr = qpu_.ctr;
                         qu.S = S;
-                        if (!nsm_) CUDA_CHECK(cudaDeviceGetAttribute(&nsm_, cudaDevAttrMultiProcessorCount, dev_));
+                        if (!nsm_) {
+                            CUDA_CHECK(cudaDeviceGetAttribute(&nsm_, cudaDevAttrMultiProcessorCount, dev_));
+                            // two ranks of this TP group on one card (a TP4 test on 3 cards): the persistent kernel waits
+                            // for the q exchange of the other rank, whose producer needs SMs of the same card: half each
+                            int same = 0;
+                            for (int g = 0; g < p_.ngpu; g++) same += comm_.dev[g] == dev_;
+                            if (gsms_ > 0) nsm_ = gsms_;  // (green context: its SMs)
+                            else if (same > 1 && comm_.p2p) nsm_ = std::max(1, nsm_ / same);
+                        }
                         kf<<<std::min(nsm_, NKV * ngrp * S), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, isel_,
                                                                                 insel_, lbmax, mr, rbcur_, q16, qdbg, qu, ngrp, kvmap(L));
                     } else
@@ -2983,6 +3470,10 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         if (p2p) {  // (without peer access the receive slots are pinned host memory, palloc)
             Xchg xc;
             for (int g = 0; g < p_.ngpu; g++) { xc.recv[g] = xpr_[g]; xc.flags[g] = xpf_[g]; }
+            if (xrecvd_ && xstage_ && xout_ && mr > 8) {  // staged without peer access: device slots (and flags)
+                xc.recv[p_.rank] = xrecvd_;
+                if (xflagd_) xc.flags[p_.rank] = xflagd_;
+            }
             xc.seq = xseq_;
             xc.done = xdone_;
             xc.scnt = xscnt_;
@@ -2995,7 +3486,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // CE (FLASH_QSA_PIPE_CE): the outbox of this parity is free once its previous side copies finished; the
                 // copies + flag (value computed here, before the pending chunk's combine bumps the counter) on xcs_
                 if (cstg && xce_rec_[cpar]) CUDA_CHECK(cudaStreamWaitEvent(st_, xce_[cpar], 0));
-                k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_, qsa_ahead_);
+                if (p_.ngpu > 1) k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_, qsa_ahead_);
                 if (cstg) {
                     k_seq_word<<<1, 1, 0, st_>>>(xsw_ + 4 + cpar, xc.seq, qsa_ahead_);
                     CUDA_CHECK(cudaEventRecord(xcf_, st_));
@@ -3005,17 +3496,19 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     xce_rec_[cpar] = true;
                 }
                 QsaBack& q = qpend_[qsa_buf_];
-                q.L = &L; q.prow = prow; q.ax = attn_x_; q.mr = mr; q.ld = ld; q.ql = ql; q.nqp = nqp;
+                q.L = &L; q.prow = prow; q.ax = attn_x_; q.mr = mr; q.ld = ld; q.ql = ql; q.nqp = nqp; q.ce = cstg;
                 qsa_deferred_ = true;
                 return;
             } else if (x16o) {
-                k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
-                if (cstg) xchg_send(1, xc, cpar, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_));
+                if (p_.ngpu > 1) k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
+                if (cstg) { xchg_send(1, xc, cpar, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_)); ce_prewait(xc); }
+                else xpull(xc, 1, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_));
                 k_qsa_comb16<<<dim3(ql, mr), HD, 0, st_>>>(attn_x_, mr, prow, ld, abr, ql * HD, xc, p_, nqp * HD);
             } else {
-            k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
+            if (p_.ngpu > 1) k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
             KCHK("k_xsend");
-            if (cstg) xchg_send(1, xc, cpar, mr, (size_t)xper(p_) * 4, xper(p_));
+            if (cstg) { xchg_send(1, xc, cpar, mr, (size_t)xper(p_) * 4, xper(p_)); ce_prewait(xc); }
+            else xpull(xc, 1, mr, (size_t)xper(p_) * 4, xper(p_));
             k_qsa_comb2<<<dim3(ql, mr), HD, 0, st_>>>(attn_x_, mr, prow, ld, abr, ql * HD, xc, p_, nqp * HD);
             }
             KCHK("k_qsa_comb2");
@@ -3033,6 +3526,25 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
     if (dh) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), (size_t)m * H, dh + 11);
 }
 
+void Worker::xpull(Xchg& x, int kind, int mr, size_t rowb, size_t per) {
+    static const bool on = env_int("QE_HOST_XPULL", 1);
+    if (!on || !xpcnt_ || comm_.p2p || p_.ngpu < 2 || mr <= 0) return;
+    // kind 2 (indexer keys): flags only. Each row block of k_idx_select reads its peers' rows once (no redundant
+    // host reads to save), but every block polled the host flag words: one serialized PCIe read per block and peer
+    // (~0.64 ms per 512-row chunk, 3 cards without P2P); the rows stay in the host-mapped slot
+    if (static const bool io = env_int("QE_HOST_XPULL_IDX", 1); kind == 2 && !io) return;
+    float* const d = kind == 0 ? xqrecvd_ : kind == 1 ? xrecvd_ : nullptr;
+    unsigned* const f = kind == 0 ? xqflagd_ : kind == 1 ? xflagd_ : xiflagd_;
+    if (!f) return;
+    const int bytes = kind == 2 ? 0 : (int)((size_t)mr * rowb);
+    const int gy = std::max(1, std::min(8, bytes / 16384));
+    k_xpull<<<dim3(p_.ngpu - 1, gy), 256, 0, st_>>>(x.recv[p_.rank], d, x.flags[p_.rank], f, x.seq, xpcnt_ + 4 * kind, p_.rank,
+                                                    p_.ngpu, (size_t)XROWS * per, bytes);
+    KCHK("k_xpull");
+    if (d) x.recv[p_.rank] = d;
+    x.flags[p_.rank] = f;
+}
+
 bool Worker::qsa_defers(int m, bool sel) const {
     static const bool x16_on = env_int("FLASH_X16", 1);
     static const bool selsub = env_int("FLASH_SEL_SUB", 0);
@@ -3042,14 +3554,35 @@ bool Worker::qsa_defers(int m, bool sel) const {
     return p2p && x16_on && !qsa_a_ && m > 8 && m <= sub && (!cstg || xcs_);
 }
 
+void Worker::ce_prewait(const Xchg& x) {
+    // Under the CE partial pipeline a pending chunk's copies run on xcs_ (and the slow-link emulation puts a kernel
+    // there); a consumer grid spinning in every block held every SM, that kernel never started, its flags never left,
+    // and the peers' consumers waited for them in turn (3 cards, FLASH_TEST_LINK_GBPS=3.3, 90K: collective timeout at
+    // exchange 0x70). One spinning block leaves the other SMs free.
+    // FLASH_CE_PREWAIT: 1 (default) = only when a kernel can sit on the side stream (the slow-link emulation's
+    // k_link_emul; host staging: k_xs_flag / k_xs_wait / k_xs_local always run there; on the CE product path xcs_ holds
+    // copies only, which need no SM, so the cycle cannot form there and the extra kernel per exchange cost 0.4 % of a
+    // 3-card 90K prefill); 2 = always; 0 = off. A kernel added to xcs_ later must be added to the auto
+    // condition.
+    static const int mode = env_int("FLASH_CE_PREWAIT", 1);
+    const bool side_kernels = comm_.lemu > 0.f || comm_.xfer == kXferHost;
+    if ((mode >= 2 || (mode == 1 && side_kernels)) && pf_ && p_.ngpu > 1 && (comm_.xfer == kXferCE || comm_.xfer == kXferHost))
+        k_qpf_qwait<<<1, 32, 0, st_>>>(x, p_);
+}
+
 void Worker::qsa_back(int slot) {
     QsaBack& q = qpend_[slot];
     if (!q.L) return;  // the chunk ran unsplit
     Xchg xc;
     for (int g = 0; g < p_.ngpu; g++) { xc.recv[g] = xpr_[g]; xc.flags[g] = xpf_[g]; }
+    if (xrecvd_ && q.ce) {  // (staged without peer access: the device slots and flags)
+        xc.recv[p_.rank] = xrecvd_;
+        if (xflagd_) xc.flags[p_.rank] = xflagd_;
+    }
     xc.seq = xseq_;
     xc.done = xdone_;
     xc.scnt = xscnt_;
+    if (q.ce) ce_prewait(xc);  // (the partials of this chunk come by the side stream's copies)
     k_qsa_comb16<<<dim3(q.ql, q.mr), HD, 0, st_>>>(q.ax, q.mr, q.prow, q.ld, ab_, q.ql * HD, xc, p_, q.nqp * HD);
     KCHK("k_qsa_comb16 (back)");
     rows8(q.L->o, ab_, q.ql * HD, part_, H, q.mr, st_);
@@ -3221,7 +3754,7 @@ void Worker::ple(Layer& L, int pos, int m, const bf16* rows) {
 void Worker::body(int m) {
     CUDA_CHECK(cudaMemcpyAsync(toks_, tok_h_, m * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(posd_, pos_h_, 8, cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(pler_, ple_h_, (size_t)m * H * 2, cudaMemcpyHostToDevice, st_));
+    if (layer_here(PLE_LAYER)) CUDA_CHECK(cudaMemcpyAsync(pler_, ple_h_, (size_t)m * H * 2, cudaMemcpyHostToDevice, st_));  // (stages without the PLE layer: none)
     comm_begin_unit(ctr_, st_);
     trunk(m, toks_);
     CUDA_CHECK(cudaMemcpyAsync(out_h_, otok_, m * 4, cudaMemcpyDeviceToHost, st_));
@@ -3233,9 +3766,15 @@ void Worker::trunk(int m, const int* toks) {
     ll_idx_ = 0;
     curpos_ = posd_;
     k_step_bump<<<1, 1, 0, st_>>>(stepc_);
-    k_embed<<<m, 256, 0, st_>>>(embed_, toks, R_);
-    KCHK("k_embed");
-    for (int li = 0; li < LAYERS; li++) {
+    // pipeline stage after the first: the residual rows come from the previous stage (decode: its device staging rows,
+    // filled before the launch; prefill: already in the batch R, pp_in_rows)
+    if (!p_.first()) {
+        if (!pf_) CUDA_CHECK(cudaMemcpyAsync(R_, pp_din_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));
+    } else {
+        k_embed<<<m, 256, 0, st_>>>(embed_, toks, R_);
+        KCHK("k_embed");
+    }
+    for (int li = p_.l0; li < p_.l1; li++) {
         Layer& L = L_[li];
         if (li == PLE_LAYER) ple(L, 0, m, nullptr);
         hc_read(L.hca, m, true);
@@ -3245,9 +3784,10 @@ void Worker::trunk(int m, const int* toks) {
         hc_write(m);
         hc_read(L.hcm, m, true);
         moe(L, m);
-        next_hc_ = li + 1 < LAYERS ? &L_[li + 1].hca : &mixer_;
+        next_hc_ = li + 1 < p_.l1 ? &L_[li + 1].hca : p_.last() ? &mixer_ : nullptr;
         hc_write(m);
         steer_mark(li, nullptr);  // the layer output: steered by the next HC read (fused) or flush_y
+        if (nfl_d_) { flush_y(m); nf_layer(li, m); }
         if (cap_) {  // activation capture (eager): the layer output with its steering applied
             steer_flush(m);
             k_capture<<<(H + 255) / 256, 256, 0, st_>>>(R_, inj_, ypend_ ? y_ : nullptr, m, cap_skip_, cap_ + (size_t)li * H);
@@ -3260,6 +3800,10 @@ void Worker::trunk(int m, const int* toks) {
         }
     }
     flush_y(m);
+    if (!p_.last()) {  // pipeline stage before the last: the rows go to the next stage (prefill: from the batch R)
+        if (!pf_) CUDA_CHECK(cudaMemcpyAsync(pp_dout_, R_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));
+        return;
+    }
     if (Rsave_) CUDA_CHECK(cudaMemcpyAsync(Rsave_, R_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));
     if (pf_) {  // prefill: only the last row needs the head
         float* Rt = R_;
@@ -3356,6 +3900,7 @@ void Worker::head_sample_b(int m, int* dst, const int* rs) {  // as head_sample,
     const int nv = p_.voc1 - p_.voc0;
     if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard, as in head()
     gemv_w8(lm_, x_, H, logits_, nv, m, st_);
+    if (con_) k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, nv, lmap_, mask_d_, MASK_WORDS);  // (a constrained batch of one)
     topk_local(logits_, nv, m, 0, cand_, st_);
     k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_);
     allgather_small(cand_, m * kTopK * 2, cand_all_, comm_, p_.rank, ctr_, st_);
@@ -3389,9 +3934,21 @@ void Worker::start_ngram_stage(const HostTables* ht) {
         unsigned last = 0;
         double tsum = 0, tmax = 0;
         long long nreq = 0, nrows = 0;
+        // spin while requests come (decode steps follow each other within milliseconds); after 5 ms without one, poll
+        // every 50 us instead of holding a core while the server is idle (the table may now be in this mode by the
+        // host-RAM plan, not only by FLASH_NGRAM_PIN=0)
+        auto busy = std::chrono::steady_clock::now();
+        unsigned spins = 0;
         while (true) {
             const unsigned s2 = *(volatile unsigned*)&flags[0];
-            if (s2 == last) { __builtin_ia32_pause(); continue; }
+            if (s2 == last) {
+                if (++spins < 4096) { __builtin_ia32_pause(); continue; }
+                spins = 0;
+                if (std::chrono::steady_clock::now() - busy > std::chrono::milliseconds(5))
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
+            spins = 0;
             __sync_synchronize();
             const double t0 = slog ? std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
             const int n = *(volatile int*)&flags[2];
@@ -3403,6 +3960,7 @@ void Worker::start_ngram_stage(const HostTables* ht) {
             __sync_synchronize();
             *(volatile unsigned*)&flags[1] = s2;
             last = s2;
+            busy = std::chrono::steady_clock::now();
             if (slog) {
                 const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - t0;
                 tsum += dt; tmax = std::max(tmax, dt); nreq++; nrows += n;
@@ -3497,7 +4055,7 @@ void Worker::prefill_body(int m, bool mtp_fill, int) {
     CUDA_CHECK(cudaMemcpyAsync(posd_, pfh_pos_, 8, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(mposd_, pfh_pos_, 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(toks_, pfh_tok_, (size_t)m * 4, cudaMemcpyHostToDevice, st_));
-    CUDA_CHECK(cudaMemcpyAsync(pler_, pfh_ple_, (size_t)m * H * 2, cudaMemcpyHostToDevice, st_));
+    if (layer_here(PLE_LAYER)) CUDA_CHECK(cudaMemcpyAsync(pler_, pfh_ple_, (size_t)m * H * 2, cudaMemcpyHostToDevice, st_));
     if (mtp_fill) CUDA_CHECK(cudaMemcpyAsync(mtok_, pfh_mt_, (size_t)m * 4, cudaMemcpyHostToDevice, st_));
     comm_begin_unit(ctr_, st_);
     trunk(m, toks_);
@@ -3533,7 +4091,9 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
     }
     // LRU bound (FLASH_PFGRAPH_CAP, default 4 per cache): every prompt length is its own key, so a server that sees
     // many lengths would otherwise keep instantiating graphs (device memory) until it runs out
-    static const int cap = env_set("FLASH_PFGRAPH_CAP") ? std::max(1, env_int("FLASH_PFGRAPH_CAP", 4)) : 4;
+    // (pipeline stages key their prefill batch graphs by the hop buffer parity too: twice the shapes, twice the cap)
+    static const int cap0 = env_set("FLASH_PFGRAPH_CAP") ? std::max(1, env_int("FLASH_PFGRAPH_CAP", 4)) : 4;
+    const int cap = p_.pp() && !env_set("FLASH_PFGRAPH_CAP") ? 2 * cap0 : cap0;
     auto& use = graph_use_[&cache];
     if (!it->second) {
         int live = 0;
@@ -3544,6 +4104,7 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
             unsigned long long best = ~0ull;
             for (auto& kv : cache)
                 if (kv.second && use[kv.first] < best) { best = use[kv.first]; victim = kv.first; }
+            xuse_.erase(cache[victim]);  // (a recycled handle value must not inherit the old tick)
             CUDA_CHECK(cudaGraphExecDestroy(cache[victim]));
             cache[victim] = nullptr;
             graphs_evicted_++;
@@ -3569,6 +4130,7 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
 }
 
 void Worker::prefill(const int* tokens, int pos, int m, const bf16* ple_rows, int* out, const int* mtp_toks, int* draft) {
+    qe_wd_crumb(wdid_, dev_, "prefill chunk (pos, rows)", pos, m);
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(m >= 1 && m <= PFM, "flash prefill m=%d", m);
     CHECK(pos + m <= max_ctx_, "flash: context %d > %d", pos + m, max_ctx_);
@@ -3581,11 +4143,19 @@ void Worker::prefill(const int* tokens, int pos, int m, const bf16* ple_rows, in
     pfh_pos_[0] = pos;
     pfh_pos_[1] = prev_m_;
     memcpy(pfh_tok_, tokens, (size_t)m * 4);
-    memcpy(pfh_ple_, ple_rows, (size_t)m * H * 2);
+    CHECK(ple_rows || !layer_here(PLE_LAYER), "flash: n-gram rows missing for the PLE layer");
+    if (ple_rows) memcpy(pfh_ple_, ple_rows, (size_t)m * H * 2);
     if (mf) memcpy(pfh_mt_, mtp_toks, (size_t)m * 4);
     const long long key = ((long long)m << 4) | (mf << 2) | (sel_on_ << 1) | (prev_m_ > 0 ? 1 : 0) | ((long long)sampling_ << 3) |
                           ((long long)con_ << 50);
+    pp_in_rows(pfb_.R, m);  // pipeline stage: the previous stage's rows straight into the chunk's R (no embedding)
     run_cached(pgraphs_, key, [&] { prefill_body(m, mf, 0); });
+    CHECK(!p_.pp() || R_ == pfb_.R, "flash: pipeline stage %d: the prefill rows did not end in the batch R (FLASH_HCW?)", p_.stage);
+    pp_out_rows(pfb_.R, m);
+    pp_hin_ = nullptr;
+    pp_hout_ = nullptr;
+    pp_nxo_ = 0;
+    pp_skip_out_ = false;
     CUDA_CHECK(cudaStreamSynchronize(st_));
     CUDA_CHECK(cudaGetLastError());
     if (selst_) {
@@ -3623,8 +4193,7 @@ void Worker::set_agpeer(int g, const Worker* w) {
     agpf_[g] = w->agflags_;
     hag_p_[g] = w->hag_h_;  // staged transfers (host staging: null otherwise)
     hagf_p_[g] = w->hagf_;
-    hxq_p_[g] = w->hxq_;
-    hxc_p_[g] = w->hxc_;
+    hx_p_[g] = w->hx_;
     hxf_p_[g] = w->hxf_;
 }
 
@@ -3644,11 +4213,15 @@ void Worker::alloc_staging() {
     xdummy_ = (unsigned*)dalloc(4 * 4);
     if (comm_.xfer == kXferCE) {  // the sequence-number words the copy engine copies into the peers' flags
         xouti_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
+        agw_ = (unsigned*)dalloc(4 * 4);
+    }
+    // the pipelined partials (CE, and host staging unless FLASH_QSA_PIPE_HOST=0): the side stream of their copies and
+    // their precomputed flag values
+    if (comm_.xfer == kXferCE || env_int("FLASH_QSA_PIPE_HOST", 1)) {
         xsw_ = (unsigned*)dalloc(8 * 4);  // [e 0..2], [4 + parity]: precomputed flags of the pipelined partials
-        CUDA_CHECK(cudaStreamCreateWithFlags(&xcs_, cudaStreamNonBlocking));
+        mkstream(&xcs_, cudaStreamNonBlocking, 0);
         CUDA_CHECK(cudaEventCreateWithFlags(&xcf_, cudaEventDisableTiming));
         for (auto& e : xce_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-        agw_ = (unsigned*)dalloc(4 * 4);
     }
     auto mapped = [&](size_t b) {
         unsigned* h = nullptr;
@@ -3659,7 +4232,7 @@ void Worker::alloc_staging() {
         return d;  // == h (UVA)
     };
     hagf_ = mapped(2 * 2 * 4 * 4);
-    hxf_ = mapped(2 * 4 * 4);
+    hxf_ = mapped(3 * 4 * 4);  // (3 kinds: the indexer exchange's words are hxf_ + 8)
     if (comm_.xfer != kXferHost) return;
     auto pinned = [&](size_t b) {
         constexpr size_t PG = (size_t)2 << 20;
@@ -3672,8 +4245,7 @@ void Worker::alloc_staging() {
         return (char*)q;
     };
     hag_h_ = pinned((size_t)2 * AG_CAP * (H * 2 + H * 2 + RW * 4));  // [2 channels]
-    hxq_ = (float*)pinned((size_t)p_.ngpu * XROWS * xper(p_) * 4);
-    hxc_ = (float*)pinned((size_t)p_.ngpu * XROWS * xper(p_) * 4);
+    hx_ = (float*)pinned((size_t)3 * XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
 }
 
 // The send kernel's view of a staged exchange: receive buffer g -> outbox region g (the kernel adds the slot offset of
@@ -3719,20 +4291,37 @@ void Worker::xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per,
     }
     // host staging: D2H of the outbox into this card's pinned rows, flags (host words), wait for the peers', H2D of the
     // peers' rows for this card (the receiver pulls), then the local flag words the consumer waits for
-    float* const hb = e == 0 ? hxq_ : hxc_;
+    // (per kind and slot: before, q had one region and the partials and the indexer keys shared one, so a sender could
+    // rewrite rows a slow peer was still copying: the indexer keys of chunk c by the partials of chunk c, 3 cards
+    // without P2P, the 32K token flips of v6 / v7)
+    const size_t hreg = ((size_t)e * XSLOT + par) * ng * XROWS * xper(p_);
+    float* const hb = hx_ + hreg;
     for (int g = 0; g < ng; g++)
         if (g != R)
             CUDA_CHECK(cudaMemcpyAsync(hb + (size_t)g * XROWS * xper(p_), ob + (size_t)g * XROWS * xper(p_), bytes, cudaMemcpyDeviceToHost, st));
     FlagP fp;
     for (int g = 0; g < 4; g++) fp.f[g] = hxf_p_[g] ? hxf_p_[g] + e * 4 : nullptr;
-    k_xs_flag<<<1, 32, 0, st>>>(fp, x.seq, R, ng);
-    k_xs_wait<<<1, 32, 0, st>>>(hxf_ + e * 4, x.seq, R, ng);
+    // (flagw: the pipelined partials on the side stream; the counter may move meanwhile (the pending chunk's combine),
+    // so the value was computed on the compute stream before the copies were forked)
+    const unsigned* const sv = flagw ? flagw : x.seq;
+    const int sa = flagw ? 0 : 1;
+    k_xs_flag<<<1, 32, 0, st>>>(fp, sv, R, ng, sa);
+    k_xs_wait<<<1, 32, 0, st>>>(hxf_ + e * 4, sv, R, ng, sa);
+    if (!comm_.p2p) {  // never host -> host: such copy nodes in the prefill graphs ended in launch failures (v5, 3 cards
+                       // without P2P, 32K / 90K): the staged slots must be device memory
+        cudaPointerAttributes pa{};
+        const bool dev = cudaPointerGetAttributes(&pa, x.recv[R]) == cudaSuccess && pa.type == cudaMemoryTypeDevice;
+        (void)cudaGetLastError();
+        CHECK(dev, "flash: staged exchange %d without peer access into host memory (receive slot %p): device slots required", e, (void*)x.recv[R]);
+    }
     for (int g = 0; g < ng; g++)
         if (g != R) {
-            const float* src = (e == 0 ? hxq_p_[g] : hxc_p_[g]) + (size_t)R * XROWS * xper(p_);
-            CUDA_CHECK(cudaMemcpyAsync(x.recv[R] + ((size_t)par * ng + g) * XROWS * per, src, bytes, cudaMemcpyHostToDevice, st));
+            const float* src = hx_p_[g] + hreg + (size_t)R * XROWS * xper(p_);
+            // (cudaMemcpyDefault: without peer access the receive slots are host-mapped memory the peers' direct sends
+            // reach, so this copy may land in host memory)
+            CUDA_CHECK(cudaMemcpyAsync(x.recv[R] + ((size_t)par * ng + g) * XROWS * per, src, bytes, comm_.p2p ? cudaMemcpyHostToDevice : cudaMemcpyDefault, st));
         }
-    k_xs_local<<<1, 32, 0, st>>>(x.flags[R], x.seq, R, ng);
+    k_xs_local<<<1, 32, 0, st>>>(x.flags[R], sv, R, ng, sa);
     KCHK("xchg host");
 }
 
@@ -3905,6 +4494,13 @@ __global__ void k_pf_bump(unsigned* __restrict__ stepcs, const int* __restrict__
 }
 
 void Worker::trunk_batch_sp(int n, unsigned selmask) {
+    static const bool trc0 = env_int("FLASH_PF_TRACE", 0);
+    auto tp0 = [&](const char* w) {
+        if (!trc0) return;
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) { fprintf(stderr, "[pftrace] rank %d n %d: fault by %s: %s\n", p_.rank, n, w, cudaGetErrorString(e)); exit(1); }
+    };
+    tp0("work before trunk_batch_sp");
     // all-reduce blocks of a unit (every collective is overlapped now)
     static const int ovb = env_int("FLASH_PFU_B", 16);
     ll_idx_ = 0;
@@ -3912,6 +4508,17 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     // the step counter (parity of the pending-row buffers): the bound slot's, or every segment's in its storage
     if (pfm_) k_pf_bump<<<1, 32, 0, st_>>>(stepcs_, segslot_d_, pfm_nseg_);
     else k_step_bump<<<1, 1, 0, st_>>>(stepc_);
+    tp0("step bump");
+    if (trc0) {
+        int mn = 1 << 30, mx = -1;
+        for (int i = 0; i < n; i++) { mn = std::min(mn, pfh_tok_[i]); mx = std::max(mx, pfh_tok_[i]); }
+        std::vector<int> td(n);
+        CUDA_CHECK(cudaMemcpy(td.data(), toks_, (size_t)n * 4, cudaMemcpyDeviceToHost));
+        int dmn = 1 << 30, dmx = -1;
+        for (int i = 0; i < n; i++) { dmn = std::min(dmn, td[i]); dmx = std::max(dmx, td[i]); }
+        fprintf(stderr, "[pftrace] rank %d n %d: host tokens %d..%d, device toks_ %d..%d, R_ %p embed %p\n", p_.rank, n, mn, mx, dmn, dmx,
+                (void*)R_, (void*)embed_);
+    }
     int* const rbc0 = rbcur_;
     float* const Rb = R_;
     bf16* const plerb = pler_;
@@ -3922,6 +4529,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     __half* const xhb = xh_;
     k_embed<<<n, 256, 0, st_>>>(embed_, toks_, Rb);
     KCHK("k_embed");
+    tp0("k_embed");
     int ub[64], cb[64];
     const int nu = pfm_ ? pf_units_multi(pf_co_, ub, cb) : pf_units(n, ub, cb);
     CHECK(nu <= (int)evd_.size(), "prefill units %d", nu);
@@ -4040,12 +4648,23 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         }
         at_rows(off);
         ypend_ = false;
+        static const bool trc3 = env_int("FLASH_PF_TRACE", 0);
+        auto tp3 = [&](const char* w) {
+            if (!trc3) return;
+            const cudaError_t e = cudaStreamSynchronize(st_);
+            if (e != cudaSuccess) { fprintf(stderr, "[pftrace] rank %d n %d layer %d chunk %d (off %d, %d rows, full %d, sel %d): fault by %s: %s\n",
+                                            p_.rank, n, li, c, off, mc, (int)L.full, (int)sel_on_, w, cudaGetErrorString(e)); exit(1); }
+        };
+        tp3("before chunk");
         if (!spx) {
             if (li == PLE_LAYER) ple(L, 0, mc, nullptr);
+            tp3("ple");
             hc_read(L.hca, mc, true);
+            tp3("hc_read");
         }
         if (L.full) qsa(L, li, 0, mc);
         else gdn(L, li, 0, mc);
+        tp3(L.full ? "qsa" : "gdn");
         if (pfm_) {
             if (c == pf_slast_[sg]) pf_swap(li < 0 ? LAYERS : li, sg, false);
             rbcur_ = rbc0;
@@ -4082,6 +4701,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     };
     auto reset_rows = [&]() { at_rows(0); posd_ = posd0; curpos_ = posd_; };
     bool clogged = false;
+    tp0("setup before the layers");
     for (int li = 0; li < LAYERS; li++) {
         Layer& L = L_[li];
         const bool spm = li >= 1;  // this layer's mixer all-reduce is sequence-parallel (the MoE input HC on own rows)
@@ -4094,8 +4714,13 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         // whose chunks all have block selection), else the pipeline is off. (The 1.3.1 non-finite spec steps with
         // QX_LOCAL were not this ordering but attnB_ overlapping expert-cache slots, fixed in alloc_state.)
         static const bool qpipe_ce = env_int("FLASH_QSA_PIPE_CE", 1);
-        const bool pipe_ce = qpipe_ce && xstage_ && comm_.xfer == kXferCE && xcs_ &&
-                             (!qx_on_ || selmask == (cb[nu] >= 32 ? ~0u : (1u << cb[nu]) - 1));
+        // host staging (no peer access): the same pipeline, the side stream does D2H -> flags -> wait -> H2D -> local
+        // flags; a receiver pulls into its own slot on its own side stream after its combine of the slot's previous
+        // chunk (stream order), and a sender rewrites its pinned rows of a slot only after the peers' flags of the next
+        // exchange, which follow their copies of the previous one on their side streams
+        // (the selmask condition is the CE push's slot ordering; a host-staged receiver writes its own slot itself)
+        const bool pipe_ce = qpipe_ce && xstage_ && (comm_.xfer == kXferCE || comm_.xfer == kXferHost) && xcs_ &&
+                             (!qx_on_ || comm_.xfer == kXferHost || selmask == (cb[nu] >= 32 ? ~0u : (1u << cb[nu]) - 1));
         static const bool clog = env_int("FLASH_PF_CHUNK_LOG", 0);  // debug: the chunk rows of every batch (rank 0)
         if (clog && L.full && !clogged && p_.rank == 0) {
             clogged = true;
@@ -4153,6 +4778,13 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             CUDA_CHECK(cudaEventRecord(evp_[u], st_));
             ar_unit(u, evp_[u], spm, spm ? &L.hcm : nullptr, -1, XB_RS_MIX, &L);
         }
+        static const bool trc2 = env_int("FLASH_PF_TRACE", 0);
+        auto tpt = [&](const char* w) {
+            if (!trc2) return;
+            const cudaError_t e = cudaStreamSynchronize(st_);
+            if (e != cudaSuccess) { fprintf(stderr, "[pftrace] rank %d n %d layer %d: fault by %s: %s\n", p_.rank, n, li, w, cudaGetErrorString(e)); exit(1); }
+        };
+        tpt("mixer");
         const int* pb = mb;
         const int np = parts_of(L, pb);
         for (int p = 0; p < np; p++) {  // MoE parts: units [pb[p], pb[p + 1])
@@ -4170,7 +4802,9 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             const bool pre = spm && agq_on_ && L.router8.q;
             int* const gs0 = gsel_; float* const gw0 = gw_; float* const gh0 = gsh_;
             if (pre) { gsel_ = gs0 + (size_t)off * TOPK; gw_ = gw0 + (size_t)off * TOPK; gsh_ = gh0 + off; moe_pre_ = true; }
+            tpt("MoE input");
             moe(L, mc);
+            tpt("moe()");
             if (pre) { gsel_ = gs0; gw_ = gw0; gsh_ = gh0; moe_pre_ = false; }
             if (rowh_) {
                 k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 1);
@@ -4197,6 +4831,23 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         // blocked the same way (cross-card deadlock, gdb: a worker thread inside cudaMemcpyAsync in row_ag; qfn_prefill_r4).
         // The sync waits only for work whose peer half every card has already issued. Graph replays are unaffected.
         eager_stage_sync();
+        {  // debug (FLASH_PF_TRACE=1, eager: FLASH_GRAPH=0): after every layer of a prefill batch: sync, fault?, non-finite
+            // residual floats and out-of-range routing ids of this rank's rows
+            static const bool trc = env_int("FLASH_PF_TRACE", 0);
+            static int tb = 0;
+            if (trc) {
+                for (int u = 0; u < nu; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));
+                if (!trc_) { CUDA_CHECK(cudaHostAlloc((void**)&trc_, 64, cudaHostAllocMapped)); }
+                memset(trc_, 0, 64);
+                k_nancnt<<<256, 256, 0, st_>>>(Rb, (size_t)n * RW, trc_);
+                const cudaError_t e = cudaStreamSynchronize(st_);
+                if (e != cudaSuccess || trc_[0] || li == LAYERS - 1)
+                    fprintf(stderr, "[pftrace] rank %d batch %d (n %d, pos %d) layer %d: %s, non-finite residual %u\n", p_.rank, tb, n,
+                            cposh_[0], li, cudaGetErrorString(e), trc_[0]);
+                if (e != cudaSuccess) exit(1);
+                if (li == LAYERS - 1) tb++;
+            }
+        }
     }
     for (int u = 0; u < nu; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));  // join
     ypend_ = false;
@@ -4341,9 +4992,20 @@ void Worker::trunk_batch(int n, unsigned selmask) {
     float* const Rb = R_;
     bf16* const plerb = pler_;
     int* const posd0 = posd_;
-    k_embed<<<n, 256, 0, st_>>>(embed_, toks_, Rb);
-    KCHK("k_embed");
     const int nch = (n + PFM - 1) / PFM;
+    if (p_.first()) {  // (later pipeline stages: the previous stage's rows, pp_in_rows before the graph or chunks below)
+        k_embed<<<n, 256, 0, st_>>>(embed_, toks_, Rb);
+        KCHK("k_embed");
+    } else if (pp_hov_) {
+        // overlapped hop: chunk c's rows land on the copy stream while earlier chunks of the first layer compute
+        CUDA_CHECK(cudaEventRecord(hev_fork_, st_));
+        CUDA_CHECK(cudaStreamWaitEvent(hopst_, hev_fork_, 0));
+        for (int c = 0; c < nch; c++) {
+            const int off = c * PFM, mc = std::min(PFM, n - off);
+            hop_in(Rb + (size_t)off * RW, pp_hin_ + (size_t)off * pp_rowb(), mc, hopst_);
+            CUDA_CHECK(cudaEventRecord(hev_in_[c], hopst_));
+        }
+    }
     if (ov && nch > 1) {
         // all-reduces + residual updates (R_c += inj_c * y_c) on cst_, chunk by chunk: the mixer of chunk c + 1 does not
         // need chunk c's sum (KV / DeltaNet state are written before the AR), the MoE half waits for all chunks, the
@@ -4363,7 +5025,9 @@ void Worker::trunk_batch(int n, unsigned selmask) {
             if (sc) k_spin<<<1, 1, 0, cst_>>>(sc);
             static const bool fused = env_int("FLASH_ARHC", 1);  // residual update in the AR tail
             static const int ovb = env_int("QE_AR_OV_BLOCKS", 8);  // fused tail: 8 (sweep 4 / 8 / 12 / 16)
-            if (!(fused && allreduce_add_hc(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H, mc, H, comm_,
+            if (p_.ngpu == 1) {  // 1-rank pipeline stage: the update straight from the partial (k_hc_write clears it)
+                k_hc_write<<<mc, 512, 0, cst_>>>(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H);
+            } else if (!(fused && allreduce_add_hc(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H, mc, H, comm_,
                                             p_.rank, ctr_, cst_, fast ? 64 : ovb))) {
                 allreduce_add(yb + (size_t)off * H, partb + (size_t)off * H, mc, H, comm_, p_.rank, ctr_, cst_, nullptr, 0.f,
                               nullptr, -1, !fast);
@@ -4377,14 +5041,15 @@ void Worker::trunk_batch(int n, unsigned selmask) {
         if (pfs_use_) {
             CUDA_CHECK(cudaEventRecord(pfs_used_[0], st_));
             CUDA_CHECK(cudaStreamWaitEvent(dst_, pfs_used_[0], 0));  // fork (graph capture: joined by the MoE waits)
-            pfs_copy(0);
-            pfs_copy(1);
+            pfs_copy(p_.l0);
+            if (p_.l0 + 1 < p_.l1) pfs_copy(p_.l0 + 1);
         }
-        for (int li = 0; li < LAYERS; li++) {
+        for (int li = p_.l0; li < p_.l1; li++) {
             Layer& L = L_[li];
             for (int c = 0; c < nch; c++) {
                 const int off = c * PFM, mc = std::min(PFM, n - off);
-                if (li > 0) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));  // MoE piece c of the previous layer
+                if (li > p_.l0) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));  // MoE piece c of the previous layer
+                else if (pp_hov_ && !p_.first()) CUDA_CHECK(cudaStreamWaitEvent(st_, hev_in_[c], 0));  // its input rows
                 static const int sm = env_int("FLASH_AROV_SPINM", 0);  // debug: lag compute
                 if (sm && ((li * 7 + c * 3 + p_.rank) % 5 == 0)) k_spin<<<1, 1, 0, st_>>>(sm);
                 posd_ = cposd_ + 2 * c;
@@ -4409,18 +5074,33 @@ void Worker::trunk_batch(int n, unsigned selmask) {
             posd_ = posd0;
             curpos_ = posd_;
             for (int c = 0; c < nch; c++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));
+            if (nfl_d_) k_nf_rows<<<64, 256, 0, st_>>>(Rb, (size_t)n * RW, nfl_d_ + li);  // (after the layer's mixer)
             if (dbgh_) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(Rb), (size_t)n * RW, dbgh_ + li * DBGK);
             hc_read(L.hcm, n, true);
             if (dbgh_) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(x_), (size_t)n * H / 2, dbgh_ + li * DBGK + 3);
             if (pfs_use_) CUDA_CHECK(cudaStreamWaitEvent(st_, pfs_cp_[li & 1], 0));
             moe(L, n);
-            if (pfs_use_ && li + 2 < LAYERS) {  // ring half li & 1 is free again: layer li + 2 goes there
+            if (pfs_use_ && li + 2 < p_.l1) {  // ring half li & 1 is free again: layer li + 2 goes there
                 CUDA_CHECK(cudaEventRecord(pfs_used_[li & 1], st_));
                 CUDA_CHECK(cudaStreamWaitEvent(dst_, pfs_used_[li & 1], 0));
                 pfs_copy(li + 2);
             }
             CUDA_CHECK(cudaEventRecord(evm_, st_));
             for (int c = 0; c < nch; c++) ar_chunk(c, evm_, c < fastn, li);
+        }
+        if (!p_.last()) {  // pipeline stage before the last: Rb holds the rows for the next stage
+            if (pp_hov_) {  // overlapped hop: chunk c leaves once its last all-reduce + update is done
+                for (int c = 0; c < nch; c++) {
+                    const int off = c * PFM, mc = std::min(PFM, n - off);
+                    CUDA_CHECK(cudaStreamWaitEvent(hopst_, evd_[c], 0));
+                    hop_out(Rb + (size_t)off * RW, (size_t)off, mc, hopst_);
+                }
+                CUDA_CHECK(cudaEventRecord(hev_join_, hopst_));
+                CUDA_CHECK(cudaStreamWaitEvent(st_, hev_join_, 0));
+            }
+            for (int c = 0; c < nch; c++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));  // join
+            ypend_ = false;
+            return;
         }
         if (!mtpb_) {
             for (int c = 0; c < nch; c++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));  // join
@@ -4481,7 +5161,7 @@ void Worker::trunk_batch(int n, unsigned selmask) {
         head(1, motok_, true);
         return;
     }
-    for (int li = 0; li < LAYERS; li++) {
+    for (int li = p_.l0; li < p_.l1; li++) {
         Layer& L = L_[li];
         for (int c = 0; c < nch; c++) {
             const int off = c * PFM, mc = std::min(PFM, n - off);
@@ -4503,16 +5183,22 @@ void Worker::trunk_batch(int n, unsigned selmask) {
         curpos_ = posd_;
         hc_read(L.hcm, n, true);
         moe(L, n);
-        for (int off = 0; off < n; off += PFM) {
-            const int mc = std::min(PFM, n - off);
-            allreduce_add(y_ + (size_t)off * H, part_ + (size_t)off * H, mc, H, comm_, p_.rank, ctr_, st_, nullptr, 0.f, nullptr,
-                          ll && mc <= kMaxBatchRows ? ll_idx_++ : -1);
+        if (p_.ngpu == 1) {  // 1-rank pipeline stage: no all-reduce, the update reads the partial (roles swapped back below)
+            std::swap(y_, part_);
+        } else {
+            for (int off = 0; off < n; off += PFM) {
+                const int mc = std::min(PFM, n - off);
+                allreduce_add(y_ + (size_t)off * H, part_ + (size_t)off * H, mc, H, comm_, p_.rank, ctr_, st_, nullptr, 0.f, nullptr,
+                              ll && mc <= kMaxBatchRows ? ll_idx_++ : -1);
+            }
         }
         KCHK("AR batch");
         ypend_ = true;
         flush_y(n);
+        if (p_.ngpu == 1) std::swap(y_, part_);
         steer(li, n, nullptr, st_, R_, nullptr, nullptr);
     }
+    if (!p_.last()) return;  // pipeline stage before the last: Rb holds the rows for the next stage
     R_ = Rb + (size_t)(n - 1) * RW;  // only the last row needs the head
     hc_read(mixer_, 1, false);
     R_ = Rb;
@@ -4591,6 +5277,7 @@ void Worker::bt_clear_y(int n) {
 
 void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_rows, int* out, const int* mtp_toks, bool last,
                            int* draft) {
+    qe_wd_crumb(wdid_, dev_, "prefill batch (pos, rows)", pos, n);
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(n >= 1 && n <= pfbn_, "flash prefill_batch n=%d", n);
     CHECK(pos + n <= max_ctx_, "flash: context %d > %d", pos + n, max_ctx_);
@@ -4615,7 +5302,8 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
     rd_pos_ = pos;
     const unsigned sel = batch_sel(pos, n);
     memcpy(pfh_tok_, tokens, (size_t)n * 4);
-    memcpy(pfh_ple_, ple_rows, (size_t)n * H * 2);
+    CHECK(ple_rows || !layer_here(PLE_LAYER), "flash: n-gram rows missing for the PLE layer");
+    if (ple_rows) memcpy(pfh_ple_, ple_rows, (size_t)n * H * 2);
     static const bool mtp_in = env_int("FLASH_MTPB", 1);  // MTP fill inside the batch pipeline
     mtpb_ = mtp_toks && has_mtp_ && mtp_in && (n + PFM - 1) / PFM > 1;
     mtpb_last_ = last;
@@ -4626,15 +5314,24 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
     // work for 96 q rows is mostly masked there (2 GPUs 90K: 17.45 -> 16.91 s; 16K: 3.093 vs 3.114 s, pfsel kept below
     // kPfselMax positions (90K: 32768 17.09 s, 16384 17.02, 8192 16.93, 0 16.91); KL at 90K 8.7e-3 vs run-to-run noise 3.8e-2)
     pfdec_ = (long long)pos >= kPfselMax;
+    // pipeline hop overlapped chunk by chunk inside the graph (FLASH_PP_HOP_OV, default on; multi-chunk batches on the
+    // overlapped all-reduce path): the graph holds the buffer addresses, so the key has the buffer parity
+    static const bool hov = env_int("FLASH_PP_HOP_OV", 1) && env_int("FLASH_AROV", 1) && !g_kchk;
+    pp_hov_ = p_.pp() && hov && nch > 1;
+    CHECK(!pp_hov_ || ((p_.first() || pp_hin_) && (p_.last() || pp_hout_ || pp_skip_out_)), "flash: pipeline stage %d: no hop buffers (pp_io)", p_.stage);
     const long long key = ((long long)sel << 24) | ((long long)n << 3) | ((long long)sampling_ << 1) | (prev_m_ > 0 ? 1 : 0) |
+                          ((long long)pp_hov_ << 57) | ((long long)(pp_hov_ ? pp_par_ : 0) << 60) |
                           ((long long)pfdec_ << 59) |
                           ((long long)con_ << 50) |
                           ((long long)mtpb_ << 61) | ((long long)(mtpb_ && last) << 62) | ((long long)pfs_now_ << 58);
     const double th2 = pft_host ? now_s() : 0.0;
+    // pipeline stage: the previous stage's rows into the batch R (after ec_tick gave the big-batch tails back), this
+    // stage's rows out of it after the launch; both on the stream, outside the graph
+    if (!pp_hov_) pp_in_rows(pfb_.R, n);
     run_cached(pbgraphs_, key, [&] {
         CUDA_CHECK(cudaMemcpyAsync(cposd_, cposh_, (size_t)2 * nch * 4, cudaMemcpyHostToDevice, st_));
         CUDA_CHECK(cudaMemcpyAsync(toks_, pfh_tok_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
-        CUDA_CHECK(cudaMemcpyAsync(pler_, pfh_ple_, (size_t)n * H * 2, cudaMemcpyHostToDevice, st_));
+        if (layer_here(PLE_LAYER)) CUDA_CHECK(cudaMemcpyAsync(pler_, pfh_ple_, (size_t)n * H * 2, cudaMemcpyHostToDevice, st_));
         if (mtpb_) CUDA_CHECK(cudaMemcpyAsync(mtok_, pfh_mt_, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
         bt_clear_y(n);
         comm_begin_unit(ctr_, st_);
@@ -4642,6 +5339,12 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
         CUDA_CHECK(cudaMemcpyAsync(pfh_out_, otok_, 4, cudaMemcpyDeviceToHost, st_));
         if (mtpb_) CUDA_CHECK(cudaMemcpyAsync(pfh_out_ + 1, motok_, 4, cudaMemcpyDeviceToHost, st_));
     });
+    if (!pp_hov_) pp_out_rows(pfb_.R, n);
+    pp_hov_ = false;
+    pp_hin_ = nullptr;
+    pp_hout_ = nullptr;
+    pp_nxo_ = 0;
+    pp_skip_out_ = false;
     const double th3 = pft_host ? now_s() : 0.0;
     CUDA_CHECK(cudaStreamSynchronize(st_));
     CUDA_CHECK(cudaGetLastError());
@@ -4801,6 +5504,12 @@ bool Worker::pf_multi_ok(const int* segn, int nseg) const {
     return true;
 }
 
+void Worker::rmin_save(int slot) {  // the MTP chain row of the prompt end just prefilled -> slot's storage
+    CUDA_CHECK(cudaSetDevice(dev_));
+    if (!Rmins_ || !Rmin_) return;
+    CUDA_CHECK(cudaMemcpyAsync(Rmins_ + (size_t)slot * RW, Rmin_, (size_t)RW * 4, cudaMemcpyDeviceToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
 void Worker::rmin_load(int slot) {
     CUDA_CHECK(cudaSetDevice(dev_));
     if (!Rmins_ || !Rmin_) return;
@@ -4810,6 +5519,7 @@ void Worker::rmin_load(int slot) {
 
 void Worker::prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const bf16* ple_rows, const int* mtp_toks, int* out,
                            int* draft) {
+    CHECK(!p_.pp(), "flash: pipeline stages (FLASH_PAR=pp / pp_prefill) do not support %s yet", "several prompts in one prefill batch");
     CUDA_CHECK(cudaSetDevice(dev_));
     std::vector<int> segn(nseg);
     int n = 0;
@@ -5084,7 +5794,7 @@ void Worker::lk_chain() {
     // the side branches (pfs_) of the outer capture stay in it until it ends: the body gets its own side stream
     // (joining pfs_ here failed with cudaErrorStreamCaptureMerge)
     cudaStream_t ps0 = pfs_;
-    if (!pfs2_) CUDA_CHECK(cudaStreamCreateWithFlags(&pfs2_, cudaStreamNonBlocking));
+    if (!pfs2_) mkstream(&pfs2_, cudaStreamNonBlocking, 0);
     pfs_ = pfs2_;
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
     chain();
@@ -5151,6 +5861,7 @@ void Worker::set_rope_chunk(int s, int i0, int m, const int* r3) {
 }
 
 void Worker::set_history(const int* ids, int n, int kfull) {
+    CHECK(!p_.pp(), "flash: pipeline stages (FLASH_PAR=pp / pp_prefill) do not support %s yet", "device lookup drafts (FLASH_LOOKUP)");
     CUDA_CHECK(cudaSetDevice(dev_));
     if (!lk_on_) return;
     CHECK(lk_kfull_ < 0 || lk_kfull_ == kfull, "flash lookup: MTP k changed (%d -> %d)", lk_kfull_, kfull);
@@ -5256,6 +5967,7 @@ void Worker::spec_discard() {
 }
 
 void Worker::spec_launch(int k, bool lookup) {
+    CHECK(!p_.pp(), "flash: pipeline stages run batched steps (batch_launch) only, not %s", "the single-sequence device loop");
     CUDA_CHECK(cudaSetDevice(dev_));
     ec_tick(spos_ + 2 * k + 2, 0);
     static const bool graphs = env_int("FLASH_GRAPH", 1);
@@ -5324,6 +6036,10 @@ int Worker::spec_finish(int* emitted) {
 // new count, and return the flagged rows. NaN / Inf only, finite garbage passes. FLASH_GUARD=1 (default): the caller
 // fails the sequences of those rows (flash_capi.cpp: the request gets an error, its conversation is dropped, the
 // server goes on), 2: log only (debugging), 3: abort the process (the old behaviour), 0: off.
+void Worker::nf_layer(int li, int m) {
+    if (!nfl_d_ || m <= 0) return;
+    k_nf_rows<<<64, 256, 0, st_>>>(R_, (size_t)m * RW, nfl_d_ + (li < 0 ? LAYERS : li));
+}
 unsigned Worker::nf_check(const char* what, int pos) {
     if (!nf_h_) return 0;
     static const bool inject = env_int("FLASH_GUARD_TEST", 0);  // test: as if it fired
@@ -5349,8 +6065,16 @@ unsigned Worker::nf_check(const char* what, int pos) {
             nfr_h_[r] = 0;
         }
     if (inj && !mask) mask = 1;
-    fprintf(stderr, "[flash] GUARD rank %d: non-finite lm_head input in %s at position %d, rows 0x%x (%u launch blocks so far)\n",
-            p_.rank, what, pos, mask, c);
+    char lay[96] = "";
+    if (nfl_h_)
+        for (int li = 0; li <= LAYERS; li++)
+            if (((volatile unsigned*)nfl_h_)[li]) {
+                snprintf(lay, sizeof lay, "; first non-finite residual after layer %d%s (FLASH_NF_LAYERS)", li, li == LAYERS ? " (MTP)" : "");
+                break;
+            }
+    fprintf(stderr, "[flash] GUARD GPU%d rank %d of %d, stage %d of %d (layers %d-%d): non-finite lm_head input in %s at position %d, "
+            "rows 0x%x, check %d (%u launch blocks so far)%s\n", dev_, p_.rank, p_.ngpu, p_.stage, p_.nstage, p_.l0, p_.l1 - 1, what, pos,
+            mask, nf_calls_, c, lay);
     fflush(stderr);
     nf_seen_ = real;  // (an injected fault does not shift the count)
     static const int mode = env_int("FLASH_GUARD", 1);
@@ -5369,6 +6093,7 @@ unsigned Worker::nf_check(const char* what, int pos) {
 }
 
 void Worker::forward_mtp(const int* tokens, int pos, int m, bool chain, int* out) {
+    qe_wd_crumb(wdid_, dev_, "mtp (pos, rows)", pos, m);
     CUDA_CHECK(cudaSetDevice(dev_));
     sel_on_ = pos + m > IDX_BUDGET + IDX_R - 1;
     CHECK(has_mtp_ && m >= 1 && m <= MAXM && (!chain || m == 1), "flash mtp m=%d", m);
@@ -5397,6 +6122,7 @@ void Worker::forward_mtp(const int* tokens, int pos, int m, bool chain, int* out
 }
 
 void Worker::forward(const int* tokens, int pos, int m, const bf16* ple_rows, int* out, float* logits_host, int commit) {
+    qe_wd_crumb(wdid_, dev_, "forward (pos, rows)", pos, m);
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(m >= 1 && m <= MAXP, "flash forward m=%d (prompts: prefill())", m);
     CHECK(pos + m <= max_ctx_, "flash: context %d > %d", pos + m, max_ctx_);
@@ -5407,9 +6133,13 @@ void Worker::forward(const int* tokens, int pos, int m, const bf16* ple_rows, in
     pos_h_[0] = pos;
     pos_h_[1] = commit < 0 ? prev_m_ : commit;
     prev_m_ = m;
-    memcpy(ple_h_, ple_rows, (size_t)m * H * 2);
+    CHECK(ple_rows || !layer_here(PLE_LAYER), "flash: n-gram rows missing for the PLE layer");
+    if (ple_rows) memcpy(ple_h_, ple_rows, (size_t)m * H * 2);
+    pp_in_rows(pp_din_, m);  // pipeline stage after the first: the previous stage's rows
     static const bool graphs = env_int("FLASH_GRAPH", 1);
-    if (!graphs || dump_) {
+    // a grammar-constrained forward (--mtp-k 0: structured output, the thinking budget's forced close) runs eagerly: the
+    // graphs are keyed without the mask, so a graph captured unconstrained would replay without it
+    if (!graphs || dump_ || con_) {
         body(m);
     } else {
         cudaGraphExec_t& gm = graph_[sampling_][sel_on_][m];
@@ -5423,12 +6153,115 @@ void Worker::forward(const int* tokens, int pos, int m, const bf16* ple_rows, in
         }
         if (!(gm && launch_graph(gm))) body(m);
     }
+    pp_out_rows(pp_dout_, m);  // pipeline stage before the last: the rows for the next stage
+    pp_hin_ = nullptr;
+    pp_hout_ = nullptr;
+    pp_nxo_ = 0;
+    pp_skip_out_ = false;
     const int nv = p_.voc1 - p_.voc0;
-    if (logits_host)
+    if (logits_host && p_.last())
         CUDA_CHECK(cudaMemcpyAsync(logits_host, logits_ + (size_t)(m - 1) * nv, (size_t)nv * 4, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
     CUDA_CHECK(cudaGetLastError());
     memcpy(out, out_h_, m * 4);
+}
+
+// slow-link emulation of a pipeline hop (FLASH_TEST_LINK_GBPS, test only): the stream waits until the emulated link
+// carried the bytes, minus what the real copy already took at FLASH_PP_REAL_GBPS (default 24)
+__global__ void k_pp_spin(unsigned long long ns) {  // wall-clock wait (global timer), not SM clocks
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do { __nanosleep(1000); asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < ns);
+}
+static void pp_link_emul(size_t bytes, cudaStream_t st) {
+    static const double gbps = env_double("FLASH_TEST_LINK_GBPS", 0.0), real = env_double("FLASH_PP_REAL_GBPS", 24.0);
+    if (gbps <= 0 || !bytes) return;
+    const double ns = bytes / gbps - (real > 0 ? bytes / real : 0.0);
+    if (ns > 1000) k_pp_spin<<<1, 1, 0, st>>>((unsigned long long)ns);
+}
+bool Worker::pp_hop16() {
+    static const bool on = env_int("FLASH_PP_HOP16", 0) != 0;
+    return on;
+}
+__global__ void k_pp_pack16(const float* __restrict__ x, bf16* __restrict__ y, size_t n) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) y[i] = __float2bfloat16(x[i]);
+}
+__global__ void k_pp_unpack16(const bf16* __restrict__ x, float* __restrict__ y, size_t n) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) y[i] = __bfloat162float(x[i]);
+}
+void Worker::pp_io(const void* in, void* out, int par) { pp_io(in, &out, out ? 1 : 0, par); }
+void Worker::pp_io(const void* in, void* const* outs, int nout, int par) {
+    CHECK(nout >= 0 && nout <= 4, "flash: pipeline stage %d: %d hop outputs (at most 4)", p_.stage, nout);
+    pp_hin_ = static_cast<const char*>(in);
+    pp_hout_ = nout > 0 ? static_cast<char*>(outs[0]) : nullptr;
+    pp_nxo_ = std::max(0, nout - 1);
+    pp_skip_out_ = nout == 0 && !p_.last() && p_.ngpu > 1;
+    for (int o = 1; o < nout; o++) pp_hxo_[o - 1] = static_cast<char*>(outs[o]);
+    pp_par_ = par & 1;
+    // local: device memory of this card (P2P receive buffers, the driver's per-group decode buffers): the producer's peer
+    // copy was the one link leg
+    pp_in_local_ = false;
+    cudaPointerAttributes a;
+    if (in && cudaPointerGetAttributes(&a, in) == cudaSuccess) pp_in_local_ = a.type == cudaMemoryTypeDevice && a.device == dev_;
+    (void)cudaGetLastError();
+}
+// wire rows (pinned host, or this card's receive buffer when the producer copied them peer-to-peer) -> fp32 rows; the
+// link leg is emulated unless the rows are local already (the P2P producer emulated the one leg)
+void Worker::hop_in(float* dst, const char* src, int rows, cudaStream_t s) {
+    const size_t rb = pp_rowb(), bytes = (size_t)rows * rb;
+    if (!pp_in_local_) pp_link_emul(bytes, s);
+    if (pp_hop16()) {
+        const bf16* w = reinterpret_cast<const bf16*>(src);
+        if (!pp_in_local_) {  // into the card first (the unpack reads device memory)
+            const size_t off = (size_t)(dst - (pp_hov_ ? pfb_.R : dst)) / RW;  // (the chunk's row within the batch)
+            bf16* d = pp_wire_in_ + off * RW;
+            CUDA_CHECK(cudaMemcpyAsync(d, src, bytes, cudaMemcpyDefault, s));
+            w = d;
+        }
+        k_pp_unpack16<<<std::min<size_t>(1024, ((size_t)rows * RW + 255) / 256), 256, 0, s>>>(w, dst, (size_t)rows * RW);
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s));
+    }
+}
+// fp32 rows -> wire rows (pinned host, or the next stage's receive buffer on its card: one peer copy) at row off of
+// every output (PP x TP: one per receiving rank of the next stage that reads this rank's rows)
+void Worker::hop_out(const float* src, size_t off, int rows, cudaStream_t s) {
+    if (!pp_hout_) return;  // (PP x TP: no receiver of this rank's rows)
+    const size_t rb = pp_rowb(), bytes = (size_t)rows * rb;
+    const void* from = src;
+    if (pp_hop16()) {
+        const size_t wo = (size_t)(src - (pp_hov_ ? pfb_.R : src)) / RW;
+        bf16* w = pp_wire_out_ + wo * RW;
+        k_pp_pack16<<<std::min<size_t>(1024, ((size_t)rows * RW + 255) / 256), 256, 0, s>>>(src, w, (size_t)rows * RW);
+        from = w;
+    }
+    for (int o = 0; o <= pp_nxo_; o++) {
+        char* dst = (o ? pp_hxo_[o - 1] : pp_hout_) + off * rb;
+        CUDA_CHECK(cudaMemcpyAsync(dst, from, bytes, cudaMemcpyDefault, s));
+        pp_link_emul(bytes, s);
+    }
+}
+void Worker::pp_in_rows(float* dst, int m) {
+    if (p_.first() || !p_.pp()) return;
+    CHECK(pp_hin_, "flash: pipeline stage %d: no input rows (pp_io) for this call", p_.stage);
+    hop_in(dst, pp_hin_, m, st_);
+}
+void Worker::pp_out_rows(const float* src, int m) {
+    if (p_.last() || !p_.pp() || pp_skip_out_) return;
+    CHECK(pp_hout_, "flash: pipeline stage %d: no output rows (pp_io) for this call", p_.stage);
+    hop_out(src, 0, m, st_);
+}
+
+Worker::KvArrays Worker::kv_arrays(int li) {
+    Layer& L = li < LAYERS ? L_[li] : mtp_;
+    CHECK(L.here && L.full && L.kc, "flash: layer %d has no KV on this worker", li);
+    return {L.kc, L.vc, L.ks, L.vs, L.ikb, L.ik_tail};
+}
+Worker::DnState Worker::dn_state(int li) {
+    Layer& L = L_[li];
+    CHECK(L.here && !L.full && L.S, "flash: layer %d has no DeltaNet state on this worker", li);
+    ws_ensure();  // the bound slot's state in the workspace
+    return {L.S, L.conv_hist, p_.v0, p_.v1, p_.k0, p_.k1};
 }
 
 void Worker::dump_resid(float* host, int m) {

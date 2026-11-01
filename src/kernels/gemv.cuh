@@ -98,6 +98,7 @@ void gemm_set_out_bf16(bool on);
 // memory, returns a count for the log) and the allocation retried; reserve grows them at load time
 void gemm_set_oom_hook(int (*fn)(void*), void* ctx);
 void gemm_reserve_ws(int t_max, int k_max, size_t skws_bytes);
+void gemm_reserve_multi(bool on);  // keep several reservations per (card, buffer): one per serving thread (PP hybrid)
 // the same for other lazily grown device workspaces (named blocks per device): qe_ws_reserve at load, qe_ws_alloc
 // for a growth (takes the reserved block of that name if it is big enough; else cudaMalloc, out of memory: the oom
 // hook + one retry). Returns the bytes of the block (>= bytes)

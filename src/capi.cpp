@@ -208,6 +208,13 @@ int qe_slot_capacity(void* e, int i) { return ((Engine*)e)->slot_capacity(i); }
 int qe_max_context(void* e) { return ((Engine*)e)->max_context(); }
 long long qe_pool_tokens(void* e) { return (long long)((Engine*)e)->pool_tokens(); }
 int qe_kv_in_ram(void*) { return 0; }  // the 27B KV pool is always in VRAM
+// the host-RAM plan of this run (host_budget.h) as JSON; the bytes written (without the 0), -1: buffer too small
+int qe_host_mem_info(void* e, char* buf, int n) {
+    const std::string& j = ((Engine*)e)->host_mem_json();
+    if (!buf || n <= (int)j.size()) return -1;
+    memcpy(buf, j.c_str(), j.size() + 1);
+    return (int)j.size();
+}
 int qe_can_admit(void* e, int n) { return ((Engine*)e)->can_admit(n); }
 int qe_pause_for(void* e, int n, int prio) { return ((Engine*)e)->pause_for(n, prio) ? 1 : 0; }
 void qe_set_prio(void* e, int slot, int prio) { ((Engine*)e)->set_prio(slot, prio); }

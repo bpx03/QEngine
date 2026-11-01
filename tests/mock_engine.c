@@ -4,7 +4,10 @@
 //   QE_MOCK_LOG     file: every start appends "P <n> <reused> <ids...>", every set_sampling "S t p k"
 // Prefix reuse is modelled like the engine's live sequence: reused = common prefix with the
 // previous prompt + its generated tokens (at most n - 1).
-//   gcc -O2 -shared -fPIC -o mock.so tests/mock_engine.c [-DMOCK_TIER0]
+//   gcc -O2 -shared -fPIC -o mock.so tests/mock_engine.c [-DMOCK_TIER0] [-DMOCK_GRAMMAR]
+// -DMOCK_GRAMMAR adds the grammar tier (TIER 8) the forced close of <think> uses (tests/test_think_budget.py): a
+// constrained step emits, per row, the one token its mask allows (else the script's), verifying the caller's drafts;
+// after an emitted </think> (248069) the script goes on after its own </think> (the model moves on to its answer).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +19,11 @@ typedef struct {
     int* rlen;
     int nrep, next, cur, rpos, limit;
     FILE* log;
+#ifdef MOCK_GRAMMAR
+    unsigned* mask;
+    int io[32];
+    int con, ncon;
+#endif
 } Mock;
 
 static void push(Mock* m, int t) {
@@ -82,8 +90,44 @@ int qe_start3(void* e, const int* ids, int n, int k, unsigned long long affinity
     push(m, m->replies[m->cur][0]);
     return m->replies[m->cur][0];
 }
+#ifdef MOCK_GRAMMAR
+#define MOCK_WORDS ((248320 + 31) / 32)
+static int one_bit(const unsigned* row) {  // the only allowed token of a mask row, else -1
+    int t = -1;
+    for (int w = 0; w < MOCK_WORDS; w++)
+        if (row[w]) {
+            if (t >= 0 || (row[w] & (row[w] - 1))) return -1;
+            t = w * 32 + __builtin_ctz(row[w]);
+        }
+    return t;
+}
+static int con_step(Mock* m, int* out) {
+    const int* r = m->replies[m->cur];
+    int kv = m->io[16] < 0 ? 0 : m->io[16] > 7 ? 7 : m->io[16];
+    if (m->k <= 0) kv = 0;
+    if (m->limit > 0 && kv + 1 > m->limit) kv = m->limit - 1;
+    int c = 0;
+    for (int row = 0; row <= kv; row++) {
+        int t = one_bit(m->mask + (size_t)row * MOCK_WORDS);
+        if (t < 0) t = m->rpos < m->rlen[m->cur] ? r[m->rpos++] : r[m->rlen[m->cur] - 1];
+        out[c++] = t;
+        push(m, t);
+        if (t == 248069)  // forced </think>: the scripted reply continues after its own
+            for (int i = m->rpos; i < m->rlen[m->cur]; i++)
+                if (r[i] == 248069) { m->rpos = i + 1; break; }
+        if (row < kv && t != m->io[17 + row]) break;  // a draft the row did not confirm
+    }
+    m->io[0] = 0;
+    m->ncon++;
+    if (m->limit > 0) m->limit -= c;
+    return c;
+}
+#endif
 int qe_spec_step(void* e, int* out) {
     Mock* m = e;
+#ifdef MOCK_GRAMMAR
+    if (m->con) return con_step(m, out);
+#endif
     const int* r = m->replies[m->cur];
     int want = m->k > 0 ? 3 : 1;  // multi-token steps like accepted MTP drafts
     if (m->limit > 0 && want > m->limit) want = m->limit;
@@ -98,7 +142,17 @@ int qe_spec_step(void* e, int* out) {
 }
 int qe_last_reused(void* e) { return ((Mock*)e)->reused; }
 int qe_last_slot(void* e) { (void)e; return 0; }
-void qe_release(void* e, int slot) { (void)e, (void)slot; }
+void qe_release(void* e, int slot) {
+    (void)slot;
+#ifdef MOCK_GRAMMAR
+    Mock* m = e;
+    m->con = 0;
+    if (m->log && m->ncon) fprintf(m->log, "C %d\n", m->ncon), fflush(m->log);
+    m->ncon = 0;
+#else
+    (void)e;
+#endif
+}
 
 #ifndef MOCK_TIER0
 int qe_vocab(void* e) { (void)e; return 248320; }
@@ -109,4 +163,22 @@ int qe_can_admit(void* e, int n) { return n <= ((Mock*)e)->max_t; }
 void qe_set_limit(void* e, int slot, int tokens) { (void)slot; ((Mock*)e)->limit = tokens; }
 double qe_warmup(void* e, int modes) { (void)e, (void)modes; return 0.0; }
 void qe_reset(void* e) { ((Mock*)e)->nseq = 0; }
+#endif
+
+#ifdef MOCK_GRAMMAR
+unsigned* qe_mask_buffer(void* e, int slot) {
+    Mock* m = e;
+    (void)slot;
+    if (!m->mask) m->mask = calloc((size_t)8 * MOCK_WORDS, 4);
+    return m->mask;
+}
+int* qe_spec_io(void* e, int slot) { (void)slot; return ((Mock*)e)->io; }
+void qe_constrain(void* e, int slot, int on) {
+    Mock* m = e;
+    (void)slot;
+    m->con = on != 0;
+    if (on) m->io[0] = m->io[16] = 0;
+    if (m->log) fprintf(m->log, "K %d\n", on), fflush(m->log);
+}
+int qe_constrained(void* e, int slot) { (void)slot; return ((Mock*)e)->con; }
 #endif

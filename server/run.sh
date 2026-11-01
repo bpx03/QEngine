@@ -40,12 +40,15 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   _phys=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
   [ "${_phys:-0}" -gt 0 ] && [ "$_phys" -lt "$_avail" ] && _avail=$_phys
 fi
-if [ "${#_req[@]}" -gt "$_avail" ]; then
-  echo "QEngine: ${#_req[@]} devices requested (--devices $_devices) but only $_avail GPU(s) visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)" >&2
+# (an index may repeat: Flash-Next pipeline stages sharing a card, e.g. --devices 0,1,2,0 = 4 stages on 3 cards)
+_uniq=$(printf '%s\n' "${_req[@]}" | sort -u | wc -l)
+_max=$(printf '%s\n' "${_req[@]}" | sort -n | tail -1)
+if [ "$_uniq" -gt "$_avail" ] || [ "${_max:-0}" -ge "$_avail" ]; then
+  echo "QEngine: ${_uniq} devices requested (--devices $_devices) but only $_avail GPU(s) visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)" >&2
   exit 1
 fi
 if [ "${#_req[@]}" -lt 2 ] || [ "${#_req[@]}" -gt 3 ]; then
-  echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engines are tested on 2 and 3 GPUs (Flash-Next needs 2 or 3)" >&2
+  echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engines are tested on 2 and 3 GPUs (Flash-Next: 2 or 3 cards: tp; 4+ cards: pp, pipeline stages, untested on 4 cards; see the README)" >&2
 fi
 # no core dumps unless QE_CORE_DUMP=1 (issue #3): a crashed engine holds 50+ GB of pinned host memory and the GPU
 # mappings; writing its core kept the GPUs busy for minutes (a restart failed meanwhile) and is rarely usable. The

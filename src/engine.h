@@ -398,6 +398,8 @@ private:
     std::vector<Snapshot> snaps_;
     // Pinned prefixes: QE_PREFIX_GB of host memory (default 8) outside the archive LRU
     size_t prefix_budget_ = 0, prefix_used_ = 0;
+    size_t emb_bytes_ = 0;      // the pinned embeddings (host-RAM plan)
+    std::string host_json_ = "{}";  // the host-RAM plan at boot (host_budget.h; qe_host_mem_info, /api/stats)
     void pin_prefix(int slot, int pos, unsigned long long affinity);
     // longest prefix of ids[0, n) that some archive / pinned prefix can restore (end state or
     // a checkpoint inside it)
@@ -502,6 +504,7 @@ private:
     size_t ram_budget();  // archive_budget_ capped by the host's memory (host_mem.h)
     qe_hostmem::CapLog cap_log_;
 public:
+    const std::string& host_mem_json() const { return host_json_; }
     void mem_guard();  // host memory below MemAvailable - margin: the archive gives memory back
 private:
     void disk_make_room(size_t need);

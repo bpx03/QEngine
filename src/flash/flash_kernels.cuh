@@ -1622,9 +1622,10 @@ __global__ void k_rag_ack(AckP a, const unsigned* seq, int rank, int ngpu) {
 struct FlagP {
     unsigned* f[4];
 };
-__global__ void k_xs_flag(FlagP p, const unsigned* seq, int rank, int ngpu) {
+// (add: 1 = the exchange counter's next value; 0 = seq points at a precomputed flag value, the pipelined partials)
+__global__ void k_xs_flag(FlagP p, const unsigned* seq, int rank, int ngpu, int add = 1) {
     if (threadIdx.x != 0) return;
-    const unsigned s = *seq + 1;
+    const unsigned s = *seq + add;
     __threadfence_system();
     for (int g = 0; g < ngpu; g++)
         if (g != rank) qe_st_release_sys(p.f[g] + rank, s);
@@ -1634,17 +1635,17 @@ __global__ void k_xs_flag(FlagP p, const unsigned* seq, int rank, int ngpu) {
 // copy-engine staged transfers: the transfer's flag value (*seq + 1) into a local word, which the stream's copies then
 // write into the peers' flag words after the rows
 __global__ void k_seq_word(unsigned* w, const unsigned* seq, int ahead = 0) { *w = *seq + 1 + ahead; }
-__global__ void k_xs_local(unsigned* mine, const unsigned* seq, int rank, int ngpu) {
+__global__ void k_xs_local(unsigned* mine, const unsigned* seq, int rank, int ngpu, int add = 1) {
     if (threadIdx.x != 0) return;
-    const unsigned s = *seq + 1;
+    const unsigned s = *seq + add;
     __threadfence();
     for (int g = 0; g < ngpu; g++)
         if (g != rank) qe_st_release_sys(mine + g, s);
 }
 // wait for the peers' flags of the exchange (host words), without advancing the counter (the consumer kernel does)
-__global__ void k_xs_wait(const unsigned* __restrict__ mine, const unsigned* seq, int rank, int ngpu) {
+__global__ void k_xs_wait(const unsigned* __restrict__ mine, const unsigned* seq, int rank, int ngpu, int add = 1) {
     if (threadIdx.x != 0) return;
-    const unsigned s = *seq + 1;
+    const unsigned s = *seq + add;
     for (int g = 0; g < ngpu; g++)
         if (g != rank)
             for (unsigned long long it = 0, ws_ = 0; (int)(qe_ld_acquire_sys(mine + g) - s) < 0; it++) {
@@ -1653,6 +1654,36 @@ __global__ void k_xs_wait(const unsigned* __restrict__ mine, const unsigned* seq
                 if (it == (1ull << 26)) printf("[flash] stall: rank %d staged exchange wait for %d: seq %u, seen %u\n", rank, g, s, qe_ld_acquire_sys(mine + g));
             }
     __threadfence_system();
+}
+// no peer access, direct (unstaged) exchanges (decode / verify rows): the peers' rows landed in this card's host-mapped
+// receive slot (their SM stores + flags). One pass copies them into the device slot of the same layout and raises the
+// device flag words, so the consumer kernels (k_qsa_dec in every split block, k_qsa_comb2 / comb16) poll and read device
+// memory instead of issuing small PCIe reads per block (decode k_qsa_dec 27.9 -> 211.5 us per call without P2P).
+// grid (ngpu - 1 owners, blocks per owner); bytes: the exchange's rows of one owner (multiple of 8)
+__global__ void k_xpull(const float* __restrict__ hrecv, float* __restrict__ drecv, const unsigned* __restrict__ hflags,
+                        unsigned* dflags, const unsigned* seq, unsigned* cnt, int rank, int ngpu, size_t per_owner, int bytes) {
+    __shared__ unsigned s_s;
+    const int owner = blockIdx.x >= (unsigned)rank ? blockIdx.x + 1 : blockIdx.x;
+    if (threadIdx.x == 0) {
+        const unsigned s = *seq + 1;
+        for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(hflags + owner) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, owner, s, qe_ld_acquire_sys(hflags + owner)); }
+        s_s = s;
+    }
+    __syncthreads();
+    const unsigned s = s_s;
+    const size_t off = ((size_t)(s & (XSLOT - 1)) * ngpu + owner) * per_owner;
+    const uint2* src = reinterpret_cast<const uint2*>(hrecv + off);
+    uint2* dst = reinterpret_cast<uint2*>(drecv + off);
+    for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < bytes / 8; i += gridDim.y * blockDim.x) dst[i] = __ldcv(src + i);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        if (atomicAdd(cnt + owner, 1u) == gridDim.y - 1) {
+            cnt[owner] = 0u;
+            __threadfence();
+            qe_st_release_sys(dflags + owner, s);
+        }
+    }
 }
 // receive slots of the QSA exchanges by an even counter at the start of a prefill batch: the host then knows the slot
 // parity of every staged exchange of the batch (its copies are addressed on the host, also in a replayed graph)
@@ -2113,13 +2144,13 @@ __global__ void k_idx_send16(const unsigned* __restrict__ loc, int m, Xchg xc, P
     for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < m * IDX_TOPB / 4; idx += gridDim.y * blockDim.x) dst[idx] = src[idx];
     xsend_done(xc, peer, s, p);
 }
-// global threshold = IDX_TOPB-th largest of the 3 x IDX_TOPB gathered keys; compact this card's selected blocks
+// global threshold = IDX_TOPB-th largest of the ngpu x IDX_TOPB gathered keys (ngpu <= kMaxTp); compact this card's selected blocks
 // (score key >= threshold) into sel[t][0..nsel[t]). One block per row; the last block bumps the exchange.
 __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* __restrict__ loc, const int* __restrict__ pos0,
                              Plan p, int lbmax, Xchg xc, int* __restrict__ sel, int* __restrict__ nsel,
                              const int* __restrict__ rpos = nullptr, bool skeys = false, KvPool kp = KvPool(),
                              const int* __restrict__ rbase = nullptr, int* __restrict__ psel = nullptr) {
-    __shared__ unsigned keys[3 * IDX_TOPB];  // ngpu <= 3
+    __shared__ unsigned keys[kMaxTp * IDX_TOPB];  // ngpu <= kMaxTp (make_plan)
     __shared__ unsigned hist[256];
     __shared__ unsigned s_s;
     __shared__ int s_cnt;

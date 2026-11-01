@@ -1441,17 +1441,18 @@ Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
 
 bool comm_enable_p2p(Comm& c, const int* devices) {
     if (!env_int("QE_P2P", 1) || c.ngpu < 2 || c.ngpu > 4) return false;
+    // (two ranks on one card, a test of TP4 on 3 cards: their buffers are local to each other, no peer access needed)
     for (int i = 0; i < c.ngpu; i++)
         for (int j = 0; j < c.ngpu; j++) {
             int can = 0;
-            if (i != j && (cudaDeviceCanAccessPeer(&can, devices[i], devices[j]) != cudaSuccess || !can))
+            if (i != j && devices[i] != devices[j] && (cudaDeviceCanAccessPeer(&can, devices[i], devices[j]) != cudaSuccess || !can))
                 return false;
         }
     const size_t bytes = (size_t)4 * c.ngpu * kMaxBatchRows * pll_row_words(c.ll_hidden) * sizeof(uint4);
     for (int i = 0; i < c.ngpu; i++) {
         CUDA_CHECK(cudaSetDevice(devices[i]));
         for (int j = 0; j < c.ngpu; j++) {
-            if (i == j) continue;
+            if (i == j || devices[i] == devices[j]) continue;
             const cudaError_t r = cudaDeviceEnablePeerAccess(devices[j], 0);
             if (r != cudaSuccess && r != cudaErrorPeerAccessAlreadyEnabled) {
                 fprintf(stderr, "P2P: enabling peer access %d->%d failed (%s), host path\n",
@@ -1806,8 +1807,10 @@ bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, i
     return true;
 }
 bool allreduce_hc_ok(const Comm& c, int m, int h) {
-    return c.p2p && c.ngpu > 1 && m >= 3 * c.ngpu && m > kMaxGemvW4Tokens && m <= c.rs_rows && h == c.ll_hidden &&
-           c.prs1[0] != nullptr && c.pflags[0] != nullptr && m * h <= c.max_elems;
+    // (no peer access: only the host-staged variant, which needs no peer flags)
+    const bool hs = !c.p2p && c.xfer == kXferHost && c.xcnt[0] != nullptr;
+    return (c.p2p || hs) && c.ngpu > 1 && m >= 3 * c.ngpu && m > kMaxGemvW4Tokens && m <= c.rs_rows && h == c.ll_hidden &&
+           c.prs1[0] != nullptr && (hs || c.pflags[0] != nullptr) && m * h <= c.max_elems;
 }
 
 // ---------------------------------------------------------------- copy-engine prefill all-reduce
@@ -1955,7 +1958,8 @@ __global__ void __launch_bounds__(512) ce_finish_kernel(float* __restrict__ resi
 }
 
 bool ce_ar_ok(const Comm& c, int m, int h, int rs_off) {
-    return c.p2p && c.cfl[0] && c.pstage[0] && h == c.ll_hidden && m <= c.rs_rows && rs_off + m <= c.rs_rows &&
+    // (no peer access: comm_select_path allocated these for 27B on 3 cards; the copies are driver-staged peer copies)
+    return (c.p2p || c.xfer == kXferHost) && c.cfl[0] && c.pstage[0] && c.prs1[0] && h == c.ll_hidden && m <= c.rs_rows && rs_off + m <= c.rs_rows &&
            m >= 3 * c.ngpu && m > kMaxGemvW4Tokens;
 }
 void ce_pack(const float* partial, int m, int h, const Comm& c, int rank, int rs_off, cudaStream_t st, int blocks) {
@@ -2163,7 +2167,16 @@ static void allreduce_hc_staged(float* R, const float* inj, const float* partial
                 CUDA_CHECK(cudaMemcpyAsync(c.xfl[g] + kind * ng + rank, c.xsw[rank], 4, cudaMemcpyDeviceToDevice, st));
     };
     if (host) {
-        CUDA_CHECK(cudaMemcpyAsync(c.hrs[rank], stage, (size_t)m * row, cudaMemcpyDeviceToHost, st));
+        // only the rows the peers own (they never read this card's own range): D2H, the busier direction of the host
+        // path (it also carries the AG sums), moves (ng - 1) / ng of the rows instead of all (QE_HS_ALLROWS=1: all)
+        static const bool allrows = env_int("QE_HS_ALLROWS", 0);
+        if (allrows) CUDA_CHECK(cudaMemcpyAsync(c.hrs[rank], stage, (size_t)m * row, cudaMemcpyDeviceToHost, st));
+        else {
+            if (o0 > 0) CUDA_CHECK(cudaMemcpyAsync(c.hrs[rank], stage, (size_t)o0 * row, cudaMemcpyDeviceToHost, st));
+            if (m > o1)
+                CUDA_CHECK(cudaMemcpyAsync(c.hrs[rank] + (size_t)o1 * h4, stage + (size_t)o1 * h4, (size_t)(m - o1) * row,
+                                           cudaMemcpyDeviceToHost, st));
+        }
         xs_flag_kernel<<<1, 32, 0, st>>>(c, rank, 0);
     } else {
         for (int g = 0; g < ng; g++)

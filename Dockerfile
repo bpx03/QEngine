@@ -1,24 +1,32 @@
 # syntax=docker/dockerfile:1
 # QEngine: Qwen3.8-27B INT4 inference server for 3x RTX 3090 (sm_86, tensor parallel 3).
+# GPU code (SASS) for sm_86 (RTX 3090, tuned), sm_89 (RTX 4090) and sm_120 (RTX 5090): see CUDA_ARCHS below.
 # The model is NOT baked in: mount it at /app/models/Qwen3.8-27B-INT4 (see docker-compose.yml).
 # Qwen3.8-Flash-Next (preview): mount it too and set QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4.
 #
 #   docker build -t qengine .                       # with vision (torch, ~+4 GB)
 #   docker build -t qengine --build-arg VISION=0 .  # text only, no torch
+#   docker build -t qengine --build-arg CUDA_ARCHS=86 .  # RTX 3090 code only (faster build)
 
 ARG CUDA_VERSION=13.1.1
 ARG UBUNTU=ubuntu24.04
 
 # ---------------------------------------------------------------- build: libqengine.so
 FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS build
+# 86 = RTX 3090 (supported, tuned), 89 = RTX 4090 (not tested by us, not tuned), 120 = RTX 5090 (community-tested,
+# not tuned). A source build without -DCMAKE_CUDA_ARCHITECTURES is sm_86 only.
+ARG CUDA_ARCHS="86;89;120"
+# the build's git hash for the start-up log (the build context has no .git): --build-arg REVISION=$(git rev-parse HEAD)
+ARG REVISION=unknown
 RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY CMakeLists.txt ./
 COPY src ./src
-# same flags as CMakeLists (sm_86, Release); g++-15 is not in Ubuntu 24.04, so the distro
+# same flags as CMakeLists (Release) plus the GPU list above; g++-15 is not in Ubuntu 24.04, so the distro
 # GCC 13 (supported by nvcc 13.1) is used
-RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
+      "-DQE_GIT_HASH=${REVISION}" \
     && cmake --build build
 
 # ---------------------------------------------------------------- runtime
@@ -148,7 +156,7 @@ ENTRYPOINT ["/usr/local/bin/qengine-entrypoint"]
 ARG REVISION=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
-      org.opencontainers.image.description="QEngine: Qwen3.8-27B INT4 (and Qwen3.8-Flash-Next preview) inference server for RTX 3090 (sm_86), OpenAI/Anthropic-compatible API; model not included" \
+      org.opencontainers.image.description="QEngine: Qwen3.8-27B INT4 (and Qwen3.8-Flash-Next preview) inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in, not tuned), OpenAI/Anthropic-compatible API; model not included" \
       org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"

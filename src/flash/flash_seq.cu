@@ -200,7 +200,7 @@ void Worker::alloc_slots() {
     CUDA_CHECK(cudaHostAlloc((void**)&bem_h_, (size_t)MAXM * (MAXM + 2) * 4, cudaHostAllocMapped | cudaHostAllocPortable));
     memset(bem_h_, 0, (size_t)MAXM * (MAXM + 2) * 4);
     CUDA_CHECK(cudaHostGetDevicePointer((void**)&bem_, bem_h_, 0));
-    blk_ = env_int("FLASH_BATCH_LOOKUP", 1);
+    blk_ = env_int("FLASH_BATCH_LOOKUP", 1) && !p_.pp();  // (pipeline stages: lookup drafts not wired yet)
     blk_min_ = env_int("FLASH_BATCH_LK_MIN", blk_min_);
     if (blk_ && ns > 1) {
         hdb_ = (int*)dalloc((size_t)ns * ((size_t)max_ctx_ + 64) * 4);
@@ -319,24 +319,58 @@ int Worker::drop_graphs(const cudaGraphExec_t* keep, double frac) {
     return (int)n;
 }
 
-void Worker::oom_reserve_take() {
-    static const long long mb = env_ll("FLASH_OOM_RESERVE_MB", 64);
+long long oom_reserve_mb() {
+    static const long long mb = std::max(0LL, env_ll("FLASH_OOM_RESERVE_MB", 64));
+    return mb;
+}
+
+// retake: after the reserve was used, only with real headroom (free >= 2 x reserve + 64 MB) and only after
+// kRetakeAfter good instantiates / launches since: taken back right away, the next instantiate that needs more failed
+// again and every cycle dropped graphs (review 2026-11-01 #4)
+void Worker::oom_reserve_take(bool retake) {
+    const long long mb = oom_reserve_mb();
     if (oom_res_ || mb <= 0) return;
     const size_t b = (size_t)mb << 20;
-    if (free_bytes() < b + ((size_t)32 << 20)) return;  // only from memory that is clearly free
-    if (cudaMalloc(&oom_res_, b) != cudaSuccess) {
+    if (retake && oom_ok_ < kRetakeAfter) return;
+    if (free_bytes() < (retake ? 2 * b + ((size_t)64 << 20) : b + ((size_t)32 << 20))) {  // clearly free memory only
+        if (retake) oom_ok_ = 0;  // next try after another kRetakeAfter good launches, not on every launch (review comm F2)
+        return;
+    }
+    // stream-ordered (the device's default pool): freeing it later needs no device-wide sync (cudaFree syncs every
+    // stream of the card, including side-stream kernels that wait for other ranks)
+    oom_res_async_ = cudaMallocAsync(&oom_res_, b, st_) == cudaSuccess;
+    if (oom_res_async_) {
+        if (cudaStreamSynchronize(st_) != cudaSuccess) {
+            (void)cudaGetLastError();
+            oom_res_ = nullptr;
+            return;
+        }
+    } else {
         (void)cudaGetLastError();
         oom_res_ = nullptr;
-        return;
+        if (cudaMalloc(&oom_res_, b) != cudaSuccess) {
+            (void)cudaGetLastError();
+            oom_res_ = nullptr;
+            return;
+        }
     }
     oom_res_bytes_ = b;
 }
 
 bool Worker::oom_reserve_free() {
     if (!oom_res_) return false;
-    CUDA_CHECK(cudaStreamSynchronize(st_));
-    CUDA_CHECK(cudaFree(oom_res_));
+    if (oom_res_async_) {
+        CUDA_CHECK(cudaFreeAsync(oom_res_, st_));
+        CUDA_CHECK(cudaStreamSynchronize(st_));  // the pool releases its free memory to the driver at a sync point ...
+        cudaMemPool_t pool;
+        if (cudaDeviceGetDefaultMemPool(&pool, dev_) == cudaSuccess) (void)cudaMemPoolTrimTo(pool, 0);  // ... and now
+        (void)cudaGetLastError();
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(st_));
+        CUDA_CHECK(cudaFree(oom_res_));
+    }
     oom_res_ = nullptr;
+    oom_ok_ = 0;
     return true;
 }
 
@@ -359,8 +393,19 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
         *e = nullptr;
         graph_oom_++;
         const double f0 = free_bytes() / 1048576.0;
-        // the least recently launched half first (issue #3 D4), then every other graph, then the emergency reserve:
-        // their memory goes back to the driver's pool (not shown as free), the next instantiate gets it
+        oom_ok_ = 0;
+        // the emergency reserve first (it exists for this; taken back only with real headroom), then the least
+        // recently launched half of the graphs (issue #3 D4), then every other graph: their memory goes back to the
+        // driver's pool (not shown as free), the next instantiate gets it
+        if (oom_reserve_free()) {
+            fprintf(stderr, "[flash] GPU%d: graph instantiate out of memory (%.0f MB free): freed the %.0f MB emergency "
+                    "reserve, retrying\n", dev_, f0, oom_res_bytes_ / 1048576.0);
+            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+            if (r != cudaErrorMemoryAllocation) goto done;
+            (void)cudaGetLastError();
+            *e = nullptr;
+        }
+        {
         static const double lru = env_double("FLASH_GRAPH_LRU_FRAC", 0.5);
         int n = lru > 0 && lru < 1 ? drop_graphs(e, lru) : drop_all_graphs(e);
         const size_t held = xheld_;
@@ -375,12 +420,6 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
             fprintf(stderr, "[flash] GPU%d: still out of memory: dropped the other %d cached graphs, retrying\n", dev_, n2);
             r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
         }
-        if (r == cudaErrorMemoryAllocation && oom_reserve_free()) {
-            (void)cudaGetLastError();
-            *e = nullptr;
-            fprintf(stderr, "[flash] GPU%d: still out of memory: freed the %.0f MB emergency reserve, retrying\n", dev_,
-                    oom_res_bytes_ / 1048576.0);
-            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
         }
         if (r == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
@@ -393,8 +432,10 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
             return false;
         }
     }
+done:
     CUDA_CHECK(r);
-    if (!oom_res_ && oom_res_bytes_) oom_reserve_take();  // re-taken once memory is clearly free again
+    xuse_[*e] = ++xtick_;  // the newest graph is not the first LRU victim before its first launch
+    if (!oom_res_ && oom_res_bytes_ && ++oom_ok_ >= kRetakeAfter) oom_reserve_take(true);
     return true;
 }
 
@@ -452,13 +493,22 @@ bool Worker::launch_graph(cudaGraphExec_t& e) {
     static const int inj = env_int("FLASH_TEST_GRAPH_LAUNCH_OOM", 0);
     const bool fake = inj > 0 && ++glaunch_calls_ == inj;
     cudaError_t r = fake ? cudaErrorMemoryAllocation : cudaGraphLaunch(e, st_);
+    if (r == cudaErrorMemoryAllocation && oom_reserve_free()) {  // the emergency reserve first (nothing was enqueued)
+        (void)cudaGetLastError();
+        graph_oom_++;
+        fprintf(stderr, "[flash] GPU%d: graph launch out of memory: freed the %.0f MB emergency reserve, retrying\n", dev_,
+                oom_res_bytes_ / 1048576.0);
+        r = cudaGraphLaunch(e, st_);
+    }
     if (r != cudaErrorMemoryAllocation) {
         CUDA_CHECK(r);
         xuse_[e] = ++xtick_;  // LRU (drop_graphs)
+        if (!oom_res_ && oom_res_bytes_ && ++oom_ok_ >= kRetakeAfter) oom_reserve_take(true);
         return true;
     }
     (void)cudaGetLastError();
     graph_oom_++;
+    oom_ok_ = 0;
     const int n = drop_all_graphs(nullptr);
     e = nullptr;
     gcool_.trip();

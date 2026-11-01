@@ -2188,6 +2188,11 @@ void Worker::forward_prefill(int m, bool logits) {
     const bool arf_xn = env_int("QE_ARF_XN", 0) != 0;
     bool defer_ok[2];
     for (int b = 0; b < 2; b++) defer_ok[b] = allreduce_deferrable(comm_, mbs[b], H, r0s[b]);
+    // no peer access (3 cards): the copy-engine all-reduce below is the deferred path (its sums land in the local prs2
+    // rows, allreduce_finish reads them); only when both micro-batches take it, else the old host path, not deferred
+    if (!comm_.p2p && env_int("QE_AR_CE", 1) && env_int("QE_HOST_CE", 2) && comm_.xfer == kXferHost && ngpu_ == 3 && ce_ar_ok(comm_, mbs[0], H, r0s[0]) &&
+        ce_ar_ok(comm_, mbs[1], H, r0s[1]))
+        defer_ok[0] = defer_ok[1] = true;
     bool pb[2];  // partial rows of b in bf16 (GEMM output mode, see part_bf16_on)
     for (int b = 0; b < 2; b++) pb[b] = part_bf16_on(defer_ok[b]);
     // owner-finished all-reduce (QE_AR_OWNFIN, comm.cuh OwnFin): the owners of the rows add, norm and
@@ -2263,6 +2268,51 @@ void Worker::forward_prefill(int m, bool logits) {
             ce_finish(resid_ + o, part, pb[b], mbs[b], H, comm_, rank, norm, eps, r0s[b], of.G, of.wxn, cs);
             cmd(false);
             ce_take_wait(seq, 1, cs);
+        } else if (ce_on && !of_on && comm_.hrs[rank] && comm_.xfer == kXferHost) {
+            // no peer access (QE_HOST_CE=2): the copy-engine all-reduce staged through pinned host memory on this
+            // stream. RS: D2H of the rows the peers own (each its range of this card's pinned rows), an event per peer
+            // through the hub, then H2D of every peer's rows of this card's range into prs1, ce_sum; AG: the own sums
+            // D2H once, the peers pull them H2D. Driver-staged peer copies (QE_HOST_CE=1) moved the AG sums once per
+            // peer and through bounce buffers. Reuse: a sender rewrites its pinned rows only after the peers' events of
+            // the next phase, recorded after their copies out of them (same stream)
+            const unsigned seq = ++ce_seq_;
+            const int m = mbs[b], ng = ngpu_, h4 = H / 4;
+            const size_t row = (size_t)H * 2;
+            auto ob = [&](int g) { return (int)((long)m * g / ng); };
+            const int o0 = ob(rank), o1 = ob(rank + 1);
+            const uint2* rows = reinterpret_cast<const uint2*>(part);
+            if (!pb[b]) {
+                if (!ce_pack_main) ce_pack(part, m, H, comm_, rank, r0s[b], cs, env_int("QE_CE_PACK_BLOCKS", 8));
+                rows = comm_.pstage[rank] + (size_t)r0s[b] * h4;
+            }
+            auto publish = [&](int kind) {
+                for (int j = 0; j < ng; j++) {
+                    if (j == rank) continue;
+                    cudaEvent_t e;
+                    CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+                    CUDA_CHECK(cudaEventRecord(e, cs));
+                    g_ce_hub.put(seq, kind, rank, j, e);  // (the receiver destroys it)
+                }
+            };
+            uint2* const hr = comm_.hrs[rank];
+            if (o0 > 0) CUDA_CHECK(cudaMemcpyAsync(hr, rows, (size_t)o0 * row, cudaMemcpyDeviceToHost, cs));
+            if (m > o1) CUDA_CHECK(cudaMemcpyAsync(hr + (size_t)o1 * h4, rows + (size_t)o1 * h4, (size_t)(m - o1) * row, cudaMemcpyDeviceToHost, cs));
+            publish(0);
+            ce_take_wait(seq, 0, cs);  // the peers' rows are in their pinned memory
+            for (int g = 0; g < ng; g++)
+                if (g != rank && o1 > o0)
+                    CUDA_CHECK(cudaMemcpyAsync(comm_.prs1[rank] + (size_t)g * comm_.rs_own * h4, comm_.hrs[g] + (size_t)o0 * h4,
+                                               (size_t)(o1 - o0) * row, cudaMemcpyHostToDevice, cs));
+            ce_sum(part, pb[b], m, H, comm_, rank, r0s[b], seq, cs);
+            uint2* const s2 = comm_.prs2[rank] + (size_t)r0s[b] * h4;
+            if (o1 > o0) CUDA_CHECK(cudaMemcpyAsync(comm_.hag[rank] + (size_t)o0 * h4, s2 + (size_t)o0 * h4, (size_t)(o1 - o0) * row,
+                                                    cudaMemcpyDeviceToHost, cs));
+            publish(1);
+            ce_take_wait(seq, 1, cs);
+            for (int g = 0; g < ng; g++)
+                if (g != rank && ob(g + 1) > ob(g))
+                    CUDA_CHECK(cudaMemcpyAsync(s2 + (size_t)ob(g) * h4, comm_.hag[g] + (size_t)ob(g) * h4, (size_t)(ob(g + 1) - ob(g)) * row,
+                                               cudaMemcpyHostToDevice, cs));
         } else if (ce_on && !of_on) {  // copy-engine all-reduce: only local kernels on this GPU's SMs
             const unsigned seq = ++ce_seq_;
             const void* rows = part;

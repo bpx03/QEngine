@@ -130,6 +130,39 @@ def drop_empty_turns(messages):
     return out, n
 
 
+class DroppedTurnLog:
+    """The HF #50 cleanup's log line, once per conversation: a client resends the same reasoning-only turns with
+    every request of a long conversation, and a line per request reads like an error. Logs a conversation again
+    only when its count grows; counts for /api/stats. key: the conversation's identity (the agent tracker's
+    conversation id, else a hash of its root)."""
+
+    def __init__(self, cap=1024):
+        import collections
+        import threading
+        self.seen, self.cap, self.lock = collections.OrderedDict(), cap, threading.Lock()
+        self.counts = {"requests": 0, "turns": 0, "logged": 0}
+
+    def note(self, key, n):
+        """n reasoning-only turns left out of this request's prompt: the count seen before when it grew (log
+        now), else None."""
+        with self.lock:
+            self.counts["requests"] += 1
+            self.counts["turns"] += n
+            prev = self.seen.get(key)
+            self.seen[key] = max(n, prev or 0)
+            self.seen.move_to_end(key)
+            while len(self.seen) > self.cap:
+                self.seen.popitem(last=False)
+            if prev is not None and n <= prev:
+                return None
+            self.counts["logged"] += 1
+            return prev or 0
+
+    def stats(self):
+        with self.lock:
+            return dict(self.counts, conversations=len(self.seen))
+
+
 def merge_leading_system(messages):
     """HF #75/#76: the stock template rejects more than one system message at the start (some
     clients send several). Merges them into one, joined like qwen38_syssafe.jinja does (trimmed,

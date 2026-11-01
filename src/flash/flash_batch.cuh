@@ -485,7 +485,7 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     xq.seq = xqseq_;
     xq.done = xqdone_;
     xq.scnt = xqscnt_;
-    k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(qbuf_, m, xq, p_);
+    if (p_.ngpu > 1) k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(qbuf_, m, xq, p_);
     Xchg xi;
     for (int g = 0; g < p_.ngpu; g++) { xi.recv[g] = xipr_[g]; xi.flags[g] = xipf_[g]; }
     xi.seq = xiseq_;
@@ -493,10 +493,12 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb);
     if (idx_gk_) k_idx_local<true><<<m, 1024, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
     else k_idx_local<<<m, 1024, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
-    k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_);
+    if (p_.ngpu > 1) k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_);
+    xpull(xi, 2, m, 0, IDX_TOPB);  // (no peer access: the flags into device memory)
     k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp, idx_gk_, kvs_ ? L.kvp : KvPool(), rb,
                                       kvs_ && m <= MAXM ? psel_ : nullptr);
     KCHK("qsa_b select");
+    xpull(xq, 0, m, (size_t)qper(p_) * 4, qper(p_));  // (no peer access: the peers' q rows into device memory)
     AttnDst d{};
     d.o[0] = attn_x_;
     for (int z = 1; z < dec_split_; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
@@ -509,7 +511,8 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     xc.seq = xseq_;
     xc.done = xdone_;
     xc.scnt = xscnt_;
-    k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(attn_x_, m, xc, p_);
+    if (p_.ngpu > 1) k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(attn_x_, m, xc, p_);
+    xpull(xc, 1, m, (size_t)xper(p_) * 4, xper(p_));
     k_qsa_comb2<<<dim3(ql, m), HD, 0, st_>>>(attn_x_, m, proj_, ld, ab_, ql * HD, xc, p_, nqp * HD);
     KCHK("qsa_b comb");
     gemv_w8_rows(L.o, ab_, ql * HD, part_, H, m, st_);
@@ -544,8 +547,9 @@ void Worker::trunk_b(int m, const int* toks, int nseg, int rps) {
     ll_idx_ = 0;
     curpos_ = posd_;
     k_step_bump_b<<<1, 32, 0, st_>>>(stepcs_, bseg_d_, nseg);
-    k_embed<<<m, 256, 0, st_>>>(embed_, toks, R_);
-    for (int li = 0; li < LAYERS; li++) {
+    if (p_.first()) k_embed<<<m, 256, 0, st_>>>(embed_, toks, R_);
+    else CUDA_CHECK(cudaMemcpyAsync(R_, pp_din_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));  // previous stage's rows
+    for (int li = p_.l0; li < p_.l1; li++) {
         Layer& L = L_[li];
         if (li == PLE_LAYER) ple_b(L, li, m, rps);
         hc_read(L.hca, m, true);
@@ -557,9 +561,14 @@ void Worker::trunk_b(int m, const int* toks, int nseg, int rps) {
         moe(L, m);
         hc_write(m);
         steer_mark(li, rslot_);  // the layer output; per row its slot's vector
+        if (nfl_d_) { flush_y(m); nf_layer(li, m); }
         bdump(li, 1, m, rps);
     }
     flush_y(m);
+    if (!p_.last()) {  // pipeline stage before the last: the rows go to the next stage
+        CUDA_CHECK(cudaMemcpyAsync(pp_dout_, R_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(Rsave_, R_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));
     hc_read(mixer_, m, false);
     if (bsamp_) head_sample_b(m, otok_);
@@ -599,7 +608,9 @@ void Worker::batch_body(int nseg, int k) {
     CUDA_CHECK(cudaMemcpyAsync(kvrb_d_, kvrb_h_, slots_.size() * 4, cudaMemcpyHostToDevice, st_));
     comm_begin_unit(ctr_, st_);
     k_bmeta<<<1, 32, 0, st_>>>(bseg_d_, nseg, rps, svp_, svt_, kvrb_d_, rpos_, rbase_, rslot_, bvt_, bpn_);
-    if (ngp_.flags) {  // staged rows (table not pinned): ids -> host -> rows
+    if (!layer_here(PLE_LAYER)) {
+        // pipeline stage without the n-gram embedding layer: no rows needed
+    } else if (ngp_.flags) {  // staged rows (table not pinned): ids -> host -> rows
         NgramDev g = ngp_;
         g.phase = 1;
         k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, g, pler_);
@@ -610,6 +621,9 @@ void Worker::batch_body(int nseg, int k) {
     k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, ngp_, pler_);
     KCHK("batch meta");
     trunk_b(m, bvt_, nseg, rps);
+    // pipeline stages before the last: their layers only; the last stage accepts, drafts and advances the per-slot
+    // speculative state, which the driver copies to the other stages before their next step (spec_state_get / _set)
+    if (!p_.last()) { KCHK("batch step (stage)"); return; }
     k_accept_b<<<1, 32, 0, st_>>>(bvt_, otok_, k, nseg, bseg_d_, bseg_d_ + MAXM, svp_, svh_, bacc_, bem_);
     if (bsamp_) pen_commit_b(spslot_, bseg_d_, nseg, bem_, MAXM + 2, svp_, st_);
     if (has_mtp_) {
@@ -648,6 +662,7 @@ void Worker::set_bhist(int slot, const int* ids, int n) {
 }
 
 void Worker::batch_launch(const int* slots, const int* bases, const int* lims, int nseg, int k) {
+    qe_wd_crumb(wdid_, dev_, "batch step (sequences, drafts)", nseg, k);
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(nseg >= 1 && nseg * (k + 1) <= MAXM && !qsa_a_ && dec_k_ && dec_split_ <= 8, "flash batch: %d x %d rows", nseg, k + 1);
     sv_stash();
@@ -658,15 +673,20 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     bnseg_ = nseg;
     brps_ = k + 1;
     bslots_.assign(slots, slots + nseg);
-    const bool con0 = con_;  // grammar masks belong to the bound slot's single steps (constrained slots never batch)
-    con_ = false;
+    // grammar masks: a constrained slot steps alone; its batch of one applies the mask rows (upload_mask, one per row
+    // of the segment) in the head of the last stage (mode B: pipeline stages run batched steps only). Otherwise the
+    // bound slot's mask belongs to its single steps.
+    const bool con0 = con_;
+    con_ = nseg == 1 && p_.last() && slots[0] < (int)con_slot_.size() && con_slot_[slots[0]] != 0;
+    CHECK(!con_ || k + 1 <= MASK_ROWS, "flash batch: a constrained step of %d rows (mask rows %d)", k + 1, MASK_ROWS);
     // per-slot sampling: the bound slot's live parameters (counter) back to its row first, reloaded after the step
     bsamp_ = false;
     for (int i = 0; i < nseg; i++) bsamp_ |= sson_.at(slots[i]) != 0;
     if (bsamp_) CUDA_CHECK(cudaMemcpyAsync(spslot_ + cur_slot_, sp_, sizeof(SampleParams), cudaMemcpyDeviceToDevice, st_));
-    const long long key = ((long long)nseg << 16) | ((long long)k << 1) | (bsamp_ ? 1 : 0);
+    const long long key = ((long long)con_ << 40) | ((long long)nseg << 16) | ((long long)k << 1) | (bsamp_ ? 1 : 0);
     if (!ev0_) { CUDA_CHECK(cudaEventCreate(&ev0_)); CUDA_CHECK(cudaEventCreate(&ev1_)); }
     CUDA_CHECK(cudaEventRecord(ev0_, st_));
+    pp_in_rows(pp_din_, nseg * (k + 1));  // pipeline stage after the first: the previous stage's rows (outside the graph)
     // one graph per shape (not LRU-capped like the prefill caches: few shapes); eager the first time (lazy library
     // allocations); an instantiate OOM drops every cached graph and retries, else the step runs eagerly
     static const bool graphs = env_int("FLASH_GRAPH", 1);
@@ -695,9 +715,60 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
         }
         if (!ran && !(it->second && launch_graph(it->second))) batch_body(nseg, k);
     }
+    pp_out_rows(pp_dout_, nseg * (k + 1));  // pipeline stage before the last: this stage's rows for the next one
+    pp_hin_ = nullptr;
+    pp_hout_ = nullptr;
+    pp_nxo_ = 0;
+    pp_skip_out_ = false;
     if (bsamp_) CUDA_CHECK(cudaMemcpyAsync(sp_, spslot_ + cur_slot_, sizeof(SampleParams), cudaMemcpyDeviceToDevice, st_));
     con_ = con0;
     CUDA_CHECK(cudaEventRecord(ev1_, st_));
+}
+
+// pipeline stages: the per-slot speculative state rows (next verify tokens [MAXM + 1], {pos, commit}, the committed
+// token pair of the n-gram rows) and the host's position / pending-commit counts, SPEC_ROW ints per slot. The last stage
+// advances them in its batched step; the driver copies them to the other stages before their next step of the group.
+void Worker::spec_state_get(const int* slots, int n, int* buf) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    sv_stash();  // a live single-sequence state into its stash row first
+    // the three per-slot arrays whole (a few KB) in three copies on the stream, then the rows on the host
+    const size_t ns = slots_.size();
+    if (!spec_h_) CUDA_CHECK(cudaHostAlloc((void**)&spec_h_, ns * (MAXM + 5) * 4, cudaHostAllocDefault));
+    CUDA_CHECK(cudaMemcpyAsync(spec_h_, svt_, ns * (MAXM + 1) * 4, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaMemcpyAsync(spec_h_ + ns * (MAXM + 1), svp_, ns * 8, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaMemcpyAsync(spec_h_ + ns * (MAXM + 3), svh_, ns * 8, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    for (int i = 0; i < n; i++) {
+        const int s = slots[i];
+        int* r = buf + (size_t)i * SPEC_ROW;
+        memcpy(r, spec_h_ + (size_t)s * (MAXM + 1), (MAXM + 1) * 4);
+        memcpy(r + MAXM + 1, spec_h_ + ns * (MAXM + 1) + 2 * s, 8);
+        memcpy(r + MAXM + 3, spec_h_ + ns * (MAXM + 3) + 2 * s, 8);
+        r[MAXM + 5] = svpos_[s];
+        r[MAXM + 6] = slot_prev_m(s);
+    }
+}
+void Worker::spec_state_set(const int* slots, int n, const int* buf) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    sv_stash();  // (otherwise a later stash of the live state would overwrite the rows set here)
+    for (int i = 0; i < n; i++) {
+        const int s = slots[i];
+        const int* r = buf + (size_t)i * SPEC_ROW;
+        CUDA_CHECK(cudaMemcpyAsync(svt_ + (size_t)s * (MAXM + 1), r, (MAXM + 1) * 4, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(svp_ + 2 * s, r + MAXM + 1, 8, cudaMemcpyHostToDevice, st_));
+        CUDA_CHECK(cudaMemcpyAsync(svh_ + 2 * s, r + MAXM + 3, 8, cudaMemcpyHostToDevice, st_));
+        svpos_[s] = r[MAXM + 5];
+        set_slot_prev_m(s, r[MAXM + 6]);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st_));  // (pageable sources: the copies are done before buf is reused)
+}
+
+void Worker::set_slot_drafts(int slot, const int* d, int n) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    sv_stash();
+    n = std::max(0, std::min(n, MAXM));
+    if (n > 0) CUDA_CHECK(cudaMemcpyAsync(svt_ + (size_t)slot * (MAXM + 1) + 1, d, (size_t)n * 4, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));  // (the caller's buffer)
 }
 
 void Worker::batch_finish(int* out, int* cnt) {
@@ -709,6 +780,7 @@ void Worker::batch_finish(int* out, int* cnt) {
         CUDA_CHECK(cudaEventElapsedTime(&ms, ev0_, ev1_));
         bgpu_ms_.push_back(ms);
     }
+    if (!p_.last()) return;  // pipeline stage before the last: no tokens here (the state comes from spec_state_set)
     for (int i = 0; i < bnseg_; i++) {
         const int* e = bem_h_ + i * (MAXM + 2);
         cnt[i] = e[0];

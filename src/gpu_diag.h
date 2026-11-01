@@ -6,8 +6,14 @@
 // SIGBUS / SIGFPE / SIGILL / SIGABRT, then the previous handler runs (Python's faulthandler: every Python stack).
 #include "env.h"
 #include <cuda_runtime.h>
+#include <errno.h>
 #include <execinfo.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -17,20 +23,69 @@
 
 namespace qe_diag {
 
-// "pid name MiB; ..." of the compute processes on the GPUs (nvidia-smi), "" when none or not available
-inline std::string gpu_holders() {
+// stdout of argv (PATH lookup) within timeout_s, else what came so far. Never blocks past the deadline: on expiry the
+// child is SIGKILLed and abandoned (no blocking waitpid: a child stuck in the driver (D state) ignores SIGKILL until its
+// driver call returns; popen + `timeout` without -k waited for it forever)
+inline std::string run_bounded(const char* const argv[], double timeout_s) {
     std::string out;
-    FILE* f = popen("timeout 10 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null", "r");
-    if (!f) return out;
-    char line[512];
-    while (fgets(line, sizeof line, f)) {
-        std::string s(line);
-        while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+    int fd[2];
+    if (pipe2(fd, O_CLOEXEC) != 0) return out;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fd[1], 1);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    pid_t pid = -1;
+    const int rc = posix_spawnp(&pid, argv[0], &fa, nullptr, const_cast<char* const*>(argv), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fd[1]);
+    if (rc != 0) {
+        close(fd[0]);
+        return out;
+    }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    bool eof = false;
+    while (true) {
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        const double left = timeout_s - ((t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9);
+        if (left <= 0) break;
+        struct pollfd pf{fd[0], POLLIN, 0};
+        const int r = poll(&pf, 1, (int)(left * 1000) + 1);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        char b[512];
+        const ssize_t n = read(fd[0], b, sizeof b);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { eof = true; break; }
+        out.append(b, (size_t)n);
+    }
+    close(fd[0]);
+    int st = 0;
+    if (!eof || waitpid(pid, &st, WNOHANG) == 0) {
+        kill(pid, SIGKILL);
+        for (int i = 0; i < 20 && waitpid(pid, &st, WNOHANG) == 0; i++) usleep(10000);  // reaped if it dies at once
+    }
+    return out;
+}
+
+// "pid name MiB; ..." of the compute processes on the GPUs (nvidia-smi, at most 10 s), "" when none or not available
+inline std::string gpu_holders() {
+    static const char* const argv[] = {"nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+                                       "--format=csv,noheader", nullptr};
+    std::string out;
+    const std::string raw = run_bounded(argv, 10.0);
+    size_t a = 0;
+    while (a < raw.size()) {
+        size_t b = raw.find('\n', a);
+        if (b == std::string::npos) b = raw.size();
+        std::string s = raw.substr(a, b - a);
+        a = b + 1;
+        while (!s.empty() && (s.back() == '\r' || s.back() == ' ')) s.pop_back();
         if (s.empty()) continue;
         if (!out.empty()) out += "; ";
         out += s;
     }
-    pclose(f);
     return out;
 }
 

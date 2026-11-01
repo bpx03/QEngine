@@ -44,8 +44,11 @@ R_TOOL = ("Run ls.\n</think>\n\n<tool_call>\n<function=Bash>\n<parameter=command
           "</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call><|im_end|>")
 R_EMPTY = "nothing to add\n</think>\n\n<|im_end|>"
 R_DONE = "ok\n</think>\n\nGotowe. Done here.<|im_end|>"
+R_THINK_EOS = "The <|im_end|>"  # EOS inside <think> (AutomationBench, 2026-11-01)
+R_BAD_TOOL = "call it\n</think>\n\n<tool_call>\n<function<parameter name=\"command\">\n</parameter>\n</tool_call><|im_end|>"
 # replies in the order of the requests below (each start takes the next line)
-SCRIPT = [R_TEXT, R_TOOL, R_EMPTY, R_DONE, R_TOOL, R_DONE, R_DONE, R_TEXT]
+SCRIPT = [R_TEXT, R_TOOL, R_EMPTY, R_DONE, R_TOOL, R_DONE, R_DONE, R_TEXT,
+          R_THINK_EOS, R_BAD_TOOL, R_TOOL, R_EMPTY, R_THINK_EOS, R_EMPTY, R_THINK_EOS]
 
 
 def build_mock(tier0):
@@ -123,8 +126,8 @@ def run(tier0):
     assert ev[-1]["usage"]["completion_tokens"] > 0
     print("  openai stream: tool call ok")
 
-    # 3. Anthropic: reasoning-only reply
-    r = c.post("/v1/messages", json={"model": name, "max_tokens": 200,
+    # 3. Anthropic: reasoning-only reply (greedy: passed through, no --empty-retry)
+    r = c.post("/v1/messages", json={"model": name, "max_tokens": 200, "temperature": 0,
                                      "messages": [{"role": "user", "content": "q1"}]}).json()
     assert [b["type"] for b in r["content"]] == ["thinking"] and r["stop_reason"] == "end_turn", r
 
@@ -177,7 +180,41 @@ def run(tier0):
     r = c.post("/v1/chat/completions", json={"model": name, "max_tokens": 4,
                                              "messages": [{"role": "user", "content": "y"}]}).json()
     assert r["choices"][0]["finish_reason"] == "length" and r["usage"]["completion_tokens"] == 4, r
-    print("  stop sequence, count_tokens, structured-output 400, max_tokens ok")
+    # 8b. a prompt over the context: OpenAI's wording (verifiers / LiteLLM detect overlong prompts by it), no start
+    n0 = len(prompts())
+    r = c.post("/v1/chat/completions", json={"model": name, "messages": [{"role": "user", "content": "x " * (mt + 64)}]})
+    e = r.json()["error"]
+    assert r.status_code == 400 and e["code"] == "context_length_exceeded", r.text
+    assert e["message"].startswith("This model's maximum context length is ") and "prompt is too long" in e["message"], e
+    r = c.post("/v1/messages", json={"model": name, "max_tokens": 10, "messages": [{"role": "user", "content": "x " * (mt + 64)}]})
+    assert r.status_code == 400 and r.json()["error"]["message"].startswith("prompt is too long"), r.text  # Claude Code
+    assert len(prompts()) == n0
+    print("  stop sequence, count_tokens, structured-output 400, max_tokens, overlong prompt 400s ok")
+
+    # 9. --empty-retry (default 2): EOS inside <think>, then a tool call that does not parse, then a good one
+    n0 = len(prompts())
+    r = c.post("/v1/chat/completions", json={"model": name, "tools": TOOLS_OAI,
+                                             "messages": [{"role": "user", "content": "pliki?"}]}).json()
+    ch = r["choices"][0]
+    assert ch["finish_reason"] == "tool_calls" and ch["message"]["tool_calls"][0]["function"]["name"] == "Bash", r
+    assert len(prompts()) == n0 + 3, prompts()[n0:]
+    assert prompts()[-1][1] > 0 and gen.think["empty_retried"] == 2 and gen.think["empty_retry_recovered"] == 1
+    want = sum(len(tok.encode(x, add_special_tokens=False).ids) - 1 for x in (R_THINK_EOS, R_BAD_TOOL, R_TOOL))
+    assert r["usage"]["completion_tokens"] == want, (r["usage"], want)
+    # retries used up: the last empty reply goes to the client (Anthropic)
+    r = c.post("/v1/messages", json={"model": name, "max_tokens": 300,
+                                     "messages": [{"role": "user", "content": "q9"}]}).json()
+    assert [b["type"] for b in r["content"]] == ["thinking"] and r["stop_reason"] == "end_turn", r
+    assert len(prompts()) == n0 + 6 and gen.think["empty_retried"] == 4, prompts()[n0:]
+    assert gen.think["empty_retry_exhausted"] == 1
+    # a seeded request is never resampled (reproducibility): its empty reply goes straight back
+    r = c.post("/v1/chat/completions", json={"model": name, "seed": 7,
+                                             "messages": [{"role": "user", "content": "q10"}]}).json()
+    assert r["choices"][0]["message"]["content"] == "" and r["choices"][0]["finish_reason"] == "stop", r
+    assert len(prompts()) == n0 + 7 and gen.think["empty_retried"] == 4, prompts()[n0:]
+    th = gen.metrics.snapshot()["thinking"]  # /api/stats thinking
+    assert th["empty_retried"] == 4 and th["empty_retry_recovered"] == 1 and th["empty_retry_exhausted"] == 1, th
+    print("  empty replies sampled again: tool call on the 3rd try, 3 empty tries passed through, seeded not retried")
     print("  engine fallbacks:", ", ".join(gen.engine.missing_optional()))
 
 

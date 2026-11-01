@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <thread>
 #include <atomic>
 #include <algorithm>
@@ -97,11 +98,33 @@ void set_yarn_factor(double f);
 // cost FLASH_PIN_VRAM_MB_PER_GB (2.0, measured: 4 KB GPU pages, THP or not) per GB on every card, charged to the
 // expert budget at load (the qe_create path sets it; flash_run has no archive)
 void set_host_reg_plan(double bytes);
+// the host -> card link (bytes / s; the slowest card): measured once before the workers load (probe_host_link), or the
+// slow-link emulation's rate (FLASH_TEST_LINK_HOST). 2 cards restage their host-backed experts every prefill pass
+// (14-16 GB per card): on a slow link (< FLASH_PFB_SLOW_GBPS, default 8) the big batches default to 16384 rows
+// (FLASH_PFB_BIG; fewer passes)
+double probe_host_link(const std::vector<int>& devs);
+void set_host_link_gbps(double gbps);
+double host_link_gbps();
+long long oom_reserve_mb();  // FLASH_OOM_RESERVE_MB (64), 0 = off
 double yarn_factor();        // 0: off
-// ranks: 2 or 3 (every split below divides: 24 QSA q heads, 48 DeltaNet value / 16 key heads, 512-position KV
-// ownership per period of 512 x ngpu positions)
+// ranks: 2, 3 or 4 (every split below divides: 24 QSA q heads, 48 DeltaNet value / 16 key heads, 512-position KV
+// ownership per period of 512 x ngpu positions), or 1: a pipeline stage (FLASH_PAR=pp / pp_prefill, pp_plan.h) that
+// holds whole layers [l0, l1) of the trunk; its collectives are local and its exchanges no-ops. PP x TP
+// (FLASH_PAR=pptp): a pipeline stage of 2 or 3 ranks, each holding its TP slice of the stage's layers [l0, l1).
+// tensor-parallel ranks at most: the comm layer's per-rank arrays (Comm::dev[4], pull mask 4 bits per rank) and the
+// QSA / row exchanges hold 4
+constexpr int kMaxTp = 4;
+static_assert(sizeof(((Comm*)nullptr)->dev) / sizeof(int) >= kMaxTp, "Comm holds kMaxTp ranks");
 struct Plan {
     int rank = 0, ngpu = 3;
+    // pipeline stage (ngpu == 1): trunk layers [l0, l1), stage `stage` of `nstage`. The first stage (l0 == 0) embeds
+    // the tokens, the last (l1 == LAYERS) runs the final mixer, lm_head and the MTP block; the others take the residual
+    // rows of the previous stage and hand theirs to the next (Worker::pp_io). TP plans: [0, LAYERS), 1 stage.
+    int l0 = 0, l1 = LAYERS, stage = 0, nstage = 1;
+    int wid = -1;  // pipeline worker index (every rank of every stage, in order; watchdog identity), -1: TP rank
+    bool first() const { return l0 == 0; }
+    bool last() const { return l1 == LAYERS; }
+    bool pp() const { return nstage > 1; }
     std::vector<int> gcard;  // expert group (e * 5 + g, e = 512 shared) -> card
     int v0 = 0, v1 = 0;     // DeltaNet value heads
     int k0 = 0, k1 = 0;     // DeltaNet key heads used by them
@@ -111,10 +134,15 @@ struct Plan {
 };
 // weights: relative share of expert groups per card (e.g. 176,160,176)
 std::vector<Plan> make_plan(int ngpu, const std::vector<double>& group_weights);
+// pipeline stages: one 1-rank plan per stage, stage s holding trunk layers [bounds[s], bounds[s + 1]) (pp_plan.h);
+// tps (PP x TP): the ranks of every stage (empty: 1 each); the plans come stage by stage, rank by rank
+std::vector<Plan> make_stage_plans(const std::vector<int>& bounds, const std::vector<int>& tps = {});
 // default expert-group weights for ngpu cards: 3 -> 176,160,176 (the desktop card GPU1 gets less), else equal
 std::vector<double> default_group_weights(int ngpu);
 // local expert groups of a card under a plan (the shared expert's included): bound of its MoE job lists
 int plan_groups(const Plan& p);
+// TP ranks per card before the workers are made (a card listed twice: green contexts split its SMs between them)
+void set_card_ranks(const std::vector<int>& devs);
 
 struct HcW {     // one hyper-connection read: Wd (+ inject rows) and Wu, INT8 g128
     W8 down, up;
@@ -168,6 +196,7 @@ struct PfJob {             // prefill: one local expert group and its rows [off,
     int ng;                // first job of an expert: its local groups (consecutive jobs), else 0
 };
 struct Layer {
+    bool here = true;      // the layer lives on this worker (pipeline stages hold a range of layers; the rest stay empty)
     bool full = false;
     HcW hca, hcm;
     // DeltaNet
@@ -196,6 +225,11 @@ struct Layer {
     char* groups = nullptr;   // local expert groups, stride GRP_BYTES (device: indices < ndev)
     char* hgroups = nullptr;  // cold groups in mapped pinned host memory (indices >= ndev): the full host copy
     char* hgroups_h = nullptr;  // the same, host address
+    // shared expert views (mode A stage, Worker::set_views): the cold groups have no own host copy; csrc[j] is cold
+    // group j's address for the kernels (host-mapped, or a peer card's VRAM), csrc_h[j] the copy source (the same under
+    // UVA), cdev[j]: device memory (a peer TP rank's resident group). Empty: hgroups / hgroups_h as above.
+    std::vector<const char*> csrc, csrc_h;
+    std::vector<char> cdev;
     int ndev = 1 << 30;
     int ncold = 0, coff = 0;  // cold groups of this layer, their first entry of the expert-cache table
     std::vector<int> cexp;    // expert of every cold group
@@ -271,6 +305,40 @@ public:
     // commit: rows of the PREVIOUS forward that become state (DeltaNet, PLE conv); -1 = all of them
     void forward(const int* tokens, int pos, int m, const bf16* ple_rows, int* out, float* logits_host = nullptr,
                  int commit = -1);
+    // pipeline stages (Plan::pp): where the next call (forward / prefill / prefill_batch / batch_launch) takes the residual
+    // rows [m][RW] from (in, ignored on the first stage) and puts its own (out, ignored on the last stage). Each is pinned
+    // host memory (host staging: D2H + H2D) or the consumer stage's receive buffer on its card (P2P, pp_rx: one copy); in
+    // the wire format (fp32, or bf16 with FLASH_PP_HOP16=1). par: which of the boundary's two buffers (double buffering;
+    // the overlapped prefill copies are in the batch graph, keyed by it). Cleared by the call.
+    void pp_io(const void* in, void* out, int par = 0);
+    // PP x TP (FLASH_PAR=pptp): this rank's rows go to several ranks of the next stage (outs[0..nout), nout <= 4)
+    void pp_io(const void* in, void* const* outs, int nout, int par);
+    // mode A with shared expert views (before load): this stage worker holds no expert weights of its own. Its expert
+    // table points at the TP worker tp[own]'s resident groups (the same card: L.groups / ndev / gmap indices shared), the
+    // other groups are cold: the TP ranks' pinned host copies (their cold groups) and the other TP ranks' resident
+    // groups (peer VRAM with peer access, else one shared pinned host copy per (rank, layer) made at load). Every source
+    // is immutable after load (TP resident groups never move, host copies are never freed), so the TP worker's expert
+    // cache and this stage never evict each other: the stage's own cache / staging ring copy from those sources.
+    void set_views(const std::vector<const Worker*>& tp, int own) { vtp_ = tp; vown_ = own; }
+    bool views() const { return !vtp_.empty(); }
+    const Layer* layer_ptr(int li) const { return li == LAYERS ? &mtp_ : &L_[li]; }
+    void set_pp_rx(bool on) { pp_rx_want_ = on; }  // before alloc_state: P2P receive buffers (2 x the batch rows)
+    void* pp_rx(int par) const { return pp_rx_[par & 1]; }
+    int pp_rx_rows() const { return pp_rx_rows_; }
+    static bool pp_hop16();                         // FLASH_PP_HOP16=1: bf16 rows on the wire (half the bytes)
+    static size_t pp_rowb() { return (size_t)RW * (pp_hop16() ? 2 : 4); }
+    const Plan& plan() const { return p_; }
+    bool layer_here(int li) const { return li >= p_.l0 && li < p_.l1; }
+    // mode A hand-over (flash_pp.cpp): a QSA layer's KV arrays (rows by this card's position ownership) and a DeltaNet
+    // layer's recurrent state of the bound slot, for the copy from a stage worker to the TP workers
+    struct KvArrays { uint8_t *kc, *vc; float *ks, *vs; bf16* ikb; float* ik_tail; };
+    KvArrays kv_arrays(int li);  // li = LAYERS: the MTP block
+    struct DnState { float *S, *conv_hist; int v0, v1, k0, k1; };
+    DnState dn_state(int li);
+    float* ple_hist() { return L_[PLE_LAYER].here ? L_[PLE_LAYER].ple_hist : nullptr; }
+    float* mtp_chain_row() { return Rmin_; }  // MTP chain input [RW] (the prompt end's MTP residual after a prefill)
+    int cur_base() const { return cur_base_; }
+    void sync() { CUDA_CHECK(cudaSetDevice(dev_)); CUDA_CHECK(cudaStreamSynchronize(st_)); }  // the worker's stream drained
     // prefill chunk of m <= PFM rows at pos (rows committed at once); argmax/sample of the last row -> *out;
     // mtp: also the MTP block over the rows (tokens shifted: mtp_toks[i] = t_{pos+i+1}) -> its draft in *draft
     void prefill(const int* tokens, int pos, int m, const bf16* ple_rows, int* out, const int* mtp_toks, int* draft);
@@ -279,7 +347,18 @@ public:
     // the MoE half over all n rows at once (each expert group read once per batch); argmax/sample of the last row
     // ctx_end: the absolute context end of the coming batches (0: the sequence regions, kv_top_); rows past
     // pfbn_mid_ live in the tails of the KV arrays (al_*), usable while the KV rows in use stay below them
-    int pf_batch(long long ctx_end = 0) const { return pfbn_ > pfbn_mid_ && !al_room(ctx_end) ? pfbn_mid_ : pfbn_; }
+    int pf_batch(long long ctx_end = 0) const {
+        if (pfbn_ > pfbn_mid_ && !al_room(ctx_end)) {
+            if (!al_said_) {  // (once per worker: the big batches are off while the KV rows reach the tails)
+                al_said_ = true;
+                fprintf(stderr, "[flash] GPU%d: prefill batches of %d rows instead of %d: the KV rows in use (context end %lld) reach "
+                        "the big-batch tails of the KV arrays\n", dev_, pfbn_mid_, pfbn_, ctx_end);
+            }
+            return pfbn_mid_;
+        }
+        return pfbn_;
+    }
+    mutable bool al_said_ = false;
     // rows of a prefill batch whose buffers never take memory from the expert cache (the rest of pf_batch() is
     // borrowed from it for the batch, prefill-r3)
     int pf_batch_base() const { return pfbn_base_; }
@@ -319,7 +398,8 @@ public:
     }
     void prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const bf16* ple_rows, const int* mtp_toks, int* out,
                        int* draft);
-    void rmin_load(int slot);  // the MTP chain residual of slot's prompt end (prefill_multi) into the chain input
+    void rmin_load(int slot);
+    void rmin_save(int slot);  // the MTP chain row of the bound slot's prompt end into slot's storage (pipeline prefill)  // the MTP chain residual of slot's prompt end (prefill_multi) into the chain input
     // MTP head over m rows at positions pos..: row i = (hidden, tokens[i]); chain = false: hidden rows of the last
     // trunk forward (rows 0..m-1), true: the MTP residual of the last row of the previous MTP call (m = 1).
     // out[i] = draft token predicted by row i.
@@ -451,14 +531,19 @@ public:
     // the least recently launched fraction `frac` of the cached graphs but *keep (1: all); issue #3 D4: an instantiate
     // OOM drops the older half first instead of every graph (a re-capture storm at the same low free memory)
     int drop_graphs(const cudaGraphExec_t* keep, double frac);
-    std::map<cudaGraphExec_t, unsigned long long> xuse_;  // graph exec -> launch tick (LRU of drop_graphs)
+    std::unordered_map<cudaGraphExec_t, unsigned long long> xuse_;  // graph exec -> instantiate / launch tick (LRU of
+                                                                    // drop_graphs); erased with every destroyed exec
     unsigned long long xtick_ = 0;
     size_t xheld_ = 0;  // cached graphs seen by the last drop_graphs (before it dropped)
-    // emergency VRAM reserve (FLASH_OOM_RESERVE_MB, default 64, inside the margin): freed when an instantiate still
-    // fails after the drop, then one more retry; taken again once that much is free
+    // emergency VRAM reserve (FLASH_OOM_RESERVE_MB, default 64, inside the margin; with no host-registration plan it
+    // is added to the margin): freed first when an instantiate or a launch runs out of memory, then one more try;
+    // taken again only with real headroom after kRetakeAfter good instantiates / launches (flash_seq.cu)
     void* oom_res_ = nullptr;
     size_t oom_res_bytes_ = 0;
-    void oom_reserve_take();
+    bool oom_res_async_ = false;  // from the stream-ordered pool (freed without a device-wide sync)
+    int oom_ok_ = 0;              // good instantiates / launches since the last out-of-memory
+    static constexpr int kRetakeAfter = 64;
+    void oom_reserve_take(bool retake = false);
     bool oom_reserve_free();
     bool graph_skip() { return gcool_.skip(); }        // a missing graph is not captured now (after a failed retry)
     int slot_prev_m(int s) const { return s == cur_slot_ ? prev_m_ : sprev_.at(s); }  // pending commit rows of slot s
@@ -474,6 +559,16 @@ public:
     // bases[slot] for every slot), k drafts each, at most lims[i] of them accepted; out[i * 64 ..] / cnt[i] per segment
     void batch_launch(const int* slots, const int* bases, const int* lims, int nseg, int k);
     void batch_finish(int* out, int* cnt);
+    // pipeline stages (flash_pp.cpp decode_batched): copy the per-slot speculative state out of the last stage and into
+    // the others, SPEC_ROW ints per slot (verify tokens, {pos, commit}, committed pair, host position, pending commits)
+    static constexpr int SPEC_ROW = MAXM + 7;
+    void spec_state_get(const int* slots, int n, int* buf);
+    void spec_state_set(const int* slots, int n, const int* buf);
+    // the next step's verify drafts of slot (1..n of its speculative row): a constrained step's planned drafts (mode B)
+    void set_slot_drafts(int slot, const int* d, int n);
+  private:
+    int* spec_h_ = nullptr;  // pinned scratch of spec_state_get
+  public:
     void sv_load();          // the bound slot's speculative state from its stash (after batched steps / a switch)
     void ws_ensure();        // the bound slot's recurrent state into the workspace (after batched steps)
     void sv_set_live() { sv_live_ = true; }  // spec_init wrote the bound slot's state
@@ -492,6 +587,8 @@ public:
     void set_bhist(int slot, const int* ids, int n);  // batched lookup: the slot's token history (prompt + emitted)
     bool batch_lookup() const { return blk_; }
     std::vector<float> bgpu_ms_;  // GPU time of every batched step
+  public:
+    float last_batch_ms() const { return bgpu_ms_.empty() ? 0.f : bgpu_ms_.back(); }
     // activation steering (QE_STEER / QE_STEER_DIR, flash_steer.h): nv vectors, w = [nv][2 modes][LAYERS][H] with the
     // sidecar strength folded in (add: alpha v; project: sqrt(alpha) unit v), vector v present on layers flo[v]..fhi[v];
     // applied to every HC stream of the residual at the output of the slot's layers. Set once after alloc_state,
@@ -606,7 +703,13 @@ private:
     // guard: rows of the last launch whose lm_head input had non-finite values (bit r = row r), logged; also
     // accumulated for take_nf (FLASH_GUARD: 1 the caller fails those sequences, 2 log only, 3 abort, 0 off)
     unsigned nf_check(const char* what, int pos);
+    // FLASH_NF_LAYERS=1 (debug, testers): per layer, did its residual hold a non-finite value (first one is printed
+    // with the GUARD line): [LAYERS + 1] host-mapped flags
+    unsigned* nfl_h_ = nullptr;
+    unsigned* nfl_d_ = nullptr;
+    void nf_layer(int li, int m);
     unsigned take_nf() { const unsigned m = nf_pending_; nf_pending_ = 0; return m; }
+    void put_nf(unsigned m) { nf_pending_ |= m; }  // (flags taken out by take_nf back; pipeline prefill flow)
     int batch_rps() const { return brps_; }
     void dump_ikb(const char* path, int nb);
   private:
@@ -644,10 +747,14 @@ private:
     unsigned* hagf_p_[4] = {};
     float* xouti_ = nullptr;  // CE: device outbox of the indexer-key exchange
     int xi_k_ = 0;            // indexer exchanges of the batch so far (staged slot parity)
-    float *xout_ = nullptr, *xoutc_ = nullptr, *hxq_ = nullptr, *hxc_ = nullptr;  // device outboxes of q / partials
+    float *xout_ = nullptr, *xoutc_ = nullptr;  // device outboxes of q / partials
+    // host staging: pinned rows of the staged exchanges [kind q, partials, indexer][XSLOT slots][ngpu][XROWS * xper]:
+    // one region per kind and slot, so a sender never rewrites rows a peer may still be copying (the receiver's copy of
+    // exchange s precedes its flag of s + 1 on its stream; the sender writes slot s again only after that flag)
+    float* hx_ = nullptr;
     unsigned *xsw_ = nullptr, *agw_ = nullptr;  // CE: sequence-number words copied into the peers' flags after the rows
-    unsigned* hxf_ = nullptr;           // [q, partials][4 senders]
-    float *hxq_p_[4] = {}, *hxc_p_[4] = {};
+    unsigned* hxf_ = nullptr;           // [q, partials, indexer][4 senders]
+    float* hx_p_[4] = {};
     unsigned* hxf_p_[4] = {};
     unsigned* xdummy_ = nullptr;        // flag words the send kernels of a staged exchange raise (the copies follow)
     bool xstage_ = false;               // inside a prefill batch (counters aligned by k_xpar_align)
@@ -862,7 +969,12 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     // drains the pending chunk before such a chunk (1.3.3, club-3090#1879). qsa_deferred_: what the last qsa() did.
     bool qsa_defers(int m, bool sel) const;
     bool qsa_deferred_ = false;
-    struct QsaBack { Layer* L = nullptr; const float* prow = nullptr; float* ax = nullptr; int mr = 0, ld = 0, ql = 0, nqp = 0; };
+    unsigned* trc_ = nullptr;  // FLASH_PF_TRACE counters (host-mapped)
+    struct QsaBack { Layer* L = nullptr; const float* prow = nullptr; float* ax = nullptr; int mr = 0, ld = 0, ql = 0, nqp = 0; bool ce = false; };
+    // CE prefill exchanges (FLASH_COMM=ce): the consumer kernels of the q / partial / indexer exchanges spin on the
+    // peers' flags in every block; a grid larger than the card then holds every SM until the flags land. One block waits
+    // for them first (k_qpf_qwait) so the other streams' kernels still get SMs (fix-134). FLASH_CE_PREWAIT=0: off.
+    void ce_prewait(const Xchg& x);
     QsaBack qpend_[2];
     int qsa_split_ = 0, qsa_buf_ = 0, qsa_ahead_ = 0;
     float *projB_ = nullptr, *attnB_ = nullptr;  // slot 1 copies of proj_ / attn_x_ (in the MoE activation buffer)
@@ -871,6 +983,11 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     void ple(Layer& L, int pos, int m, const bf16* rows);
 
     Plan p_;
+    bool dev_first_ = true;  // the first worker on its card (per-card registrations, see the constructor)
+    double card_share_ = 1.0;  // the part of the card's free memory this worker's expert cache takes (several stages on a card)
+  public:
+    void set_card_share(double f) { card_share_ = std::clamp(f, 0.05, 1.0); }
+  private:
     int dev_, max_ctx_, rows_ = 0;  // owned KV rows per card (the pool: logical rows when streaming)
     // KV streaming (FLASH_KV_STREAM): rows_ = logical pool rows (FLASH_KV_STREAM_CTX positions, host memory), srows_ =
     // rows of one sequence of max_ctx (selection buffers, device K / V arrays: block cache + expert-cache tail),
@@ -976,6 +1093,16 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     float *pairs_ = nullptr, *pairs_all_ = nullptr;
     int* otok_ = nullptr;
     float* xrecv_ = nullptr;
+    // no peer access + host staging: device receive slots of the staged q / partial exchanges (the copies land here, the
+    // consumers read device memory; the direct sends keep the host-mapped xrecv_ / xqrecv_)
+    float *xrecvd_ = nullptr, *xqrecvd_ = nullptr;
+    // ... and their consumer flag words in device memory (k_xs_local / k_qxlocal16 raise them on this card): the
+    // consumers poll a flag in every block, from host-mapped words that was a PCIe read per block (k_qsa_comb16 4.3 ms
+    // per 512-row chunk, 3 cards without P2P)
+    unsigned *xflagd_ = nullptr, *xqflagd_ = nullptr, *xiflagd_ = nullptr;
+    unsigned* xpcnt_ = nullptr;  // k_xpull block counters [q 4][partials 4][indexer 4]
+    // no peer access, direct exchange: pull the peers' rows into the device slot, point x's own slot / flags there
+    void xpull(Xchg& x, int kind, int mr, size_t rowb, size_t per);
     unsigned *xflags_ = nullptr, *xseq_ = nullptr, *xdone_ = nullptr, *xscnt_ = nullptr, *xqscnt_ = nullptr, *xiscnt_ = nullptr;
     float* xpr_[4] = {};
     bool qsa_a_ = false;
@@ -1105,6 +1232,40 @@ private:
     int prev_m_ = 0;
     unsigned* stepc_ = nullptr;
     float* Rmin_ = nullptr;   // MTP chain input row
+    // pipeline stage hand-off (pp_io): host rows of the next call, and the decode rows' device staging (MAXM rows, the
+    // graphs copy them to / from R_ at fixed addresses)
+    const char* pp_hin_ = nullptr;
+    char* pp_hout_ = nullptr;
+    char* pp_hxo_[3] = {};                   // PP x TP: more receivers of this rank's rows (the next stage has more ranks)
+    int pp_nxo_ = 0;
+    bool pp_skip_out_ = false;               // PP x TP: no rank of the next stage reads this rank's rows
+    int pp_par_ = 0;
+    bool pp_in_local_ = false;               // the input is this card's own receive buffer (P2P: no link leg here)
+    bool pp_rx_want_ = false;
+    std::vector<const Worker*> vtp_;  // shared expert views (set_views)
+    void* gctx_ = nullptr;  // CUgreenCtx: green context (TP ranks sharing a card), streams made in it
+    int gsms_ = 0;
+    int wdid_ = 0;  // watchdog / breadcrumb identity (TP rank, or the pipeline worker index)
+    void mkstream(cudaStream_t* s, unsigned flags, int prio);
+    int vown_ = -1;
+    void view_groups(Layer& L, int li);  // li = -1: the MTP block
+    const char* cold_h(const Layer& L, int j) const { return L.csrc_h.empty() ? L.hgroups_h + (size_t)j * GRP_BYTES : L.csrc_h[j]; }
+    const char* cold_d(const Layer& L, int j) const { return L.csrc.empty() ? L.hgroups + (size_t)j * GRP_BYTES : L.csrc[j]; }
+    // copies out of the cold sources: host -> device (TP), or any (views: peer VRAM too)
+    cudaMemcpyKind cold_kind() const { return vtp_.empty() ? cudaMemcpyHostToDevice : cudaMemcpyDefault; }
+    void* pp_rx_[2] = {};
+    int pp_rx_rows_ = 0;
+    float *pp_din_ = nullptr, *pp_dout_ = nullptr;
+    bf16 *pp_wire_in_ = nullptr, *pp_wire_out_ = nullptr;  // FLASH_PP_HOP16: bf16 rows before unpack / after pack
+    cudaStream_t hopst_ = nullptr;           // overlapped prefill hop: copy stream, per-chunk input events, fork / join
+    std::vector<cudaEvent_t> hev_in_;
+    cudaEvent_t hev_fork_ = nullptr, hev_join_ = nullptr;
+    bool pp_hov_ = false;                    // this prefill batch's hop runs chunk by chunk on hopst_ inside the graph
+    void hop_in(float* dst, const char* src, int rows, cudaStream_t s);    // wire rows -> fp32 rows (+ link emulation)
+    // fp32 rows -> wire rows at row `off` of every output (pp_hout_ + pp_hxo_) (+ link emulation)
+    void hop_out(const float* src, size_t off, int rows, cudaStream_t s);
+    void pp_in_rows(float* dst, int m);    // before a launch: the previous stage's rows (serial, outside the graph)
+    void pp_out_rows(const float* src, int m);  // after it: this stage's rows (serial, outside the graph)
     // steering (set_steer): vectors, per-slot {vector, mode, lo, hi} and scale [slots] and the bound slot's copy [1]
     float *steer_w_ = nullptr, *steer_dw_ = nullptr, *steer_sc_d_ = nullptr, *steer_csc_d_ = nullptr;
     int *steer_sl_d_ = nullptr, *steer_csl_d_ = nullptr;

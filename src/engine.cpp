@@ -1,5 +1,6 @@
 #include "env.h"
 #include "engine.h"
+#include "host_budget.h"
 
 #include <sys/mman.h>
 #include "snap_policy.h"
@@ -178,6 +179,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         CUDA_CHECK(e);
     }
     memcpy(embed_, emb.data, emb.nbytes);
+    emb_bytes_ = emb.nbytes;
 
     comm_ = comm_create(devices.size(), kChunk * cfg_.hidden, cfg_.hidden);
     devs_ = devices;
@@ -256,12 +258,45 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     // instead of on the request path.
     std::vector<size_t> sizes;
     for (auto& w : workers_) sizes.push_back(w->snapshot_bytes());
-    archive_budget_ = (size_t)((env_double("QE_KV_ARCHIVE_GB", 32.0)) *
-                               (1ull << 30));
+    {  // host-RAM plan (host_budget.h): the archive and the pinned prefixes get what the host has left after the server,
+        // the embeddings and the snapshot buffers, up to their defaults (32 + 8 GiB); QE_KV_ARCHIVE_GB / QE_PREFIX_GB win
+        namespace hb = qe_hostbudget;
+        hb::In in;
+        in.cards = (int)workers_.size();
+        in.total = (double)qe_hostmem::total();
+        in.avail = (double)qe_hostmem::available(true);
+        {
+            const qe_hostmem::CgroupMem cg = qe_hostmem::cgroup_mem();
+            in.cg_limit = cg.limit;
+            in.cg_anon = cg.anon;
+        }
+        in.margin_now = (double)qe_hostmem::margin();
+        if (env_double("QE_HOST_RESERVE_GB", -1.0) >= 0) in.reserve = env_double("QE_HOST_RESERVE_GB", -1.0) * 1e9;
+        in.base = std::max(0.0, env_double("QE_HOST_BASE_GB", 6.0)) * 1e9;
+        double snap = 0;
+        for (size_t sz : sizes) snap += (double)sz;
+        in.fixed = (double)emb_bytes_ + snap * max_snaps_;
+        const double GiB = (double)(1ull << 30);
+        in.arch_def = 32 * GiB;
+        in.pref_def = 8 * GiB;
+        if (env_set("QE_KV_ARCHIVE_GB")) in.arch_user = std::max(0.0, env_double("QE_KV_ARCHIVE_GB", 32.0)) * GiB;
+        if (env_set("QE_PREFIX_GB")) in.pref_user = std::max(0.0, env_double("QE_PREFIX_GB", 8.0)) * GiB;
+        in.arch_env = "QE_KV_ARCHIVE_GB";
+        in.pref_env = "QE_PREFIX_GB";
+        in.prefix_needs_archive = false;  // (27B: the pinned prefixes have their own budget)
+        const hb::Out o = hb::plan(in);
+        for (auto& w : o.warn) printf("host RAM plan: warning: %s\n", w.c_str());
+        printf("%s\n", hb::line(in, o).c_str());
+        fflush(stdout);
+        host_json_ = hb::json(in, o);
+        // the env expressions of 1.3.3 while the plan keeps the default or the set value (bit-identical budgets)
+        const double ka = in.arch_user >= 0 ? in.arch_user : in.arch_def, kp = in.pref_user >= 0 ? in.pref_user : in.pref_def;
+        archive_budget_ = o.archive == ka ? (size_t)((env_double("QE_KV_ARCHIVE_GB", 32.0)) * (1ull << 30)) : (size_t)o.archive;
+        prefix_budget_ = o.prefix == kp ? (size_t)((env_double("QE_PREFIX_GB", 8.0)) * (1ull << 30)) : (size_t)o.prefix;
+    }
     if (env_set("QE_ARCHIVE_MIN")) archive_min_ = env_int("QE_ARCHIVE_MIN", archive_min_);
     if (env_set("QE_SHARE_PREFIX")) share_prefix_ = env_int("QE_SHARE_PREFIX", share_prefix_) != 0;
     pool_log_ = env_int("QE_POOL_LOG", 0);
-    prefix_budget_ = (size_t)((env_double("QE_PREFIX_GB", 8.0)) * (1ull << 30));
     disk_init();
     if (env_int("QE_ARCHIVE_PINNED", 1))
         hpool_.start(archive_budget_ + prefix_budget_,
@@ -1045,6 +1080,10 @@ void Engine::push_mask(int slot) {
 void Engine::constrain(int slot, bool on) {
     Seq& q = seqs_.at(slot);
     if (on && !q.constrained) finish_for(slot);  // nothing of this slot may be queued ahead
+    if (!on && q.constrained) {  // back to free decoding mid-reply (forced close of <think>): the lookup histories
+        if (slot == cur_) lk_slot_ = -1;  // missed the constrained steps' tokens: rebuilt at the next step
+        lkb_inval(slot);
+    }
     q.constrained = on;
     if (on) {
         int* io = spec_io(slot);
@@ -2297,6 +2336,8 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     k_ = k;
     last_copied_ = 0;
     last_from_archive_ = false;
+    std::vector<char> was_active(seqs_.size());  // (restored when the start fails for room: review comm F3)
+    for (size_t i = 0; i < seqs_.size(); i++) was_active[i] = seqs_[i].active;
     if (!concurrent_)
         for (auto& q : seqs_) q.active = false;
     const int kstart = next_k();  // drafts produced at the end of the prompt
@@ -2308,6 +2349,12 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     const auto t0 = now();
     const long long sk = steer_key();  // this request's steering (set_steering): its cached states only
     const int slot = pick_slot(ids, n, k, affinity);
+    if (pf_of(slot)) {  // never expected (release drops an abandoned prompt): its stale prompt must not serve this one
+        fprintf(stderr, "[qengine] BUG: slot %d still had a prompt in flight at a new start: dropped\n", slot);
+        pfs_.erase(pfs_.begin() + (pf_of(slot) - pfs_.data()));
+        seqs_[slot].seq.clear();
+        seqs_[slot].pos = 0;
+    }
     finish_for(slot);
     const int prev_cur = cur_;
     if (slot != cur_) use_slot(slot);
@@ -2489,6 +2536,9 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         }
         q.active = false;
         q.affinity = prev_aff;
+        if (!concurrent_)  // the running sequences go on (non-concurrent callers step their single sequence)
+            for (size_t i = 0; i < seqs_.size(); i++)
+                if ((int)i != slot) seqs_[i].active = was_active[i];
         if (prev_cur >= 0 && prev_cur != slot) {
             use_slot(prev_cur);
             resync(seqs_[prev_cur], prev_cur);
@@ -2809,6 +2859,17 @@ void Engine::release(int slot) {
         seqs_[slot].paused = false;
         detach(slot);
     }
+    // a prompt abandoned in flight (its request failed or was cancelled before start_finish): drop it, else the next
+    // request on this slot would be prefilled / answered from it. Its rows past the restored
+    // prefix and its recurrent state are partial: the slot keeps no reusable content.
+    for (size_t i = 0; i < pfs_.size();)
+        if (pfs_[i].slot == slot) {
+            pfs_.erase(pfs_.begin() + i);
+            seqs_[slot].seq.clear();
+            seqs_[slot].pos = 0;
+        } else {
+            i++;
+        }
     seqs_.at(slot).active = false;
     seqs_[slot].full = false;
     seqs_[slot].end = 0;

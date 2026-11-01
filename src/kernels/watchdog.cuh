@@ -60,6 +60,12 @@ void qe_wd_init(int rank, int device);              // current device: install t
 int qe_wd_budget_ms();                              // 0 = off
 bool qe_fault_skip(int rank, const char* kind);      // fault injection (QE_FAULT_SKIP_AR_RANK), off by default
 [[noreturn]] void qe_wd_host_timeout(const char* what);  // a host-side wait ran past the budget
+// breadcrumbs for hang reports (remote diagnosis): per worker id (the qe_wd_init rank), what its host thread launched
+// last (op, two numbers, a launch count) and its streams; printed with the watchdog's timeout report: the host side
+// and each stream's state (idle / busy / error) next to the device-side waits
+void qe_wd_crumb(int id, int device, const char* what, long long a, long long b);
+void qe_wd_stream(int id, int device, void* stream);  // (cudaStream_t)
+void qe_wd_crumbs_print();
 
 #ifdef __CUDACC__
 namespace {

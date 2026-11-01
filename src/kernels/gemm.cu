@@ -3239,6 +3239,11 @@ int (*g_oom_hook[kTlDevs])(void*) = {};
 void* g_oom_ctx[kTlDevs] = {};
 std::mutex g_tl_res_mu;
 std::map<std::pair<int, std::string>, std::pair<void*, size_t>> g_tl_res;  // (device, buffer name) -> reserved block
+// several engine workers on one card, each on its own serving thread (the PP hybrid: a TP rank and a pipeline stage):
+// their reservations are kept side by side (each thread's first growth takes one), not replaced
+std::map<std::pair<int, std::string>, std::vector<std::pair<void*, size_t>>> g_tl_res_more;
+bool g_tl_res_multi = false;
+void tl_reserve_multi(bool on) { std::lock_guard<std::mutex> g(g_tl_res_mu); g_tl_res_multi = on; }
 int tl_dev() { int d = 0; cudaGetDevice(&d); return d; }
 void tl_set_oom_hook(int (*fn)(void*), void* ctx) {
     const int d = tl_dev();
@@ -3259,6 +3264,15 @@ static size_t tl_alloc(void** p, size_t bytes, const char* what) {
             g_tl_res.erase(it);
             return n;
         }
+        auto im = g_tl_res_more.find({dev, what});
+        if (im != g_tl_res_more.end())
+            for (size_t k = 0; k < im->second.size(); k++)
+                if (im->second[k].second >= bytes) {
+                    *p = im->second[k].first;
+                    const size_t n = im->second[k].second;
+                    im->second.erase(im->second.begin() + k);
+                    return n;
+                }
     }
     thread_local int calls = 0;
     const bool fake = inj > 0 && ++calls == inj;
@@ -3280,6 +3294,7 @@ static void tl_reserve(const char* what, size_t bytes) {
     CUDA_CHECK(cudaMalloc(&p, bytes));
     std::lock_guard<std::mutex> g(g_tl_res_mu);
     auto& slot = g_tl_res[{tl_dev(), what}];
+    if (slot.first && g_tl_res_multi) { g_tl_res_more[{tl_dev(), what}].push_back({p, bytes}); return; }
     if (slot.first) CUDA_CHECK(cudaFree(slot.first));
     slot = {p, bytes};
 }
@@ -4164,6 +4179,7 @@ void tune_record(const TuneKey& key, std::pair<int, int> v) {
 void gemm_set_out_bf16(bool on) { tl_out16 = on; }
 void gemm_set_oom_hook(int (*fn)(void*), void* ctx) { tl_set_oom_hook(fn, ctx); }
 void gemm_reserve_ws(int t_max, int k_max, size_t skws_bytes) { tl_reserve_ws(t_max, k_max, skws_bytes); }
+void gemm_reserve_multi(bool on) { tl_reserve_multi(on); }  // (was defined inside the anonymous namespace: libqflash.so did not load)
 size_t qe_ws_alloc(void** p, size_t bytes, const char* what) { return tl_alloc(p, bytes, what); }
 void qe_ws_reserve(const char* what, size_t bytes) { tl_reserve(what, bytes); }
 

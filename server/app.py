@@ -32,11 +32,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from agents import Tracker
 from qe_env import env_float, env_int, env_str
 import loop_guard
-from engine import Engine, SequenceFault
+from engine import Engine, SequenceFault, StartRefused
 import engine_stats
 from steering import DEFAULT as STEER_DEFAULT, resolve_steering
 from grammar import GrammarError, Grammars, TokenLookup, schema_of
-from model_profile import Profile, drop_empty_turns, merge_leading_system
+from think_budget import BudgetError, ThinkControl, ThinkIds, empty_reply, request_budget
+from model_profile import DroppedTurnLog, Profile, drop_empty_turns, merge_leading_system
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -46,30 +47,48 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 STEP_PROF = env_str("QE_STEP_PROF", "0") != "0"
 # forward progress (issue #3): the scheduler loop beats a heartbeat; no beat for QE_HANG_S seconds (an engine call that
 # never returns) -> Python + native stacks, the requests end with an error, exit 75 (docker / systemd restart it).
-# A start refused after admission (KV pool full) is requeued for up to QE_START_RETRY_S seconds before it fails.
+# A start refused after admission for lack of room (KV pool full, prompts in flight) is requeued while sequences run,
+# for up to QE_START_RETRY_S seconds, before it fails; bad input and too-long refusals fail at once.
 # A sequence that gets no token for QE_NO_PROGRESS_STEPS steps and QE_NO_PROGRESS_S seconds while not paused fails.
 HANG_S = env_float("QE_HANG_S", 180.0)
 START_RETRY_S = env_float("QE_START_RETRY_S", 60.0)
 NOPROG_STEPS = env_int("QE_NO_PROGRESS_STEPS", 64)
 NOPROG_S = env_float("QE_NO_PROGRESS_S", 10.0)
+# the hang deadline while the slots are persisted to the disk cache (27B --disk-cache: idle and at shutdown)
+HANG_PERSIST_S = env_float("QE_HANG_PERSIST_S", 3600.0)
 
 
-def native_stacks():
-    """Native stacks of every thread of this process (gdb when installed, else /proc task states) to stdout."""
-    gdb = shutil.which("gdb")
-    if gdb:
-        try:  # Yama ptrace_scope 1: allow the child gdb to attach to its parent
-            import ctypes
-            ctypes.CDLL(None).prctl(0x59616D61, ctypes.c_ulong(-1 & 0xFFFFFFFFFFFFFFFF), 0, 0, 0)
+QE_HANG_DIAG_S = env_float("QE_HANG_DIAG_S", 30.0)  # hang monitor: time for the diagnostics before the hard exit
+
+
+def run_bounded(cmd, timeout):
+    """stdout of cmd, or None. Never blocks past `timeout`: on expiry the child is killed and abandoned (no wait():
+    a child stuck in the driver (D state) ignores SIGKILL until the driver call returns, and CPython's
+    subprocess.run(timeout=) waits for it without a bound)."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                             text=True, start_new_session=True)
+    except Exception as ex:
+        print(f"[hang] {cmd[0]}: {ex}", flush=True)
+        return None
+    try:
+        out, _ = p.communicate(timeout=max(0.1, timeout))
+        return out
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
         except Exception:
             pass
-        try:
-            r = subprocess.run([gdb, "-p", str(os.getpid()), "-batch", "-ex", "thread apply all bt"],
-                               capture_output=True, text=True, timeout=120)
-            print(r.stdout[-200000:], flush=True)
-            return
-        except Exception as ex:
-            print(f"[hang] gdb failed: {ex}", flush=True)
+        print(f"[hang] {os.path.basename(cmd[0])} did not finish in {timeout:.0f} s: abandoned", flush=True)
+        return None
+    except Exception as ex:
+        print(f"[hang] {cmd[0]}: {ex}", flush=True)
+        return None
+
+
+def task_states():
+    """[(tid, comm, state, wchan, syscall)] of this process's threads (from /proc, never blocks on the driver)."""
+    out = []
     for t in sorted(os.listdir("/proc/self/task"), key=int):
         def rd(f):
             try:
@@ -78,8 +97,56 @@ def native_stacks():
             except OSError:
                 return "?"
         stat = rd("stat")
-        print(f"[hang] task {t} {rd('comm')}: state {stat[stat.rfind(')') + 2:][:1]}, wchan {rd('wchan')}, "
-              f"syscall {rd('syscall')[:60]}", flush=True)
+        out.append((t, rd("comm"), stat[stat.rfind(")") + 2:][:1], rd("wchan"), rd("syscall")[:60]))
+    return out
+
+
+def native_stacks(timeout=20.0):
+    """Native stacks of every thread of this process to stdout: the /proc task states, then gdb (when installed and no
+    thread is in uninterruptible sleep: gdb's attach waits for such a thread, and a killed gdb can leave the process
+    stopped). Bounded by `timeout`."""
+    ts = task_states()
+    for t, comm, st, wchan, sc in ts:
+        print(f"[hang] task {t} {comm}: state {st}, wchan {wchan}, syscall {sc}", flush=True)
+    gdb = shutil.which("gdb")
+    if not gdb:
+        return
+    if any(st == "D" for _, _, st, _, _ in ts):
+        print("[hang] a thread is in uninterruptible sleep (D, stuck in the driver): no gdb", flush=True)
+        return
+    try:  # Yama ptrace_scope 1: allow the child gdb to attach to its parent
+        import ctypes
+        ctypes.CDLL(None).prctl(0x59616D61, ctypes.c_ulong(-1 & 0xFFFFFFFFFFFFFFFF), 0, 0, 0)
+    except Exception:
+        pass
+    out = run_bounded([gdb, "-p", str(os.getpid()), "-batch", "-ex", "thread apply all bt"], timeout)
+    if out:
+        print(out[-200000:], flush=True)
+
+
+def hard_exit_guard(after_s, code=75):
+    """The hard bound of the hang path: an in-process timer exits with `code` after `after_s`, and an outside watcher
+    process SIGKILLs this one (SIGCONT first: a killed gdb can leave it stopped) after_s + 10 s later if it still
+    runs. The watcher ends quietly when this process exits first (its pipe closes)."""
+    t = threading.Timer(after_s, lambda: os._exit(code))
+    t.daemon = True
+    t.start()
+    try:
+        r, w = os.pipe()  # the watcher reads r: EOF = this process is gone
+        src = ("import os, select, signal, sys\n"
+               "r = select.select([0], [], [], float(sys.argv[2]))[0]\n"
+               "if not r:\n"
+               "    p = int(sys.argv[1])\n"
+               "    for s in (signal.SIGCONT, signal.SIGKILL):\n"
+               "        try: os.kill(p, s)\n"
+               "        except OSError: pass\n")
+        subprocess.Popen([sys.executable, "-I", "-c", src, str(os.getpid()), str(after_s + 10.0)], stdin=r,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        os.close(r)
+        os.set_inheritable(w, False)
+        hard_exit_guard.keep = w  # held open until the process exits
+    except Exception as ex:
+        print(f"[hang] outside watcher not started: {ex}", flush=True)
 _pc = time.perf_counter
 
 # ----------------------------------------------------------------------------- template
@@ -136,6 +203,7 @@ class Parser:
         self.mode = "reasoning" if thinking else "content"
         self.buf = ""
         self.tool_text = ""
+        self.lead = False  # right after </think>: newlines before the answer are dropped, also in later chunks
 
     def _hold(self, s):
         # length of the longest suffix of s that is a prefix of a tag we may still see
@@ -153,6 +221,11 @@ class Parser:
                 self.tool_text += self.buf
                 self.buf = ""
                 break
+            if self.lead and self.mode == "content":
+                self.buf = self.buf.lstrip("\n")
+                if not self.buf:
+                    break
+                self.lead = False
             tag = "</think>" if self.mode == "reasoning" else "<tool_call>"
             i = self.buf.find(tag)
             if self.mode == "content" and self.buf.lstrip().startswith("<think>") and not out:
@@ -166,6 +239,7 @@ class Parser:
                 if self.mode == "reasoning":
                     self.mode = "content"
                     self.buf = self.buf[i + len(tag):].lstrip("\n")
+                    self.lead = True
                 else:
                     self.mode = "tool"
                     self.tool_text = self.buf[i:]
@@ -542,9 +616,26 @@ class Generator:
             print(f"engine: optional C API not provided (fallbacks in use): {', '.join(missing)}", flush=True)
         # structured output (response_format): llguidance matchers, masks written into the engine
         self.grammars = None
+        print(f"engine parallel mode: {self.engine.par.get('mode', 'tp')} ({self.engine.par.get('why', '')})", flush=True)
+        if self.vision is not None and not self.engine.has("vision"):  # (mode B: no image input on the pipeline stages)
+            print(f"--vision ignored: {self.engine.refused.get('vision', 'the engine has no image input')}", flush=True)
+            self.vision = None
         if self.engine.has("grammar"):
             self.grammars = Grammars(tok_json, self.engine.vocab(), sorted(self.eos))
             self.grammars.prepare()
+        # thinking budget (server/think_budget.py): the forced close of <think> goes through the grammar tier
+        self.think_ids = ThinkIds(self.tok)
+        self.can_force = self.engine.has("grammar") and self.think_ids.ok
+        self.think = {"requests_with_budget": 0, "forced_budget": 0, "forced_max_tokens": 0, "forced_failed": 0,
+                      "empty_replies": 0, "empty_stop": 0, "empty_length": 0, "empty_after_forced_close": 0,
+                      "empty_retried": 0, "empty_retry_recovered": 0, "empty_retry_exhausted": 0}
+        self.think_mu = threading.Lock()  # (counted from the scheduler thread and the event loop: review server F9)
+        self.drop_log = DroppedTurnLog()  # --drop-empty-turns (HF #50): logged once per conversation
+        if not self.can_force:
+            print("thinking budget: not enforced (the engine has no grammar C API or the tokenizer no <think> "
+                  "tokens): budgets are ignored and max_tokens may end inside <think>", flush=True)
+        elif getattr(args, "thinking_budget", 0):
+            print(f"thinking budget: {args.thinking_budget} tokens by default (a request's budget wins)", flush=True)
         from metrics import Metrics
         stats = os.path.expanduser(args.stats_file)
         self.metrics = Metrics(stats, args.served_name)
@@ -552,8 +643,14 @@ class Generator:
         self.agents = Tracker(override=getattr(args, "main_agent_re", None))
         self.sched = {"main_pauses": 0, "main_cutins": 0, "backfills": 0}
         snap = self.metrics.snapshot
+        # parallel mode of the engine (FLASH_PAR / the boot-time pick: mode, why, probe numbers)
+        par_info = getattr(self.engine, "par_info", None)
+        host_mem = getattr(self.engine, "host_mem", None)  # the host-RAM plan of the boot (src/host_budget.h)
         self.metrics.snapshot = lambda: dict(snap(), agents=self.agents.stats(), sched=dict(self.sched),
-                                             loop_guard=self.guard_stats())
+                                             loop_guard=self.guard_stats(),
+                                             parallel=par_info() if par_info else {"mode": "tp"},
+                                             host_memory=host_mem() if host_mem else {},
+                                             thinking=self.think_snapshot(), history=self.drop_log.stats())
         if args.metrics_port:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if env_str("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
@@ -568,45 +665,80 @@ class Generator:
         self.n_faults = 0  # engine NaN guard faults seen (faults())
         self.cur_slot = -1
         self.dirty = False  # slots changed since the last persist
-        self.hb, self.hb_what = time.time(), "start"  # scheduler heartbeat (_hang_monitor)
+        self.hb, self.hb_what, self.hb_limit = time.monotonic(), "start", HANG_S  # scheduler heartbeat (_hang_monitor)
         self.jobs_ref = ([], [])  # the scheduler's (active, prefills), for the hang monitor
-        self.retry_q = []  # (time, job): starts refused after admission, back to the queue at that time
+        self.retry_q = []  # (time, job, retry_gen): starts refused after admission (see _loop)
+        self.retry_gen = 0  # +1 whenever a sequence or a prefill ends: the refused starts try again
         self.starting = None  # the job inside begin_start (hang monitor)
+        self.engine.set_exit_hook(self._on_engine_exit)
         threading.Thread(target=self._loop, daemon=True).start()
         if HANG_S > 0:
             threading.Thread(target=self._hang_monitor, daemon=True).start()
 
-    def beat(self, what):
-        self.hb, self.hb_what = time.time(), what
+    def beat(self, what, limit=None):
+        """Scheduler heartbeat. limit: the hang deadline until the next beat (a known long operation, e.g. the disk
+        persist), else HANG_S."""
+        self.hb, self.hb_what, self.hb_limit = time.monotonic(), what, limit or HANG_S
+
+    def fail_open(self, ex):
+        """Every open request (queued, waiting for a retry, starting, prefilling, generating) ends with `ex` now, without
+        an engine call and without the scheduler's lock (the engine or the scheduler is the stuck part; the process
+        exits next). Twice, a moment apart: a request that was being queued during the first pass."""
+        for k in range(2):
+            active, prefills = self.jobs_ref
+            for j in list(active) + list(prefills) + list(self.queue) + [r[1] for r in self.retry_q] + \
+                    ([self.starting] if self.starting is not None else []):
+                if not j.finished:
+                    j.error, j.finished = ex, True
+                    j.done.set()
+            if k == 0:
+                time.sleep(0.2)
+
+    def _on_engine_exit(self, reason):
+        """The engine ends the process (a stall seen by its run() monitor, a CUDA error, a failed check): the open
+        requests get an error event first (engine thread, bounded by QE_EXIT_HOOK_S)."""
+        self.stopping = True
+        print(f"[fatal] the engine is ending the process ({reason or 'fatal error'}): the open requests end with an "
+              f"error", flush=True)
+        self.fail_open(SequenceFault(f"{reason or 'fatal error'}; the server restarts"))  # (the API adds "engine error:")
+        time.sleep(2.0)  # the error events reach the clients
 
     def _hang_monitor(self):
         """No scheduler heartbeat for HANG_S seconds: an engine call does not return (a worker stuck in the driver, a
-        stalled GPU). Dump the Python and native stacks and the GPUs' state, end the requests with an error and exit
-        (75) so the server is restarted, instead of hanging silently (issue #3)."""
+        stalled GPU). The requests end with an error, new ones are refused and a hard exit is armed first; then the
+        Python and native stacks and the GPUs' state are logged (bounded), and the server exits (75) so it is
+        restarted, instead of hanging silently (issue #3). Also during a shutdown (SIGTERM), with twice the deadline."""
         while True:
             time.sleep(2.0)
-            age = time.time() - self.hb
-            if age < HANG_S or self.stopping:
+            age = time.monotonic() - self.hb  # monotonic: a wall-clock step (NTP) is no hang
+            limit = self.hb_limit * (2 if self.stopping else 1)
+            if age < limit:
                 continue
-            print(f"[hang] the scheduler has not advanced for {age:.0f} s (QE_HANG_S {HANG_S:.0f}); last: {self.hb_what}. "
-                  f"Python and native stacks follow, then the requests end with an error and the server exits (75).",
-                  flush=True)
-            faulthandler.dump_traceback(all_threads=True)
-            native_stacks()
+            t_hang = time.monotonic()
+            # 1. no new work, every open request gets its error now (no engine call: the engine is the stuck part;
+            # no lock: the stuck scheduler may hold self.cv), and the hard exit is armed before any diagnostics
+            self.stopping = True
+            hard_exit_guard(QE_HANG_DIAG_S + 3.0)
+            what = self.hb_what
+            print(f"[hang] the scheduler has not advanced for {age:.0f} s (deadline {limit:.0f} s, QE_HANG_S {HANG_S:.0f}); "
+                  f"last: {what}. The open requests end with an error; stacks follow (at most {QE_HANG_DIAG_S:.0f} s), "
+                  f"then the server exits (75).", flush=True)
+            self.fail_open(SequenceFault(f"engine hang: no progress for {age:.0f} s (last: {what}); the server restarts"))
+            # 2. diagnostics, each bounded by what is left of QE_HANG_DIAG_S
+            def left():
+                return QE_HANG_DIAG_S - (time.monotonic() - t_hang)
             try:
-                r = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,memory.total,utilization.gpu,pstate",
-                                    "--format=csv,noheader"], capture_output=True, text=True, timeout=20)
-                print(f"[hang] nvidia-smi: {r.stdout.strip()}", flush=True)
-            except Exception:
-                pass
-            ex = SequenceFault(f"engine hang: no progress for {age:.0f} s (last: {self.hb_what}); the server restarts")
-            active, prefills = self.jobs_ref
-            for j in list(active) + list(prefills) + list(self.queue) + [x for _, x in self.retry_q] + \
-                    ([self.starting] if self.starting is not None else []):
-                if not j.finished:  # no engine call (the engine is the stuck part)
-                    j.error, j.finished = ex, True
-                    j.done.set()
-            time.sleep(3.0)  # the error events reach the clients
+                faulthandler.dump_traceback(all_threads=True)
+                native_stacks(timeout=max(1.0, left() - 10.0))
+                if left() > 2.0:
+                    out = run_bounded(["nvidia-smi", "--query-gpu=index,memory.used,memory.total,utilization.gpu,pstate",
+                                       "--format=csv,noheader"], min(10.0, left() - 1.0))
+                    if out is not None:
+                        print(f"[hang] nvidia-smi: {out.strip()}", flush=True)
+            except Exception as e2:
+                print(f"[hang] diagnostics: {e2!r}", flush=True)
+            # 3. the error events reach the clients (at least 3 s after they were set), then exit
+            time.sleep(max(0.0, min(3.0 - (time.monotonic() - t_hang), left())))
             os._exit(75)
 
     def prompt(self, messages, tools, kw, meta=None, track=False, guard_on=True):
@@ -640,7 +772,7 @@ class Generator:
         guard = self.loop_check(messages, info) if track and guard_on else None
         if guard and self.args.loop_guard_note:  # the repeated call's result tells the model it is looping
             messages, guard["note"] = loop_guard.add_note(messages, guard["turns"])
-        messages = self.clean_history(messages)
+        messages = self.clean_history(messages, info, track)
         if getattr(self.args, "sort_tools", 1):
             tools = canonical_tools(tools)
         text = self.tmpl.render(messages, tools, **kw)
@@ -709,14 +841,28 @@ class Generator:
             return {"turns": getattr(self.args, "loop_guard_turns", 0), "triggers": self.guards["triggers"],
                     "recent": list(self.guards["recent"])}
 
-    def clean_history(self, messages):
-        """Model-specific history fixes before the template (--merge-system, --drop-empty-turns)."""
+    def clean_history(self, messages, info=None, track=False):
+        """Model-specific history fixes before the template (--merge-system, --drop-empty-turns). track: a
+        generation request (info: the agent tracker's view of it); the HF #50 drop is logged once per
+        conversation and again only when its count grows."""
         if self.args.merge_system:
             messages = merge_leading_system(messages)
         if self.args.drop_empty_turns:
             messages, n = drop_empty_turns(messages)
-            if n:
-                print(f"history: dropped {n} assistant turn(s) with only reasoning (HF #50)", flush=True)
+            if n and track:
+                conv = getattr(getattr(info, "conv", None), "id", None)
+                if conv is not None:
+                    key, who = ("conv", conv), f"conversation {conv}"
+                else:  # no tracker conversation (--main-agent-re): the conversation's root (system + first user)
+                    root = json.dumps(messages[:2], sort_keys=True, default=str)
+                    key = ("root", hashlib.blake2b(root.encode(), digest_size=8).hexdigest())
+                    who = f"conversation {key[1][:8]}"
+                sess = (getattr(getattr(info, "session", None), "key", "") or "")[2:10]
+                prev = self.drop_log.note(key, n)
+                if prev is not None:
+                    print(f"history: {who}{f' (session {sess})' if sess else ''}: the client's history has {n} "
+                          f"assistant turn(s) with reasoning only{f' (was {prev})' if prev else ''}; left out of "
+                          f"the prompt (HF #50, --drop-empty-turns 0 keeps them)", flush=True)
         return messages
 
     def encode(self, text):
@@ -825,6 +971,14 @@ class Generator:
         cap = max(self.engine.slots) - self.args.mtp_k - 2
         return f"prompt is too long: {len(ids)} tokens > {cap} maximum" if len(ids) > cap else None
 
+    def think_snapshot(self):
+        with self.think_mu:
+            return dict(self.think)
+
+    def think_add(self, key, n=1):
+        with self.think_mu:
+            self.think[key] = self.think.get(key, 0) + int(n)
+
     def stop_requests(self):
         """Shutdown (SIGTERM / SIGINT, before uvicorn waits for the open streams): queued requests fail now, prompts
         being prefilled at the scheduler's next pass, generating ones at their next step; each ends with an error
@@ -832,6 +986,8 @@ class Generator:
         with self.cv:
             self.stopping = True
             q, self.queue = self.queue, []
+            q += [r[1] for r in self.retry_q]  # starts refused for room, waiting to be requeued (review server F6)
+            self.retry_q = []
             for j in q:
                 j.fail(SequenceFault("server is shutting down"))
             self.cv.notify()
@@ -879,7 +1035,7 @@ class Generator:
     def no_progress(self, j, n):
         """A sequence that gets no token for NOPROG_STEPS steps and NOPROG_S seconds while it is not paused fails
         with an error (and the pool state is logged) instead of looping silently (issue #3 D2)."""
-        if n or j.finished:
+        if n or j.finished or NOPROG_STEPS <= 0 or NOPROG_S <= 0:  # QE_NO_PROGRESS_STEPS / _S = 0: off
             j.empty_n, j.t_tok = 0, time.time()
             return
         j.empty_n = getattr(j, "empty_n", 0) + 1
@@ -911,6 +1067,7 @@ class Generator:
         e = self.engine
         active = []
         idle_persist = self.args.persist_idle
+        idle_since = None  # start of the idle time before the idle disk persist
         last_snap = 0.0
         # prompts being prefilled chunk by chunk: at most two, the newest first; a short prompt
         # (little left to compute) may be started while a long one is in progress and runs to
@@ -933,10 +1090,20 @@ class Generator:
         while True:
             self.beat("scheduler loop")
             self.jobs_ref = (active, prefills)
-            if self.retry_q and self.retry_q[0][0] <= time.time():  # refused starts back to the queue (in order)
+            if self.retry_q:  # refused starts back to the queue (in order): a sequence or prefill ended since the
+                # refusal (retry_gen), the backoff ran out, or nothing runs any more (the last try decides)
+                tn = time.monotonic()
+                idle = not active and not prefills
                 with self.cv:
-                    while self.retry_q and self.retry_q[0][0] <= time.time():
-                        self.queue.append(self.retry_q.pop(0)[1])
+                    keep = []
+                    for r in self.retry_q:
+                        if self.stopping:  # (shutdown: never admitted again)
+                            r[1].fail(SequenceFault("server is shutting down"))
+                        elif idle or r[2] != self.retry_gen or r[0] <= tn:
+                            self.queue.append(r[1])
+                        else:
+                            keep.append(r)
+                    self.retry_q = keep
             if time.time() - last_mg > 1.0:  # host memory pressure: the archive gives memory back (engine)
                 last_mg = time.time()
                 try:
@@ -953,8 +1120,7 @@ class Generator:
             with self.cv:
                 while not self.queue and not active and not self.ctrl and not prefills:
                     self.beat("idle")
-                    if self.retry_q:  # a refused start waits for its retry time
-                        self.cv.wait(max(0.0, min(0.05, self.retry_q[0][0] - time.time())))
+                    if self.retry_q:  # (released at the top of the loop when idle)
                         break
                     # idle: archive the idle conversations to host memory piece by piece (~64 MB
                     # per GPU per call, a few ms each), so that evicting them later for another
@@ -968,11 +1134,19 @@ class Generator:
                         continue
                     # long idle: save the conversations to the disk cache (they then survive a
                     # restart / model swap even without a clean shutdown)
+                    # (waited in slices of at most HANG_S / 2 with a beat in between: --persist-idle above QE_HANG_S
+                    # must not look like a hang)
                     if self.dirty and idle_persist > 0 and self.args.disk_cache:
-                        if not self.cv.wait(idle_persist):
-                            if not self.queue and not self.ctrl:
-                                self.ctrl.append((e.persist, None))
-                                self.dirty = False
+                        if idle_since is None:
+                            idle_since = time.monotonic()
+                        rest = idle_persist - (time.monotonic() - idle_since)
+                        if rest > 0:
+                            self.cv.wait(min(rest, HANG_S / 2) if HANG_S > 0 else rest)
+                            continue
+                        idle_since = None
+                        if not self.queue and not self.ctrl:
+                            self.ctrl.append((e.persist, None))
+                            self.dirty = False
                     elif not self.cv.wait(1.0) and time.time() - last_mg > 1.0:
                         # idle: the host memory check still runs (another process may grow meanwhile)
                         last_mg = time.time()
@@ -983,11 +1157,16 @@ class Generator:
                             pass
                         finally:
                             self.cv.acquire()
+                if self.queue or active or prefills or self.ctrl:
+                    idle_since = None
                 if not active and not prefills:
                     ctrl, self.ctrl = self.ctrl, []
             for fn, ev in ctrl:
                 try:
                     t0 = time.time()
+                    # the disk persist (27B --disk-cache) can take minutes: its own, longer hang deadline
+                    self.beat("persist" if fn == e.persist else f"ctrl {getattr(fn, '__name__', '?')}",
+                              max(HANG_S, HANG_PERSIST_S) if fn == e.persist else None)
                     fn()
                     if fn == e.persist:
                         print(f"persisted slots to the disk cache in {time.time() - t0:.1f}s "
@@ -1016,8 +1195,9 @@ class Generator:
                     if i is not None:
                         admit = self.queue.pop(i)
                         long_ = max(prefills, key=lambda j: len(j.ids) - max(0, e.prefill_pos(j.slot))) if prefills else None
-                        if long_ is not None and (not adm.multi or len(long_.ids) - max(0, e.prefill_pos(long_.slot)) +
-                                                  admit.est > adm.join_cap()):  # a cut-in on the long prompt in progress
+                        if long_ is not None and not getattr(admit, "n_refused", 0) and \
+                                (not adm.multi or len(long_.ids) - max(0, e.prefill_pos(long_.slot)) +
+                                 admit.est > adm.join_cap()):  # a cut-in on the long prompt in progress (once per request)
                             if not any(j is not long_ for j in prefills):
                                 long_.round_tok = 0  # a new cut-in round
                             long_.round_tok += admit.est
@@ -1043,28 +1223,37 @@ class Generator:
                     tr("begin_start", tb, len(admit.ids))
                     prefills.append(admit)
                 except Exception as ex:
-                    # a refused prompt ("KV pool full") may have switched the engine's current
+                    # a prompt refused after the engine's checks of its input may have switched the engine's current
                     # slot: the next single-sequence step must resume its own slot first
-                    self.cur_slot = -1
+                    if not (isinstance(ex, StartRefused) and ex.code != StartRefused.NO_ROOM):
+                        self.cur_slot = -1
                     self.starting = None
                     # admitted (can_admit said yes) but the start found no room, e.g. a donor conversation that is
-                    # generating cannot be shared in place: wait for the running sequences instead of failing at once
-                    t_ref = getattr(admit, "t_refused", None) or time.time()
-                    if "KV pool full" in str(ex) and time.time() - t_ref < START_RETRY_S and not self.stopping:
+                    # generating cannot be shared in place: wait for the running sequences instead of failing at once.
+                    # Only a refusal that can go away (no room, prompts in flight) and only while something runs (idle,
+                    # nothing can change: the refusal is final); bad input / too long fail at once with their message
+                    t_ref = getattr(admit, "t_refused", None) or time.monotonic()
+                    retry = isinstance(ex, StartRefused) and ex.retry and (active or prefills) and not self.stopping
+                    if retry and time.monotonic() - t_ref < START_RETRY_S:
                         admit.t_refused = t_ref
                         admit.n_refused = getattr(admit, "n_refused", 0) + 1
                         admit.slot = -1
-                        if admit.n_refused == 1 or admit.n_refused % 20 == 0:
+                        if admit.n_refused == 1:  # logged once per request
                             try:
                                 pi = e.pool_info()
                                 busy = sum(1 for x in pi["slots"] if x["active"])
                                 note = f"{busy} active slots, {pi['events']['evict']} evictions, {pi['paused']} paused"
                             except Exception:
                                 note = "pool info unavailable"
-                            print(f"[sched] start of {len(admit.ids)} tokens refused after admission (KV pool full; "
-                                  f"{note}): requeued, try {admit.n_refused}", flush=True)
-                        self.retry_q.append((time.time() + 0.25, admit))
+                            print(f"[sched] start of {len(admit.ids)} tokens refused after admission ({ex}; {note}): "
+                                  f"requeued until a running sequence finishes (at most {START_RETRY_S:.0f} s)", flush=True)
+                        # back when a sequence or prefill ends (retry_gen), else after a backoff of 0.5 .. 4 s
+                        back = min(4.0, 0.5 * 2 ** (admit.n_refused - 1))
+                        self.retry_q.append((time.monotonic() + back, admit, self.retry_gen))
                     else:
+                        if getattr(admit, "n_refused", 0):
+                            print(f"[sched] start of {len(admit.ids)} tokens failed after {admit.n_refused} refusals in "
+                                  f"{time.monotonic() - t_ref:.1f} s: {ex}", flush=True)
                         admit.fail(ex)
                 if not adm.multi:
                     break
@@ -1119,6 +1308,8 @@ class Generator:
                                 finished = [cur]
                         tc = time.time() - tc
                         decode_until = time.time() + (tc * share / (1 - share) if 0 < share < 1 else 0)
+                    if finished:
+                        self.retry_gen += 1  # a prefill ended (in-flight limit, donor done)
                     for cur in finished:
                         tf = time.time()
                         try:
@@ -1132,6 +1323,7 @@ class Generator:
                             cur.fail(ex)
                         prefills.remove(cur)
                 except Exception as ex:
+                    self.retry_gen += 1
                     self.cur_slot = -1  # (as above: the engine's bound slot is unknown after a failed prefill)
                     for j in list(prefills) if adm.multi and len(prefills) >= 2 else [cur]:
                         j.fail(ex)
@@ -1140,6 +1332,7 @@ class Generator:
             active = [j for j in active if not j.check_done()]
             if len(active) < n_active:
                 bg_done = False  # a conversation went idle: worth archiving
+                self.retry_gen += 1  # room may have freed: refused starts try again
             if not active:
                 prof_last = 0.0
                 if self.queue and not prefills:  # nothing running and nothing admitted
@@ -1148,8 +1341,12 @@ class Generator:
                 continue
             try:
                 for j in active:
-                    if j.stops and STOP_ROLLBACK and not j.finished:
-                        e.set_no_ahead(j.slot, j.stop_risk())
+                    if j.finished:
+                        continue
+                    stop = bool(j.stops and STOP_ROLLBACK) and j.stop_risk()
+                    near = j.tc is not None and j.tc.near()  # a forced close may come: nothing decoded ahead of it
+                    if (j.stops and STOP_ROLLBACK) or j.tc is not None:
+                        e.set_no_ahead(j.slot, stop or near)
                 if len(active) == 1:
                     j = active[0]
                     if self.cur_slot != j.slot:
@@ -1327,6 +1524,9 @@ class Job:
         self.det = Detok(g.tok)
         self.n, self.finish, self.text_all, self.cut = 0, "length", "", False
         self.loop_checked = 0
+        self.tc = None  # thinking state / forced close (server/think_budget.py)
+        if g.think_ids.ok and g.think_ids.open_at_end(self.ids, g.im_start):
+            self.tc = ThinkControl(self, self.p.get("think_budget"), g.think_ids, g.can_force)
         self.feed([first])
 
     def feed(self, pending):
@@ -1375,6 +1575,8 @@ class Job:
                 pending = pending[:i]
                 break
         self.n += len(pending)
+        if self.tc is not None:
+            self.tc.track(pending)
         if STEP_PROF:
             q0 = _pc()
         s = self.det.push(pending) if pending else ""
@@ -1416,6 +1618,8 @@ class Job:
         if (stop_now or self.n >= self.max_new or
                 len(self.ids) + self.n + 8 >= g.engine.slots[self.slot]):
             self.finished = True
+        elif self.tc is not None:
+            self.tc.after(pending)  # a forced close of <think> in flight, or one due now (budget / answer tail)
 
     def kept_tokens(self, text):
         """Reply tokens wholly inside the text before the stop (trailing whitespace dropped: the
@@ -1482,6 +1686,24 @@ class Job:
                 self.stats["penalty"] = self.penalty
             if self.guarded:
                 self.stats["loop_guard"] = self.guarded
+            tc = getattr(self, "tc", None)
+            if tc is not None:
+                self.stats["think"] = tc.stats()
+                g = self.gen
+                g.think_add("requests_with_budget", tc.budget is not None)
+                if tc.forced:
+                    g.think_add("forced_" + tc.forced)
+                if tc.failed:
+                    g.think_add("forced_failed")
+            if getattr(self, "det", None) is not None and not self.cancelled() and not getattr(self, "shut", False):
+                er = empty_reply(self)  # a turn with no text and no tool call: say why (EOS after think / cut-off)
+                if er is not None:
+                    g = self.gen
+                    g.think_add("empty_replies")
+                    g.think_add("empty_" + self.finish)
+                    g.think_add("empty_after_forced_close", bool(er["forced"]))
+                    self.stats["empty"] = {k: v for k, v in er.items() if k != "line"}
+                    print(er["line"], flush=True)
             if self.grammar is not None:
                 self.stats["grammar_s"] = self.grammar_s
                 self.stats["grammar_steps"] = self.gsteps
@@ -1561,6 +1783,12 @@ def stream_bridge(gen, ids, params, affinity=0):
     return agen()
 
 
+def bad_input(ex):
+    """A final start refusal (bad input, too long for the engine): the client's request is at fault -> 400, not an
+    engine error 500 that a client would retry unchanged (review server F5)."""
+    return isinstance(ex, StartRefused) and not ex.retry
+
+
 async def fault_events(it):
     """stream_bridge items, with an engine fault (SequenceFault) as the last item instead of an exception."""
     try:
@@ -1568,6 +1796,81 @@ async def fault_events(it):
             yield item
     except SequenceFault as ex:
         yield ex
+
+
+async def complete(gen, ids, params, aff, thinking, tools):
+    """A non-streamed reply: (parser, parts, stats, tool calls), or the SequenceFault of an engine error. A sampled
+    reply that ends by itself (finish stop) with no text and no tool call -- reasoning only (EOS inside or right after
+    <think>, HF Qwen3.8-Flash-Next #50) or a tool call that does not parse -- is sampled again, up to --empty-retry
+    times: agent harnesses (AutomationBench, verifiers, Claude Code) end the task on such a turn, so one bad sample
+    costs the whole task. The prompt is cached, so a retry costs only its decode. Off for greedy (temperature 0) and
+    seeded requests (a resample would repeat the output or break reproducibility), structured output (single-use
+    grammar), ignore_eos and client stop sequences (the stop may have cut the text). Streams are never retried: their
+    bytes are already sent. usage.completion_tokens counts the tokens of every try; finish_reason is the last try's."""
+    tries = max(0, getattr(gen.args, "empty_retry", 0))
+    temp = params.get("temperature")
+    temp = gen.args.temperature if temp is None else temp
+    if (params.get("grammar") is not None or temp <= 0 or params.get("seed") is not None or params.get("ignore_eos")
+            or params.get("stop")):
+        tries = 0
+    spent, spent_s, first = 0, 0.0, None
+    for attempt in range(tries + 1):
+        parser = Parser(thinking)
+        parts = {"reasoning": "", "content": ""}
+        st = None
+        p = dict(params, empty_retry=(attempt, tries)) if tries else params  # the empty-reply WARNING says retry k/N
+        async for item in fault_events(stream_bridge(gen, ids, p, aff)):
+            if isinstance(item, SequenceFault):
+                return item
+            if isinstance(item, dict):
+                st = item
+                for kind, t in parser.feed("", final=True):
+                    parts[kind] += t
+            else:
+                for kind, t in parser.feed(item):
+                    parts[kind] += t
+        if first is None:
+            first = st
+        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+        empty = not calls and not parts["content"].strip() and st["finish"] == "stop"
+        if not empty:
+            if attempt:
+                gen.think_add("empty_retry_recovered")
+                print(f"empty reply: recovered on retry {attempt}/{tries}: "
+                      f"{f'{len(calls)} tool call(s)' if calls else 'text answer' if parts['content'].strip() else st['finish']}",
+                      flush=True)
+            break
+        if attempt == tries:
+            if tries:
+                gen.think_add("empty_retry_exhausted")
+                print(f"empty reply: still empty after {tries}/{tries} retries, returned to the client as is",
+                      flush=True)
+            break
+        spent += st["completion_tokens"]
+        spent_s += st.get("decode_s", 0.0)
+        gen.think_add("empty_retried")
+        if parser.tool_text:  # the empty-reply WARNING skips replies with <tool_call>: this is the line for it
+            raw = diag_dump("tool", parser.tool_text)
+            print(f"WARNING empty reply: a tool call that does not parse ({st['completion_tokens']} tokens"
+                  f"{', raw: ' + raw if raw else ''}); retry {attempt + 1}/{tries} follows", flush=True)
+    if spent:
+        # usage over all tries (review server F4): the client's prompt usage and the prefill are the first try's (the
+        # retries come from the cache), tokens and decode time the sum, so the logged tok/s stays true
+        st = dict(st, completion_tokens=st["completion_tokens"] + spent, empty_retries=attempt,
+                  decode_s=st.get("decode_s", 0.0) + spent_s)
+        for k in ("cached_tokens", "prefill_s", "cache_src"):
+            if k in first:
+                st[k] = first[k]
+    return parser, parts, st, calls
+
+
+def think_note(st):
+    th = st.get("think")
+    if not th or (th["budget"] is None and not th["forced"]):
+        return ""
+    b = f"/{th['budget']}" if th["budget"] is not None else ""
+    f = f", forced close ({th['forced']}, {th['forced_tokens']} tokens)" if th["forced"] else ""
+    return f" | think {th['tokens']}{b}{f}{' FAILED' if th.get('failed') else ''}"
 
 
 def log_stats(kind, st):
@@ -1579,7 +1882,7 @@ def log_stats(kind, st):
           f"{st['grammar_forced']} forced drafts" if "grammar_s" in st else "")
     print(f"[{kind}] slot {st['slot']} prompt {st['prompt_tokens']} (cached {st['cached_tokens']}{src}, prefill "
           f"{pps:.0f} tok/s) | gen {st['completion_tokens']} @ {tps:.1f} tok/s | {st['finish']}{gr}"
-          f"{' | stop trim ' + ('ok' if st['stop_trim'] else 'missed') if 'stop_trim' in st else ''}",
+          f"{' | stop trim ' + ('ok' if st['stop_trim'] else 'missed') if 'stop_trim' in st else ''}{think_note(st)}",
           flush=True)
     engine_stats.log(st, st.get("drafts"))  # [stats] lines for benchmark log parsers (QE_STATS_LOG=0: off)
 
@@ -1618,7 +1921,8 @@ def structured(gen, body, kw):
     if schema is None:
         return None
     if gen.grammars is None:
-        raise GrammarError("structured output is not supported by this engine (no grammar C API)")
+        why = getattr(gen.engine, "refused", {}).get("grammar")
+        raise GrammarError(why or "structured output is not supported by this engine (no grammar C API)")
     kw["enable_thinking"] = False
     return gen.grammars.matcher(schema)
 
@@ -1857,6 +2161,11 @@ def build_app(gen: Generator, args):
         tools = body.get("tools")
         kw = template_kwargs(body, args.think, args.reasoning_effort)
         try:
+            budget = request_budget(body, kw, args.thinking_budget)
+        except BudgetError as ex:
+            return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
+                                           "param": "thinking_budget"}}, status_code=400)
+        try:
             grammar = structured(gen, body, kw)
         except GrammarError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
@@ -1873,7 +2182,12 @@ def build_app(gen: Generator, args):
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error", "param": "messages"}},
                                 status_code=400)
         if gen.too_long(ids):
-            return JSONResponse({"error": {"message": gen.too_long(ids), "type": "invalid_request_error",
+            # OpenAI's wording: harnesses detect an overlong prompt by it (verifiers / AutomationBench end the rollout
+            # cleanly and score it instead of aborting it, LiteLLM raises ContextWindowExceededError)
+            cap = max(gen.engine.slots) - gen.args.mtp_k - 2
+            return JSONResponse({"error": {"message": f"This model's maximum context length is {cap} tokens. However, "
+                                                      f"your messages resulted in {len(ids)} tokens ({gen.too_long(ids)}).",
+                                           "type": "invalid_request_error",
                                            "code": "context_length_exceeded"}}, status_code=400)
         if body.get("loop_guard") is False:  # per request off-switch of the cross-turn loop guard
             ids.guard = None
@@ -1883,7 +2197,7 @@ def build_app(gen: Generator, args):
                   "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens"),
                   "stop": [stop] if isinstance(stop, str) else stop,
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
-                  "grammar": grammar, "steering_sel": steer,
+                  "grammar": grammar, "steering_sel": steer, "think_budget": budget,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(kw.get("enable_thinking", True))
@@ -1894,9 +2208,12 @@ def build_app(gen: Generator, args):
                     for i, c in enumerate(calls)]
 
         def usage(st):
-            return {"prompt_tokens": st["prompt_tokens"], "completion_tokens": st["completion_tokens"],
-                    "total_tokens": st["prompt_tokens"] + st["completion_tokens"],
-                    "prompt_tokens_details": {"cached_tokens": st["cached_tokens"]}}
+            u = {"prompt_tokens": st["prompt_tokens"], "completion_tokens": st["completion_tokens"],
+                 "total_tokens": st["prompt_tokens"] + st["completion_tokens"],
+                 "prompt_tokens_details": {"cached_tokens": st["cached_tokens"]}}
+            if st.get("think"):
+                u["completion_tokens_details"] = {"reasoning_tokens": st["think"]["tokens"]}
+            return u
 
         if body.get("stream"):
             async def sse():
@@ -1910,8 +2227,12 @@ def build_app(gen: Generator, args):
                 sse_s = [0.0, 0]  # QE_STEP_PROF: event-loop time of parser + chunk JSON, chunks
                 async for item in fault_events(stream_bridge(gen, ids, params, aff)):
                     if isinstance(item, SequenceFault):  # the engine failed this request: an error event, then the end
-                        yield "data: " + json.dumps({"error": {"message": f"engine error: {item}", "type": "server_error",
-                                                               "code": 500}}) + "\n\n"
+                        if bad_input(item):
+                            yield "data: " + json.dumps({"error": {"message": str(item), "type": "invalid_request_error",
+                                                                   "code": 400}}) + "\n\n"
+                        else:
+                            yield "data: " + json.dumps({"error": {"message": f"engine error: {item}",
+                                                                   "type": "server_error", "code": 500}}) + "\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     if not started:  # role chunk with the first token: clients measure TTFT on it
@@ -1947,20 +2268,13 @@ def build_app(gen: Generator, args):
                             a0 = _pc()
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        parts = {"reasoning": "", "content": ""}
-        st = None
-        async for item in fault_events(stream_bridge(gen, ids, params, aff)):
-            if isinstance(item, SequenceFault):
-                return JSONResponse({"error": {"message": f"engine error: {item}", "type": "server_error"}},
-                                    status_code=500)
-            if isinstance(item, dict):
-                st = item
-                for kind, t in parser.feed("", final=True):
-                    parts[kind] += t
-            else:
-                for kind, t in parser.feed(item):
-                    parts[kind] += t
-        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+        r = await complete(gen, ids, params, aff, kw.get("enable_thinking", True), tools)
+        if isinstance(r, SequenceFault):
+            if bad_input(r):
+                return JSONResponse({"error": {"message": str(r), "type": "invalid_request_error"}}, status_code=400)
+            return JSONResponse({"error": {"message": f"engine error: {r}", "type": "server_error"}},
+                                status_code=500)
+        parser, parts, st, calls = r
         msg = {"role": "assistant", "content": parts["content"].strip() or (None if calls else "")}
         if parts["reasoning"]:
             msg["reasoning_content"] = parts["reasoning"].strip()
@@ -1977,9 +2291,10 @@ def build_app(gen: Generator, args):
     async def count_tokens(req: Request):
         body = await req.json()
         try:
-            ids, _ = gen.prompt(anthropic_to_messages(body), anthropic_tools(body.get("tools")),
-                                template_kwargs(body, args.think, args.reasoning_effort))
-        except InputError as ex:
+            kw = template_kwargs(body, args.think, args.reasoning_effort)
+            request_budget(body, kw)  # (budget 0: rendered without thinking, as the request would be)
+            ids, _ = gen.prompt(anthropic_to_messages(body), anthropic_tools(body.get("tools")), kw)
+        except (InputError, BudgetError) as ex:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
                                 status_code=400)
         return {"input_tokens": len(ids)}
@@ -1992,6 +2307,11 @@ def build_app(gen: Generator, args):
                 json.dump(body, f, ensure_ascii=False, indent=1)
         tools = anthropic_tools(body.get("tools"))
         kw = template_kwargs(body, args.think, args.reasoning_effort)
+        try:
+            budget = request_budget(body, kw, args.thinking_budget)
+        except BudgetError as ex:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
+                                status_code=400)
         try:
             grammar = structured(gen, body, kw)
         except GrammarError as ex:
@@ -2017,7 +2337,7 @@ def build_app(gen: Generator, args):
             ids.guard = None
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
-                  "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer,
+                  "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer, "think_budget": budget,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         mid = "msg_" + uuid.uuid4().hex[:24]
         parser = Parser(kw.get("enable_thinking", True))
@@ -2062,8 +2382,9 @@ def build_app(gen: Generator, args):
 
                 async for item in fault_events(stream_bridge(gen, ids, params, aff)):
                     if isinstance(item, SequenceFault):  # the engine failed this request: an error event, then the end
-                        yield ev("error", {"type": "error", "error": {"type": "api_error",
-                                                                       "message": f"engine error: {item}"}})
+                        yield ev("error", {"type": "error", "error": {
+                            "type": "invalid_request_error" if bad_input(item) else "api_error",
+                            "message": str(item) if bad_input(item) else f"engine error: {item}"}})
                         return
                     if isinstance(item, dict):
                         st = item
@@ -2096,20 +2417,14 @@ def build_app(gen: Generator, args):
                             yield x
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        parts = {"reasoning": "", "content": ""}
-        st = None
-        async for item in fault_events(stream_bridge(gen, ids, params, aff)):
-            if isinstance(item, SequenceFault):
-                return JSONResponse({"type": "error", "error": {"type": "api_error",
-                                                                "message": f"engine error: {item}"}}, status_code=500)
-            if isinstance(item, dict):
-                st = item
-                for kind, t in parser.feed("", final=True):
-                    parts[kind] += t
-            else:
-                for kind, t in parser.feed(item):
-                    parts[kind] += t
-        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+        r = await complete(gen, ids, params, aff, kw.get("enable_thinking", True), tools)
+        if isinstance(r, SequenceFault):
+            if bad_input(r):
+                return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(r)}},
+                                    status_code=400)
+            return JSONResponse({"type": "error", "error": {"type": "api_error",
+                                                            "message": f"engine error: {r}"}}, status_code=500)
+        parser, parts, st, calls = r
         content = []
         if parts["reasoning"].strip():
             content.append({"type": "thinking", "thinking": parts["reasoning"].strip(), "signature": ""})
@@ -2164,7 +2479,7 @@ def parse_args(argv=None):
                     help="chat template (default: server/templates/qwen38_syssafe.jinja, else the model's own)")
     ap.add_argument("--devices", default=None,
                     help="GPU indices within CUDA_VISIBLE_DEVICES (default: every visible GPU, else 0,1,2); "
-                         "Flash-Next runs on 2 or 3")
+                         "Flash-Next: 2 or 3 cards: tp; 4+ cards: pp (pipeline stages; see the README)")
     def ctx_arg(v):  # 262144, 256K, 1M (K = 1024 tokens)
         m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*", v)
         if not m:
@@ -2189,6 +2504,12 @@ def parse_args(argv=None):
                     help="default reasoning effort for requests that send none (xhigh, high = xhigh, medium, low; "
                          "a request's reasoning_effort or chat_template_kwargs.reasoning_effort wins; other values "
                          "render as medium); env QE_REASONING_EFFORT; default: unset = the template's own (xhigh)")
+    ap.add_argument("--thinking-budget", type=int, default=env_int("QE_THINKING_BUDGET", 0),
+                    help="default thinking budget in tokens for requests that send none (0 = off): at the budget the "
+                         "server closes <think> with a short wrap-up and the model answers; a request's "
+                         "thinking.budget_tokens (Anthropic) / thinking_budget (OpenAI, also in chat_template_kwargs; "
+                         "aliases thinking_token_budget, max_thinking_tokens, custom_params.thinking_budget, "
+                         "reasoning.max_tokens) wins, a negative one turns it off; env QE_THINKING_BUDGET")
     ap.add_argument("--served-name", default=None,
                     help="model id in the API (default per model: qwen3.8-27b-qengine / qwen3.8-flash-next-qengine)")
     ap.add_argument("--tokenizer", default=None,
@@ -2251,6 +2572,11 @@ def parse_args(argv=None):
     ap.add_argument("--sort-tools", type=int, default=1,
                     help="render the tools sorted by name with sorted JSON keys, so a client that reorders the same "
                          "tools between turns keeps the prompt cache (0 = the client's order)")
+    ap.add_argument("--empty-retry", type=int, default=env_int("QE_EMPTY_RETRY", 2),
+                    help="a non-streamed sampled reply that ends (EOS) with no text and no tool call (reasoning only, "
+                         "or a tool call that does not parse) is sampled again up to N times: agent harnesses end the "
+                         "task on such a turn. Never for streams, greedy (temperature 0) or seeded requests, "
+                         "structured output or client stop sequences (0 = off); env QE_EMPTY_RETRY")
     ap.add_argument("--loop-guard-tokens", type=int, default=600,
                     help="end a reply whose last N+ tokens are one short fragment repeated (0 = off)")
     ap.add_argument("--presence-penalty", type=float, default=env_float("QE_PRESENCE_PENALTY", 0.0),
@@ -2351,13 +2677,26 @@ def main():
                 gen.stop_requests()
             super().handle_exit(sig, frame)
 
+    # uvicorn (>= 0.29) re-raises the SIGTERM / SIGINT it caught once its run() ends, against the handlers that were
+    # in place before it: with the default ones the process died right there, so the conversations were never saved
+    # to --disk-cache at shutdown (docker stop) and the stats were not written. A no-op handler takes that re-raise;
+    # a signal during the save below ends the process at once (a second docker stop / Ctrl-C).
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *a: None)
     Server(uvicorn.Config(build_app(gen, args), host=args.host, port=args.port, log_level="warning")).run()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda n, f: os._exit(128 + n))
     gen.metrics.save()
     # uvicorn returns after SIGTERM / SIGINT: save the live conversations before exiting
     if args.disk_cache:
         t0 = time.time()
         gen.run_on_engine(gen.engine.persist)
         print(f"shutdown: slots saved in {time.time() - t0:.1f}s", flush=True)
+    gen.engine.set_exit_hook(None)
+    # end here, as the re-raised signal did before: no interpreter / CUDA teardown while engine threads still run
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

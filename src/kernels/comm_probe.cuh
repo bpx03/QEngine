@@ -633,7 +633,55 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                         env, want.c_str(), what.c_str(), env);
         }
     }
-    if (c.p2p && x != kXferP2P && staged) {
+    // no peer access: the host-staged collectives (copies through pinned host memory by the copy engines, local work on
+    // the SMs) need each card's own receive / sum rows in device memory, which comm_enable_p2p did not allocate. Before
+    // this, a box without P2P kept xfer = P2P semantics over host-mapped memory: every prefill all-reduce read and wrote
+    // host memory with SM loads / stores (3 x 3090 without P2P, 10K: 3.75 s vs 1.36 s with P2P).
+    // QE_HOST_STAGED=0: the old zero-copy path
+    const bool nop2p_staged = !c.p2p && staged && ng > 1 && x == kXferHost && env_int("QE_HOST_STAGED", 1);
+    if (nop2p_staged) {
+        c.rs_rows = c.max_elems / c.ll_hidden;
+        c.rs_own = (c.rs_rows + c.ngpu - 1) / c.ngpu;
+        for (int i = 0; i < ng; i++) {
+            CUDA_CHECK(cudaSetDevice(devices[i]));
+            CUDA_CHECK(cudaMalloc(&c.prs1[i], (size_t)c.ngpu * c.rs_own * c.ll_hidden * 2));
+            CUDA_CHECK(cudaMalloc(&c.prs2[i], (size_t)c.rs_rows * c.ll_hidden * 2));
+        }
+        for (int i = 0; i < ng; i++) c.dev[i] = devices[i];
+    }
+    // 27B (staged = false), no peer access, 3 cards: the copy-engine prefill all-reduce (ce_pack / ce_sum on the SMs,
+    // the rows moved by the engine's copy thread with cudaMemcpyPeerAsync, which the driver stages through host memory
+    // without peer access; the waits are host-side events, nothing polls host memory) needs its receive / sum / pack
+    // rows in device memory. Before, 27B without P2P ran every prefill all-reduce as SM loads / stores on host-mapped
+    // memory (allreduce_rs_rows_kernel over c.data). QE_HOST_CE=0: the old path
+    // QE_HOST_CE: 2 (default) explicit host staging (model.cpp), 1 driver-staged peer copies, 0 the old SM path
+    const bool nop2p_ce = !c.p2p && !staged && ng == 3 && x == kXferHost && env_int("QE_HOST_CE", 2) && env_int("QE_AR_CE", 1);
+    if (nop2p_ce) {
+        c.rs_rows = c.max_elems / c.ll_hidden;
+        c.rs_own = (c.rs_rows + c.ngpu - 1) / c.ngpu;
+        for (int i = 0; i < ng; i++) {
+            CUDA_CHECK(cudaSetDevice(devices[i]));
+            CUDA_CHECK(cudaMalloc(&c.prs1[i], (size_t)c.ngpu * c.rs_own * c.ll_hidden * 2));
+            CUDA_CHECK(cudaMalloc(&c.prs2[i], (size_t)c.rs_rows * c.ll_hidden * 2));
+            CUDA_CHECK(cudaMalloc(&c.pstage[i], (size_t)c.rs_rows * c.ll_hidden * 2));
+            CUDA_CHECK(cudaMalloc(&c.cfl[i], (size_t)2 * c.ngpu * kCeSlots * sizeof(unsigned)));
+            CUDA_CHECK(cudaMemset(c.cfl[i], 0, (size_t)2 * c.ngpu * kCeSlots * sizeof(unsigned)));
+            if (env_int("QE_HOST_CE", 2) >= 2) {  // explicit host staging: pinned rows per rank (its NUMA node)
+                const size_t rb = (size_t)c.rs_rows * c.ll_hidden * 2, pg = 2u << 20, cap = (rb + pg - 1) / pg * pg;
+                for (uint2** q : {&c.hrs[i], &c.hag[i]}) {
+                    void* p = nullptr;
+                    CHECK(posix_memalign(&p, pg, cap) == 0 && p, "comm: host staging buffers");
+                    numa_place(p, cap, {gpu_numa_node(devices[i])});
+                    memset(p, 0, cap);
+                    CUDA_CHECK(cudaHostRegister(p, cap, cudaHostRegisterPortable));
+                    *q = (uint2*)p;
+                }
+            }
+        }
+        for (int i = 0; i < ng; i++) c.dev[i] = devices[i];
+        c.xfer = x;
+    }
+    if ((c.p2p || nop2p_staged) && x != kXferP2P && staged) {
         for (int i = 0; i < ng; i++) {
             CUDA_CHECK(cudaSetDevice(devices[i]));
             const size_t fb = (size_t)2 * ng * sizeof(unsigned);

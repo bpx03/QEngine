@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <unistd.h>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -99,6 +100,79 @@ inline size_t margin() {
         return gb >= 0 ? (size_t)(gb * 1e9) : std::max<size_t>((size_t)8e9, total() / 20);
     }();
     return m;
+}
+
+// cgroup v2 memory limit of this process (systemd-run -p MemoryMax, docker --memory): the smallest memory.max on the
+// path from its cgroup up to the root, and that cgroup's anonymous bytes (memory.stat anon; page cache is reclaimable).
+// {0, 0}: no limit. Read by the host-RAM plan at boot (host_budget.h); the runtime guard above keeps MemAvailable.
+struct CgroupMem {
+    double limit = 0, anon = 0;
+};
+inline CgroupMem cgroup_mem() {
+    CgroupMem r;
+    std::string path;
+    if (FILE* f = fopen("/proc/self/cgroup", "r")) {
+        char line[1024];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "0::", 3)) {
+                path = line + 3;
+                while (!path.empty() && (path.back() == '\n' || path.back() == '/')) path.pop_back();
+            }
+        fclose(f);
+    }
+    if (path.empty() || access("/sys/fs/cgroup/cgroup.controllers", R_OK) != 0) {  // cgroup v1 / hybrid: the memory controller
+        std::string v1;
+        if (FILE* f = fopen("/proc/self/cgroup", "r")) {
+            char line[1024];
+            while (fgets(line, sizeof line, f)) {
+                const char* c = strchr(line, ':');
+                if (c && !strncmp(c + 1, "memory:", 7)) { v1 = c + 8; break; }
+            }
+            fclose(f);
+        }
+        while (!v1.empty() && (v1.back() == '\n' || v1.back() == '/')) v1.pop_back();
+        for (const std::string& dir : {"/sys/fs/cgroup/memory" + v1, std::string("/sys/fs/cgroup/memory")})
+            if (FILE* f = fopen((dir + "/memory.limit_in_bytes").c_str(), "r")) {
+                double l = 0;
+                const bool ok = fscanf(f, "%lf", &l) == 1;
+                fclose(f);
+                if (ok && l > 0 && l < 1e18) {  // (no limit: ~9.2e18)
+                    r.limit = l;
+                    if (FILE* s = fopen((dir + "/memory.stat").c_str(), "r")) {
+                        char k[64];
+                        double x;
+                        while (fscanf(s, "%63s %lf", k, &x) == 2)
+                            if (!strcmp(k, "rss")) { r.anon = x; break; }
+                        fclose(s);
+                    }
+                }
+                break;
+            }
+        return r;
+    }
+    for (std::string p = path;; p = p.rfind('/') == std::string::npos ? std::string() : p.substr(0, p.rfind('/'))) {
+        const std::string dir = "/sys/fs/cgroup" + p;
+        if (FILE* f = fopen((dir + "/memory.max").c_str(), "r")) {
+            char v[64] = "";
+            if (fscanf(f, "%63s", v) == 1 && strcmp(v, "max")) {
+                const double l = atof(v);
+                if (l > 0 && (r.limit == 0 || l < r.limit)) {
+                    r.limit = l;
+                    r.anon = 0;
+                    if (FILE* s = fopen((dir + "/memory.stat").c_str(), "r")) {
+                        char k[64];
+                        double x;
+                        while (fscanf(s, "%63s %lf", k, &x) == 2)
+                            if (!strcmp(k, "anon")) { r.anon = x; break; }
+                        fclose(s);
+                    }
+                }
+            }
+            fclose(f);
+        }
+        if (p.empty()) break;
+    }
+    return r;
 }
 
 // bytes the archive may still take from the host (0 at or below the margin)

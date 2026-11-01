@@ -3,7 +3,8 @@
 - src/env.h (the engines' switches): tests/env_unit.cpp compiled with the host C++ compiler and run;
 - the FLASH_COMM=auto tax rule (src/kernels/comm_rule.h): tests/comm_rule_unit.cpp, same way;
 - the graph-instantiate OOM policy (src/flash/graph_oom.h): tests/graph_oom_unit.cpp, same way;
-- the NaN guard abort rule (src/flash/guard_rule.h): tests/guard_rule_unit.cpp, same way.
+- the NaN guard abort rule (src/flash/guard_rule.h): tests/guard_rule_unit.cpp, same way;
+- the host-RAM budget at boot (src/host_budget.h): tests/host_budget_unit.cpp, same way.
   python tests/test_env.py
 """
 import os
@@ -67,10 +68,15 @@ def test_guard_rule():
     run_cpp("guard_rule_unit")
 
 
+def test_host_budget():
+    run_cpp("host_budget_unit")
+
+
 if __name__ == "__main__":
     test_python()
     test_cpp()
     test_comm_rule()
     test_graph_oom()
     test_guard_rule()
+    test_host_budget()
     print("test_env: ok")

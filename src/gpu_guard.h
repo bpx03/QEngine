@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 namespace qe_gpu_guard {
@@ -59,22 +60,24 @@ inline std::string holder_pid(int fd) {
     const size_t nl = s.find('\n');
     return nl == std::string::npos ? s : s.substr(0, nl);
 }
-// the lock holder is exiting: zombie / dead, or flagged PF_EXITING (0x4) / PF_DUMPCORE (0x200) in /proc/<pid>/stat
-inline bool dying_holder(int fd) {
+// the lock holder is exiting: 1 = zombie / dead, or flagged PF_EXITING (0x4) / PF_DUMPCORE (0x200) in
+// /proc/<pid>/stat; 2 = not visible here (no /proc entry): gone (the lock is about to be released), or a live holder
+// in another PID namespace (a lock directory shared between containers / host), so only a short wait; 0 = alive
+inline int dying_holder(int fd) {
     const std::string pid = holder_pid(fd);
-    if (pid.empty() || pid.find_first_not_of("0123456789") != std::string::npos) return false;
+    if (pid.empty() || pid.find_first_not_of("0123456789") != std::string::npos) return 0;
     FILE* f = fopen(("/proc/" + pid + "/stat").c_str(), "r");
-    if (!f) return true;  // gone: the lock is about to be released
+    if (!f) return 2;
     char b[1024] = {0};
     const size_t n = fread(b, 1, sizeof b - 1, f);
     fclose(f);
     const char* q = strrchr(b, ')');
-    if (!q || (size_t)(q - b) + 4 > n) return false;
+    if (!q || (size_t)(q - b) + 4 > n) return 0;
     char st = 0;
     unsigned long flags = 0;
     int ppid = 0, pgrp = 0, sess = 0, tty = 0, tpgid = 0;
-    if (sscanf(q + 2, "%c %d %d %d %d %d %lu", &st, &ppid, &pgrp, &sess, &tty, &tpgid, &flags) != 7) return false;
-    return st == 'Z' || st == 'X' || (flags & 0x4) || (flags & 0x200);
+    if (sscanf(q + 2, "%c %d %d %d %d %d %lu", &st, &ppid, &pgrp, &sess, &tty, &tpgid, &flags) != 7) return 0;
+    return st == 'Z' || st == 'X' || (flags & 0x4) || (flags & 0x200) ? 1 : 0;
 }
 
 // Locks every CUDA device in `devs` (ordinals within CUDA_VISIBLE_DEVICES); "" when the process may use them, else the
@@ -95,13 +98,24 @@ inline std::string acquire(const std::vector<int>& devs) {
         const std::string path = dir + "/gpu-" + id + ".lock";
         const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (fd < 0) continue;  // no lock directory: no guard (never stop a start for it)
-        if (flock(fd, LOCK_EX | LOCK_NB) != 0 && dying_holder(fd)) {
+        int dying = 0;
+        if (flock(fd, LOCK_EX | LOCK_NB) != 0 && (dying = dying_holder(fd)) != 0) {
             // the previous engine is still ending (a core dump being written, stuck in the driver after a crash): wait
-            // for it up to FLASH_PIN_WAIT_S (60) seconds instead of failing at once (issue #3)
-            const int wait_s = env_int("FLASH_PIN_WAIT_S", 60);
-            fprintf(stderr, "qflash: GPU %d: the previous QEngine process (%s) is still exiting (core dump or a stuck driver "
-                    "call?); waiting up to %d s for it to release the GPU\n", d, holder_pid(fd).c_str(), wait_s);
-            for (int i = 0; i < wait_s && flock(fd, LOCK_EX | LOCK_NB) != 0; i++) sleep(1);
+            // for it up to QE_GPU_LOCK_WAIT_S (60) seconds instead of failing at once (issue #3). The 1.3.3 name
+            // FLASH_PIN_WAIT_S is read when the new one is not set. A holder this process cannot see (another PID
+            // namespace: a container restarted while the old one still writes its core dump) gets the same wait
+            // (review comm F4: 5 s made the restart fail where 1.3.3 waited)
+            const int w = std::max(0, env_set("QE_GPU_LOCK_WAIT_S") ? env_int("QE_GPU_LOCK_WAIT_S", 60)
+                                                                    : env_int("FLASH_PIN_WAIT_S", 60));
+            const int wait_s = w;
+            if (wait_s > 0)
+                fprintf(stderr, "qflash: GPU %d: the previous QEngine process (%s) %s; waiting up to %d s for it to release "
+                        "the GPU\n", d, holder_pid(fd).c_str(), dying == 2 ? "is not visible from here (gone, or in another "
+                        "PID namespace)" : "is still exiting (core dump or a stuck driver call?)", wait_s);
+            for (int i = 0; i < wait_s && flock(fd, LOCK_EX | LOCK_NB) != 0; i++) {
+                if (i > 0 && i % 10 == 0) fprintf(stderr, "qflash: GPU %d: still waiting for the previous process (%d of %d s)\n", d, i, wait_s);
+                sleep(1);
+            }
         }
         if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
             char buf[512] = {0};
