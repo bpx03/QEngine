@@ -93,6 +93,10 @@ long long kv_ram_tokens();   // FLASH_KV_RAM_TOKENS
 // 262,144; set_yarn_factor before the Workers are made). Contexts above 262,144 need FLASH_KV=ram.
 constexpr int NATIVE_CTX = 262144;
 void set_yarn_factor(double f);
+// host memory the engine will register after load (the archive + pinned-prefix budget, issue #3): its GPU mappings
+// cost FLASH_PIN_VRAM_MB_PER_GB (2.0, measured: 4 KB GPU pages, THP or not) per GB on every card, charged to the
+// expert budget at load (the qe_create path sets it; flash_run has no archive)
+void set_host_reg_plan(double bytes);
 double yarn_factor();        // 0: off
 // ranks: 2 or 3 (every split below divides: 24 QSA q heads, 48 DeltaNet value / 16 key heads, 512-position KV
 // ownership per period of 512 x ngpu positions)
@@ -443,7 +447,19 @@ public:
     bool inst_graph(cudaGraphExec_t* e, cudaGraph_t g);
     bool launch_graph(cudaGraphExec_t& e);  // false: out of memory, every graph dropped, run eagerly (flash_seq.cu)
     int glaunch_calls_ = 0;
-    int drop_all_graphs(const cudaGraphExec_t* keep);  // every cached graph but *keep; map entries stay (= seen)
+    int drop_all_graphs(const cudaGraphExec_t* keep) { return drop_graphs(keep, 1.0); }  // map entries stay (= seen)
+    // the least recently launched fraction `frac` of the cached graphs but *keep (1: all); issue #3 D4: an instantiate
+    // OOM drops the older half first instead of every graph (a re-capture storm at the same low free memory)
+    int drop_graphs(const cudaGraphExec_t* keep, double frac);
+    std::map<cudaGraphExec_t, unsigned long long> xuse_;  // graph exec -> launch tick (LRU of drop_graphs)
+    unsigned long long xtick_ = 0;
+    size_t xheld_ = 0;  // cached graphs seen by the last drop_graphs (before it dropped)
+    // emergency VRAM reserve (FLASH_OOM_RESERVE_MB, default 64, inside the margin): freed when an instantiate still
+    // fails after the drop, then one more retry; taken again once that much is free
+    void* oom_res_ = nullptr;
+    size_t oom_res_bytes_ = 0;
+    void oom_reserve_take();
+    bool oom_reserve_free();
     bool graph_skip() { return gcool_.skip(); }        // a missing graph is not captured now (after a failed retry)
     int slot_prev_m(int s) const { return s == cur_slot_ ? prev_m_ : sprev_.at(s); }  // pending commit rows of slot s
     int rope_shift(int s) const { return mmdel_h_.empty() ? 0 : mmdel_h_.at(s); }  // multimodal RoPE shift of slot s
@@ -841,6 +857,11 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     // chunk's partials (buffers of slot qsa_buf_), qsa_back(slot) combines them and runs o_proj later, after the next
     // chunk's front half (the partial exchange flies under it)
     void qsa_back(int slot);
+    // whether qsa() with qsa_split_ defers a chunk of m rows (sends, combine + o_proj in qsa_back). Chunks it cannot
+    // defer (<= 8 rows, ...) take the immediate exchange, whose number assumes no pending send: the pipelined loop
+    // drains the pending chunk before such a chunk (1.3.3, club-3090#1879). qsa_deferred_: what the last qsa() did.
+    bool qsa_defers(int m, bool sel) const;
+    bool qsa_deferred_ = false;
     struct QsaBack { Layer* L = nullptr; const float* prow = nullptr; float* ax = nullptr; int mr = 0, ld = 0, ql = 0, nqp = 0; };
     QsaBack qpend_[2];
     int qsa_split_ = 0, qsa_buf_ = 0, qsa_ahead_ = 0;

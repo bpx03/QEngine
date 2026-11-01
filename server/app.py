@@ -11,9 +11,14 @@ import array
 import hashlib
 import asyncio
 import collections
+import faulthandler
 import json
 import os
 import re
+import shutil
+import signal
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -39,6 +44,42 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 # feed = detokenize + parser hand-off, check_done, the rest of the loop iteration), one JSON line per
 # request to $QE_STEP_PROF_FILE (default step_prof.jsonl) with the prompt ids, plus a log summary
 STEP_PROF = env_str("QE_STEP_PROF", "0") != "0"
+# forward progress (issue #3): the scheduler loop beats a heartbeat; no beat for QE_HANG_S seconds (an engine call that
+# never returns) -> Python + native stacks, the requests end with an error, exit 75 (docker / systemd restart it).
+# A start refused after admission (KV pool full) is requeued for up to QE_START_RETRY_S seconds before it fails.
+# A sequence that gets no token for QE_NO_PROGRESS_STEPS steps and QE_NO_PROGRESS_S seconds while not paused fails.
+HANG_S = env_float("QE_HANG_S", 180.0)
+START_RETRY_S = env_float("QE_START_RETRY_S", 60.0)
+NOPROG_STEPS = env_int("QE_NO_PROGRESS_STEPS", 64)
+NOPROG_S = env_float("QE_NO_PROGRESS_S", 10.0)
+
+
+def native_stacks():
+    """Native stacks of every thread of this process (gdb when installed, else /proc task states) to stdout."""
+    gdb = shutil.which("gdb")
+    if gdb:
+        try:  # Yama ptrace_scope 1: allow the child gdb to attach to its parent
+            import ctypes
+            ctypes.CDLL(None).prctl(0x59616D61, ctypes.c_ulong(-1 & 0xFFFFFFFFFFFFFFFF), 0, 0, 0)
+        except Exception:
+            pass
+        try:
+            r = subprocess.run([gdb, "-p", str(os.getpid()), "-batch", "-ex", "thread apply all bt"],
+                               capture_output=True, text=True, timeout=120)
+            print(r.stdout[-200000:], flush=True)
+            return
+        except Exception as ex:
+            print(f"[hang] gdb failed: {ex}", flush=True)
+    for t in sorted(os.listdir("/proc/self/task"), key=int):
+        def rd(f):
+            try:
+                with open(f"/proc/self/task/{t}/{f}") as h:
+                    return h.read().strip()
+            except OSError:
+                return "?"
+        stat = rd("stat")
+        print(f"[hang] task {t} {rd('comm')}: state {stat[stat.rfind(')') + 2:][:1]}, wchan {rd('wchan')}, "
+              f"syscall {rd('syscall')[:60]}", flush=True)
 _pc = time.perf_counter
 
 # ----------------------------------------------------------------------------- template
@@ -527,7 +568,46 @@ class Generator:
         self.n_faults = 0  # engine NaN guard faults seen (faults())
         self.cur_slot = -1
         self.dirty = False  # slots changed since the last persist
+        self.hb, self.hb_what = time.time(), "start"  # scheduler heartbeat (_hang_monitor)
+        self.jobs_ref = ([], [])  # the scheduler's (active, prefills), for the hang monitor
+        self.retry_q = []  # (time, job): starts refused after admission, back to the queue at that time
+        self.starting = None  # the job inside begin_start (hang monitor)
         threading.Thread(target=self._loop, daemon=True).start()
+        if HANG_S > 0:
+            threading.Thread(target=self._hang_monitor, daemon=True).start()
+
+    def beat(self, what):
+        self.hb, self.hb_what = time.time(), what
+
+    def _hang_monitor(self):
+        """No scheduler heartbeat for HANG_S seconds: an engine call does not return (a worker stuck in the driver, a
+        stalled GPU). Dump the Python and native stacks and the GPUs' state, end the requests with an error and exit
+        (75) so the server is restarted, instead of hanging silently (issue #3)."""
+        while True:
+            time.sleep(2.0)
+            age = time.time() - self.hb
+            if age < HANG_S or self.stopping:
+                continue
+            print(f"[hang] the scheduler has not advanced for {age:.0f} s (QE_HANG_S {HANG_S:.0f}); last: {self.hb_what}. "
+                  f"Python and native stacks follow, then the requests end with an error and the server exits (75).",
+                  flush=True)
+            faulthandler.dump_traceback(all_threads=True)
+            native_stacks()
+            try:
+                r = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,memory.total,utilization.gpu,pstate",
+                                    "--format=csv,noheader"], capture_output=True, text=True, timeout=20)
+                print(f"[hang] nvidia-smi: {r.stdout.strip()}", flush=True)
+            except Exception:
+                pass
+            ex = SequenceFault(f"engine hang: no progress for {age:.0f} s (last: {self.hb_what}); the server restarts")
+            active, prefills = self.jobs_ref
+            for j in list(active) + list(prefills) + list(self.queue) + [x for _, x in self.retry_q] + \
+                    ([self.starting] if self.starting is not None else []):
+                if not j.finished:  # no engine call (the engine is the stuck part)
+                    j.error, j.finished = ex, True
+                    j.done.set()
+            time.sleep(3.0)  # the error events reach the clients
+            os._exit(75)
 
     def prompt(self, messages, tools, kw, meta=None, track=False, guard_on=True):
         """Returns (ids, affinity): affinity = hash of the system prompt, so the main agent and
@@ -796,6 +876,29 @@ class Generator:
                 hit = True
         return hit
 
+    def no_progress(self, j, n):
+        """A sequence that gets no token for NOPROG_STEPS steps and NOPROG_S seconds while it is not paused fails
+        with an error (and the pool state is logged) instead of looping silently (issue #3 D2)."""
+        if n or j.finished:
+            j.empty_n, j.t_tok = 0, time.time()
+            return
+        j.empty_n = getattr(j, "empty_n", 0) + 1
+        t_tok = getattr(j, "t_tok", None) or time.time()
+        j.t_tok = t_tok
+        if j.empty_n < NOPROG_STEPS or time.time() - t_tok < NOPROG_S:
+            return
+        try:
+            pi = self.engine.pool_info()
+            if pi["slots"][j.slot]["paused"]:
+                j.empty_n = 0
+                return
+        except Exception:
+            pi = None
+        print(f"engine error: no progress on slot {j.slot} ({len(j.ids)} prompt tokens, {getattr(j, 'n', 0)} generated): "
+              f"{j.empty_n} steps without a token in {time.time() - t_tok:.0f} s; pool: {json.dumps(pi)[:2000]}", flush=True)
+        j.fail(SequenceFault("engine error: no progress (no token for "
+                             f"{j.empty_n} steps); see the server log"))
+
     def run_on_engine(self, fn):
         """Run fn() on the scheduler thread between requests and wait for it."""
         ev = threading.Event()
@@ -828,6 +931,12 @@ class Generator:
                 trace.write(json.dumps([kind, round(t0, 6), round(time.time() - t0, 6), n, toks]) + "\n")
         last_mg = 0.0
         while True:
+            self.beat("scheduler loop")
+            self.jobs_ref = (active, prefills)
+            if self.retry_q and self.retry_q[0][0] <= time.time():  # refused starts back to the queue (in order)
+                with self.cv:
+                    while self.retry_q and self.retry_q[0][0] <= time.time():
+                        self.queue.append(self.retry_q.pop(0)[1])
             if time.time() - last_mg > 1.0:  # host memory pressure: the archive gives memory back (engine)
                 last_mg = time.time()
                 try:
@@ -843,6 +952,10 @@ class Generator:
             ctrl = []
             with self.cv:
                 while not self.queue and not active and not self.ctrl and not prefills:
+                    self.beat("idle")
+                    if self.retry_q:  # a refused start waits for its retry time
+                        self.cv.wait(max(0.0, min(0.05, self.retry_q[0][0] - time.time())))
+                        break
                     # idle: archive the idle conversations to host memory piece by piece (~64 MB
                     # per GPU per call, a few ms each), so that evicting them later for another
                     # prompt costs nothing on its path; then wait for work
@@ -919,14 +1032,36 @@ class Generator:
                 prof_last = 0.0  # QE_STEP_PROF: no gap across a prefill
                 try:
                     tb = time.time()
+                    self.beat("start")
+                    self.starting = admit  # (the hang monitor fails it too: out of the queue, not in prefills yet)
                     admit.begin_start()
+                    self.starting = None
                     tr("begin_start", tb, len(admit.ids))
                     prefills.append(admit)
                 except Exception as ex:
                     # a refused prompt ("KV pool full") may have switched the engine's current
                     # slot: the next single-sequence step must resume its own slot first
                     self.cur_slot = -1
-                    admit.fail(ex)
+                    self.starting = None
+                    # admitted (can_admit said yes) but the start found no room, e.g. a donor conversation that is
+                    # generating cannot be shared in place: wait for the running sequences instead of failing at once
+                    t_ref = getattr(admit, "t_refused", None) or time.time()
+                    if "KV pool full" in str(ex) and time.time() - t_ref < START_RETRY_S and not self.stopping:
+                        admit.t_refused = t_ref
+                        admit.n_refused = getattr(admit, "n_refused", 0) + 1
+                        admit.slot = -1
+                        if admit.n_refused == 1 or admit.n_refused % 20 == 0:
+                            try:
+                                pi = e.pool_info()
+                                busy = sum(1 for x in pi["slots"] if x["active"])
+                                note = f"{busy} active slots, {pi['events']['evict']} evictions, {pi['paused']} paused"
+                            except Exception:
+                                note = "pool info unavailable"
+                            print(f"[sched] start of {len(admit.ids)} tokens refused after admission (KV pool full; "
+                                  f"{note}): requeued, try {admit.n_refused}", flush=True)
+                        self.retry_q.append((time.time() + 0.25, admit))
+                    else:
+                        admit.fail(ex)
                 if not adm.multi:
                     break
             if self.stopping and prefills:  # shutdown: prompts being prefilled end now (stop_requests)
@@ -962,6 +1097,7 @@ class Generator:
                     else:
                         tc = time.time()
                         ready = None
+                        self.beat("prefill")
                         if adm.multi and len(prefills) >= 2:  # one batch over the prompts in flight
                             order = adm.batch_order(tc, prefills)
                             ready = e.prefill_multi([j.slot for j in order], budget)
@@ -1012,6 +1148,7 @@ class Generator:
                         e.resume(j.slot)
                         self.cur_slot = j.slot
                     ts = time.time()
+                    self.beat("step")
                     if STEP_PROF:
                         p0 = _pc()
                     toks = e.step()
@@ -1024,6 +1161,7 @@ class Generator:
                     if self.faults(active) or j.finished:
                         continue
                     j.feed(toks)
+                    self.no_progress(j, len(toks))
                     if STEP_PROF:
                         p3 = _pc()
                         gap = p0 - prof_last if prof_last else 0.0  # previous step's return -> this call
@@ -1033,6 +1171,7 @@ class Generator:
                 else:
                     self.cur_slot = -1  # batch steps undo the queued-ahead single step
                     ts = time.time()
+                    self.beat("batch step")
                     res = e.step_batch([j.slot for j in active])
                     tr("batch", ts, len(active), sum(len(r) for r in res))
                     self.metrics.step(active, [len(r) for r in res], time.time() - ts)
@@ -1041,6 +1180,7 @@ class Generator:
                     for j, toks in zip(active, res):
                         if not j.finished:
                             j.feed(toks)
+                            self.no_progress(j, len(toks))
                     tr("feed", tf, len(active))
             except Exception as ex:
                 for j in active:
@@ -2190,6 +2330,10 @@ def main():
     if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
         import assets
         assets.ensure(args.model)
+    try:  # kill -USR1 <pid>: Python stacks of every thread (the native ones: gdb -p <pid>)
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except Exception:
+        pass
     gen = Generator(args)
     class Server(uvicorn.Server):  # SIGTERM / SIGINT: end the requests first, then uvicorn's wait for the streams
         def handle_exit(self, sig, frame):

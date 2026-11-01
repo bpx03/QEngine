@@ -52,6 +52,31 @@ inline void mkdirs(const std::string& path) {
         if (i == path.size() || path[i] == '/') mkdir(path.substr(0, i).c_str(), 0755);
 }
 
+inline std::string holder_pid(int fd) {
+    char buf[64] = {0};
+    const ssize_t n = pread(fd, buf, sizeof buf - 1, 0);
+    std::string s = n > 0 ? std::string(buf, n) : "";
+    const size_t nl = s.find('\n');
+    return nl == std::string::npos ? s : s.substr(0, nl);
+}
+// the lock holder is exiting: zombie / dead, or flagged PF_EXITING (0x4) / PF_DUMPCORE (0x200) in /proc/<pid>/stat
+inline bool dying_holder(int fd) {
+    const std::string pid = holder_pid(fd);
+    if (pid.empty() || pid.find_first_not_of("0123456789") != std::string::npos) return false;
+    FILE* f = fopen(("/proc/" + pid + "/stat").c_str(), "r");
+    if (!f) return true;  // gone: the lock is about to be released
+    char b[1024] = {0};
+    const size_t n = fread(b, 1, sizeof b - 1, f);
+    fclose(f);
+    const char* q = strrchr(b, ')');
+    if (!q || (size_t)(q - b) + 4 > n) return false;
+    char st = 0;
+    unsigned long flags = 0;
+    int ppid = 0, pgrp = 0, sess = 0, tty = 0, tpgid = 0;
+    if (sscanf(q + 2, "%c %d %d %d %d %d %lu", &st, &ppid, &pgrp, &sess, &tty, &tpgid, &flags) != 7) return false;
+    return st == 'Z' || st == 'X' || (flags & 0x4) || (flags & 0x200);
+}
+
 // Locks every CUDA device in `devs` (ordinals within CUDA_VISIBLE_DEVICES); "" when the process may use them, else the
 // error message (nothing stays locked then). Locks this process already holds are kept (a second engine in-process).
 inline std::string acquire(const std::vector<int>& devs) {
@@ -70,6 +95,14 @@ inline std::string acquire(const std::vector<int>& devs) {
         const std::string path = dir + "/gpu-" + id + ".lock";
         const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (fd < 0) continue;  // no lock directory: no guard (never stop a start for it)
+        if (flock(fd, LOCK_EX | LOCK_NB) != 0 && dying_holder(fd)) {
+            // the previous engine is still ending (a core dump being written, stuck in the driver after a crash): wait
+            // for it up to FLASH_PIN_WAIT_S (60) seconds instead of failing at once (issue #3)
+            const int wait_s = env_int("FLASH_PIN_WAIT_S", 60);
+            fprintf(stderr, "qflash: GPU %d: the previous QEngine process (%s) is still exiting (core dump or a stuck driver "
+                    "call?); waiting up to %d s for it to release the GPU\n", d, holder_pid(fd).c_str(), wait_s);
+            for (int i = 0; i < wait_s && flock(fd, LOCK_EX | LOCK_NB) != 0; i++) sleep(1);
+        }
         if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
             char buf[512] = {0};
             const ssize_t n = pread(fd, buf, sizeof buf - 1, 0);

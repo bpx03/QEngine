@@ -12,6 +12,8 @@
 #include "../env.h"
 #include "flash.h"
 #include <map>
+#include <cmath>
+#include <algorithm>
 
 namespace flash {
 
@@ -281,11 +283,14 @@ void Worker::use_slot(int s, int base) {
 // slot, stashed per-slot sets, batched, prefill). Map entries stay with nullptr (= seen: captured again on the next
 // use), so the references and iterators the callers hold stay valid. Syncs first: an in-flight graph frees its
 // memory only when it completes.
-int Worker::drop_all_graphs(const cudaGraphExec_t* keep) {
+int Worker::drop_graphs(const cudaGraphExec_t* keep, double frac) {
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    int n = 0;
+    std::vector<std::pair<unsigned long long, cudaGraphExec_t*>> all;
     auto d = [&](cudaGraphExec_t& x) {
-        if (x && &x != keep) { CUDA_CHECK(cudaGraphExecDestroy(x)); x = nullptr; n++; }
+        if (x && &x != keep) {
+            auto it = xuse_.find(x);
+            all.push_back({it == xuse_.end() ? 0ull : it->second, &x});
+        }
     };
     for (auto& a : graph_) for (auto& b : a) for (auto& c : b) d(c);
     for (auto& a : mgraph_) for (auto& b : a) for (auto& c : b) d(c);
@@ -297,8 +302,42 @@ int Worker::drop_all_graphs(const cudaGraphExec_t* keep) {
         for (auto* c : {&gs.pg, &gs.pbg}) for (auto& kv : *c) d(kv.second);
     }
     for (auto* c : {&cgraph_, &bgraphs_, &pgraphs_, &pbgraphs_, &pmgraphs_}) for (auto& kv : *c) d(kv.second);
+    size_t n = all.size();
+    xheld_ = n;
+    if (frac < 1.0) {  // the least recently launched first (never launched = oldest)
+        n = std::min(all.size(), (size_t)std::ceil(all.size() * frac));
+        std::nth_element(all.begin(), all.begin() + (n ? n - 1 : 0), all.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+    for (size_t i = 0; i < n; i++) {
+        cudaGraphExec_t& x = *all[i].second;
+        xuse_.erase(x);
+        CUDA_CHECK(cudaGraphExecDestroy(x));
+        x = nullptr;
+    }
     graphs_evicted_ += n;
-    return n;
+    return (int)n;
+}
+
+void Worker::oom_reserve_take() {
+    static const long long mb = env_ll("FLASH_OOM_RESERVE_MB", 64);
+    if (oom_res_ || mb <= 0) return;
+    const size_t b = (size_t)mb << 20;
+    if (free_bytes() < b + ((size_t)32 << 20)) return;  // only from memory that is clearly free
+    if (cudaMalloc(&oom_res_, b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        oom_res_ = nullptr;
+        return;
+    }
+    oom_res_bytes_ = b;
+}
+
+bool Worker::oom_reserve_free() {
+    if (!oom_res_) return false;
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    CUDA_CHECK(cudaFree(oom_res_));
+    oom_res_ = nullptr;
+    return true;
 }
 
 // graph instantiation with little free memory (graph_oom.h, club-3090#1846: 4 slots, the expert cache sized to the
@@ -320,10 +359,29 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
         *e = nullptr;
         graph_oom_++;
         const double f0 = free_bytes() / 1048576.0;
-        const int n = drop_all_graphs(e);  // their memory goes back to the driver's pool (not shown as free)
-        fprintf(stderr, "[flash] GPU%d: graph instantiate out of memory (%.0f MB free): dropped %d cached graphs, retrying%s\n",
-                dev_, f0, n, inj.first(call, p_.rank) ? " (FLASH_TEST_GRAPH_OOM)" : "");
+        // the least recently launched half first (issue #3 D4), then every other graph, then the emergency reserve:
+        // their memory goes back to the driver's pool (not shown as free), the next instantiate gets it
+        static const double lru = env_double("FLASH_GRAPH_LRU_FRAC", 0.5);
+        int n = lru > 0 && lru < 1 ? drop_graphs(e, lru) : drop_all_graphs(e);
+        const size_t held = xheld_;
+        fprintf(stderr, "[flash] GPU%d: graph instantiate out of memory (%.0f MB free): dropped %d of %zu cached graphs%s, "
+                "retrying%s\n", dev_, f0, n, held, n < (int)held ? " (least recently used)" : "",
+                inj.first(call, p_.rank) ? " (FLASH_TEST_GRAPH_OOM)" : "");
         r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+        if (r == cudaErrorMemoryAllocation && n < (int)held) {
+            (void)cudaGetLastError();
+            *e = nullptr;
+            const int n2 = drop_all_graphs(e);
+            fprintf(stderr, "[flash] GPU%d: still out of memory: dropped the other %d cached graphs, retrying\n", dev_, n2);
+            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+        }
+        if (r == cudaErrorMemoryAllocation && oom_reserve_free()) {
+            (void)cudaGetLastError();
+            *e = nullptr;
+            fprintf(stderr, "[flash] GPU%d: still out of memory: freed the %.0f MB emergency reserve, retrying\n", dev_,
+                    oom_res_bytes_ / 1048576.0);
+            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+        }
         if (r == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             *e = nullptr;
@@ -336,6 +394,7 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
         }
     }
     CUDA_CHECK(r);
+    if (!oom_res_ && oom_res_bytes_) oom_reserve_take();  // re-taken once memory is clearly free again
     return true;
 }
 
@@ -395,6 +454,7 @@ bool Worker::launch_graph(cudaGraphExec_t& e) {
     cudaError_t r = fake ? cudaErrorMemoryAllocation : cudaGraphLaunch(e, st_);
     if (r != cudaErrorMemoryAllocation) {
         CUDA_CHECK(r);
+        xuse_[e] = ++xtick_;  // LRU (drop_graphs)
         return true;
     }
     (void)cudaGetLastError();

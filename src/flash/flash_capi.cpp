@@ -36,7 +36,9 @@
 #include "flash_steer.h"
 #include "guard_rule.h"
 #include "../host_mem.h"
+[[noreturn]] void qe_wd_host_timeout(const char* what);  // kernels/watchdog.cu: report + exit 75
 #include "../gpu_guard.h"
+#include "../gpu_diag.h"
 
 using namespace flash;
 
@@ -339,6 +341,13 @@ struct FE {
     std::atomic<int> go{0}, done{0};
     std::atomic<bool> quit{false};
     std::vector<std::thread> pool;
+    // bounded run() (issue #3 D3): a worker stuck inside a CUDA call (driver, stalled device) used to hang the server
+    // silently with rank 0 spinning here. The monitor thread ends the process with a diagnosis instead (the server
+    // or its container is restarted): FLASH_RUN_TIMEOUT_S (default 120; 0 off).
+    std::atomic<long long> run_t0{0};           // steady-clock ns when the current run() started; 0: none
+    std::atomic<const char*> run_tag{"-"};       // what it runs (the job's caller)
+    std::atomic<int> rank_gen[16] = {};          // the run() generation each rank finished last
+    std::thread mon;  // (rank_gen zeroed in start_monitor)
     // sequence slots; cs = the slot the single-sequence path (prefill, speculative steps) is bound to
     std::vector<Slot> sl;
     int cs = 0, np = 0, period = 1536, reserve = 1024;
@@ -379,7 +388,7 @@ struct FE {
     void drain() {
         if (!inflight) return;
         job = [this](int r) { W[r]->spec_discard(); };
-        run();
+        run("drain");
         inflight = false;
         if (take_nf()) fault(cs, "dropped step", (int)S().hist.size());
         Slot& q = S();
@@ -441,6 +450,7 @@ struct FE {
     int next_id = 1, ckpt_every = 8192, ckpt_min = 512, ckpt_keep = 6, end_cut = 4096;
     unsigned long long tick = 0;
     const Conv* hold = nullptr;   // the conversation a start is restoring from (never evicted meanwhile)
+    const Pin* hold_pin = nullptr;  // the pinned prefix a start is restoring from (drop_pin skips it meanwhile)
     long long n_evict = 0, n_restore = 0, n_sync = 0, n_move = 0, n_grow = 0, n_slot_evict = 0, n_pause = 0, n_resume = 0;
     unsigned long long admit_tick = 0, pause_tick = 0;
     bool log = false;             // FLASH_SLOT_LOG=1: archive / restore / pool events on stderr
@@ -476,18 +486,52 @@ struct FE {
         return nullptr;
     }
 
-    void run() {
+    static long long now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void run(const char* tag = "job") {
+        run_tag.store(tag);
+        qe_diag::job_tag().store(tag);
         done.store(0);
-        go.fetch_add(1, std::memory_order_acq_rel);
+        const int g = go.fetch_add(1, std::memory_order_acq_rel) + 1;
+        run_t0.store(now_ns());
         job(0);
+        rank_gen[0].store(g);
         while (done.load(std::memory_order_acquire) != ng - 1) std::this_thread::yield();
+        run_t0.store(0);
+        qe_diag::job_tag().store(nullptr);
+    }
+    // the run() monitor (see run_t0): prints the job, the elapsed time and the ranks that have not finished, then ends
+    // the process through the watchdog's host timeout (exit code 75). No CUDA call here: the driver may be the stuck part.
+    void start_monitor() {
+        for (auto& x : rank_gen) x.store(0);
+        const double tmo = env_double("FLASH_RUN_TIMEOUT_S", 120.0);
+        if (!(tmo > 0) || ng > 16) return;
+        mon = std::thread([this, tmo] {
+            while (!quit.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                const long long t0 = run_t0.load();
+                if (!t0 || (now_ns() - t0) / 1e9 < tmo) continue;
+                const int g = go.load();
+                std::string late;
+                for (int r = 0; r < ng; r++)
+                    if (rank_gen[r].load() != g) late += " " + std::to_string(r) + " (GPU" + std::to_string(devs[r]) + ")";
+                if (run_t0.load() != t0) continue;  // it finished meanwhile
+                char what[512];
+                snprintf(what, sizeof what, "engine job '%s' not finished after %.0f s (FLASH_RUN_TIMEOUT_S); ranks still in it:%s. "
+                         "A rank stuck in a CUDA call means the driver or a GPU stalled: check `dmesg` for Xid lines",
+                         run_tag.load(), (now_ns() - t0) / 1e9, late.empty() ? " none (rank 0's own wait)" : late.c_str());
+                fflush(stdout);
+                qe_wd_host_timeout(what);
+            }
+        });
     }
     // the single-sequence path works on slot s from now on
     void bind(int s) {
         drain();
         const int b = sl[s].base;
         job = [&](int r) { W[r]->use_slot(s, b); };
-        run();
+        run("bind");
         if (s != cs) {  // the lookup history on the devices belonged to the previous slot
             sl[s].lk_stale = true;
             lk_next = 0;
@@ -508,7 +552,7 @@ struct FE {
             W[r]->forward(toks.data(), pos, m, ple.data(), o.data(), nullptr, -1);
             if (r == 0) outs = o;
         };
-        run();
+        run("forward");
         return outs[m - 1];
     }
     int mtp(const std::vector<int>& toks, int pos, bool chain) {
@@ -518,7 +562,7 @@ struct FE {
             W[r]->forward_mtp(toks.data(), pos, m, chain, o.data());
             if (r == 0) outs = o;
         };
-        run();
+        run("mtp");
         return outs[m - 1];
     }
 
@@ -549,7 +593,7 @@ struct FE {
             W[r]->set_kv_top(top);
             W[r]->kv_claim(0);  // expert-cache slots below the top -> KV (KV in RAM: block-cache entries of the active ones)
         };
-        run();
+        run("update_top");
     }
     // valid KV positions of a slot (its tokens + the rows of a step past them)
     int kv_len(const Slot& q) const { return std::min(q.cap * period, (int)q.hist.size() + MAXP + 1); }
@@ -571,7 +615,7 @@ struct FE {
         if (q.base == to) return;
         const int from = q.base, n = kv_len(q);
         job = [&](int r) { W[r]->kv_move(from, to, n); };
-        run();
+        run("move_region");
         q.base = to;
         n_move++;
         if (log) fprintf(stderr, "[qflash] pool: slot %d moved %d -> %d (%d tokens)\n", s, from, to, n);
@@ -616,7 +660,7 @@ struct FE {
                         int top = at + need;  // the target rows leave the expert cache before the copy
                         for (auto& o : sl) if (o.cap) top = std::max(top, o.base + o.cap);
                         job = [&](int r) { W[r]->set_kv_top(top); W[r]->kv_claim(0); };
-                        run();
+                        run("ensure_region");
                         move_region(s, at);
                     }
                     break;
@@ -658,7 +702,7 @@ struct FE {
                 int top = at + need;  // the target rows leave the expert cache before the copy
                 for (auto& o : sl) if (o.cap) top = std::max(top, o.base + o.cap);
                 job = [&](int r) { W[r]->set_kv_top(top); W[r]->kv_claim(0); };
-                run();
+                run("ensure_region");
                 move_region(s, at);
             }
             q.base = at;
@@ -675,7 +719,7 @@ struct FE {
     void make_room_around(int s, int need) {
         Slot& q = sl[s];
         job = [&](int r) { W[r]->set_kv_top(np); W[r]->kv_claim(0); };  // the whole pool leaves the expert cache first
-        run();
+        run("make_room_around");
         std::vector<int> lo, hi;
         for (int i = 0; i < (int)sl.size(); i++)
             if (i != s && sl[i].cap) (sl[i].base < q.base ? lo : hi).push_back(i);
@@ -699,7 +743,7 @@ struct FE {
     void rebind() {
         const int b = sl[cs].base;
         job = [&](int r) { W[r]->use_slot(cs, b); };
-        run();
+        run("rebind");
     }
     int prio_of(int s) const { return sl[s].conv ? sl[s].conv->prio : 0; }
     // ---- NaN guard (Worker::nf_check, FLASH_GUARD=1): a reply whose forward produced non-finite values fails alone
@@ -842,7 +886,7 @@ struct FE {
             CHECK(off == b.n[r], "flash archive: blob size mismatch (%zu vs %zu)", off, b.n[r]);
             CUDA_CHECK(cudaStreamSynchronize(s));
         };
-        run();
+        run("xfer");
     }
     // H2D of archived KV segment g (positions [a, z), region base b) limited to the positions < upto: the device pieces
     // of [a, min(z, upto)) are prefixes of those of [a, z) (same rows from r0, fewer rows / index blocks)
@@ -867,7 +911,7 @@ struct FE {
             CHECK(off == g.n[r] || part.empty(), "flash archive: blob size mismatch (%zu vs %zu)", off, g.n[r]);
             CUDA_CHECK(cudaStreamSynchronize(s));
         };
-        run();
+        run("xfer_part");
     }
     std::vector<size_t> sizes_of(const std::function<void(int, std::vector<Worker::Piece>&)>& pieces) {
         std::vector<size_t> v(ng);
@@ -1027,7 +1071,7 @@ struct FE {
     bool drop_pin(const char* why) {
         auto v = pins.end();
         for (auto it = pins.begin(); it != pins.end(); ++it)
-            if (v == pins.end() || it->prio < v->prio || (it->prio == v->prio && it->used < v->used)) v = it;
+            if (&*it != hold_pin && (v == pins.end() || it->prio < v->prio || (it->prio == v->prio && it->used < v->used))) v = it;
         if (v == pins.end()) return false;
         fprintf(stderr, "[qflash] archive: pinned prefix %zu tokens dropped (%s; %.2f GB, pinned %.2f of %.2f GB)\n",
                 v->toks.size(), why, v->bytes / 1e9, (pin_used - v->bytes) / 1e9, pin_budget / 1e9);
@@ -1199,7 +1243,7 @@ struct FE {
         const int b = q.base;
         Conv* c = q.conv;
         job = [&](int r) { W[r]->kv_claim(hn); };
-        run();
+        run("unpause_slot");
         for (auto& g : c->segs) xfer_part(*g, b, g->t0, g->t1, hn);
         q.paused = false;
         n_resume++;
@@ -1252,6 +1296,12 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     for (auto& x : split(devices && *devices ? devices : "0,1,2", ',')) e->devs.push_back(std::stoi(x));
     e->ng = e->devs.size();
     if (e->ng != 2 && e->ng != 3) { fprintf(stderr, "qflash: 2 or 3 GPUs required (%d given)\n", e->ng); delete e; return nullptr; }
+    qe_diag::install_fatal_handler();  // a native backtrace on SIGSEGV & co. (issue #3), then Python's faulthandler
+    {  // the first CUDA call: a clear message when CUDA cannot be used (an old process on the GPUs, a driver error)
+        int nd = 0;
+        const cudaError_t ce = cudaGetDeviceCount(&nd);
+        if (ce != cudaSuccess) { qe_diag::explain_start_failure("cudaGetDeviceCount", ce); delete e; return nullptr; }
+    }
     {  // one QEngine process per GPU (gpu_guard.h)
         const std::string busy = qe_gpu_guard::acquire(e->devs);
         if (!busy.empty()) { fprintf(stderr, "qflash: %s\n", busy.c_str()); delete e; return nullptr; }
@@ -1417,6 +1467,13 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             fclose(f);
         }
     }
+    {  // the archive's and pinned prefixes' host registrations after load: charged to the expert budget (issue #3)
+        const double agb = env_double("FLASH_KV_ARCHIVE_GB", 48.0), pgb = env_double("FLASH_PREFIX_GB", 8.0);
+        double plan = agb > 0 && env_int("FLASH_ARCHIVE_PINNED", 1) ? (agb + std::max(0.0, pgb)) * 1e9 : 0.0;
+        // at most what the host can pin now (MemAvailable above the host margin)
+        plan = std::min(plan, std::max(0.0, (double)qe_hostmem::available(true) - (double)qe_hostmem::margin()));
+        flash::set_host_reg_plan(plan);
+    }
     e->W.resize(e->ng);
     {
         std::vector<std::thread> th;
@@ -1482,15 +1539,27 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     for (int r = 1; r < e->ng; r++)
         e->pool.emplace_back([e, r] {
             int seen = 0;
+            // test hook (FLASH_TEST_RUN_STALL=S): the last rank stalls in its first job S seconds after start-up, as a
+            // worker stuck in the driver would (checks the run() monitor)
+            static const double stall = env_double("FLASH_TEST_RUN_STALL", -1.0);
+            const auto t_ready = std::chrono::steady_clock::now();
             while (true) {
                 int g;
                 while ((g = e->go.load(std::memory_order_acquire)) == seen && !e->quit.load()) std::this_thread::yield();
                 if (e->quit.load()) return;
                 seen = g;
+                if (stall >= 0 && r == e->ng - 1 &&
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ready).count() >= stall) {
+                    fprintf(stderr, "[test] rank %d stalls in job '%s' (FLASH_TEST_RUN_STALL)\n", r, e->run_tag.load());
+                    while (!e->quit.load()) std::this_thread::sleep_for(std::chrono::seconds(1));
+                    return;
+                }
                 e->job(r);
+                e->rank_gen[r].store(g);
                 e->done.fetch_add(1, std::memory_order_acq_rel);
             }
         });
+    e->start_monitor();
     e->ple.resize((size_t)MAXM * H);
     e->outs.resize(MAXM);
     for (int r = 0; r < e->ng; r++) e->W[r]->reset();
@@ -1528,6 +1597,7 @@ void qe_destroy(void* p) {
     e->drain();
     e->quit.store(true);
     for (auto& t : e->pool) t.join();
+    if (e->mon.joinable()) e->mon.join();
     // GPU memory is released at process exit
 }
 
@@ -1685,7 +1755,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
             const int fb = e->sl[x].base, tb = e->sl[y].base;
             e->bind(y);
             e->job = [&](int r) { e->W[r]->kv_claim(L); e->W[r]->kv_move(fb, tb, L); };
-            e->run();
+            e->run("acquire_slot");
         }
         const bool pend = s.st->pend;
         e->xfer(*s.st, [&](int r, std::vector<Worker::Piece>& ps) { e->W[r]->state_pieces_of(y, pend, ps); }, false);
@@ -1713,7 +1783,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         for (auto& g : s.c->segs)
             if (g->t0 < L) use.push_back(g.get());
         e->job = [&](int r) { e->W[r]->kv_claim(L); };
-        e->run();
+        e->run("acquire_slot");
         const int b = e->sl[y].base;
         // only the positions < L: a segment can reach far past them (a conversation archived at 138K, a 25K prompt
         // resuming at its system-end checkpoint) and the new region is sized for this prompt only; the whole segment
@@ -1741,6 +1811,10 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         pf.ms_restore = FE::now_ms() - t0 - pf.ms_pool;
     } else if (s.pin) {  // a pinned system prefix: its KV rows + state from host memory, a new conversation shares them
         const double t0 = FE::now_ms();
+        // acquire_slot may evict a slot -> sync -> new_blob -> mem_guard -> drop_pin under host-memory pressure: the
+        // pin is held until the start has copied it (issue #3 D1: s.pin was read after it could have been erased)
+        e->hold_pin = s.pin;
+        struct Unhold { FE* e; ~Unhold() { e->hold_pin = nullptr; } } unhold{e};
         y = acquire_slot(e, n, {});
         if (y < 0) return e->hold = nullptr, -1;
         pf.ms_pool = FE::now_ms() - t0;
@@ -1748,7 +1822,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         L = s.L;
         e->bind(y);
         e->job = [&](int r) { e->W[r]->kv_claim(L); };
-        e->run();
+        e->run("acquire_slot");
         e->xfer_part(*pn.kv, e->sl[y].base, 0, L, L);
         e->xfer(*pn.st, [&](int r, std::vector<Worker::Piece>& ps) { e->W[r]->state_pieces_of(y, false, ps); }, false);
         for (int r = 0; r < e->ng; r++) e->W[r]->set_slot_prev_m(y, 0);
@@ -1770,7 +1844,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         if (y < 0) return e->hold = nullptr, -1;
         e->bind(y);
         e->job = [&](int r) { e->W[r]->reset_slot(y); };
-        e->run();
+        e->run("acquire_slot");
         e->sl[y].hist.clear();
         target = new_conv(nullptr);
     }
@@ -1812,7 +1886,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     float ssc;
     FE::steer_unkey(target->steer, sv, smd, slo, shi, ssc);
     e->job = [&](int r) { e->W[r]->set_constrained(y, false); e->W[r]->set_steer_slot(y, sv, smd, slo, shi, ssc); };
-    e->run();
+    e->run("acquire_slot");
     q.active = true;  // taken (not evicted by another start) until released
     q.paused = false;
     if (e->W[0]->kv_stream()) e->update_top();  // KV in RAM: block-cache entries sized to the active regions
@@ -1834,7 +1908,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
             CUDA_CHECK(cudaHostAlloc((void**)&t, cap * H * sizeof(bf16), cudaHostAllocMapped | cudaHostAllocPortable));
             if (base) memcpy(t, e->img, (size_t)base * H * sizeof(bf16));
             e->job = [&](int r) { e->W[r]->set_image_table(t); };
-            e->run();
+            e->run("acquire_slot");
             if (e->img) CUDA_CHECK(cudaFreeHost(e->img));
             e->img = t;
             e->img_cap = cap;
@@ -1850,7 +1924,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         delta = 0;
     }
     e->job = [&](int r) { e->W[r]->set_rope_slot(y, delta); e->W[r]->set_rope_chunk(y, 0, 0, nullptr); };
-    e->run();
+    e->run("acquire_slot");
     if (e->budget) {  // checkpoints of the committed state: the system end (hint), every ckpt_every, the prompt end - 1
         std::vector<int> c;
         if (hint > L && hint < n && hint >= e->ckpt_min) c.push_back(hint);
@@ -1885,7 +1959,7 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
     {
         const unsigned* mh = e->S().con ? e->mh(e->cs) : nullptr;  // constrained: mask 0 serves the prompt's last chunk
         e->job = [&](int r) { e->W[r]->ws_ensure(); if (mh) e->W[r]->upload_mask(mh, 1); };  // after batched steps the slot's state is in its storage
-        e->run();
+        e->run("qe_prefill_more_slot");
     }
     const int n = pf.n;
     const int* ids = pf.ids.data();
@@ -1920,12 +1994,12 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
                 e->W[r]->prefill_batch(dids + i, i, m, rows.data(), &oo, e->k > 0 ? mt.data() : nullptr, lastb, &dd);
                 if (r == 0) { o = oo; d = dd; }
             };
-            e->run();
+            e->run("qe_prefill_more_slot");
             if (e->k > 0) {
                 if (d == -2) {  // MTP fill not in the batch (one chunk): separate pass
                     if (lastb) mt[m - 1] = o;
                     e->job = [&](int r) { int dd; e->W[r]->prefill_batch_mtp(mt.data(), i, m, &dd); if (r == 0) d = dd; };
-                    e->run();
+                    e->run("qe_prefill_more_slot");
                 }
                 if (lastb) pf.drafts = {d};
             }
@@ -1935,14 +2009,14 @@ int qe_prefill_more_slot(void* p, int slot, int budget) {
             for (int j = 0; j < m; j++) mt.push_back(i + j + 1 < n ? dids[i + j + 1] : -1);
             if (e->k > 0 && !lastb) {
                 e->job = [&](int r) { if (r3) e->W[r]->set_rope_chunk(pslot, i, m, r3); int oo, dd; e->W[r]->prefill(ch.data(), i, m, rows.data(), &oo, mt.data(), &dd); if (r == 0) { o = oo; d = dd; } };
-                e->run();
+                e->run("qe_prefill_more_slot");
             } else {
                 e->job = [&](int r) { if (r3) e->W[r]->set_rope_chunk(pslot, i, m, r3); int oo; e->W[r]->prefill(ch.data(), i, m, rows.data(), &oo, nullptr, nullptr); if (r == 0) o = oo; };
-                e->run();
+                e->run("qe_prefill_more_slot");
                 if (e->k > 0) {  // the last row's MTP token is the first generated one
                     mt[m - 1] = o;
                     e->job = [&](int r) { int dd; e->W[r]->prefill_mtp(mt.data(), i, m, &dd); if (r == 0) d = dd; };
-                    e->run();
+                    e->run("qe_prefill_more_slot");
                 }
             }
             if (lastb && e->k > 0) pf.drafts = {d};
@@ -2054,7 +2128,7 @@ int qe_prefill_multi(void* p, const int* slots, int nslots, int budget, int* don
         e->W[r]->prefill_multi(sg.data(), ns, toks.data(), rows.data(), e->k > 0 ? mt.data() : nullptr, o.data(), d.data());
         if (r == 0) { outs = o; drs = d; }
     };
-    e->run();
+    e->run("qe_prefill_multi");
     int k = 0;
     for (int j = 0; j < ns; j++) {
         FE::Pf& pf = *pk[j].pf;
@@ -2095,7 +2169,7 @@ static void spec_start(FE* e, int nxt, const std::vector<int>& first_drafts, con
             std::vector<int> h(ids, ids + n);
             h.push_back(nxt);
             e->job = [&](int r) { e->W[r]->set_history(h.data(), (int)h.size(), e->k); };
-            e->run();
+            e->run("spec_start");
             e->lk_next = e->W[0]->lookup_drafts();
         }
     }
@@ -2120,7 +2194,7 @@ int qe_start_finish_slot(void* p, int slot) {
     }
     if (pf.multi_end && e->k > 0) {  // the MTP chain continues from its prompt end (kept per slot by the shared batch)
         e->job = [&](int r) { e->W[r]->rmin_load(pf.slot); };
-        e->run();
+        e->run("qe_start_finish_slot");
     }
     spec_start(e, pf.nxt, pf.drafts, pf.ids.data(), n);
     Slot& q = e->S();
@@ -2128,7 +2202,7 @@ int qe_start_finish_slot(void* p, int slot) {
     if (q.pen) {  // the first token (sampled at the prompt end) sits at position n
         const int t = pf.nxt;
         e->job = [&](int r) { e->W[r]->pen_host(&t, 1, n); };
-        e->run();
+        e->run("qe_start_finish_slot");
     }
     q.active = true;
     q.remain = -1;
@@ -2206,12 +2280,12 @@ static int spec_step_impl(void* p, int* out) {
     if (e->k == 0) {
         if ((int)q.hist.size() + 2 > qe_max_context(p) || !e->room_or_pause(e->cs, (int)q.hist.size() + 2, {e->cs})) return 0;
         e->job = [&](int r) { e->W[r]->ws_ensure(); };
-        e->run();
+        e->run("spec_step_impl");
         const int pos = q.hist.size();
         const int t = e->forward({q.pending}, pos);
         if (q.pen) {
             e->job = [&](int r) { e->W[r]->pen_host(&t, 1, pos + 1); };
-            e->run();
+            e->run("spec_step_impl");
         }
         q.pending = t;
         out[0] = t;
@@ -2231,7 +2305,7 @@ static int spec_step_impl(void* p, int* out) {
             e->W[r]->upload_drafts(io + 17, kv);
             e->W[r]->spec_launch_con(kv, e->k);
         };
-        e->run();
+        e->run("spec_step_impl");
         std::vector<int> em(MAXM + 1);
         int cnt = 0;
         e->job = [&](int r) {
@@ -2239,7 +2313,7 @@ static int spec_step_impl(void* p, int* out) {
             const int c = e->W[r]->spec_finish(v.data());
             if (r == 0) { em = v; cnt = c; io[0] = e->W[0]->next_drafts(e->cs, e->k, io + 1); }
         };
-        e->run();
+        e->run("spec_step_impl");
         e->prev_lk = false;
         e->lk_next = 0;
         q.lk_stale = true;
@@ -2256,7 +2330,7 @@ static int spec_step_impl(void* p, int* out) {
     }
     if (!e->inflight) {  // the slot's speculative state may be in its stash (batched steps / a switch)
         e->job = [&](int r) { e->W[r]->sv_load(); };
-        e->run();
+        e->run("spec_step_impl");
         if (q.lk_stale) {
             q.lk_stale = false;
             e->lk_next = 0;
@@ -2265,7 +2339,7 @@ static int spec_step_impl(void* p, int* out) {
                 std::vector<int> h = q.hist;
                 h.push_back(q.pending);
                 e->job = [&](int r) { e->W[r]->set_history(h.data(), (int)h.size(), e->k); };
-                e->run();
+                e->run("spec_step_impl");
                 e->lk_next = e->W[0]->lookup_drafts();
             }
         }
@@ -2278,7 +2352,7 @@ static int spec_step_impl(void* p, int* out) {
     } else {
         if (!next_step(e, ks, lk)) return 0;
         e->job = [&](int r) { e->W[r]->spec_launch(ks, lk); };
-        e->run();
+        e->run("spec_step_impl");
     }
     e->inflight = false;
     std::vector<int> em(MAXM + 1);
@@ -2288,7 +2362,7 @@ static int spec_step_impl(void* p, int* out) {
         const int c = e->W[r]->spec_finish(v.data());
         if (r == 0) { em = v; cnt = c; }
     };
-    e->run();
+    e->run("spec_step_impl");
     e->prev_lk = lk;
     e->lk_next = e->W[0]->lookup_drafts();
     // processed now: the previous pending token + the accepted drafts (all emitted tokens but the last)
@@ -2311,7 +2385,7 @@ static int spec_step_impl(void* p, int* out) {
         bool lk2;
         if (next_step(e, ks2, lk2, true)) {
             e->job = [&](int r) { e->W[r]->spec_launch(ks2, lk2); };
-            e->run();
+            e->run("spec_step_impl");
             e->inflight = true;
             e->ahead_ks = ks2;
             e->ahead_lk = lk2;
@@ -2374,7 +2448,7 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
             std::vector<int> h = q.hist;
             h.push_back(q.pending);
             e->job = [&](int r) { e->W[r]->set_bhist(s, h.data(), (int)h.size()); };
-            e->run();
+            e->run("qe_step_batch");
             q.bhist = want;
         }
     std::vector<int> bases(e->sl.size());
@@ -2396,7 +2470,7 @@ void qe_step_batch(void* p, const int* slots, int n, int* out, int* cnt) {
         e->W[r]->batch_finish(oo.data(), cc.data());
         if (r == 0) { o = oo; c = cc; }
     };
-    e->run();
+    e->run("qe_step_batch");
     if (const unsigned bad = e->take_nf()) {  // rows with non-finite values: their sequences fail, the others go on
         const int rps = e->W[0]->batch_rps();
         for (int j = 0; j < nr; j++) {
@@ -2462,7 +2536,7 @@ void qe_release(void* p, int slot) {
         q.active = false;
         if (q.con) {
             e->job = [&](int r) { e->W[r]->set_constrained(sid, false); };
-            e->run();
+            e->run("qe_release");
         }
         if (q.conv) e->forget(q.conv);  // never a source again (the next turn recomputes it)
         e->evict_slot(sid);
@@ -2488,7 +2562,7 @@ void qe_release(void* p, int slot) {
         q.con = false;
         const int s = e->batch_api ? slot : e->cs;
         e->job = [&](int r) { e->W[r]->set_constrained(s, false); };
-        e->run();
+        e->run("qe_release");
     }
 }
 // the reply may emit at most `tokens` more tokens: no step is launched ahead past it
@@ -2526,7 +2600,7 @@ void qe_constrain(void* p, int slot, int on) {
         e->W[r]->set_constrained(slot, on != 0);
         if (mh) e->W[r]->upload_mask(mh, 1);
     };
-    e->run();
+    e->run("qe_constrain");
 }
 int qe_constrained(void* p, int slot) { return ((FE*)p)->sl.at(slot).con ? 1 : 0; }
 
@@ -2539,7 +2613,7 @@ int qe_drafts(void* p, int slot, int* out) {
     if (e->k <= 0 || q.pending < 0) return 0;
     int n = 0;
     e->job = [&](int r) { if (r == 0) n = e->W[0]->next_drafts(slot, e->k, out); };
-    e->run();
+    e->run("qe_drafts");
     return n;
 }
 int qe_trim(void* p, int slot, int pos) {
@@ -2561,7 +2635,7 @@ int qe_trim(void* p, int slot, int pos) {
         e->W[w]->sv_set_live();
         e->W[w]->set_prev_m(r);
     };
-    e->run();
+    e->run("qe_trim");
     q.rb_pos = -1;
     q.synced = false;
     q.lk_stale = true;
@@ -2615,7 +2689,7 @@ int qe_capture(void* p, const int* ids, int n, int r0, float* out) {
     if (y < 0) return -1;
     e->bind(y);
     e->job = [&](int r) { e->W[r]->reset_slot(y); e->W[r]->set_steer_slot(y, -1, 0, 0, -1, 1.f); e->W[r]->cap_begin(); };
-    e->run();
+    e->run("qe_capture");
     std::vector<int> hist;
     for (int i = 0; i < n; i += PFM) {
         const int m = std::min(PFM, n - i);
@@ -2626,10 +2700,10 @@ int qe_capture(void* p, const int* ids, int n, int r0, float* out) {
         }
         const int skip = std::max(0, std::min(m, r0 - i));
         e->job = [&](int r) { int o; e->W[r]->cap_skip(skip); e->W[r]->prefill(ids + i, i, m, rows.data(), &o, nullptr, nullptr); };
-        e->run();
+        e->run("qe_capture");
     }
     e->job = [&](int r) { e->W[r]->cap_end(r == 0 ? out : nullptr); };
-    e->run();
+    e->run("qe_capture");
     for (int k = 0; k < LAYERS * H; k++) out[k] /= (float)(n - r0);
     e->evict_slot(y);  // scratch: nothing to keep
     e->update_top();
@@ -2642,7 +2716,7 @@ void qe_reset(void* p) {
     e->drain();
     for (int s = 0; s < (int)e->sl.size(); s++) {
         e->job = [&](int r) { e->W[r]->reset_slot(s); };
-        e->run();
+        e->run("qe_reset");
         e->sl[s] = Slot{};
     }
     e->convs.clear();

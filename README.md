@@ -8,11 +8,12 @@ with tensor parallelism 3 over PCIe.
 in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
 in our quick tests.
 
-> **QEngine 1.3.2: Qwen3.8-Flash-Next.** QEngine 1.3.2 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s with
+> **QEngine 1.3.3: Qwen3.8-Flash-Next.** QEngine 1.3.3 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s with
 > image input, an optional KV cache in host RAM, an opt-in context of up to 1M tokens, pinned system prompts for
 > agents and faster prefill on 2 cards: see [Qwen3.8-Flash-Next](#qwen38-flash-next)
 > and the ready-to-run model on [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine); the `latest`
-> Docker image runs both models.
+> Docker image runs both models. 1.3.3 is a bug-fix release (`FLASH_COMM=ce` empty replies, hangs with a full KV
+> pool); see the [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.3).
 
 - C++/CUDA engine (`src/`, about 26k lines), built as a shared library (`libqengine.so`).
 - Python server (`server/`) that loads the library through ctypes and exposes an OpenAI-compatible
@@ -693,8 +694,11 @@ The settings a Flash-Next setup usually needs; everything else has a measured de
 | `--max-ctx` | `262144` | tokens per conversation. Flash-Next above 262,144 (`512K`, `1M` = 1,048,576) turns on YaRN RoPE scaling (the model card's long-context setting) and needs `FLASH_KV=ram`; the default stays the native RoPE. See [docs/advanced.md](docs/advanced.md#context-up-to-1m-tokens-yarn-opt-in) |
 | `FLASH_MAX_SEQS` | 16 | sequence slots (conversations served at once, 1..16); lower it to free VRAM for the expert cache on a single-user setup |
 | `FLASH_KV_ARCHIVE_GB` | 48 | host-RAM archive of conversations (0 = off). When it is full, finished and normal conversations go first (least recently used); the main agent thread gives back its newest part first and keeps a prefix it resumes from. Capped at what the host can spare (see Host RAM safety) |
-| `FLASH_EC_MARGIN_MB` | 256 | VRAM per card left free next to the expert cache; a list sets it per card, e.g. `256,2048,256` when GPU1 drives a desktop. CUDA graphs of new conversation shapes grow into it; when one does not fit, the engine drops its cached graphs and retries, and if that fails runs the step without a graph instead of stopping, so the default works for few-slot setups too |
+| `FLASH_EC_MARGIN_MB` | 256 | VRAM per card left free next to the expert cache; a list sets it per card, e.g. `256,2048,256` when GPU1 drives a desktop. CUDA graphs of new conversation shapes grow into it; when one does not fit, the engine drops its cached graphs and retries, and if that fails runs the step without a graph instead of stopping, so the default works for few-slot setups too. GPU memory that the archive's and pinned prompts' host memory needs after start (`FLASH_PIN_VRAM_MB_PER_GB`, 2 MB per GB on every card, up to 112 MB with the defaults) is kept out of the expert cache in addition to this margin |
 | `FLASH_COMM` | `auto` | prefill transfers between the cards: `auto` (startup probe, see [Interconnect probe](#hardware-requirements-and-limitations)), `p2p`, `pull` / `push` (P2P with SM loads by the receiver / SM stores by the sender on every pair), `ce` (copy engine), `host` (through pinned host memory); decode unchanged |
+| `FLASH_RUN_TIMEOUT_S` | 120 | an engine step that has not finished after this many seconds (a GPU or driver stall) ends the process with a message that names the step and the card; exit code 75, so Docker (`--restart`) or systemd restarts it. `0` = off |
+| `QE_HANG_S` | 180 | the server's own watchdog: no scheduler progress for this long writes the Python and native stacks to the log, ends the open requests with an error and exits (75). `kill -USR1 <pid>` writes the Python stacks at any time. `0` = off |
+| `QE_CORE_DUMP` | 0 | `1` keeps core dumps of a crashed server. Off by default: the core of a process with tens of GB of pinned host memory took minutes to write and kept the GPUs busy meanwhile; a crash prints native and Python stacks to the log either way |
 | `QE_STEERING` (Docker) | 0 | `1`: the [included steering vector](#included-vector-flash-next) `refusal_projection` is the default of every request; `<name>`: that vector (included or mounted at `/vectors`) is the default; any value but 0 loads all of them (a request picks one with `"steering": "<name>"` or sends `"steering": false`); 0 loads nothing |
 | `FLASH_PFB_BIG` | 8192 on 2 cards, 4096 on 3 | rows of a large prefill batch (used when nothing else decodes). On 2 cards the rows past 4096 share memory with the unused end of the KV cache, so decode keeps its expert residency: long prompts prefill faster (server 10K +5 %, 90K +4 %) at unchanged decode. `4096` is the old default, `0` turns large batches off. See [docs/advanced.md](docs/advanced.md#large-prefill-batches-flash_pfb_big) |
 
@@ -806,7 +810,7 @@ docker pull ghcr.io/bpx03/qengine:latest          # ~0.3 GB, no image input
 docker pull ghcr.io/bpx03/qengine:vision          # ~3 GB, with the vision encoder (torch)
 ```
 
-Tags: `latest` / `1.3.2` and `vision` / `1.3.2-vision`, built from `main` (1.3.2; both engine libraries, so the same
+Tags: `latest` / `1.3.3` and `vision` / `1.3.3-vision`, built from `main` (1.3.3; both engine libraries, so the same
 image serves Qwen3.8-27B and Qwen3.8-Flash-Next). Earlier releases stay available under their version tags (e.g.
 `1.3` / `1.3-vision`).
 Use `ghcr.io/bpx03/qengine:latest` in place of `qengine` in the commands below, or build the image yourself.
@@ -856,8 +860,8 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Performance in the container matches bare metal (single-user decode, same GPUs).
 
-**Flash-Next** runs in the same image (`latest` or `1.3.2`; image input with `--vision 1` needs the `vision` or
-`1.3.2-vision` image).
+**Flash-Next** runs in the same image (`latest` or `1.3.3`; image input with `--vision 1` needs the `vision` or
+`1.3.3-vision` image).
 Point `QE_MODEL` at the
 Flash-Next model directory and pass the `FLASH_*` variables with `-e`:
 

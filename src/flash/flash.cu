@@ -8,6 +8,7 @@
 #include "flash_kernels.cuh"
 #include "flash_pfq.cuh"
 #include "../kernels/watchdog.cuh"
+#include "../gpu_diag.h"
 #include "../host_mem.h"
 #include <unistd.h>
 #include "../kernels/ops.cuh"
@@ -114,7 +115,10 @@ char* pin_host_file(const std::string& path, size_t off, size_t n, const void* s
             err[t] = host_register_wait(p + c0, c1 - c0, cudaHostRegisterMapped | cudaHostRegisterPortable, "pin_host_file");
         });
     for (auto& x : th) x.join();
-    for (auto e : err) CHECK(e == cudaSuccess, "pin_host_file: cudaHostRegister: %s", cudaGetErrorString(e));
+    for (auto e : err) {
+        if (e != cudaSuccess && e != cudaErrorMemoryAllocation) qe_diag::explain_start_failure("pin_host_file: cudaHostRegister", e);
+        CHECK(e == cudaSuccess, "pin_host_file: cudaHostRegister: %s", cudaGetErrorString(e));
+    }
     size_t h = 0;
     for (size_t x : hit) h += x;
     posix_fadvise(fd, foff, tot, POSIX_FADV_DONTNEED);
@@ -144,7 +148,10 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
         });
     for (auto& x : th) x.join();
     if (!chunked) err[0] = host_register_wait(p, cap, cudaHostRegisterMapped | cudaHostRegisterPortable, "pin_host");
-    for (auto e : err) CHECK(e == cudaSuccess, "pin_host: cudaHostRegister: %s", cudaGetErrorString(e));
+    for (auto e : err) {
+        if (e != cudaSuccess && e != cudaErrorMemoryAllocation) qe_diag::explain_start_failure("pin_host: cudaHostRegister", e);
+        CHECK(e == cudaSuccess, "pin_host: cudaHostRegister: %s", cudaGetErrorString(e));
+    }
     return p;
 }
 // launch KERNEL<NT> with NT = 8-token tiles of m rows
@@ -421,6 +428,8 @@ unsigned long long Worker::checksum(int first, int last) {
 
 static double g_yarn_req = 0;
 void set_yarn_factor(double f) { g_yarn_req = f; }
+static double g_host_reg_plan = 0;
+void set_host_reg_plan(double bytes) { g_host_reg_plan = bytes; }
 double yarn_factor() {
     const double f = env_set("FLASH_YARN") ? env_double("FLASH_YARN", 0) : g_yarn_req;
     return f > 1 ? f : 0;
@@ -1568,6 +1577,7 @@ void Worker::alloc_state() {
     load_deferred_groups();
     ec_init();
     pfs_init();
+    oom_reserve_take();  // emergency reserve (FLASH_OOM_RESERVE_MB), out of the margin left after the budget
     if (kvs_) {
         CHECK(dec_k_ && !qsa_a_ && env_int("FLASH_ATTN_TC", 2) == 2,
               "flash: FLASH_KV_STREAM needs the default attention kernels (FLASH_ATTN_DEC, FLASH_ATTN_TC=2, no FLASH_QSA_A)");
@@ -1652,6 +1662,14 @@ void Worker::load_deferred_groups() {
         for (std::string x; std::getline(ss, x, ',') && i <= p_.rank; i++) margin_mb = atof(x.c_str());
     }
     const long long fr = (long long)free_bytes();
+    // host memory registered after load (archive slabs + pinned prefixes, in the background): its GPU page tables
+    // take 2 MB per GB on every card, outside the old margin (issue #3: 56 GB -> 112 MB of the 256 MB margin)
+    static const double reg_rate = env_double("FLASH_PIN_VRAM_MB_PER_GB", 2.0);
+    const double hostreg_mb = std::max(0.0, reg_rate) * g_host_reg_plan / 1e9;
+    if (hostreg_mb > 0 && p_.rank == 0)
+        fprintf(stderr, "[flash] expert budget: %.0f MB per card kept for the GPU mappings of %.1f GB of host memory registered "
+                "after load (archive + pinned prefixes)\n", hostreg_mb, g_host_reg_plan / 1e9);
+    margin_mb += hostreg_mb;
     // + per layer: gmap, allocation rounding (2 MiB), the cache table (8 B per group)
     const long long other = (long long)nshared * GRP_BYTES + (long long)ec_defer_l_.size() * (2 << 20) + (long long)gs.size() * 8;
     long long nres = (fr - (long long)(margin_mb * 1048576.0) - other) / (long long)GRP_BYTES;
@@ -2676,6 +2694,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
           "flash: QSA rows %d past the slot-1 projection buffer", L.qkv.n);
     struct Restore { Worker* w; float* p; float* a; ~Restore() { w->proj_ = p; w->attn_x_ = a; } } restore{this, proj0, ax0};
     if (qsa_split_) qpend_[qsa_buf_].L = nullptr;
+    qsa_deferred_ = false;
     const int ql = p_.q1 - p_.q0;
     const int ld = L.qkv.n;
     // decode: the indexer projection + key prep on a graph side branch (only the block selection and later steps use
@@ -2971,7 +2990,8 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             const bool cstg = xstage_ && xout_ && mr > 8;
             const Xchg xcs = cstg ? xchg_outbox(1, xc, cpar, xper(p_)) : xc;
             xb_add(XB_PART, (size_t)mr * (x16o ? (size_t)QPC(p_) * XP16 * 4 : (size_t)xper(p_) * 4) * (p_.ngpu - 1));
-            if (x16o && qsa_split_ && (!cstg || xcs_) && mr == m && !dh) {  // pipelined: the combine + o_proj in qsa_back
+            if (qsa_split_ && !dh && qsa_defers(m, sel_on_)) {  // pipelined: the combine + o_proj in qsa_back
+                // (qsa_defers(m) = x16o && (!cstg || xcs_) && mr == m: the pipelined loop asks it before the chunk)
                 // CE (FLASH_QSA_PIPE_CE): the outbox of this parity is free once its previous side copies finished; the
                 // copies + flag (value computed here, before the pending chunk's combine bumps the counter) on xcs_
                 if (cstg && xce_rec_[cpar]) CUDA_CHECK(cudaStreamWaitEvent(st_, xce_[cpar], 0));
@@ -2986,6 +3006,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 }
                 QsaBack& q = qpend_[qsa_buf_];
                 q.L = &L; q.prow = prow; q.ax = attn_x_; q.mr = mr; q.ld = ld; q.ql = ql; q.nqp = nqp;
+                qsa_deferred_ = true;
                 return;
             } else if (x16o) {
                 k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
@@ -3010,6 +3031,15 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
     rows8(L.o, ab_, ql * HD, part_, H, m, st_);
     if (!ijoined) CUDA_CHECK(cudaStreamWaitEvent(st_, pfe1_, 0));
     if (dh) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), (size_t)m * H, dh + 11);
+}
+
+bool Worker::qsa_defers(int m, bool sel) const {
+    static const bool x16_on = env_int("FLASH_X16", 1);
+    static const bool selsub = env_int("FLASH_SEL_SUB", 0);
+    static const bool p2p = env_int("FLASH_XP2P", 1);
+    const int sub = sel && selsub ? MAXM : XROWS;  // qsa() runs the chunk in sub-chunks of this many rows
+    const bool cstg = xstage_ && xout_ && m > 8;
+    return p2p && x16_on && !qsa_a_ && m > 8 && m <= sub && (!cstg || xcs_);
 }
 
 void Worker::qsa_back(int slot) {
@@ -4051,6 +4081,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         }
     };
     auto reset_rows = [&]() { at_rows(0); posd_ = posd0; curpos_ = posd_; };
+    bool clogged = false;
     for (int li = 0; li < LAYERS; li++) {
         Layer& L = L_[li];
         const bool spm = li >= 1;  // this layer's mixer all-reduce is sequence-parallel (the MoE input HC on own rows)
@@ -4065,8 +4096,22 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         static const bool qpipe_ce = env_int("FLASH_QSA_PIPE_CE", 1);
         const bool pipe_ce = qpipe_ce && xstage_ && comm_.xfer == kXferCE && xcs_ &&
                              (!qx_on_ || selmask == (cb[nu] >= 32 ? ~0u : (1u << cb[nu]) - 1));
+        static const bool clog = env_int("FLASH_PF_CHUNK_LOG", 0);  // debug: the chunk rows of every batch (rank 0)
+        if (clog && L.full && !clogged && p_.rank == 0) {
+            clogged = true;
+            std::string rs;
+            for (int c = 0; c < cb[nu]; c++) rs += " " + std::to_string(chunk_off(c + 1, n) - chunk_off(c, n));
+            fprintf(stderr, "[pfchunk] n %d segs %d chunks %d pipe %d sel %08x rows%s\n", n, pfm_ ? pfm_nseg_ : 1, cb[nu],
+                    (int)(projB_ && !dbgh_ && cb[nu] > 1 && ((qpipe && !xstage_ && comm_.p2p) || pipe_ce)), selmask, rs.c_str());
+        }
         if (L.full && projB_ && !dbgh_ && cb[nu] > 1 && ((qpipe && !xstage_ && comm_.p2p) || pipe_ce)) {
+            // a chunk that qsa() cannot defer (<= 8 rows: a prompt's tail or a 1-row resume segment of a batch) sends
+            // with the immediate exchange number (seq + 1): drain the pending chunk first, else both use the same
+            // number and receive slot and combine each other's partials (club-3090#1879: wrong first token / EOS).
+            // ahead = 1 only when the pending chunk really deferred its combine. FLASH_QSA_PIPE_FLUSH=0: the old loop.
+            static const bool pflush = env_int("FLASH_QSA_PIPE_FLUSH", 1);
             int pend = -1, pend_u = -1;
+            bool pend_def = false;
             auto back = [&](int c, int uu) {
                 at_rows(chunk_off(c, n));
                 qsa_back(c & 1);
@@ -4078,14 +4123,23 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             for (int u = 0; u < nu; u++) {
                 if (li > 0) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));  // the previous layer's MoE unit u
                 for (int c = cb[u]; c < cb[u + 1]; c++) {
+                    const bool dfr = qsa_defers(chunk_off(c + 1, n) - chunk_off(c, n), (selmask >> c) & 1);
+                    if (pflush && !dfr && pend >= 0 && pend_def) {  // drain: the immediate exchange follows
+                        back(pend, pend_u);
+                        pend = -1;
+                    }
                     qsa_split_ = 1;
                     qsa_buf_ = c & 1;
-                    qsa_ahead_ = pend >= 0 ? 1 : 0;
+                    qsa_ahead_ = pend >= 0 && (pend_def || !pflush) ? 1 : 0;
+                    qsa_deferred_ = false;
                     mixer_chunk(L, li, c, spx);
                     qsa_split_ = 0;
+                    CHECK(!pflush || qsa_deferred_ == dfr, "flash: QSA pipeline chunk %d (%d rows): deferred %d, predicted %d",
+                          c, chunk_off(c + 1, n) - chunk_off(c, n), (int)qsa_deferred_, (int)dfr);
                     if (pend >= 0) back(pend, pend_u);
                     pend = c;
                     pend_u = u;
+                    pend_def = qsa_deferred_;
                 }
             }
             back(pend, pend_u);

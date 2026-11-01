@@ -47,4 +47,8 @@ fi
 if [ "${#_req[@]}" -lt 2 ] || [ "${#_req[@]}" -gt 3 ]; then
   echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engines are tested on 2 and 3 GPUs (Flash-Next needs 2 or 3)" >&2
 fi
+# no core dumps unless QE_CORE_DUMP=1 (issue #3): a crashed engine holds 50+ GB of pinned host memory and the GPU
+# mappings; writing its core kept the GPUs busy for minutes (a restart failed meanwhile) and is rarely usable. The
+# crash report (native + Python stacks) is in the log either way.
+[ "${QE_CORE_DUMP:-0}" = 1 ] || ulimit -c 0
 exec "${PYTHON:-python3}" server/app.py --host 127.0.0.1 --port "$PORT" "${_extra[@]}" "$@"
