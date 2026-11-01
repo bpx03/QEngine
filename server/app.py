@@ -1036,6 +1036,10 @@ class Generator:
                     self.starting = admit  # (the hang monitor fails it too: out of the queue, not in prefills yet)
                     admit.begin_start()
                     self.starting = None
+                    # the engine is bound to the new prompt's slot now: the next single step must resume its own
+                    # sequence first (without this, a step in a --prefill-share window decoded the slot of the prompt
+                    # just admitted, and the running request streamed another conversation's tokens)
+                    self.cur_slot = -1
                     tr("begin_start", tb, len(admit.ids))
                     prefills.append(admit)
                 except Exception as ex:
@@ -1122,9 +1126,13 @@ class Generator:
                             tr("finish_start", tf)
                             active.append(cur)
                         except Exception as ex:
+                            # the engine may be bound to this slot now (start_finish binds it before it fails or
+                            # before a later call raises): the next single step must resume its own sequence
+                            self.cur_slot = -1
                             cur.fail(ex)
                         prefills.remove(cur)
                 except Exception as ex:
+                    self.cur_slot = -1  # (as above: the engine's bound slot is unknown after a failed prefill)
                     for j in list(prefills) if adm.multi and len(prefills) >= 2 else [cur]:
                         j.fail(ex)
                         prefills.remove(j)
@@ -1152,6 +1160,8 @@ class Generator:
                     if STEP_PROF:
                         p0 = _pc()
                     toks = e.step()
+                    if not toks:  # no token (paused, refused by the engine's slot check ...): resume explicitly next time
+                        self.cur_slot = -1
                     if STEP_PROF:
                         p1 = _pc()
                     tr("step", ts, 1, len(toks))

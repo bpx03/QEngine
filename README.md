@@ -8,12 +8,12 @@ with tensor parallelism 3 over PCIe.
 in our benchmark (see [Benchmark summary](#benchmark-summary)), and well ahead of SGLang, Ollama and LM Studio
 in our quick tests.
 
-> **QEngine 1.3.3: Qwen3.8-Flash-Next.** QEngine 1.3.3 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s with
+> **QEngine 1.3.3.1: Qwen3.8-Flash-Next.** QEngine 1.3.3.1 runs Qwen3.8-Flash-Next (INT4) on 3 or 2 RTX 3090s with
 > image input, an optional KV cache in host RAM, an opt-in context of up to 1M tokens, pinned system prompts for
 > agents and faster prefill on 2 cards: see [Qwen3.8-Flash-Next](#qwen38-flash-next)
 > and the ready-to-run model on [Hugging Face](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine); the `latest`
-> Docker image runs both models. 1.3.3 is a bug-fix release (`FLASH_COMM=ce` empty replies, hangs with a full KV
-> pool); see the [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.3).
+> Docker image runs both models. 1.3.3.1 fixes a case where a reply could pick up text from another conversation
+> running at the same time; please upgrade, see the [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.3.1).
 
 - C++/CUDA engine (`src/`, about 26k lines), built as a shared library (`libqengine.so`).
 - Python server (`server/`) that loads the library through ctypes and exposes an OpenAI-compatible
@@ -810,7 +810,7 @@ docker pull ghcr.io/bpx03/qengine:latest          # ~0.3 GB, no image input
 docker pull ghcr.io/bpx03/qengine:vision          # ~3 GB, with the vision encoder (torch)
 ```
 
-Tags: `latest` / `1.3.3` and `vision` / `1.3.3-vision`, built from `main` (1.3.3; both engine libraries, so the same
+Tags: `latest` / `1.3.3.1` and `vision` / `1.3.3.1-vision`, built from `main` (1.3.3.1; both engine libraries, so the same
 image serves Qwen3.8-27B and Qwen3.8-Flash-Next). Earlier releases stay available under their version tags (e.g.
 `1.3` / `1.3-vision`).
 Use `ghcr.io/bpx03/qengine:latest` in place of `qengine` in the commands below, or build the image yourself.
@@ -860,8 +860,8 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 Performance in the container matches bare metal (single-user decode, same GPUs).
 
-**Flash-Next** runs in the same image (`latest` or `1.3.3`; image input with `--vision 1` needs the `vision` or
-`1.3.3-vision` image).
+**Flash-Next** runs in the same image (`latest` or `1.3.3.1`; image input with `--vision 1` needs the `vision` or
+`1.3.3.1-vision` image).
 Point `QE_MODEL` at the
 Flash-Next model directory and pass the `FLASH_*` variables with `-e`:
 

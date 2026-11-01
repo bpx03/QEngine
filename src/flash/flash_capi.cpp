@@ -2264,6 +2264,20 @@ static int spec_step_impl(void* p, int* out);
 int qe_spec_step(void* p, int* out) {
     FE* e = (FE*)p;
     if (e->S().fault) return 0;
+    // the bound slot must belong to a running reply: not released, its prompt not still being prefilled (a step there
+    // would continue another conversation and hand its tokens to the caller's request)
+    if (e->prefilling(e->cs) || !e->S().active) {
+        static long long n_bug = 0;
+        static double t_bug = 0;
+        n_bug++;
+        if (FE::now_ms() - t_bug > 1000) {  // at most one line per second, with the count
+            t_bug = FE::now_ms();
+            fprintf(stderr, "[qflash] BUG: single step on slot %d (%s): no tokens; the caller must qe_resume its running "
+                            "sequence first (%lld refused steps)\n", e->cs, e->prefilling(e->cs) ? "its prompt is being prefilled" : "not active", n_bug);
+            fflush(stderr);
+        }
+        return 0;
+    }
     const int n = spec_step_impl(p, out);
     if (e->take_nf()) {  // the step's rows (the bound slot's) had non-finite values: no tokens, the request fails
         e->fault(e->cs, "decode step", (int)e->S().hist.size());

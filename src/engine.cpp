@@ -3231,6 +3231,21 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
 }
 
 int Engine::spec_step(int* out) {
+    // the current slot must belong to a running reply: not released, its prompt not still being prefilled (a step there
+    // would continue another conversation and hand its tokens to the caller's request)
+    if (pf_of(cur_) || !seqs_[cur_].active) {
+        static long long n_bug = 0;
+        static auto t_bug = std::chrono::steady_clock::time_point{};
+        n_bug++;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - t_bug > std::chrono::seconds(1)) {  // at most one line per second, with the count
+            t_bug = now;
+            fprintf(stderr, "[qengine] BUG: single step on slot %d (%s): no tokens; the caller must qe_resume its running "
+                            "sequence first (%lld refused steps)\n", cur_, pf_of(cur_) ? "its prompt is being prefilled" : "not active", n_bug);
+            fflush(stderr);
+        }
+        return 0;
+    }
     Seq& q = seqs_[cur_];
     if (q.paused) {  // stepped alone: resume as soon as its region fits (else no tokens yet)
         if (!unpause_slot(cur_)) return 0;
