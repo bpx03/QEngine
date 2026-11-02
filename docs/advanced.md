@@ -41,6 +41,9 @@ and uses the default too. In Docker pass them with `-e`.
 | `FLASH_PF_STAGE_XMB` | `1024` (`2048` on `FLASH_PAR=pp` stages) | Size cap (MB per card) of the ring that stages host-backed expert groups for large prefill batches. The part above 512 MB is lent to the expert cache between large prefill batches and taken back for each one. It matters on 2 cards, where about half of the expert groups live in host RAM; on 3 cards 512 MB already hold a layer. | `0` restores the fixed 512 MB ring (to rule it out while debugging); otherwise leave it. |
 | `FLASH_NGRAM` | auto | n-gram embedding table: `int8` when `ngram_int8.safetensors` exists in the model directory, else `bf16`. | Set `bf16` to force the BF16 table (needs the original shard and 102 GB of pinned RAM). |
 | `FLASH_NGRAM_PIN` | set by the host-RAM plan (`1` when the table fits) | `0`: disk mode, the INT8 n-gram table is read through the file mapping instead of being pinned; `1`: pinned even if the plan says it does not fit (see [Host memory](../README.md#host-memory-flash-next) in the README; measurements under [Disk mode](#disk-mode-for-the-n-gram-table)). | Leave unset: the start-up picks it from the RAM. |
+| `FLASH_WEIGHTS_COLD` | `1` | After the load, the engine drops the page cache of the model files it no longer reads: every weight file, and the n-gram table file too when the table is pinned. In disk mode the table's file is kept, so the weights' page cache (about 70 GB, read last) no longer pushes the table out. The mappings stay valid; nothing reads them during serving. | `0` keeps the page cache (only to rule it out). |
+| `FLASH_TP_SPIN_US` | `5000` | Tensor parallel: µs a helper thread (one per card after the first) spins after its last job before it sleeps until the next one. The jobs of a decode step and consecutive steps come within this window, so serving speed is unchanged, and an idle server uses no CPU (1.3.4.2 and earlier: one core per helper). | `-1` spins all the time (the old behaviour). |
+| `FLASH_NGRAM_SPIN_MS` | `50` | Disk mode: ms the row-copy thread of each card spins after the last request; then it only polls, every 50 µs during the first second and every 1 ms after, so an idle server costs almost no CPU (1.3.4.2 and earlier: about a third of a core per card). The first decode step after a pause waits at most one poll. | `-1` spins all the time; `0` polls at every step (slower). |
 | `FLASH_LOOKUP` | `1` | Lookup drafts: when the recent tokens repeat an earlier part of the conversation, drafts are copied from there. | `0` turns them off (with `FLASH_DETERMINISTIC=1` for reproducible runs). |
 | `FLASH_PREFIX_GB` | `8` | Host RAM for pinned system prompts: the KV and state at the end of each agent kind's system prompt (and tools) are kept outside the conversation archive, so a new agent of that kind starts after its system prompt even when the archive is full (a 20K-token system prompt takes about 0.4 GB). Used only as prefixes appear; the least recently used one gives way when it is full. Needs the archive (`FLASH_KV_ARCHIVE_GB` > 0). | Lower it on a machine short of RAM; `0` turns it off. |
 | `FLASH_CKPT_MIN` | `512` | A conversation gets a checkpoint where it diverges from a cached one at least this many tokens in (prefix reuse across conversations). | Rarely. |
@@ -153,7 +156,8 @@ with the table on a PCIe 4.0 NVMe SSD, archive off, output tok/s (October 25, 20
 
 Cold, every n-gram row that is not in the page cache is a random 4 KB disk read (median time to first token 1.7 s in
 the cold run, 0.22 s pinned). With more free RAM the page cache keeps more of the table and the numbers move toward
-the warm row.
+the warm row. Since 1.3.4.3 the engine drops the weight files' page cache after the load (`FLASH_WEIGHTS_COLD`), so the table is
+the only model file that competes for the page cache.
 
 ### Image input
 
@@ -296,7 +300,9 @@ tokens actually computed (cached prefix tokens excluded).
 `/api/stats` counters (monitoring port): `version` and `build` (the release, e.g. `1.3.4.2`, and the engine's build hash;
 since 1.3.4.2, shown in the qetop and dashboard headers), `thinking` (`requests_with_budget`, `forced_budget`, `forced_max_tokens`,
 `forced_failed`, `empty_replies`, `empty_stop`, `empty_length`, `empty_after_forced_close`, `empty_retried`,
-`empty_retry_recovered`, `empty_retry_exhausted`), `history_drops` (reasoning-only turns left out; since 1.3.4.2, earlier `history`), `parallel` (Flash-Next
+`empty_retry_recovered`, `empty_retry_exhausted`; since 1.3.4.3 `budget_default` (the `--thinking-budget` number or
+per-effort map), `effort_rules` (how the chat template names efforts) and `budget_from` (thinking replies per budget
+source: `request`, `effort:<level>`, `default`, `off`, `none`; an empty-reply retry counts again)), `history_drops` (reasoning-only turns left out; since 1.3.4.2, earlier `history`), `parallel` (Flash-Next
 mode, reason, probe numbers), `graphs` (Flash-Next cached CUDA graphs per card: `est_mb`, `peak_mb`, `budget_mb`,
 `budget_evictions`, `evicted`, `too_big`, `oom`, `eager`, `pf_eager` (prompt steps run without a graph because their
 shape did not come back within `FLASH_PFGRAPH_WINDOW`), `pf_noroom` (prompt steps without a graph because the decode

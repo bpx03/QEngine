@@ -4057,25 +4057,36 @@ void Worker::start_ngram_stage(const HostTables* ht) {
     // the host side: poll the request, copy the rows (page cache / disk through the file mapping), report done
     const bool slog = env_int("FLASH_NGRAM_STAGE_LOG", 0);
     const int rank = p_.rank;
+    // the request flag is written by the GPU into mapped host memory: no futex to sleep on, the thread polls it.
+    // While requests come it spins (a decode step asks once per step: 9 ms at c=1, 23 ms at c=8 on 3 cards; the GPU
+    // waits for the rows, so a sleeping poller would sit in series with every step); after FLASH_NGRAM_SPIN_MS (50)
+    // without one it only sleeps between polls, 50 us for the first second, then 1 ms: an idle server costs ~0.1 %
+    // of a core per card and the first request after a pause waits at most one sleep (issue #5: the old loop
+    // restarted a 4096-pause spin after every 50 us sleep, half a core per card). -1: never sleeps.
+    static const int spin_ms = env_int("FLASH_NGRAM_SPIN_MS", 50);
     std::thread([ht, req, stage, flags, slog, rank] {
         unsigned last = 0;
         double tsum = 0, tmax = 0;
         long long nreq = 0, nrows = 0;
-        // spin while requests come (decode steps follow each other within milliseconds); after 5 ms without one, poll
-        // every 50 us instead of holding a core while the server is idle (the table may now be in this mode by the
-        // host-RAM plan, not only by FLASH_NGRAM_PIN=0)
-        auto busy = std::chrono::steady_clock::now();
+        using clk = std::chrono::steady_clock;
+        auto busy = clk::now();
         unsigned spins = 0;
+        bool idle = false;
         while (true) {
             const unsigned s2 = *(volatile unsigned*)&flags[0];
             if (s2 == last) {
-                if (++spins < 4096) { __builtin_ia32_pause(); continue; }
-                spins = 0;
-                if (std::chrono::steady_clock::now() - busy > std::chrono::milliseconds(5))
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (!idle) {
+                    if (++spins < 1024) { __builtin_ia32_pause(); continue; }
+                    spins = 0;  // (the clock every 1024 pauses)
+                    if (spin_ms < 0 || clk::now() - busy < std::chrono::milliseconds(spin_ms)) continue;
+                    idle = true;
+                }
+                std::this_thread::sleep_for(clk::now() - busy < std::chrono::seconds(1) ? std::chrono::microseconds(50)
+                                                                                      : std::chrono::microseconds(1000));
                 continue;
             }
             spins = 0;
+            idle = false;
             __sync_synchronize();
             const double t0 = slog ? std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
             const int n = *(volatile int*)&flags[2];

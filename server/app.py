@@ -37,7 +37,8 @@ from engine import Engine, SequenceFault, StartRefused
 import engine_stats
 from steering import DEFAULT as STEER_DEFAULT, resolve_steering
 from grammar import GrammarError, Grammars, TokenLookup, schema_of
-from think_budget import BudgetError, ThinkControl, ThinkIds, empty_reply, request_budget
+from think_budget import (BudgetError, BudgetMap, ThinkControl, ThinkIds, budget_banner, budget_source, empty_reply,
+                          probe_rules, request_budget)
 from model_profile import DroppedTurnLog, Profile, drop_empty_turns, merge_leading_system
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -686,14 +687,22 @@ class Generator:
         self.can_force = self.engine.has("grammar") and self.think_ids.ok
         self.think = {"requests_with_budget": 0, "forced_budget": 0, "forced_max_tokens": 0, "forced_failed": 0,
                       "empty_replies": 0, "empty_stop": 0, "empty_length": 0, "empty_after_forced_close": 0,
-                      "empty_retried": 0, "empty_retry_recovered": 0, "empty_retry_exhausted": 0}
+                      "empty_retried": 0, "empty_retry_recovered": 0, "empty_retry_exhausted": 0,
+                      "budget_from": {}}
         self.think_mu = threading.Lock()  # (counted from the scheduler thread and the event loop: review server F9)
         self.drop_log = DroppedTurnLog()  # --drop-empty-turns (HF #50): logged once per conversation
         if not self.can_force:
             print("thinking budget: not enforced (the engine has no grammar C API or the tokenizer no <think> "
                   "tokens): budgets are ignored and max_tokens may end inside <think>", flush=True)
-        elif getattr(args, "thinking_budget", 0):
-            print(f"thinking budget: {args.thinking_budget} tokens by default (a request's budget wins)", flush=True)
+        # how the template renders reasoning_effort (the key of a per-effort budget map; issue #4)
+        probe = [{"role": "user", "content": "probe"}]
+        self.effort_rules = probe_rules(
+            lambda e: self.tmpl.render([dict(m) for m in probe], None, enable_thinking=True, reasoning_effort=e),
+            log=lambda m: print(m, flush=True))
+        self.budget_map = BudgetMap.parse(getattr(args, "thinking_budget", 0))
+        if self.can_force:
+            for line in budget_banner(self.budget_map, self.effort_rules):
+                print(line, flush=True)
         from metrics import Metrics
         stats = os.path.expanduser(args.stats_file)
         self.metrics = Metrics(stats, args.served_name)
@@ -1046,7 +1055,18 @@ class Generator:
 
     def think_snapshot(self):
         with self.think_mu:
-            return dict(self.think)
+            out = dict(self.think)
+            out["budget_from"] = dict(out.get("budget_from") or {})
+        bm = getattr(self, "budget_map", None)
+        if bm is not None:
+            out["budget_default"] = bm.config()
+            out["effort_rules"] = self.effort_rules.describe()
+        return out
+
+    def think_src(self, src):
+        with self.think_mu:
+            d = self.think.setdefault("budget_from", {})
+            d[src] = d.get(src, 0) + 1
 
     def think_add(self, key, n=1):
         with self.think_mu:
@@ -1599,7 +1619,8 @@ class Job:
         self.loop_checked = 0
         self.tc = None  # thinking state / forced close (server/think_budget.py)
         if g.think_ids.ok and g.think_ids.open_at_end(self.ids, g.im_start):
-            self.tc = ThinkControl(self, self.p.get("think_budget"), g.think_ids, g.can_force)
+            self.tc = ThinkControl(self, self.p.get("think_budget"), g.think_ids, g.can_force,
+                                   self.p.get("think_budget_src"))
         self.feed([first])
 
     def feed(self, pending):
@@ -1764,6 +1785,7 @@ class Job:
                 self.stats["think"] = tc.stats()
                 g = self.gen
                 g.think_add("requests_with_budget", tc.budget is not None)
+                g.think_src(tc.src)
                 if tc.forced:
                     g.think_add("forced_" + tc.forced)
                 if tc.failed:
@@ -1941,7 +1963,7 @@ def think_note(st):
     th = st.get("think")
     if not th or (th["budget"] is None and not th["forced"]):
         return ""
-    b = f"/{th['budget']}" if th["budget"] is not None else ""
+    b = f"/{th['budget']} ({th.get('budget_from') or 'request'})" if th["budget"] is not None else ""
     f = f", forced close ({th['forced']}, {th['forced_tokens']} tokens)" if th["forced"] else ""
     return f" | think {th['tokens']}{b}{f}{' FAILED' if th.get('failed') else ''}"
 
@@ -1964,14 +1986,17 @@ def log_stats(kind, st):
 
 
 # reasoning efforts qwen38_syssafe.jinja knows: 'high' renders as 'xhigh', 'medium' adds no instruction, and
-# any other value ('minimal', 'max', 'none', typos) renders as 'medium' (the model's own template raises instead)
+# any other value ('none', typos) renders as 'medium' (the model's own template raises instead); the server rewrites
+# 'max' to 'xhigh' and 'minimal' to 'low' before rendering (think_budget.QWEN_RULES.client)
 KNOWN_EFFORTS = ("xhigh", "high", "medium", "low")
+CLIENT_EFFORTS = ("max", "minimal")
 
 
-def template_kwargs(body, default_think, default_effort=None):
+def template_kwargs(body, default_think, default_effort=None, anthropic=False):
     """Template variables of a request. Effort: the request's chat_template_kwargs.reasoning_effort, else its
-    top-level reasoning_effort (OpenAI field, also read on the Anthropic path), else --reasoning-effort
-    (default_effort; None = the template's own default, xhigh). A null value counts as not sent."""
+    top-level reasoning_effort (OpenAI field, also read on the Anthropic path), else (anthropic: /v1/messages)
+    output_config.effort, else --reasoning-effort (default_effort; None = the template's own default, xhigh).
+    A null value counts as not sent."""
     kw = dict(body.get("chat_template_kwargs") or {})
     th = body.get("thinking")
     if isinstance(th, dict) and th.get("type") == "disabled":
@@ -1979,6 +2004,9 @@ def template_kwargs(body, default_think, default_effort=None):
     if kw.get("reasoning_effort") is None:
         kw.pop("reasoning_effort", None)
         eff = body.get("reasoning_effort")
+        oc = body.get("output_config")
+        if eff is None and anthropic and isinstance(oc, dict):
+            eff = oc.get("effort")
         if eff is None:
             eff = default_effort
         if eff is not None:
@@ -2232,9 +2260,9 @@ def build_app(gen: Generator, args):
     async def chat(req: Request):
         body = await req.json()
         tools = body.get("tools")
-        kw = template_kwargs(body, args.think, args.reasoning_effort)
+        kw = gen.effort_rules.client_effort(template_kwargs(body, args.think, args.reasoning_effort))
         try:
-            budget = request_budget(body, kw, args.thinking_budget)
+            budget, budget_src = budget_source(body, kw, gen.budget_map, gen.effort_rules)
         except BudgetError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "thinking_budget"}}, status_code=400)
@@ -2271,6 +2299,7 @@ def build_app(gen: Generator, args):
                   "stop": [stop] if isinstance(stop, str) else stop,
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
                   "grammar": grammar, "steering_sel": steer, "think_budget": budget,
+                  "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(kw.get("enable_thinking", True))
@@ -2364,7 +2393,8 @@ def build_app(gen: Generator, args):
     async def count_tokens(req: Request):
         body = await req.json()
         try:
-            kw = template_kwargs(body, args.think, args.reasoning_effort)
+            kw = gen.effort_rules.client_effort(template_kwargs(body, args.think, args.reasoning_effort,
+                                                                anthropic=True))
             request_budget(body, kw)  # (budget 0: rendered without thinking, as the request would be)
             ids, _ = gen.prompt(anthropic_to_messages(body), anthropic_tools(body.get("tools")), kw)
         except (InputError, BudgetError) as ex:
@@ -2379,9 +2409,9 @@ def build_app(gen: Generator, args):
             with open(os.path.join(env_str("QE_DUMP_PROMPTS"), f"{time.time():.3f}.json"), "w") as f:
                 json.dump(body, f, ensure_ascii=False, indent=1)
         tools = anthropic_tools(body.get("tools"))
-        kw = template_kwargs(body, args.think, args.reasoning_effort)
+        kw = gen.effort_rules.client_effort(template_kwargs(body, args.think, args.reasoning_effort, anthropic=True))
         try:
-            budget = request_budget(body, kw, args.thinking_budget)
+            budget, budget_src = budget_source(body, kw, gen.budget_map, gen.effort_rules)
         except BudgetError as ex:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
                                 status_code=400)
@@ -2411,6 +2441,7 @@ def build_app(gen: Generator, args):
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
                   "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer, "think_budget": budget,
+                  "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         mid = "msg_" + uuid.uuid4().hex[:24]
         parser = Parser(kw.get("enable_thinking", True))
@@ -2574,15 +2605,20 @@ def parse_args(argv=None):
                          "release into ~/.cache/qengine/assets; QE_FETCH_ASSETS=0: no download)")
     ap.add_argument("--think", type=int, default=1, help="default enable_thinking")
     ap.add_argument("--reasoning-effort", default=env_str("QE_REASONING_EFFORT"),
-                    help="default reasoning effort for requests that send none (xhigh, high = xhigh, medium, low; "
+                    help="default reasoning effort for requests that send none (xhigh, high = xhigh, max = xhigh, "
+                         "medium, low, minimal = low; "
                          "a request's reasoning_effort or chat_template_kwargs.reasoning_effort wins; other values "
                          "render as medium); env QE_REASONING_EFFORT; default: unset = the template's own (xhigh)")
-    ap.add_argument("--thinking-budget", type=int, default=env_int("QE_THINKING_BUDGET", 0),
+    ap.add_argument("--thinking-budget", default=env_str("QE_THINKING_BUDGET"),
                     help="default thinking budget in tokens for requests that send none (0 = off): at the budget the "
-                         "server closes <think> with a short wrap-up and the model answers; a request's "
-                         "thinking.budget_tokens (Anthropic) / thinking_budget (OpenAI, also in chat_template_kwargs; "
-                         "aliases thinking_token_budget, max_thinking_tokens, custom_params.thinking_budget, "
-                         "reasoning.max_tokens) wins, a negative one turns it off; env QE_THINKING_BUDGET")
+                         "server closes <think> with a short wrap-up and the model answers. One number for every "
+                         "request, or a budget per reasoning effort, e.g. low:4096,medium:16384,xhigh:32768 with an "
+                         "optional default:N (or *:N) for the rest; the effort is the one the prompt is rendered with "
+                         "(Qwen3.8: high / max = xhigh, minimal = low, unknown = medium; an entry < 0 = no budget for "
+                         "that effort). A malformed value stops the start-up. A request's thinking.budget_tokens (Anthropic) / "
+                         "thinking_budget (OpenAI, also in chat_template_kwargs; aliases thinking_token_budget, "
+                         "max_thinking_tokens, custom_params.thinking_budget, reasoning.max_tokens) wins, a negative "
+                         "one turns it off; env QE_THINKING_BUDGET")
     ap.add_argument("--served-name", default=None,
                     help="model id in the API (default per model: qwen3.8-27b-qengine / qwen3.8-flash-next-qengine)")
     ap.add_argument("--tokenizer", default=None,
@@ -2691,9 +2727,13 @@ def parse_args(argv=None):
     if not args.template:
         args.template = os.path.join(args.model, "chat_template.jinja")
     args.think = bool(args.think)
+    try:
+        args.thinking_budget = BudgetMap.parse(args.thinking_budget)
+    except ValueError as ex:
+        ap.error(f"--thinking-budget / QE_THINKING_BUDGET: {ex}")
     if args.reasoning_effort is not None:
         args.reasoning_effort = args.reasoning_effort.strip().lower() or None  # '' = unset, like the env var
-    if args.reasoning_effort is not None and args.reasoning_effort not in KNOWN_EFFORTS:
+    if args.reasoning_effort is not None and args.reasoning_effort not in KNOWN_EFFORTS + CLIENT_EFFORTS:
         print(f"[server] warning: --reasoning-effort {args.reasoning_effort!r} is not one of "
               f"{', '.join(KNOWN_EFFORTS)}: the template renders it as medium", flush=True)
     # the MTP head fine-tuned on the engine's own answers: +8% accepted drafts

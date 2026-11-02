@@ -23,6 +23,13 @@ default; 0: no thinking at all, i.e. enable_thinking=false):
   max_thinking_tokens (SGLang /generate), custom_params.thinking_budget (SGLang chat), reasoning.max_tokens
   (OpenRouter), thinking.budget_tokens (Anthropic {type: enabled}; on both paths), else --thinking-budget /
   QE_THINKING_BUDGET (0 = off).
+
+The server default (BudgetMap) is either one number for every request or a budget per reasoning effort
+(`low:4096,medium:16384,xhigh:32768,default:8192`, issue #4). A request that sends no budget gets the entry of the
+effort its prompt is rendered with (kw["reasoning_effort"] after template_kwargs and the client aliases of
+EffortRules.client_effort: Qwen3.8 max = xhigh, minimal = low), normalised the way the served chat template renders
+it (EffortRules, probed from the template at start-up: Qwen3.8 high = xhigh, others = medium; GLM-5.3 low / high,
+others = max), else the `default:` / `*:` entry, else no budget.
 """
 from qe_env import env_int, env_str
 
@@ -73,9 +80,190 @@ def _int(v, name):
     return int(f) if f <= 0 or f == int(f) else int(f) + 1
 
 
-def request_budget(body, kw, default=0):
-    """The request's thinking budget in tokens (None: no budget). Pops thinking_budget from the template kwargs;
-    a budget of 0 turns thinking off for the request (kw enable_thinking=false)."""
+# effort names a budget map may use (the union of what the templates render)
+EFFORT_NAMES = ("low", "medium", "high", "xhigh", "max")
+
+
+class EffortRules:
+    """How a chat template turns the reasoning_effort variable into the effort it renders: `unset` when the
+    variable is not passed, a value of `levels` as is, an `alias` to its level, anything else `fallback`. The
+    comparison is exact (no lower-casing), as in the templates. `client`: effort names of other APIs that the server
+    rewrites before rendering (Anthropic / vLLM `max`, `minimal`), so the template and the budget see the level the
+    client meant instead of the template's fallback."""
+
+    def __init__(self, name, levels, unset, fallback, alias=None, client=None):
+        self.name, self.levels, self.unset, self.fallback = name, tuple(levels), unset, fallback
+        self.alias, self.client = dict(alias or {}), dict(client or {})
+
+    def client_effort(self, kw):
+        """Rewrites kw["reasoning_effort"] by the client aliases (before the prompt is rendered)."""
+        e = kw.get("reasoning_effort")
+        if isinstance(e, str) and e in self.client:
+            kw["reasoning_effort"] = self.client[e]
+        return kw
+
+    def level(self, effort):
+        if effort is None:
+            return self.unset
+        if not isinstance(effort, str):
+            return self.fallback
+        if effort in self.levels:
+            return effort
+        return self.alias.get(effort, self.fallback)
+
+    def describe(self):
+        al = "".join(f", {k} = {v}" for k, v in {**self.client, **self.alias}.items())
+        return f"{self.name}: {' / '.join(self.levels)}{al}, unset = {self.unset}, others = {self.fallback or 'as sent'}"
+
+
+# qwen38_syssafe.jinja (the server default for Qwen3.8-27B and -Flash-Next; the models' own chat_template.jinja is
+# the same without the 'high' alias and raises on other values, so those requests fail before any budget matters)
+# (client aliases: Anthropic effort max / vLLM-SGLang buckets; without them max and minimal would render as medium)
+QWEN_RULES = EffortRules("qwen3.8", ("low", "medium", "xhigh"), "xhigh", "medium", {"high": "xhigh"},
+                         {"max": "xhigh", "minimal": "low"})
+# GLM-5.3-Flash chat_template.jinja: `reasoning_effort in ['low', 'high'] else 'max'` ("Reasoning Effort: Max")
+GLM_RULES = EffortRules("glm-5.3", ("low", "high", "max"), "max", "max", client={"minimal": "low"})
+# a template whose rendering fits neither: the effort as sent; a request with no effort uses the xhigh entry (the
+# Qwen3.8 default), so a map with an xhigh entry still bounds clients that send none
+RAW_RULES = EffortRules("not recognised (efforts as sent)", EFFORT_NAMES, "xhigh", None)
+PROBE_EFFORTS = (None, "low", "medium", "high", "xhigh", "max", "minimal", "none", "__qe_probe__")
+
+
+def probe_rules(render, log=None):
+    """The EffortRules of a template: `render(effort)` renders a probe prompt with thinking on (None: no
+    reasoning_effort variable). A rule set fits when the efforts it maps to one level render the same prompt and
+    efforts of different levels render different ones (values the template raises on are left out). Render errors
+    go to `log` in one line: template errors (the stock Qwen template refuses unknown efforts) only when no rule set
+    fits, any other error always."""
+    out, errs = {}, []
+    for e in PROBE_EFFORTS:
+        try:
+            out[e] = render(e)
+        except Exception as ex:  # noqa: BLE001 (the stock Qwen template raises on unknown efforts)
+            errs.append((e, ex))
+    rules = _fit(out)
+    odd = [(e, ex) for e, ex in errs if not type(ex).__module__.startswith("jinja2")]
+    if log is not None and (odd or (errs and rules is RAW_RULES)):
+        e, ex = (odd or errs)[0]
+        log(f"[server] warning: reasoning effort probe of the chat template: {len(errs)} of {len(PROBE_EFFORTS)} "
+            f"renders failed (first: effort {e!r}: {type(ex).__name__}: {str(ex)[:160]})")
+    return rules
+
+
+def _fit(out):
+    for rules in (QWEN_RULES, GLM_RULES):
+        seen, ok = {}, True
+        for e, text in out.items():
+            lv = rules.level(e)
+            if seen.setdefault(lv, text) != text:
+                ok = False
+        if ok and len(set(seen.values())) == len(seen) and len(seen) > 1:
+            return rules
+    return RAW_RULES
+
+
+class BudgetMap:
+    """The server's default thinking budget: one number (`default`) or a budget per effort level (`by_effort`),
+    parsed from --thinking-budget / QE_THINKING_BUDGET. 0 / unset / a negative number: no budget. An entry of 0
+    or below means no budget for that effort (the default entry does not apply to it)."""
+
+    def __init__(self, by_effort=None, default=0, plain=True):
+        self.by_effort, self.default, self.plain = dict(by_effort or {}), max(0, int(default or 0)), plain
+
+    @classmethod
+    def parse(cls, v):
+        if isinstance(v, BudgetMap):
+            return v
+        if v is None:
+            return cls()
+        if isinstance(v, bool):
+            raise ValueError(f"thinking budget {v!r}: not a token count")
+        if isinstance(v, int):
+            return cls(default=v)
+        s = str(v).strip()
+        if not s:
+            return cls()
+        if ":" not in s:
+            try:
+                return cls(default=int(s, 10))
+            except ValueError:
+                raise ValueError(f"thinking budget {s!r}: expected a token count (e.g. 8192) or a map like "
+                                 f"low:4096,medium:16384,xhigh:32768[,default:8192]") from None
+        by, dflt = {}, None
+        for part in s.split(","):
+            k, sep, n = part.partition(":")
+            k = k.strip().lower()
+            if not sep or not k:
+                raise ValueError(f"thinking budget map {s!r}: entry {part.strip()!r} is not <effort>:<tokens>")
+            if k not in EFFORT_NAMES + ("default", "*"):
+                raise ValueError(f"thinking budget map {s!r}: unknown effort {k!r} (known: "
+                                 f"{', '.join(EFFORT_NAMES)}, default or *)")
+            try:
+                t = int(n.strip(), 10)
+            except ValueError:
+                raise ValueError(f"thinking budget map {s!r}: {k}: {n.strip()!r} is not a token count") from None
+            t = max(0, t)  # negative = no budget for that effort, as 0 (and as a negative plain number)
+            key = "default" if k in ("default", "*") else k
+            if key in by or (key == "default" and dflt is not None):
+                raise ValueError(f"thinking budget map {s!r}: {key} given twice")
+            if key == "default":
+                dflt = t
+            else:
+                by[key] = t
+        return cls(by, dflt or 0, plain=False)
+
+    def __bool__(self):
+        return self.default > 0 or any(v > 0 for v in self.by_effort.values())
+
+    def resolve(self, effort, rules):
+        """(budget or None, source) for a request that sends no budget of its own."""
+        if self.by_effort:
+            lv = (rules or QWEN_RULES).level(effort)
+            if lv in self.by_effort:
+                b = self.by_effort[lv]
+                return (b, f"effort:{lv}") if b > 0 else (None, f"effort:{lv}")
+        if self.default > 0:
+            return self.default, "default"
+        return None, "none"
+
+    def config(self):
+        """For /api/stats: the plain number, or the map ({effort: tokens, "default": tokens})."""
+        if self.plain:
+            return self.default
+        return {**self.by_effort, **({"default": self.default} if self.default else {})}
+
+    def describe(self):
+        if self.plain:
+            return f"{self.default} tokens" if self.default else "none"
+        ent = ", ".join(f"{k} {v or 'none'}" for k, v in self.by_effort.items())
+        return f"{ent}{', ' if ent else ''}default {self.default or 'none'}"
+
+    def unreachable(self, rules):
+        """Map entries the template never renders (they can never apply)."""
+        return [k for k in self.by_effort if k not in rules.levels] if rules is not RAW_RULES else []
+
+
+def budget_banner(bm, rules):
+    """Start-up lines of the server default budget (none when there is none; the plain number as in 1.3.4)."""
+    if bm.plain:
+        return [f"thinking budget: {bm.default} tokens by default (a request's budget wins)"] if bm else []
+    out = [f"thinking budget by effort: {bm.describe()} (template efforts {rules.describe()}; a request's budget "
+           f"wins)"]
+    if rules is RAW_RULES:
+        out.append("[server] warning: thinking budget map: the chat template's reasoning efforts were not recognised "
+                   "(neither Qwen3.8 nor GLM-5.3 rendering); efforts are matched as sent and a request with no effort "
+                   "uses the xhigh entry")
+    dead = bm.unreachable(rules)
+    if dead:
+        out.append(f"[server] warning: thinking budget map: {', '.join(dead)} never applies (the template renders "
+                   f"{rules.describe()})")
+    return out
+
+
+def budget_source(body, kw, default=0, rules=None):
+    """(budget or None, source): the request's own budget ("request"), else the server default for the effort the
+    prompt is rendered with ("effort:<level>" / "default"), else ("none"). Pops thinking_budget from the template
+    kwargs; a budget of 0 turns thinking off for the request (kw enable_thinking=false)."""
     cands = [("chat_template_kwargs.thinking_budget", kw.pop("thinking_budget", None))]
     for k in ("thinking_budget", "thinking_token_budget", "max_thinking_tokens"):
         cands.append((k, body.get(k)))
@@ -93,12 +281,17 @@ def request_budget(body, kw, default=0):
             continue
         b = _int(v, name)
         if b < 0:
-            return None
+            return None, "off"
         if b == 0:
             kw["enable_thinking"] = False
-            return None
-        return b
-    return default if default and default > 0 else None
+            return None, "request"
+        return b, "request"
+    return BudgetMap.parse(default).resolve(kw.get("reasoning_effort"), rules)
+
+
+def request_budget(body, kw, default=0, rules=None):
+    """The request's thinking budget in tokens (None: no budget); see budget_source."""
+    return budget_source(body, kw, default, rules)[0]
 
 
 class ThinkIds:
@@ -135,8 +328,9 @@ class ThinkIds:
 class ThinkControl:
     """Thinking state of one reply and its forced close (driven by Job.feed on the scheduler thread)."""
 
-    def __init__(self, job, budget, ti, can_force):
+    def __init__(self, job, budget, ti, can_force, src=None):
         self.job, self.budget, self.ti, self.can_force = job, budget, ti, can_force
+        self.src = src or ("request" if budget is not None else "none")  # where the budget came from (budget_source)
         self.open = ti.open_at_end(job.ids, job.gen.im_start)
         self.n = 0              # thinking tokens so far (the forced wrap-up included)
         self.forced = None      # why the thinking was closed by the server: "budget" / "max_tokens"
@@ -246,7 +440,8 @@ class ThinkControl:
         return bool(self.tail) and j.max_new - j.n <= self.ti.wrap_max + self.tail + margin
 
     def stats(self):
-        return {"tokens": self.n, "budget": self.budget, "forced": self.forced, "forced_tokens": self.n_forced,
+        return {"tokens": self.n, "budget": self.budget, "budget_from": self.src, "forced": self.forced,
+                "forced_tokens": self.n_forced,
                 **({"failed": self.failed} if self.failed else {})}
 
 

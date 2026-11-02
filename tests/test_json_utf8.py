@@ -146,7 +146,7 @@ class FakeEngine:
 
 
 def job(schema, max_new=4000, loop_guard=600, stops=()):
-    g = types.SimpleNamespace(eos=set(EOS), engine=FakeEngine(), tok=tok,
+    g = types.SimpleNamespace(eos=set(EOS), engine=FakeEngine(), tok=tok, im_start=-1,
                               args=types.SimpleNamespace(mtp_k=3, loop_guard_tokens=loop_guard))
     j = app.Job.__new__(app.Job)
     j.gen, j.ids, j.p, j.slot, j.finished = g, [1] * 100, {}, 0, False
@@ -154,6 +154,7 @@ def job(schema, max_new=4000, loop_guard=600, stops=()):
     j.grammar, j.grammar_s, j.gsteps = G.matcher(schema), 0.0, 0
     j.det = app.Detok(tok)
     j.n, j.finish, j.text_all, j.cut, j.loop_checked = 0, "length", "", False, 0
+    j.glk, j.tc = None, None  # (fields Job.__init__ sets: the grammar lock, the thinking state)
     j.grammar.fill(g.engine.masks[0])
     return j
 

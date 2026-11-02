@@ -432,15 +432,26 @@ struct FE {
     }
     // persistent workers
     std::function<void(int)> job;
-    std::atomic<int> go{0}, done{0};
+    std::atomic<unsigned> go{0};  // (unsigned: wraps after 2^32 runs without undefined behaviour)
+    std::atomic<int> done{0};
     std::atomic<bool> quit{false};
+    // idle workers (issue #5): a rank > 0 worker spins FLASH_TP_SPIN_US after its last job (decode steps and the jobs
+    // of one step come back to back), then sleeps on `go` (futex) and counts itself in `go_sleepers`; every bump of
+    // `go` goes through bump_go(), which wakes sleepers. Both sides are seq_cst (store-load): either the worker sees
+    // the new `go` before it sleeps, or bump_go() sees its count, so no wake-up is lost.
+    std::atomic<int> go_sleepers{0};
+    unsigned bump_go() {
+        const unsigned g = go.fetch_add(1, std::memory_order_seq_cst) + 1;
+        if (go_sleepers.load(std::memory_order_seq_cst) > 0) go.notify_all();
+        return g;
+    }
     std::vector<std::thread> pool;
     // bounded run() (issue #3 D3): a worker stuck inside a CUDA call (driver, stalled device) used to hang the server
     // silently with rank 0 spinning here. The monitor thread ends the process with a diagnosis instead (the server
     // or its container is restarted): FLASH_RUN_TIMEOUT_S (default 120; 0 off).
     std::atomic<long long> run_t0{0};           // steady-clock ns when the current run() started; 0: none
     std::atomic<const char*> run_tag{"-"};       // what it runs (the job's caller)
-    std::atomic<int> rank_gen[16] = {};          // the run() generation each rank finished last
+    std::atomic<unsigned> rank_gen[16] = {};          // the run() generation each rank finished last
     std::thread mon;  // (rank_gen zeroed in start_monitor)
     // sequence slots; cs = the slot the single-sequence path (prefill, speculative steps) is bound to
     std::vector<Slot> sl;
@@ -654,7 +665,7 @@ struct FE {
         run_tag.store(tag);
         qe_diag::job_tag().store(tag);
         if (ppb) {  // the stage threads (one per card); the bound slot first (the prefill flow re-binds between micro-batches)
-            const int g = go.fetch_add(1, std::memory_order_acq_rel) + 1;
+            const unsigned g = bump_go();
             run_t0.store(now_ns());
             const int cslot = cs, cbase = cs < (int)sl.size() ? sl[cs].base : 0;
             const bool rb = !sl.empty();
@@ -668,7 +679,7 @@ struct FE {
             return;
         }
         done.store(0);
-        const int g = go.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const unsigned g = bump_go();
         run_t0.store(now_ns());
         job(0);
         rank_gen[0].store(g);
@@ -705,7 +716,7 @@ struct FE {
                 const long long t0 = run_t0.load();
                 if (!t0 || (now_ns() - t0) / 1e9 < tmo) continue;
                 if (traced()) continue;  // a debugger holds the process (breakpoint): no stall
-                const int g = go.load();
+                const unsigned g = go.load();
                 std::string late;
                 for (int r = 0; r < ng; r++)
                     if (rank_gen[r].load() != g) late += " " + std::to_string(r) + " (GPU" + std::to_string(devs[r]) + ")";
@@ -2453,14 +2464,27 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         for (int r = 0; r < e->ng; r++) e->W[r]->test_hog(env_ll("FLASH_TEST_VRAM_HOG_MB", 0));
     for (int r = 1; r < e->ng && !e->ppb; r++)  // (mode B: the pipeline's stage threads run the jobs)
         e->pool.emplace_back([e, r] {
-            int seen = 0;
+            unsigned seen = 0;
             // test hook (FLASH_TEST_RUN_STALL=S): the last rank stalls in its first job S seconds after start-up, as a
             // worker stuck in the driver would (checks the run() monitor)
             static const double stall = env_double("FLASH_TEST_RUN_STALL", -1.0);
             const auto t_ready = std::chrono::steady_clock::now();
+            // the spin before a worker sleeps (see go_sleepers); -1: never sleeps (the old busy wait)
+            static const int spin_us = env_int("FLASH_TP_SPIN_US", 5000);
             while (true) {
-                int g;
-                while ((g = e->go.load(std::memory_order_acquire)) == seen && !e->quit.load()) std::this_thread::yield();
+                unsigned g = e->go.load(std::memory_order_acquire);
+                if (g == seen) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    while ((g = e->go.load(std::memory_order_acquire)) == seen &&
+                           (spin_us < 0 || std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(spin_us)))
+                        std::this_thread::yield();
+                    while (g == seen) {  // idle: sleep until bump_go() (qe_destroy bumps it too)
+                        e->go_sleepers.fetch_add(1, std::memory_order_seq_cst);
+                        e->go.wait(seen, std::memory_order_seq_cst);
+                        e->go_sleepers.fetch_sub(1, std::memory_order_seq_cst);
+                        g = e->go.load(std::memory_order_acquire);
+                    }
+                }
                 if (e->quit.load()) return;
                 seen = g;
                 if (stall >= 0 && r == e->ng - 1 &&
@@ -2551,6 +2575,34 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             if (pp_holds[r]) { CUDA_CHECK(cudaSetDevice(e->devs[r])); CUDA_CHECK(cudaFree(pp_holds[r])); }
         pp_hybrid_init(e, model, pp_bounds_v, cold, prior, draft_ids);
     }
+    {  // issue #6: after the load nothing reads the model files' mappings except the n-gram table in disk mode (host-
+        // backed expert groups, the embedding and MTP are pinned copies), yet their page cache is the newest, so the
+        // kernel would evict the table's pages first (disk mode: FLASH_NGRAM_PIN=0 or the host-RAM plan). Page the
+        // files out, except a file whose mapping the engine still reads (the table in disk mode / FLASH_NGRAM_HMM=1,
+        // decided by address). FLASH_WEIGHTS_COLD=0 keeps the page cache.
+        if (env_int("FLASH_WEIGHTS_COLD", 1)) {
+            auto in_use = [e](const void* base, size_t n) {
+                const char *b = (const char*)base, *x = b + n;
+                for (const uint8_t* q : e->ht.ngram8) if ((const char*)q >= b && (const char*)q < x) return true;
+                for (const bf16* q : e->ht.ngram) if ((const char*)q >= b && (const char*)q < x) return true;
+                return false;
+            };
+            const double t0 = secs();
+            const long long c0 = meminfo_cached();
+            PageOut o = e->st.page_out(in_use);
+            const PageOut om = e->mst.page_out(in_use);
+            o.dropped += om.dropped;
+            o.requested += om.requested;
+            o.measured = o.measured && om.measured;
+            if (o.measured)
+                fprintf(stderr, "[qflash %.0fs] model files: %.1f GB of page cache paged out in %.1f s (FLASH_WEIGHTS_COLD=0 keeps it)\n",
+                        secs(), o.dropped / 1e9, secs() - t0);
+            else  // (files of another user: the kernel reports their cache state only to the owner)
+                fprintf(stderr, "[qflash %.0fs] model files: page-out of %.1f GB requested in %.1f s, host page cache %.1f GB smaller "
+                        "(FLASH_WEIGHTS_COLD=0 keeps it)\n",
+                        secs(), o.requested / 1e9, secs() - t0, (c0 - meminfo_cached()) / 1e9);
+        }
+    }
     fprintf(stderr, "[qflash %.0fs] ready, context %d\n", secs(), e->ctx);
     return e;
 }
@@ -2562,6 +2614,7 @@ void qe_destroy(void* p) {
     e->pp_drop();
     for (auto& x : e->pfs) e->ppb_quiesce(x.slot, true);
     e->quit.store(true);
+    e->bump_go();  // wakes the sleeping rank workers (they see quit before they take a job)
     for (auto& t : e->pool) t.join();
     if (e->mon.joinable()) e->mon.join();
     // GPU memory is released at process exit

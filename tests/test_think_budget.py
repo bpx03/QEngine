@@ -1,9 +1,12 @@
 """CPU test of the hard thinking budget (server/think_budget.py) on the mock engine with the grammar tier
 (tests/mock_engine.c -DMOCK_GRAMMAR): request fields and aliases, the forced close at the budget, the answer tail
-when max_tokens would end inside <think>, streaming split, tool call after a forced close, /api/stats counters.
-No GPU.
+when max_tokens would end inside <think>, streaming split, tool call after a forced close, /api/stats counters;
+the default budget per reasoning effort (issue #4): map parsing, the effort rules of every chat template we serve
+(qwen38_syssafe.jinja, the Qwen3.8-27B / -Flash-Next own templates, GLM-5.3-Flash's when present), precedence, the
+Anthropic output_config.effort, the budget source in /api/stats and the request log line. No GPU.
 
   python tests/test_think_budget.py           # Flash-Next model directory (tokenizer / template)
+  QE_MOCK_MODEL=models/Qwen3.8-27B-INT4 python tests/test_think_budget.py   # 27B
 """
 import contextlib
 import io
@@ -60,6 +63,191 @@ def sse(text):
     return out
 
 
+# synthetic templates (machine-independent): GLM-5.3-Flash's effort lines as in its chat_template.jinja, and one that
+# renders no effort at all (not recognised)
+GLM_LIKE = ("{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and "
+            "reasoning_effort in ['low', 'high'] else 'max' -%}"
+            "<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}"
+            "{% for m in messages %}<|user|>{{ m.content }}{% endfor %}<|assistant|><think>")
+NO_EFFORT = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+             "<|im_start|>assistant\n<think>\n")
+
+
+def _synthetic(name, text):
+    path = os.path.join(TMP, name)
+    with open(path, "w") as f:
+        f.write(text)
+    return path
+
+
+TEMPLATES = [  # (label, path, rules): the chat templates the server may render with
+    ("qwen38_syssafe (server default, both Qwen models)",
+     os.path.join(HERE, "..", "server", "templates", "qwen38_syssafe.jinja"), "qwen"),
+    ("model dir own (QE_MOCK_MODEL)", os.path.join(MODEL, "chat_template.jinja"), "qwen"),
+    ("GLM-5.3-Flash effort lines (synthetic)", _synthetic("glm_like.jinja", GLM_LIKE), "glm"),
+    ("no effort rendered (synthetic)", _synthetic("no_effort.jinja", NO_EFFORT), "raw"),
+] + [(f"{label} (skipped if missing)", path, rules) for label, path, rules in (  # real files, where present
+    ("Qwen3.8-27B own", os.path.join(os.environ.get("QE_27B_MODEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "Qwen3.8-27B-INT4")),
+                                     "chat_template.jinja"), "qwen"),
+    ("GLM-5.3-Flash own", os.environ.get("QE_GLM_TEMPLATE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "GLM-5.3-Flash", "chat_template.jinja")),
+     "glm"))]
+
+
+def rendered_effort(text):
+    """The effort a rendered prompt carries (Qwen3.8: the xhigh / low instruction, medium = none; GLM: the
+    'Reasoning Effort: X' line)."""
+    if "Reasoning Effort: " in text:
+        return text.split("Reasoning Effort: ", 1)[1].split("<", 1)[0].strip().lower()
+    for lv in ("xhigh", "low"):
+        if f"Reasoning effort is set to {lv}." in text:
+            return lv
+    return "medium"
+
+
+def effort_units():
+    tb = think_budget
+    BM = tb.BudgetMap
+    # map parsing: valid
+    assert BM.parse(None).config() == 0 and not BM.parse("") and not BM.parse("0") and BM.parse("8192").config() == 8192
+    assert BM.parse(" 300 ").plain and BM.parse(300).default == 300 and not BM.parse("-5")  # plain: as 1.3.4
+    m = BM.parse("low:4096,medium:16384,xhigh:32768")
+    assert m.config() == {"low": 4096, "medium": 16384, "xhigh": 32768} and not m.plain, m.config()
+    assert BM.parse(" Low : 5 , *:9").config() == {"low": 5, "default": 9}
+    assert BM.parse("default:7").config() == {"default": 7} and BM.parse("max:3,high:2").by_effort == {"max": 3, "high": 2}
+    # malformed: a clear error naming the entry
+    assert BM.parse("low:-1,default:9").by_effort == {"low": 0}  # negative entry = no budget, as 0 / plain -5
+    for bad in ("low", "abc", "low:x", "foo:1", "low:1,low:2", "default:1,*:2", "low:1,", ":5",
+                "low:1.5", "minimal:3"):
+        try:
+            BM.parse(bad)
+            raise AssertionError(f"accepted {bad!r}")
+        except ValueError as ex:
+            assert "thinking budget" in str(ex), ex
+    # the start-up check: a malformed value stops the server with the message (argparse exit 2)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        try:
+            app.parse_args(["--model", MODEL, "--metrics-port", "0", "--thinking-budget", "low:4k"])
+            raise AssertionError("malformed --thinking-budget accepted")
+        except SystemExit as ex:
+            assert ex.code == 2
+    assert "QE_THINKING_BUDGET" in err.getvalue() and "'4k' is not a token count" in err.getvalue(), err.getvalue()
+    os.environ["QE_THINKING_BUDGET"] = "low:40,xhigh:60"
+    try:
+        a = app.parse_args(["--model", MODEL, "--metrics-port", "0"])
+        assert a.thinking_budget.config() == {"low": 40, "xhigh": 60}
+        a = app.parse_args(["--model", MODEL, "--metrics-port", "0", "--thinking-budget", "77"])
+        assert a.thinking_budget.plain and a.thinking_budget.default == 77  # the flag wins over the env
+    finally:
+        del os.environ["QE_THINKING_BUDGET"]
+    assert not app.parse_args(["--model", MODEL, "--metrics-port", "0"]).thinking_budget  # unset: no budget
+
+    # effort rules: exactly what the templates do (exact match, no lower-casing)
+    Q, G = tb.QWEN_RULES, tb.GLM_RULES
+    for e, want in ((None, "xhigh"), ("low", "low"), ("medium", "medium"), ("xhigh", "xhigh"), ("high", "xhigh"),
+                    ("minimal", "medium"), ("max", "medium"), ("none", "medium"), ("LOW", "medium"), ("", "medium"),
+                    (3, "medium")):
+        assert Q.level(e) == want, (e, Q.level(e))
+    for e, want in ((None, "max"), ("low", "low"), ("high", "high"), ("xhigh", "max"), ("medium", "max"),
+                    ("max", "max"), ("Low", "max")):
+        assert G.level(e) == want, (e, G.level(e))
+    # client aliases, rewritten before rendering: Qwen max = xhigh, minimal = low; GLM keeps max, minimal = low
+    ce = lambda r, e: r.client_effort({"reasoning_effort": e})["reasoning_effort"]  # noqa: E731
+    assert ce(Q, "max") == "xhigh" and ce(Q, "minimal") == "low" and ce(Q, "none") == "none" and ce(Q, "MAX") == "MAX"
+    assert ce(G, "max") == "max" and ce(G, "minimal") == "low" and ce(G, "xhigh") == "xhigh"
+    assert Q.client_effort({}) == {} and ce(Q, 3) == 3
+    # probe errors: logged once (template errors only when nothing fits, other errors always)
+    logs = []
+    assert tb.probe_rules(lambda e: (_ for _ in ()).throw(RuntimeError("boom")), logs.append) is tb.RAW_RULES
+    assert len(logs) == 1 and "9 of 9 renders failed" in logs[0] and "RuntimeError: boom" in logs[0], logs
+    logs = []
+    tb.probe_rules(lambda e: "x" if e is None else 1 / 0, logs.append)
+    assert len(logs) == 1 and "ZeroDivisionError" in logs[0], logs
+    assert tb.RAW_RULES.level(None) == "xhigh" and tb.RAW_RULES.level("low") == "low"  # unset: the xhigh entry
+
+    # precedence: request > the effort's entry > default > none
+    bs = tb.budget_source
+    m = BM.parse("low:40,medium:50,xhigh:60")
+    for e, want in (("low", (40, "effort:low")), ("medium", (50, "effort:medium")), ("xhigh", (60, "effort:xhigh")),
+                    ("high", (60, "effort:xhigh")), ("minimal", (50, "effort:medium")), ("bogus", (50, "effort:medium")),
+                    (None, (60, "effort:xhigh"))):
+        kw = {} if e is None else {"reasoning_effort": e}
+        assert bs({}, kw, m, Q) == want, (e, bs({}, kw, m, Q))
+    md = BM.parse("low:40,default:70")
+    assert bs({}, {"reasoning_effort": "medium"}, md, Q) == (70, "default")
+    assert bs({}, {"reasoning_effort": "low"}, md, Q) == (40, "effort:low")
+    assert bs({}, {"reasoning_effort": "low"}, BM.parse("low:0,default:70"), Q) == (None, "effort:low")  # 0: none
+    assert bs({}, {"reasoning_effort": "medium"}, BM.parse("low:40"), Q) == (None, "none")
+    for body in ({"thinking_budget": 30}, {"chat_template_kwargs": {}, "thinking_token_budget": 30},
+                 {"max_thinking_tokens": 30}, {"custom_params": {"thinking_budget": 30}}, {"reasoning": {"max_tokens": 30}},
+                 {"thinking": {"type": "enabled", "budget_tokens": 30}}):
+        assert bs(body, {"reasoning_effort": "low"}, m, Q) == (30, "request"), body
+    assert bs({}, {"reasoning_effort": "low", "thinking_budget": 31}, m, Q) == (31, "request")
+    assert bs({"thinking_budget": -1}, {"reasoning_effort": "low"}, m, Q) == (None, "off")  # off over the map
+    kw = {"reasoning_effort": "low"}
+    assert bs({"thinking_budget": 0}, kw, m, Q) == (None, "request") and kw["enable_thinking"] is False
+    # plain integer: one budget for every effort, as in 1.3.4 (int, str and BudgetMap)
+    for d in (300, "300", BM.parse("300")):
+        for e in (None, "low", "xhigh", "bogus"):
+            assert bs({}, {} if e is None else {"reasoning_effort": e}, d, Q) == (300, "default")
+    assert tb.request_budget({}, {}, 300) == 300 and tb.request_budget({}, {}) is None
+    assert bs({}, {}, 0, Q) == (None, "none")
+    # GLM rules: low / high / max (no medium / xhigh level); the default entry covers the rest
+    mg = BM.parse("low:40,high:50,max:60")
+    assert bs({}, {}, mg, G) == (60, "effort:max") and bs({}, {"reasoning_effort": "xhigh"}, mg, G) == (60, "effort:max")
+    assert bs({}, {"reasoning_effort": "high"}, mg, G) == (50, "effort:high")
+    mq = BM.parse("low:40,medium:50,xhigh:60,default:70")  # a Qwen-style map on GLM: medium / xhigh never apply
+    assert bs({}, {"reasoning_effort": "medium"}, mq, G) == (70, "default") and mq.unreachable(G) == ["medium", "xhigh"]
+    assert bs({}, {"reasoning_effort": "low"}, mq, G) == (40, "effort:low")
+    assert any("never applies" in l for l in tb.budget_banner(mq, G))
+    assert tb.budget_banner(BM.parse("300"), Q) == ["thinking budget: 300 tokens by default (a request's budget wins)"]
+    assert tb.budget_banner(BM.parse(""), Q) == []  # nothing set: no line, as before
+    assert "low 40, medium 50, xhigh 60, default none" in tb.budget_banner(m, Q)[0]
+
+    # Anthropic output_config.effort (/v1/messages only); the top-level reasoning_effort and the kwargs win
+    tk = app.template_kwargs
+    assert tk({"output_config": {"effort": "low"}}, True, None, anthropic=True)["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in tk({"output_config": {"effort": "low"}}, True)  # OpenAI path: not read
+    assert tk({"output_config": {"effort": "low"}, "reasoning_effort": "xhigh"}, True, None,
+              anthropic=True)["reasoning_effort"] == "xhigh"
+    assert tk({"output_config": {"effort": "low"}, "chat_template_kwargs": {"reasoning_effort": "medium"}}, True, None,
+              anthropic=True)["reasoning_effort"] == "medium"
+    assert tk({"output_config": {"effort": "low"}}, True, "xhigh", anthropic=True)["reasoning_effort"] == "low"
+    assert tk({"output_config": {"format": {"type": "json_schema"}}}, True, "medium",
+              anthropic=True)["reasoning_effort"] == "medium"  # no effort in output_config: the server default
+    print("  effort map: parsing (valid / malformed / start-up error), rules, precedence, output_config.effort ok")
+
+    # per template: the rules probed from the template, and for every effort a request can send, the budget's
+    # level is the effort the rendered prompt carries
+    msgs = [{"role": "user", "content": "probe"}]
+    for label, path, kind in TEMPLATES:
+        if not os.path.exists(path):
+            print(f"  template {label}: {path} missing, skipped")
+            continue
+        t = app.Template(path)
+        rules = tb.probe_rules(lambda e: t.render([dict(x) for x in msgs], None, enable_thinking=True,
+                                                  reasoning_effort=e))
+        glm = kind == "glm"
+        assert rules is {"qwen": Q, "glm": G, "raw": tb.RAW_RULES}[kind], (label, rules.describe())
+        if kind == "raw":
+            assert tb.budget_source({}, {}, BM.parse("low:40,xhigh:60"), rules) == (60, "effort:xhigh")
+            print(f"  template {label}: {rules.describe()}")
+            continue
+        seen = []
+        for e in tb.PROBE_EFFORTS + ("LOW", ""):
+            for body, dflt in (({"reasoning_effort": e}, None), ({}, e), ({"output_config": {"effort": e}}, None)):
+                kw = rules.client_effort(tk(body, True, dflt, anthropic=True))
+                try:
+                    text = t.render([dict(x) for x in msgs], None, **kw)
+                except Exception:  # noqa: BLE001 (stock Qwen template: unknown efforts fail the request)
+                    assert not glm and "own" in label and e not in ("low", "medium", "xhigh", "max", "minimal", None)
+                    continue
+                lv = rules.level(kw.get("reasoning_effort"))
+                assert rendered_effort(text) == lv, (label, e, lv, rendered_effort(text))
+                seen.append(lv)
+        print(f"  template {label}: {rules.describe()}; rendered levels {sorted(set(seen))} match")
+
+
 def main():
     so = os.path.join(TMP, "mockg.so")
     subprocess.check_call(["gcc", "-O2", "-shared", "-fPIC", "-DMOCK_GRAMMAR", "-o", so,
@@ -87,8 +275,10 @@ def main():
         except think_budget.BudgetError:
             pass
     print("  request fields / aliases ok")
+    effort_units()
 
-    args = app.parse_args(["--model", MODEL, "--engine-lib", so, "--metrics-port", "0",
+    # (--drop-empty-turns 1: the Flash-Next default, explicit so the HF #50 part runs on a 27B directory too)
+    args = app.parse_args(["--model", MODEL, "--engine-lib", so, "--metrics-port", "0", "--drop-empty-turns", "1",
                            "--stats-file", os.path.join(TMP, "stats.json")])
     tok = args.profile.tokenizer()[0]
     order = [R_LONG,      # 1 OpenAI budget 64
@@ -106,7 +296,11 @@ def main():
              R_LONG,          # 13 normal turn: no warning
              R_TOOL,          # 14 tool call only: no warning
              R_SHORT, R_SHORT, R_SHORT, R_SHORT,  # 15-18 history with reasoning-only turns (HF #50 log)
-             R_LONG]          # 19 max_tokens 300 + ignore_eos: no answer tail
+             R_LONG,          # 19 max_tokens 300 + ignore_eos: no answer tail
+             R_LONG, R_LONG, R_LONG, R_LONG,  # 20-23 effort map: low, high (= xhigh), minimal (= medium), unset
+             R_LONG, R_LONG,  # 24-25 Anthropic output_config.effort low; request budget over the map
+             R_LONG, R_LONG, R_LONG, R_LONG,  # 26-29 max (chat / Anthropic) = xhigh, none = medium, -1 = off
+             R_LONG, R_LONG]  # 30-31 thinking off with the map; plain integer default
     with open(script, "w") as f:
         for r in order:
             f.write(",".join(map(str, tok.encode(r, add_special_tokens=False).ids)) + "\n")
@@ -281,6 +475,84 @@ def main():
     assert u["completion_tokens_details"]["reasoning_tokens"] == 300, u
     assert not any(k[0] == "C" for k in klines()[nk:]), klines()[nk:]
     print("  ignore_eos max_tokens 300: no answer tail, 300 reasoning tokens")
+
+    # 20-27. default budget per reasoning effort (issue #4) on the served template
+    assert gen.effort_rules is think_budget.QWEN_RULES, gen.effort_rules.describe()
+    gen.budget_map = think_budget.BudgetMap.parse("low:40,medium:50,xhigh:60")
+    st0 = gen.think_snapshot()["budget_from"]
+
+    def eff_run(path, body, want):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            if path == "chat":
+                r = c.post("/v1/chat/completions", json={"model": name, "messages": msgs, **body}).json()
+                m = r["choices"][0]["message"]
+                rt = r["usage"]["completion_tokens_details"]["reasoning_tokens"]
+                assert m["content"] == ANSWER, r
+            else:
+                r = c.post("/v1/messages", json={"model": name, "max_tokens": 4000, "messages": msgs, **body}).json()
+                th = "".join(b["thinking"] for b in r["content"] if b["type"] == "thinking")
+                rt = len(tok.encode(th, add_special_tokens=False).ids)
+                assert any(b["type"] == "text" and b["text"] == ANSWER for b in r["content"]), r
+        line = [l for l in buf.getvalue().splitlines() if l.startswith(f"[{path}]")][-1]
+        b, src = want
+        if b is None:
+            assert " think " not in line or "/" not in line.split(" think ")[1], line
+        else:
+            assert b <= rt <= b + 3 + wrap_n + 2, (body, rt, b)
+            assert f"/{b} ({src})" in line, line
+        return rt, line
+
+    cases = [("chat", {"reasoning_effort": "low"}, (40, "effort:low")),
+             ("chat", {"reasoning_effort": "high"}, (60, "effort:xhigh")),
+             ("chat", {"chat_template_kwargs": {"reasoning_effort": "minimal"}}, (40, "effort:low")),
+             ("chat", {}, (60, "effort:xhigh")),                                       # template default xhigh
+             ("messages", {"output_config": {"effort": "low"}}, (40, "effort:low")),
+             ("chat", {"reasoning_effort": "low", "thinking_budget": 30}, (30, "request")),
+             ("chat", {"reasoning_effort": "max"}, (60, "effort:xhigh")),              # client alias max = xhigh
+             ("messages", {"output_config": {"effort": "max"}}, (60, "effort:xhigh")),
+             ("chat", {"reasoning_effort": "none"}, (50, "effort:medium")),            # the template's fallback
+             ("chat", {"reasoning_effort": "low", "thinking_budget": -1}, (None, "off"))]
+    for path, body, want in cases:
+        rt, line = eff_run(path, body, want)
+        print(f"  effort map {path} {body}: {rt} reasoning tokens, log '{line.split(' | ')[-1]}'")
+    # 26. thinking off: the prompt does not open <think>, no budget applies (no thinking state at all)
+    nk = len(klines())
+    r = c.post("/v1/chat/completions", json={"model": name, "messages": msgs, "reasoning_effort": "low",
+                                             "chat_template_kwargs": {"enable_thinking": False}}).json()
+    assert not any(k[0] == "C" for k in klines()[nk:]), klines()[nk:]
+    p = [l for l in open(log) if l.startswith("P ")][-1].split()
+    assert tok.decode([int(x) for x in p[3:]], skip_special_tokens=False).endswith("<think>\n\n</think>\n\n")
+    # 27. plain integer default: unchanged meaning (one budget for every effort, source "default")
+    gen.budget_map = think_budget.BudgetMap.parse("45")
+    eff_run("chat", {"reasoning_effort": "low"}, (45, "default"))
+    th = gen.metrics.snapshot()["thinking"]
+    got = {k: v - st0.get(k, 0) for k, v in th["budget_from"].items() if v - st0.get(k, 0)}
+    assert got == {"effort:low": 3, "effort:xhigh": 4, "effort:medium": 1, "request": 1, "off": 1, "default": 1}, got
+    assert th["budget_default"] == 45 and th["effort_rules"].startswith("qwen3.8"), th
+    print("  thinking off: no forced close; plain 45: default; /api/stats budget_from", got)
+    # the prompt really carries the aliased effort: max renders the xhigh instruction on /v1/messages
+    r = c.post("/v1/messages/count_tokens", json={"model": name, "messages": msgs, "output_config": {"effort": "max"}})
+    r2 = c.post("/v1/messages/count_tokens", json={"model": name, "messages": msgs, "reasoning_effort": "xhigh"})
+    r3 = c.post("/v1/messages/count_tokens", json={"model": name, "messages": msgs, "reasoning_effort": "none"})
+    assert r.json() == r2.json() != r3.json(), (r.json(), r2.json(), r3.json())
+
+    # start-up with a map: the banner (and the warning for a template whose efforts are not recognised)
+    for tmpl, want, warn in ((None, "thinking budget by effort: low 40, xhigh 60, default none (template efforts "
+                                    "qwen3.8:", False),
+                             (os.path.join(TMP, "no_effort.jinja"), "thinking budget by effort: low 40, xhigh 60", True)):
+        a2 = app.parse_args(["--model", MODEL, "--engine-lib", so, "--metrics-port", "0", "--thinking-budget",
+                             "low:40,xhigh:60", "--stats-file", os.path.join(TMP, "stats2.json")] +
+                            (["--template", tmpl] if tmpl else []))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            g2 = app.Generator(a2)
+        out = buf.getvalue()
+        assert want in out, out
+        assert ("were not recognised" in out) == warn, out
+        assert (g2.effort_rules is think_budget.RAW_RULES) == warn
+        assert think_budget.budget_source({}, {}, g2.budget_map, g2.effort_rules) == (60, "effort:xhigh")
+        print("  start-up:", " | ".join(l for l in out.splitlines() if "thinking budget" in l))
     print("ok")
 
 

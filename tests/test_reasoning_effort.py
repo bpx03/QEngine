@@ -116,8 +116,11 @@ def test_args():
         assert parse(["--reasoning-effort", empty])[0] is None
     assert parse([], "low")[0] == "low"
     assert parse(["--reasoning-effort", "Medium"], "low")[0] == "medium"  # the flag wins, lower-cased
-    eff, log = parse(["--reasoning-effort", "minimal"])
-    assert eff == "minimal" and "renders it as medium" in log
+    eff, log = parse(["--reasoning-effort", "bogus"])
+    assert eff == "bogus" and "renders it as medium" in log
+    for alias in ("minimal", "max"):  # rewritten by the server (minimal = low, max = xhigh): no warning
+        eff, log = parse(["--reasoning-effort", alias])
+        assert eff == alias and "warning" not in log, log
     assert "warning" not in parse(["--reasoning-effort", "low"])[1]
 
 

@@ -26,6 +26,13 @@ the default settings:
 (November 2, 2026, both columns on the same day with the same desktop load on GPU1, default weights; method under
 [Benchmarks](#benchmarks), where the 2-card and the 27B numbers are too.)
 
+**What is new in 1.3.4.3:** the default thinking budget can be set per reasoning effort
+(`QE_THINKING_BUDGET=low:4096,medium:16384,xhigh:32768`, see [Thinking budget](#thinking-budget-and-the-answer-tail);
+`/v1/messages` also reads Anthropic's `output_config.effort`). Two fixes: an idle Flash-Next server no longer keeps
+CPU cores busy (about 2 cores before, about 0.02 now, on 3 cards), and after the load the engine releases the page
+cache of the weight files, so they no longer push the n-gram table out of RAM when it is read through the page cache
+([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4.3)).
+
 **What is new in 1.3.4.2:** faster Flash-Next decode (+14 % with 8 agents, +7 to +12 % single-stream; one
 conversation's output bit for bit as 1.3.4.1), the web dashboard's agents table and `qetop` work again, and both
 show the running version and build ([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4.2)).
@@ -118,7 +125,7 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 ```
 
 - Without `QE_MODEL` the container serves `/app/models/Qwen3.8-27B-INT4`.
-- Images: `latest` / `1.3.4.2` (text only, ~0.4 GB download) and `vision` / `1.3.4.2-vision` (with the image encoder, ~3.2 GB download).
+- Images: `latest` / `1.3.4.3` (text only, ~0.4 GB download) and `vision` / `1.3.4.3-vision` (with the image encoder, ~3.2 GB download).
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -380,7 +387,9 @@ set does not fit, the log says so and the value is kept. `QE_HOST_RESERVE_GB` ch
 - **n-gram table in the page cache** (`FLASH_NGRAM_PIN=0`, or chosen at start-up): the table stays in the file mapping
   and a host thread copies the rows each step needs. With the table fully in the page cache, agent throughput at 8
   conversations was 793 tok/s (pinned: 805); with the whole server limited to 12 GB of RAM, 493 tok/s (3 cards,
-  October 25, 2026). Details: [docs/advanced.md](docs/advanced.md#disk-mode-for-the-n-gram-table).
+  October 25, 2026). After the load the engine drops the page cache of the weight files (it never reads them again),
+  so they don't push the table out of the page cache (`FLASH_WEIGHTS_COLD=0` keeps it). Details:
+  [docs/advanced.md](docs/advanced.md#disk-mode-for-the-n-gram-table).
 - The 27B needs much less: its archive defaults to 32 GB (`QE_KV_ARCHIVE_GB`) plus 8 GB of pinned prompts
   (`QE_PREFIX_GB`), sized the same way. Its defaults fit from 64 GB of RAM.
 
@@ -521,7 +530,9 @@ the GPU (server defaults: `--presence-penalty`, `--frequency-penalty`).
 **Thinking and reasoning effort**: thinking is on by default (`--think 0` turns it off by default;
 `chat_template_kwargs.enable_thinking` per request). `reasoning_effort` (`xhigh` = the template default, `high` is the
 same, `medium`, `low`) per request or as a server default with `--reasoning-effort` / `QE_REASONING_EFFORT`; a
-request's value wins. Unknown values render as `medium`.
+request's value wins. `max` is taken as `xhigh` and `minimal` as `low` (the names other APIs use); other unknown
+values render as `medium`. On `/v1/messages` the Anthropic `output_config.effort` is used when the request sends no
+`reasoning_effort` (so `max` gets the most reasoning).
 
 ### Thinking budget and the answer tail
 
@@ -532,8 +543,22 @@ zero. A budget stops that:
 - per request: Anthropic `thinking: {"type": "enabled", "budget_tokens": N}`; OpenAI path `thinking_budget` (top
   level or in `chat_template_kwargs`; `thinking_token_budget`, `max_thinking_tokens`,
   `custom_params.thinking_budget` and `reasoning.max_tokens` are accepted too);
-- server default for requests that send none: `--thinking-budget N` / `QE_THINKING_BUDGET=N` (0 = off). A request's
-  value wins; a negative one turns the budget off for that request; 0 turns thinking off.
+- server default for requests that send none: `--thinking-budget N` / `QE_THINKING_BUDGET=N` (0 = off), one budget
+  for every request. A request's value wins; a negative one turns the budget off for that request; 0 turns thinking
+  off.
+- or a default per reasoning effort: `QE_THINKING_BUDGET=low:4096,medium:16384,xhigh:32768` (the same value works
+  for `--thinking-budget`), optionally with `default:N` (or `*:N`) for efforts the map does not list. The effort is
+  the one the prompt is rendered with (the request's, else `--reasoning-effort`, else the template's `xhigh`), named
+  the way the template renders it: `high` and `max` use the `xhigh` entry, `minimal` the `low` entry, other unknown
+  values the `medium` entry. An entry of 0 or below means no budget for that effort (as a plain 0 or negative
+  number). Order: the request's budget, then its effort's entry, then `default:`, then none. With a custom
+  `--template` whose efforts the server does not recognise, a warning is printed at start-up, efforts are matched as
+  sent, and requests without one use the `xhigh` entry.
+- since 1.3.4.3 a malformed value (e.g. `8k`, `1.5`, `low:4k`, an unknown effort) stops the server at start-up with an
+  error naming the entry; 1.3.4.2 and earlier warned and ran without a budget.
+- the start-up line prints the map, and `/api/stats` (`thinking.budget_from`) and the per-request log line
+  (`think 66/4096 (effort:low)`) show where each budget came from: `request`, `effort:<level>`, `default`, `off` (the
+  request turned the budget off) or `none`.
 
 At the budget the server writes a one-sentence wrap-up and `</think>` (27 tokens; `QE_THINK_WRAP` changes the
 sentence), and the model goes on with its answer or tool call. The reasoning holds at most the budget plus one decode
@@ -646,7 +671,7 @@ turn the model made up.
   mode and the CUDA-graph memory per card.
 
 **Monitoring.** Live dashboard and Prometheus metrics on `http://127.0.0.1:9393/` (`--metrics-port`), terminal
-monitor `server/qetop.py`. Both show the running version and build in the header (e.g. `QEngine 1.3.4.2 (build abc1234)`).
+monitor `server/qetop.py`. Both show the running version and build in the header (e.g. `QEngine 1.3.4.3 (build abc1234)`).
 
 ## Settings
 
@@ -663,8 +688,8 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `QE_DEVICES` (Docker `QE_GPUS`) | all visible GPUs (Docker `0,1,2`) | physical GPU ids, e.g. `0,2` |
 | `--max-ctx` | `262144` | context per conversation (`256K`, `1M` accepted); Flash-Next above 262,144 needs `FLASH_KV=ram` |
 | `--think` | `1` | thinking on by default (a request's `enable_thinking` wins) |
-| `--reasoning-effort` / `QE_REASONING_EFFORT` | the template's (`xhigh`) | default effort: `xhigh`, `high`, `medium`, `low` |
-| `--thinking-budget` / `QE_THINKING_BUDGET` | `0` (off) | default thinking budget in tokens |
+| `--reasoning-effort` / `QE_REASONING_EFFORT` | the template's (`xhigh`) | default effort: `xhigh`, `high` / `max` (= `xhigh`), `medium`, `low`, `minimal` (= `low`) |
+| `--thinking-budget` / `QE_THINKING_BUDGET` | `0` (off) | default thinking budget in tokens, or one per effort (`low:4096,medium:16384,xhigh:32768[,default:N]`) |
 | `QE_THINK_TAIL` | `auto` | room kept for the answer: 1/8 of `max_tokens`, 64 to 2048 tokens; a number; `0` = off |
 | `--empty-retry` / `QE_EMPTY_RETRY` | `2` | resample a non-streamed empty reply up to N times; `0` = off |
 | `--vision` | `0` | `1`: image input (Docker: the `vision` image) |
@@ -693,6 +718,9 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `FLASH_KV_ARCHIVE_GB` | `48` (less on smaller machines) | host-RAM archive of conversations; `0` = off; a set value wins over the [host-RAM plan](#host-memory-flash-next) |
 | `FLASH_PREFIX_GB` | `8` (less on smaller machines) | host RAM for pinned system prompts; `0` = off |
 | `FLASH_NGRAM_PIN` | set by the host-RAM plan (`1` when it fits) | `1`: pin the n-gram table; `0`: read it through the page cache |
+| `FLASH_WEIGHTS_COLD` | `1` | after the load, drop the page cache of the model files the engine no longer reads (all but the n-gram table in page-cache mode); `0` = keep it |
+| `FLASH_TP_SPIN_US` | `5000` | µs a tensor-parallel helper thread spins after its last job before it sleeps (an idle server then uses no CPU); `-1` = always spin |
+| `FLASH_NGRAM_SPIN_MS` | `50` | page-cache mode of the n-gram table: ms the row-copy thread spins after the last request, then it polls every 50 µs (1 ms after a second); `-1` = always spin |
 | `QE_HOST_RESERVE_GB` | max(8, 8 % of RAM) | host-RAM plan: RAM left to the system and the desktop (both models) |
 | `FLASH_RUN_TIMEOUT_S` | `120` | engine step monitor in seconds; `0` = off |
 
