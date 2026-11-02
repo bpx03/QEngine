@@ -46,9 +46,12 @@
   "credit": "Strata by Niko1221 (https://github.com/Niko1221/Strata) and its fork by sergqwer (https://github.com/sergqwer/Strata-pr, MIT), which published this vector",
   "license": "Qwen Community License 1.0 (derived from the model's activations)",
   "compatibility": {
-    "model": "Qwen3.8-Flash-Next-QE-INT4",
+    "model": [
+      "Qwen3.8-Flash-Next-QE-INT4",
+      "bpx03/Qwen3.8-Flash-Next-QEngine@1.3.4.1"
+    ],
     "hidden_size": 2560,
-    "note": "measured on another quantization of the same model; not valid for Qwen3.8-27B"
+    "note": "measured on another quantization of the same model; not valid for Qwen3.8-27B; checked on the 1.3.4.1 checkpoint (XSTest refusal rates and coherence as on 1.3.4, 2026-11-02)"
   },
   "modes": {
     "add": {

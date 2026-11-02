@@ -311,15 +311,41 @@ inline SteerSpec steer_load(const std::string& spec_in, const std::string& meta_
         } catch (std::runtime_error& e) {
             if (std::string(e.what()).rfind("steering:", 0) == 0) throw;
         }
+        // checkpoint identity: config.json "qengine_checkpoint" (written by tools/convert_flash_next.py) against the
+        // sidecar's compatibility.model (a string or a list); checkpoints without the id: the directory name as before
         const Json* cp = get(j, "compatibility");
         const Json* cm = cp ? get(*cp, "model") : nullptr;
         static const bool chk = env_int("QE_STEER_MODEL_CHECK", 1);
-        if (chk && cm && cm->type == Json::Str && !placeholder(cm->str)) {
+        std::vector<std::string> want;
+        if (cm && cm->type != Json::Str && cm->type != Json::Arr)
+            throw std::runtime_error("steering: sidecar " + meta + ": compatibility.model must be a string or a list of strings");
+        if (cm && cm->type == Json::Str && !placeholder(cm->str)) want.push_back(cm->str);
+        if (cm && cm->type == Json::Arr)
+            for (auto& x : cm->arr) {
+                if (x.type != Json::Str)
+                    throw std::runtime_error("steering: sidecar " + meta + ": compatibility.model must be a string or a list of strings");
+                if (!placeholder(x.str)) want.push_back(x.str);
+            }
+        if (chk && !want.empty()) {
+            std::string id;
+            try {
+                Json cfg = Json::parse(read_file(model_dir + "/config.json"));
+                if (cfg.has("qengine_checkpoint") && cfg["qengine_checkpoint"].type == Json::Str) id = cfg["qengine_checkpoint"].str;
+            } catch (std::exception&) {
+            }
             std::string dn = model_dir;
+            if (char* rp = realpath(model_dir.c_str(), nullptr)) { dn = rp; free(rp); }  // "." or a link: the real name
             while (dn.size() > 1 && dn.back() == '/') dn.pop_back();
             dn = dn.substr(dn.find_last_of('/') + 1);
-            if (dn != cm->str && dn.find(cm->str) == std::string::npos && cm->str.find(dn) == std::string::npos)
-                mismatch("compatibility.model '" + cm->str + "', this checkpoint '" + dn + "'; QE_STEER_MODEL_CHECK=0 skips the name check");
+            bool ok = false;
+            for (auto& w : want)  // no id (older checkpoints): the directory name, a substring only from 8 characters on
+                ok = ok || (!id.empty() ? w == id
+                                        : (dn == w || dn.find(w) != std::string::npos || (dn.size() >= 8 && w.find(dn) != std::string::npos)));
+            std::string ws;
+            for (auto& w : want) ws += (ws.empty() ? "'" : ", '") + w + "'";
+            if (!ok)
+                mismatch("compatibility.model " + ws + ", this checkpoint " + (!id.empty() ? "id '" + id + "'" : "directory '" + dn + "'") +
+                         "; QE_STEER_MODEL_CHECK=0 skips this check");
         }
     }
     // tensors
@@ -437,12 +463,39 @@ inline SteerSpec steer_load(const std::string& spec_in, const std::string& meta_
 
 // the server's vector set: QE_STEER (one file, sidecar QE_STEER_META) and / or every *.gguf of QE_STEER_DIR (sidecar
 // next to it); names unique. *def: QE_STEER_DEFAULT by name, else the QE_STEER vector when it is the only one, else -1.
+// vectors that could not be loaded (file, reason): dropped with a warning, the server keeps running without them;
+// listed in /v1/steering and /api/stats ("dropped")
+inline std::vector<std::pair<std::string, std::string>>& steer_dropped() {
+    static std::vector<std::pair<std::string, std::string>> d;
+    return d;
+}
+inline void steer_drop(const std::string& file, const std::string& why) {
+    steer_dropped().push_back({file, why});
+    fprintf(stderr, "[steering] WARN: %s not loaded: %s (the server runs without it)\n", file.c_str(), why.c_str());
+}
 inline std::vector<SteerSpec> steer_load_env(int hidden, int layers, const std::string& model_dir, int* def) {
     std::vector<SteerSpec> v;
     *def = -1;
+    steer_dropped().clear();
     const char* one = env_str("QE_STEER");
     const char* dir = env_str("QE_STEER_DIR");
-    if (one && *one) v.push_back(steer_load(one, env_str("QE_STEER_META") ? env_str("QE_STEER_META") : "", hidden, layers, model_dir));
+    auto load = [&](const std::string& spec, const std::string& meta) {
+        try {
+            SteerSpec x = steer_load(spec, meta, hidden, layers, model_dir);
+            for (auto& y : v)
+                if (y.name == x.name) throw std::runtime_error("steering: two vectors named '" + x.name + "': " + y.file + " and " + x.file);
+            v.push_back(std::move(x));
+        } catch (std::exception& e) {
+            steer_drop(spec, e.what());
+        }
+    };
+    if (one && *one) {  // a lone QE_STEER file is an explicit request for that vector: it must load
+        try {
+            v.push_back(steer_load(one, env_str("QE_STEER_META") ? env_str("QE_STEER_META") : "", hidden, layers, model_dir));
+        } catch (std::exception& e) {
+            throw std::runtime_error(std::string("steering: QE_STEER ") + one + " cannot be used: " + e.what());
+        }
+    }
     if (dir && *dir) {
         std::vector<std::string> files;
         if (DIR* d = opendir(dir)) {
@@ -451,24 +504,26 @@ inline std::vector<SteerSpec> steer_load_env(int hidden, int layers, const std::
                 if (n.size() > 5 && n.substr(n.size() - 5) == ".gguf") files.push_back(std::string(dir) + "/" + n);
             }
             closedir(d);
+            if (files.empty()) steer_drop(dir, "no *.gguf in QE_STEER_DIR");
         } else {
-            throw std::runtime_error(std::string("steering: cannot open QE_STEER_DIR ") + dir);
+            steer_drop(dir, "cannot open QE_STEER_DIR");
         }
         std::sort(files.begin(), files.end());
-        if (files.empty()) throw std::runtime_error(std::string("steering: no *.gguf in QE_STEER_DIR ") + dir);
-        for (auto& f : files) v.push_back(steer_load(f, "", hidden, layers, model_dir));
+        for (auto& f : files) load(f, "");
     }
-    for (size_t a = 0; a < v.size(); a++)
-        for (size_t b = 0; b < a; b++)
-            if (v[a].name == v[b].name)
-                throw std::runtime_error("steering: two vectors named '" + v[a].name + "': " + v[b].file + " and " + v[a].file);
     if (const char* dn = env_str("QE_STEER_DEFAULT"); dn && *dn) {
         for (size_t a = 0; a < v.size(); a++)
             if (v[a].name == dn) *def = (int)a;
-        if (*def < 0 && strcmp(dn, "off") != 0) {
-            std::string names;
+        if (*def < 0 && strcmp(dn, "off") != 0) {  // the default was asked for explicitly: no silent unsteered start
+            std::string names, why;
             for (auto& x : v) names += (names.empty() ? "" : ", ") + x.name;
-            throw std::runtime_error(std::string("steering: QE_STEER_DEFAULT '") + dn + "' is not a loaded vector (" + names + ")");
+            for (auto& d : steer_dropped()) {
+                std::string stem = d.first.substr(d.first.find_last_of('/') + 1);
+                if (stem.size() > 5 && stem.substr(stem.size() - 5) == ".gguf") stem = stem.substr(0, stem.size() - 5);
+                if (stem == dn) why = ": " + d.second;
+            }
+            throw std::runtime_error(std::string("steering: QE_STEER_DEFAULT '") + dn + "' is not a loaded vector (loaded: " +
+                                     (names.empty() ? "none" : names) + ")" + why);
         }
     } else if (one && *one && v.size() == 1) {
         *def = 0;
@@ -501,6 +556,10 @@ inline std::string steer_info_json(const std::vector<SteerSpec>& v, int def) {
         o += (i ? ", " : "") + std::string("{\"name\": ") + json_str(x.name) + b + ", \"description\": " + json_str(x.description) +
              ", \"intended\": " + json_str(x.intended) + ", \"file\": " + json_str(x.file) + "}";
     }
+    o += "], \"dropped\": [";
+    for (size_t i = 0; i < steer_dropped().size(); i++)
+        o += (i ? ", " : "") + std::string("{\"file\": ") + json_str(steer_dropped()[i].first) + ", \"reason\": " +
+             json_str(steer_dropped()[i].second) + "}";
     return o + "]}";
 }
 

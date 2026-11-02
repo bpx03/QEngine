@@ -119,7 +119,7 @@ def rtn_int4(w, scale_dtype, search=True):
     cands = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75] if search else [1.0]
     best_err, best_s = None, None
     for c in cands:
-        s = (amax / 7.0 * c).to(scale_dtype).float()
+        s = (amax / 7.0 * c).to(scale_dtype).float().clamp_min(1e-30)
         qv = torch.clamp(torch.round(g / s), -8, 7)
         err = ((qv * s - g) ** 2).sum(-1, keepdim=True)
         if best_err is None:
@@ -141,14 +141,59 @@ def rtn_int4(w, scale_dtype, search=True):
 
 
 # ---------------------------------------------------------------- per-unit conversion
+QE_W8Q = os.environ.get("QE_W8Q", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "qe_w8q"))
+
+
+def int8_engine(w):
+    """w [N, K] bf16 -> (int8 [N, K], bf16 scales [N, K/128]) computed by the engine's own quantize_w8 kernel
+    (build/qe_w8q, GPU): the values load_w8 would produce at load, bit for bit"""
+    import subprocess, tempfile
+    N, K = w.shape
+    with tempfile.TemporaryDirectory() as td:
+        fi, fq, fs = (os.path.join(td, x) for x in ("w.bf16", "q.i8", "s.bf16"))
+        w.contiguous().view(torch.int16).numpy().tofile(fi)
+        subprocess.run([QE_W8Q, fi, fq, fs, str(N), str(K)], check=True)
+        import numpy as np
+        q = torch.from_numpy(np.fromfile(fq, dtype=np.int8).reshape(N, K).copy())
+        sc = torch.from_numpy(np.fromfile(fs, dtype=np.int16).reshape(N, K // 128).copy()).view(torch.bfloat16)
+    return q, sc
+
+
+def load_gptq(d, fn):
+    """precomputed calibrated tensors (tools/qfn_quant/qfn_gptq.py) or {}"""
+    if not d or not os.path.exists(os.path.join(d, fn)):
+        return {}
+    with safe_open(os.path.join(d, fn), "pt", device="cpu") as f:
+        return {k: f.get_tensor(k) for k in f.keys()}
+
+
 def conv_layer(args):
-    L, src_dir, dst_dir, nverify = args
+    L, src_dir, dst_dir, nverify, dense_dir, exp_dir, keep16, int8 = args
     t0 = time.time()
     torch.set_num_threads(6)
     S = Src(src_dir)
     pre = f"{P}layers.{L}."
     out, stats = {}, {}
-    # routed experts: lossless repack
+    dense = load_gptq(dense_dir, f"dense_L{L:02d}.safetensors")
+    # classes kept in BF16 (the engine stores them as INT8 g128 at load): drop their calibrated INT4 tensors
+    keep = {"linear_attn." + c for c in keep16 + int8}
+    dense = {k: v for k, v in dense.items() if k[len(pre):].rsplit(".", 1)[0] not in keep}
+    expg = load_gptq(exp_dir, f"experts_L{L:02d}.safetensors")
+    ln = os.path.join(dst_dir, f"experts-{L:02d}.safetensors")
+    if os.path.lexists(ln):  # a link of an earlier run would duplicate the expert tensors of this layer file
+        os.remove(ln)
+    if expg:
+        want = {"gate_up_proj.weight_packed": ((NE, 2 * I, H // 8), torch.int32), "gate_up_proj.weight_scale": ((NE, 2 * I, H // 128), torch.float16),
+                "down_proj.weight_packed": ((NE, H, I // 8), torch.int32), "down_proj.weight_scale": ((NE, H, I // 128), torch.float16)}
+        assert sorted(expg) == sorted(pre + "mlp.experts." + k for k in want), sorted(expg)
+        for k, (shp, dt) in want.items():
+            t = expg[pre + "mlp.experts." + k]
+            assert tuple(t.shape) == shp and t.dtype == dt, (k, t.shape, t.dtype)
+        # the experts file is linked into the checkpoint as is (relative link: the engine opens every .safetensors of
+        # the directory; names are unique), not copied into the layer file
+        os.symlink(os.path.relpath(os.path.join(exp_dir, f"experts_L{L:02d}.safetensors"), dst_dir), ln)
+        stats["experts"] = "linked " + os.path.basename(os.path.normpath(exp_dir))
+    # routed experts: lossless repack (unless calibrated GPTQ experts are given)
     gu_q = torch.empty(NE, 2 * I, H // 8, dtype=torch.int32)
     gu_s = torch.empty(NE, 2 * I, H // 128, dtype=torch.float16)
     dn_q = torch.empty(NE, H, I // 8, dtype=torch.int32)
@@ -162,10 +207,11 @@ def conv_layer(args):
             n = qw.shape[1]
             qd[e, r0:r0 + n] = qw.t()
             sd[e, r0:r0 + n] = sc.t()
-    out[pre + "mlp.experts.gate_up_proj.weight_packed"] = gu_q
-    out[pre + "mlp.experts.gate_up_proj.weight_scale"] = gu_s
-    out[pre + "mlp.experts.down_proj.weight_packed"] = dn_q
-    out[pre + "mlp.experts.down_proj.weight_scale"] = dn_s
+    if not expg:
+        out[pre + "mlp.experts.gate_up_proj.weight_packed"] = gu_q
+        out[pre + "mlp.experts.gate_up_proj.weight_scale"] = gu_s
+        out[pre + "mlp.experts.down_proj.weight_packed"] = dn_q
+        out[pre + "mlp.experts.down_proj.weight_scale"] = dn_s
     # bit-exactness check on sample experts (dequantized repack == dequantized original, fp32 exact)
     g = torch.Generator().manual_seed(L)
     ver = []
@@ -176,9 +222,9 @@ def conv_layer(args):
             n = ref.shape[0]
             mine = dequant_ours(qd[e, r0:r0 + n], sd[e, r0:r0 + n])
             ver.append(bool(torch.equal(ref, mine)))
-    stats["experts_verified"] = len(ver)
-    stats["experts_bitexact"] = all(ver)
-    # shared expert: RTN, fp16 scales (runs in the expert kernel); gate_up stacked like the experts
+    stats["experts_verified"] = len(ver) if not expg else 0
+    stats["experts_bitexact"] = all(ver) if not expg else None  # the AutoRound repack is not used with linked experts
+    # shared expert: RTN (or calibrated GPTQ), fp16 scales (runs in the expert kernel); gate_up stacked like the experts
     sh = {}
     for nm in ("gate_proj", "up_proj", "down_proj"):
         w = S.get(f"{pre}mlp.shared_expert.{nm}.weight")
@@ -189,12 +235,38 @@ def conv_layer(args):
     out[pre + "mlp.shared_expert.gate_up_proj.weight_scale"] = torch.cat([sh["gate_proj"][1], sh["up_proj"][1]])
     out[pre + "mlp.shared_expert.down_proj.weight_packed"] = sh["down_proj"][0]
     out[pre + "mlp.shared_expert.down_proj.weight_scale"] = sh["down_proj"][1]
+    for k, v in dense.items():  # calibrated GDN / shared expert / PLE replace the RTN tensors of the same names
+        base = k[len(pre):].rsplit(".", 1)[0]
+        if k in out:  # shared expert: same shape / dtype as the RTN tensors
+            assert out[k].shape == v.shape and out[k].dtype == v.dtype, (k, out[k].shape, v.shape, out[k].dtype, v.dtype)
+        else:  # GDN / PLE: shape from the BF16 source, bf16 scales, int32 packs
+            assert base in RTN_BF16, k
+            N, K = S.get(pre + base + ".weight").shape
+            if k.endswith(".weight_packed"):
+                assert tuple(v.shape) == (N, K // 8) and v.dtype == torch.int32, (k, v.shape, v.dtype)
+            else:
+                assert tuple(v.shape) == (N, K // 128) and v.dtype == torch.bfloat16, (k, v.shape, v.dtype)
+        out[k] = v
+    if dense:
+        stats["dense"] = "gptq: " + ",".join(sorted({k.split(pre)[-1].rsplit(".", 1)[0] for k in dense}))
     # everything else of the layer
     for k in S.keys(pre):
         rest = k[len(pre):]
         if rest.startswith("mlp.experts.") or rest.startswith("mlp.shared_expert.") or "ngram_embedding" in rest:
             continue
         base = rest[:-len(".weight")] if rest.endswith(".weight") else None
+        if base in keep and base.split(".")[-1] in int8:  # stored INT8 g128: the values the engine computes at load
+            q, sc = int8_engine(S.get(k))
+            out[pre + base + ".weight"] = q
+            out[pre + base + ".weight_scale"] = sc
+            stats[base] = "int8 g128 (engine quantize_w8)"
+            continue
+        if base in keep:
+            out[k] = S.get(k).contiguous()
+            stats[base] = "bf16 (INT8 at load)"
+            continue
+        if base in RTN_BF16 and pre + base + ".weight_packed" in dense:
+            continue
         if base in RTN_BF16:
             q, s, st = rtn_int4(S.get(k), torch.bfloat16)
             out[pre + base + ".weight_packed"] = q
@@ -285,6 +357,71 @@ def conv_base(args):
     return "base.safetensors", list(out.keys()), time.time() - t0
 
 
+def qengine_config(cfg, a, keep16, int8):
+    """the source config.json with AutoRound's quantization_config replaced by a description of these files.
+    quant_method "qengine": descriptive only (no loader should claim it; QEngine itself reads the formats from the
+    tensors), every quantised tensor class with its storage, scale dtype and layout"""
+    cfg.pop("quantization_config", None)
+    old_id = None
+    try:
+        old_id = json.load(open(os.path.join(a.dst, "config.json"))).get("qengine_checkpoint")
+    except Exception:
+        pass
+    if a.checkpoint_id:  # identity for steering-vector sidecars (compatibility.model; src/steer.h)
+        cfg["qengine_checkpoint"] = a.checkpoint_id
+    elif old_id:
+        cfg["qengine_checkpoint"] = old_id
+        print(f"keeping qengine_checkpoint {old_id} of the existing config.json (--checkpoint-id sets another)")
+    cfg["qengine_quant_calibrated"] = {"dense_gptq": bool(a.dense_gptq), "experts_gptq": bool(a.experts_gptq),
+                                       "bf16_int8_at_load": a.keep_bf16}
+    gdn = [c for c in ("in_proj_qkv", "in_proj_z", "out_proj")]
+    dense4 = [c for c in ("linear_attn." + g for g in gdn) if c.split(".")[-1] not in keep16 + int8]
+    ple4 = ["ple.key_proj", "ple.value_proj"]
+    cfg["qengine_quant"] = {
+        "experts": ("linked per-layer files from " + os.path.basename(os.path.normpath(a.experts_gptq))) if a.experts_gptq
+                   else "Intel AutoRound INT4, lossless repack",
+        ("dense_gptq_int4" if a.dense_gptq else "dense_rtn_int4"): dense4 + ple4 + ["mlp.shared_expert"],
+        "int8_g128": ["linear_attn." + c for c in int8],
+        "bf16_in_files_int8_at_load": ["linear_attn." + c for c in keep16] +
+                                      ["self_attn.q/k/v/o_proj", "lm_head", "mlp.gate (router)", "hyper_connection mix matrices",
+                                       "mtp self_attn / fc (BF16 copies in mtp.safetensors)"],
+        "bf16": "embed_tokens, norms, gates, linear_attn in_proj_a/b / conv1d / A_log / dt_bias, indexer, vision",
+        "ngram_table": "ngram_int8.safetensors: per row 160 x int8 then an fp16 scale (x = q * scale)",
+    }
+    g = lambda bits, sdt: {"num_bits": bits, "type": "int", "symmetric": True, "strategy": "group", "group_size": 128,
+                           "dynamic": False, "scale_dtype": sdt}
+    groups = {
+        "int4_experts": {"targets": ["re:model\\.language_model\\.layers\\.\\d+\\.mlp\\.experts\\.(gate_up|down)_proj$"],
+                         "weights": g(4, "float16"),
+                         "layout": "512 experts stacked per layer: int32 [512, N, K/8] (u = q + 8, LSB first) + fp16 scales "
+                                   "[512, N, K/128]; gate_up = gate rows then up rows"},
+        "int4_shared_expert": {"targets": ["re:.*\\.mlp\\.shared_expert\\.(gate_up|down)_proj$"], "weights": g(4, "float16"),
+                               "layout": "int32 [N, K/8] + fp16 scales [N, K/128]; gate_up = gate rows then up rows "
+                                         "(trunk and MTP block)"},
+        "int4_dense": {"targets": ["re:model\\.language_model\\.layers\\.\\d+\\.(" + "|".join(c.replace(".", "\\.") for c in dense4 + ple4) + ")$"],
+                       "weights": g(4, "bfloat16"), "layout": "int32 [N, K/8] (u = q + 8, LSB first) + bf16 scales [N, K/128]"},
+        "int4_mtp": {"targets": ["re:mtp\\.(layers\\.0\\.self_attn\\.(q|k|v|o)_proj|fc_embedding|fc_hidden)$"], "weights": g(4, "bfloat16"),
+                     "layout": "mtp-int4.safetensors, int32 [N, K/8] + bf16 scales [N, K/128] (QEngine runs the BF16 copies "
+                               "of these from mtp.safetensors as INT8)"},
+        "int8_ngram": {"targets": ["re:.*\\.ple_embedding\\.ngram_q8\\.shard_\\d+$"],
+                       "weights": {"num_bits": 8, "type": "int", "symmetric": True, "strategy": "channel", "dynamic": False,
+                                   "scale_dtype": "float16"},
+                       "layout": "uint8 rows of 162 bytes: 160 x int8 then the row's fp16 scale"},
+    }
+    if int8:
+        groups["int8_gdn"] = {"targets": ["re:.*\\.linear_attn\\.(" + "|".join(int8) + ")$"], "weights": g(8, "bfloat16"),
+                              "layout": "int8 [N, K] (levels -127..127) + bf16 scales [N, K/128]"}
+    cfg["quantization_config"] = {
+        "quant_method": "qengine",
+        "note": "descriptive only: these files are for QEngine (github.com/bpx03/QEngine), which reads the formats from the "
+                "tensors; group naming follows compressed-tensors where it fits",
+        "config_groups": groups,
+        "ignore": ["lm_head", "re:.*\\.self_attn\\.(q|k|v|o)_proj$", "re:.*hyper_connection.*", "re:.*\\.mlp\\.gate$",
+                   "re:.*embed_tokens$"],
+    }
+    return cfg
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=SRC)
@@ -296,7 +433,29 @@ def main():
     ap.add_argument("--mtp-int4", action="store_true", help="also write mtp-int4.safetensors: RTN INT4 MTP experts/shared (fp16 "
                     "scales, stacked like the trunk) + attention/fc (default: only the BF16 passthrough mtp.safetensors)")
     ap.add_argument("--skip-base", action="store_true")
+    ap.add_argument("--dense-gptq", default="", help="dir of dense_L<l>.safetensors (tools/qfn_quant/qfn_gptq.py dense): "
+                    "calibrated GPTQ INT4 GDN in/out, shared expert, PLE k/v instead of RTN")
+    ap.add_argument("--keep-bf16", default="", help="comma list of dense tensors kept BF16 (engine: INT8 g128 at load), "
+                    "e.g. out_proj or in_proj_qkv,in_proj_z,out_proj (the engine takes in_proj_qkv and in_proj_z together)")
+    ap.add_argument("--int8", default="", help="comma list of GDN projections stored as INT8 g128 (int8 .weight + bf16 "
+                    ".weight_scale [N, K/128], symmetric, levels -127..127): out_proj and / or in_proj_qkv,in_proj_z; the values "
+                    "are computed with the engine's quantize_w8 kernel (build/qe_w8q, needs a GPU), so they equal what the "
+                    "engine would compute at load from BF16")
+    ap.add_argument("--checkpoint-id", default="", help="config.json qengine_checkpoint: the identity steering-vector "
+                    "sidecars name in compatibility.model (e.g. bpx03/Qwen3.8-Flash-Next-QEngine@1.3.4.1)")
+    ap.add_argument("--config-only", action="store_true", help="only rewrite DST/config.json (description of the files)")
+    ap.add_argument("--index-from", default="", help="checkpoint dir whose index entries for the files not written here "
+                    "(base, vision, MTP, n-gram; with --skip-base / --skip-mtp) are merged into this index (server/vision.py "
+                    "resolves tensors through it)")
+    ap.add_argument("--experts-gptq", default="", help="dir of experts_L<l>.safetensors (qfn_gptq.py experts): calibrated "
+                    "GPTQ INT4 routed experts from the BF16 checkpoint instead of the AutoRound repack")
     a = ap.parse_args()
+    keep16 = tuple(c for c in a.keep_bf16.split(",") if c)
+    int8 = tuple(c for c in a.int8.split(",") if c)
+    for lst, nm in ((keep16, "--keep-bf16"), (int8, "--int8")):
+        assert set(lst) <= {"out_proj", "in_proj_qkv", "in_proj_z"} and (("in_proj_qkv" in lst) == ("in_proj_z" in lst)), \
+            f"{nm} {','.join(lst)}: allowed: out_proj, in_proj_qkv + in_proj_z (together)"
+    assert not set(keep16) & set(int8), "a tensor in both --keep-bf16 and --int8"
     os.makedirs(a.dst, exist_ok=True)
     S = Src(a.src)
     ngram_files = sorted({f for k, f in S.where.items() if "ngram_embedding" in k})
@@ -323,16 +482,16 @@ def main():
     if os.path.exists(off):
         shutil.copy(os.path.join(a.src, "tokenizer.json"), os.path.join(a.dst, "tokenizer.autoround.json"))
         shutil.copy(off, os.path.join(a.dst, "tokenizer.json"))
-    # config: drop the AutoRound quantization_config, describe ours
-    cfg = json.load(open(os.path.join(a.src, "config.json")))
-    cfg.pop("quantization_config", None)
-    cfg["qengine_quant"] = {"format": "pack-quantized-int4-sym-g128", "experts": "AutoRound lossless repack, fp16 scales",
-                            "dense_rtn": list(RTN_BF16) + ["shared_expert"] + (["mtp"] if a.mtp_int4 else []), "bf16_kept": "qsa q/k/v/o, mtp, hc, router, lm_head, embed, indexer, gates, norms"}
+    cfg = qengine_config(json.load(open(os.path.join(a.src, "config.json"))), a, keep16, int8)
+    if a.config_only:
+        json.dump(cfg, open(os.path.join(a.dst, "config.json"), "w"), indent=1)
+        print("config.json rewritten")
+        return
     json.dump(cfg, open(os.path.join(a.dst, "config.json"), "w"), indent=1)
 
     t0 = time.time()
     with ProcessPoolExecutor(a.workers) as ex:
-        futs = [ex.submit(conv_layer, (L, a.src, a.dst, a.verify)) for L in layers]
+        futs = [ex.submit(conv_layer, (L, a.src, a.dst, a.verify, a.dense_gptq, a.experts_gptq, keep16, int8)) for L in layers]
         fb = None if a.skip_base else ex.submit(conv_base, (a.src, a.dst))
         fm = None if a.skip_mtp else ex.submit(conv_mtp if a.mtp_int4 else conv_mtp_bf16, (a.src, a.dst))
         fm2 = ex.submit(conv_mtp_bf16, (a.src, a.dst)) if (a.mtp_int4 and not a.skip_mtp) else None
@@ -340,8 +499,11 @@ def main():
             L, fn, keys, st, dt = fu.result()
             for k in keys:
                 wmap[k] = fn
+            if st.get("experts", "").startswith("gptq"):
+                for k in ("gate_up_proj.weight_packed", "gate_up_proj.weight_scale", "down_proj.weight_packed", "down_proj.weight_scale"):
+                    wmap[f"{P}layers.{L}.mlp.experts.{k}"] = f"experts-{L:02d}.safetensors"
             report["layers"][str(L)] = st
-            print(f"layer {L:2d} {dt:6.1f}s bitexact={st['experts_bitexact']} ({st['experts_verified']} matrices)", flush=True)
+            print(f"layer {L:2d} {dt:6.1f}s bitexact={st['experts_bitexact']} ({st['experts_verified']} matrices) {st.get('experts', '')} {st.get('dense', '')}", flush=True)
         if fb:
             fn, keys, dt = fb.result()
             for k in keys:
@@ -357,6 +519,10 @@ def main():
             fn, keys, _, dt = fm2.result()
             for k in keys:
                 wmap.setdefault(k, fn)
+    if a.index_from:
+        for k, f in json.load(open(os.path.join(a.index_from, "model.safetensors.index.json")))["weight_map"].items():
+            if k not in wmap and not f.startswith("layer-"):
+                wmap[k] = f
     json.dump({"metadata": {}, "weight_map": wmap}, open(idx_path, "w"), indent=1)
     json.dump(report, open(rep_path, "w"), indent=1)
     print(f"done in {time.time() - t0:.0f}s")

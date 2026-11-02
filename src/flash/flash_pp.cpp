@@ -1579,7 +1579,7 @@ std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vec
                 S[s]->set_expert_prior(prior);
                 S[s]->set_draft_vocab(draft_ids);
                 S[s]->set_pp_rx(rx[s]);
-                if (mine.size() > 1) S[s]->set_card_share(1.0 / (double)(mine.size() - j));
+                if (mine.size() > 1) { S[s]->set_card_share(1.0 / (double)(mine.size() - j)); S[s]->set_card_workers((int)mine.size()); }
                 if (s < (int)views.size()) S[s]->set_views(views, s);  // the TP rank on this card
                 S[s]->load(st, ht, s == n - 1 ? mst : nullptr);
                 S[s]->alloc_state();
@@ -1723,7 +1723,7 @@ std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups,
                 W[i]->set_expert_prior(prior);
                 W[i]->set_draft_vocab(draft_ids);
                 W[i]->set_pp_rx(rx[i]);
-                if (mine.size() > 1) W[i]->set_card_share(1.0 / (double)(mine.size() - j));
+                if (mine.size() > 1) { W[i]->set_card_share(1.0 / (double)(mine.size() - j)); W[i]->set_card_workers((int)mine.size()); }
                 W[i]->load(st, ht, s == n - 1 ? mst : nullptr);
                 W[i]->alloc_state();
             }

@@ -46,6 +46,12 @@ int main() {
     while (c.skip()) skipped++;
     EXPECT(skipped == kCoolSteps);
 
+    // graph memory estimate: never below the measured cost on the 3090s
+    struct M { size_t nodes; double mb; };
+    for (M m : {M{1166, 10.0}, M{1286, 12.0}, M{1080, 8.0}, M{6100, 46.0}, M{5996, 42.0}, M{1463, 10.0}, M{41, 0.0}})
+        EXPECT(est_bytes(m.nodes, 0) >= (size_t)(m.mb * 1048576.0));
+    EXPECT(est_bytes(6100, 0) < (size_t)56 << 20);  // and not far above it (the budget holds as many as it can)
+
     if (fails) return 1;
     printf("graph_oom_unit: ok\n");
     return 0;

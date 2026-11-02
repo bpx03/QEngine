@@ -385,7 +385,7 @@ int main(int argc, char** argv) {
                     W[r]->set_cold(cold);
                     W[r]->set_expert_prior(prior);
                     W[r]->set_draft_vocab(draft_ids);
-                    if (mine.size() > 1) W[r]->set_card_share(1.0 / (double)(mine.size() - j));
+                    if (mine.size() > 1) { W[r]->set_card_share(1.0 / (double)(mine.size() - j)); W[r]->set_card_workers((int)mine.size()); }
                     W[r]->load(st, ht, use_mtp ? &mst : nullptr);
                     nw[r] = W[r]->nallocs();
                     W[r]->alloc_state();
@@ -521,7 +521,7 @@ int main(int argc, char** argv) {
                 std::vector<int> ids;
                 for (auto& x : split(sl, ',')) if (!x.empty() && x != "\n") ids.push_back(atoi(x.c_str()));
                 const int n = ids.size();
-                N = std::min(N, n - 1);
+                N = std::min(N, env_int("FLASH_TF_ROW0", 0) ? n : n - 1);  // FLASH_TF_ROW0=1: also row 0 (no prefill), KL harness
                 const int np0 = n - N;
                 pp.all([](int, Worker* w) { w->reset(); });
                 if (np0 > 0) pp.prefill(ids.data(), np0, pps.mb, [&](int t0, int m, bf16* o) { ngram_rows(ht, ids, t0, m, o); }, false);
@@ -837,7 +837,7 @@ int main(int argc, char** argv) {
             std::vector<int> ids;
             for (auto& x : split(sl, ',')) if (!x.empty() && x != "\n") ids.push_back(atoi(x.c_str()));
             const int n = ids.size();
-            N = std::min(N, n - 1);
+            N = std::min(N, env_int("FLASH_TF_ROW0", 0) ? n : n - 1);  // FLASH_TF_ROW0=1: also row 0 (no prefill), KL harness
             for (int r = 0; r < ng; r++) W[r]->reset();
             hist.clear();
             const int np0 = n - N;

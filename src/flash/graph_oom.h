@@ -21,6 +21,24 @@ namespace graph_oom {
 
 constexpr int kCoolSteps = 64;  // graph captures skipped after a failed retry
 
+// device memory of an instantiated graph executable, estimated from its nodes (child-graph bodies included; a
+// conditional node's body is not reachable through the runtime API). Measured on RTX 3090 / CUDA 13.1 / driver
+// 615.71 (54 fresh instantiates): 7.0-7.7 KB per node, taken in 2 MB steps
+// (decode / batched / speculative graphs ~1,100-1,300 nodes = 8-12 MB, a big prefill batch up to 6,100 nodes = 46 MB).
+// 8 KB per node + one 2 MB step: never below the measured cost, so the budget is not overrun
+constexpr size_t kNodeBytes = 8192, kGraphBytes = (size_t)2 << 20;
+inline size_t est_bytes(size_t nodes, size_t /*kernels*/) { return kGraphBytes + nodes * kNodeBytes; }
+
+// the graph budget of a card in MB (FLASH_GRAPH_MB), added to the expert budget's margin at load. Agent traffic on
+// 3 cards (1.3.4-rc2 gate shape) keeps ~17 decode-side graphs (~170 MB) plus the 4 big prefill batch graphs of the
+// newest prompt lengths (up to 46 MB each); 256 MB holds the decode set and the newest prefill batches, older prefill
+// batch graphs (one prompt length each, rarely replayed) are destroyed first
+constexpr int kGraphMbDefault = 256;
+// the part of the graph budget charged to FLASH_EC_MARGIN_MB (at most half of it), where every graph lived up to
+// 1.3.4; the rest is added to the margin. At the peak of the hermes-like stress the full budget on top left 262 MB
+// free on GPU0 (the user margin untouched), and 2 cards lost 1.6 % decode (c=1) to it against 0.5 % on 3 cards
+constexpr int kGraphInMarginMb = 128;
+
 // "3,7, 12" -> {3, 7, 12}; empty / null -> {}; junk entries are skipped
 inline std::vector<int> parse_list(const char* s) {
     std::vector<int> v;

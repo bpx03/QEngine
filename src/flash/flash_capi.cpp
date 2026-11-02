@@ -2260,9 +2260,10 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         if (par == flash_pp::Par::PP && !e->steer.empty()) {
             fprintf(stderr, "qflash: FLASH_PAR=pp: steering vectors are not supported by the pipeline stages: not loaded (requests "
                     "asking for steering are refused)\n");
+            for (auto& x : e->steer) steer_drop(x.file, "FLASH_PAR=pp: steering vectors are not supported by the pipeline stages");
             e->steer.clear();
             e->steer_def = -1;
-            e->steer_json = "{\"default\": null, \"vectors\": []}";
+            e->steer_json = steer_info_json(e->steer, e->steer_def);
             qe_set_steering_ex(e, -1, 1.f, -1, -1, -1);
         }
         if (par == flash_pp::Par::PP && env_set("QE_P2P") && !env_int("QE_P2P", 1) && !env_set("FLASH_PP_P2P"))
@@ -2392,7 +2393,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                     e->W[r]->set_cold(cold);
                     e->W[r]->set_expert_prior(prior);
                     e->W[r]->set_draft_vocab(draft_ids);
-                    if (mine.size() > 1) e->W[r]->set_card_share(1.0 / (double)(mine.size() - j));
+                    if (mine.size() > 1) { e->W[r]->set_card_share(1.0 / (double)(mine.size() - j)); e->W[r]->set_card_workers((int)mine.size()); }
                     const double a = secs();
                     e->W[r]->load(e->st, e->ht, &e->mst);
                     const double b = secs();
@@ -2421,6 +2422,8 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         e->steer_json = steer_info_json(e->steer, e->steer_def);
         for (auto& x : e->steer) x.w.clear();
         fprintf(stderr, "steering: %d vector(s), default %s\n", nv, e->steer_def >= 0 ? e->steer[e->steer_def].name.c_str() : "off");
+    } else {
+        e->steer_json = steer_info_json(e->steer, e->steer_def);  // no vector: still lists the dropped ones
     }
     ng_th.join();
     for (int i = 0; i < 128; i++) {
@@ -4234,6 +4237,44 @@ void qe_pool_counters(void* p, long long* out) {
 
 // the host-RAM plan of this run (host_budget.h) as JSON: MemTotal / MemAvailable at boot, reserve, each consumer's
 // planned size, what was reduced and why, warnings; the bytes written (without the 0), -1: buffer too small
+// cached CUDA graphs per card as JSON (graph budget FLASH_GRAPH_MB, /api/stats "graphs"): estimated MB now and at
+// the peak, the budget, graphs destroyed to stay in it (the budget) / for any reason, graphs larger than the budget,
+// instantiate out-of-memory events, steps run eagerly after a failed retry. Lock-free (atomic counters): safe while
+// the engine runs. Returns the length, -1 if buf is too small.
+int qe_graph_info(void* p, char* buf, int n) {
+    FE* e = (FE*)p;
+    struct C { long long est = 0, peak = 0, bud = 0, fit = 0, ev = 0, big = 0, oom = 0, eager = 0, pfe = 0, pfn = 0; };
+    std::map<int, C> card;
+    for (const Worker* w : e->W) {
+        if (!w) continue;
+        C& c = card[w->device()];
+        c.est += (long long)w->gbytes_.load(std::memory_order_relaxed);
+        c.peak += (long long)w->gpeak_.load(std::memory_order_relaxed);
+        c.bud += (long long)w->gbudget_;
+        c.fit += w->gfit_.load(std::memory_order_relaxed);
+        c.ev += w->graphs_evicted_.load(std::memory_order_relaxed);
+        c.big += w->gbig_.load(std::memory_order_relaxed);
+        c.oom += w->graph_oom_.load(std::memory_order_relaxed);
+        c.eager += w->graph_eager_.load(std::memory_order_relaxed);
+        c.pfe += w->pf_eager_.load(std::memory_order_relaxed);
+        c.pfn += w->pf_noroom_.load(std::memory_order_relaxed);
+    }
+    std::string j = "{\"cards\":[";
+    char b[384];
+    bool first = true;
+    for (auto& [d, c] : card) {
+        snprintf(b, sizeof b, "%s{\"gpu\":%d,\"est_mb\":%.1f,\"peak_mb\":%.1f,\"budget_mb\":%.1f,\"budget_evictions\":%lld,"
+                 "\"evicted\":%lld,\"too_big\":%lld,\"oom\":%lld,\"eager\":%lld,\"pf_eager\":%lld,\"pf_noroom\":%lld}", first ? "" : ",",
+                 d, c.est / 1048576.0, c.peak / 1048576.0, c.bud / 1048576.0, c.fit, c.ev, c.big, c.oom, c.eager, c.pfe, c.pfn);
+        j += b;
+        first = false;
+    }
+    j += "]}";
+    if (!buf || n <= (int)j.size()) return -1;
+    memcpy(buf, j.c_str(), j.size() + 1);
+    return (int)j.size();
+}
+
 int qe_host_mem_info(void* p, char* buf, int n) {
     const std::string& j = ((FE*)p)->hb_json;
     if (!buf || n <= (int)j.size()) return -1;

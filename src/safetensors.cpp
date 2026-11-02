@@ -33,6 +33,16 @@ void SafeTensors::open(const std::string& path) {
         size_t b = v["data_offsets"][0].i(), e = v["data_offsets"][1].i();
         t.data = data + b;
         t.nbytes = e - b;
+        // a name in two files is allowed only with identical content (MTP: mtp.safetensors and mtp-int4 both carry the
+        // unquantised tensors); a differing duplicate (e.g. a stale expert link next to a re-converted layer file)
+        // would otherwise override silently, depending on the directory order
+        auto it = tensors_.find(name);
+        if (it != tensors_.end() && (it->second.dtype != t.dtype || it->second.shape != t.shape ||
+                                     it->second.nbytes != t.nbytes || memcmp(it->second.data, t.data, t.nbytes) != 0)) {
+            size_t off = 0;
+            throw std::runtime_error("tensor " + name + " in both " + file_of(it->second.data, &off) + " and " + path +
+                                     " with different content");
+        }
         tensors_[name] = t;
     }
 }

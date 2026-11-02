@@ -17,6 +17,14 @@ _SIGS = {
     "qe_capture": (ctypes.c_int, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int,
                                   ctypes.POINTER(ctypes.c_float)]),
 }
+def _dropped_note(info, name):
+    """the start-up drop reason of a vector (by name: the file stem), or of all dropped vectors, for an error message"""
+    d = info.get("dropped") or []
+    if name is not None:
+        d = [x for x in d if x.get("file", "").rsplit("/", 1)[-1].rsplit(".", 1)[0] == name or x.get("file", "").endswith("=" + name)]
+    return ("; dropped at start: " + "; ".join("%s (%s)" % (x.get("file"), x.get("reason")) for x in d)) if d else ""
+
+
 DEFAULT = (-2, 1.0, -1, -1, -1)  # the server default vector with its defaults
 OFF = (-1, 1.0, -1, -1, -1)
 
@@ -36,8 +44,8 @@ class SteeringMixin:
         modes: {add|project: {layers, scale}}, description, intended, file}]}"""
         f = self._steer_fn("qe_steer_info")
         if f is None:
-            return {"default": None, "vectors": []}
-        return json.loads(f(self.h).decode())
+            return {"default": None, "vectors": [], "dropped": []}
+        return json.loads(f(self.h).decode("utf-8", "replace"))
 
     def set_steering(self, vec=-2, scale=1.0, mode=-1, lo=-1, hi=-1):
         """Steering of the next start: vector index (steer_info order), -1 off, -2 the server default; scale
@@ -77,7 +85,11 @@ def resolve_steering(info, body):
     "layers": [lo, hi]}: that vector; the scale multiplies the mode's sidecar scale, mode and layers default to the
     sidecar's (the layers to the chosen mode's default range) and the layers must lie in the vector's file. info: the
     engine's steer_info(). Raises ValueError (HTTP 400) for an unknown name or a bad value."""
-    if "steering" not in body or body["steering"] is True:
+    if "steering" not in body:
+        return DEFAULT
+    if body["steering"] is True:
+        if info.get("default") is None:
+            raise ValueError('"steering": true, but the server has no default vector%s' % _dropped_note(info, None))
         return DEFAULT
     st = body["steering"]
     if st is False or st is None:
@@ -98,7 +110,7 @@ def resolve_steering(info, body):
             raise ValueError('"steering": no default vector; name one of: %s' % (", ".join(names) or "(none loaded)"))
         name = info["default"]
     if name not in names:
-        raise ValueError('unknown steering vector "%s"; loaded: %s' % (name, ", ".join(names) or "(none)"))
+        raise ValueError('unknown steering vector "%s"; loaded: %s%s' % (name, ", ".join(names) or "(none)", _dropped_note(info, name)))
     v = vecs[names.index(name)]
     scale = st.get("scale", 1.0)
     if isinstance(scale, bool) or not isinstance(scale, (int, float)) or scale != scale or abs(scale) == float("inf"):

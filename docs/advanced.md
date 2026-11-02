@@ -293,7 +293,11 @@ tokens actually computed (cached prefix tokens excluded).
 `/api/stats` counters (monitoring port): `thinking` (`requests_with_budget`, `forced_budget`, `forced_max_tokens`,
 `forced_failed`, `empty_replies`, `empty_stop`, `empty_length`, `empty_after_forced_close`, `empty_retried`,
 `empty_retry_recovered`, `empty_retry_exhausted`), `history` (reasoning-only turns left out), `parallel` (Flash-Next
-mode, reason, probe numbers).
+mode, reason, probe numbers), `graphs` (Flash-Next cached CUDA graphs per card: `est_mb`, `peak_mb`, `budget_mb`,
+`budget_evictions`, `evicted`, `too_big`, `oom`, `eager`, `pf_eager` (prompt steps run without a graph because their
+shape did not come back within `FLASH_PFGRAPH_WINDOW`), `pf_noroom` (prompt steps without a graph because the decode
+graphs keep the room); a fast-growing `budget_evictions` under steady traffic means
+`FLASH_GRAPH_MB` is too small for the working set).
 
 ### Failure handling and host memory
 
@@ -361,8 +365,11 @@ needed is in this repository plus Intel's checkpoint (169 GB download):
 ```bash
 # 1. Intel's INT4 AutoRound checkpoint
 hf download Intel/Qwen3.8-Flash-Next-W4A16-AutoRound --local-dir models/Qwen3.8-Flash-Next-W4A16-AutoRound
-# 2. convert -> models/Qwen3.8-Flash-Next-QE-INT4 (experts repacked, dense parts RTN INT4 / BF16, INT4 MTP head)
-python3 tools/convert_flash_next.py --mtp-int4
+# 2. convert -> models/Qwen3.8-Flash-Next-QE-INT4 (experts repacked, DeltaNet projections INT8 g128, other dense
+#    parts RTN INT4 / BF16, INT4 MTP head). --int8 computes the INT8 values with the engine's own kernel
+#    (build/qe_w8q, needs one GPU), so they equal what the engine would compute from BF16
+cmake --build build --target qe_w8q
+python3 tools/convert_flash_next.py --mtp-int4 --int8 in_proj_qkv,in_proj_z,out_proj
 # 3. INT8 n-gram table -> models/Qwen3.8-Flash-Next-QE-INT4/ngram_int8.safetensors (51.8 GB)
 python3 tools/convert_ngram_int8.py
 # 4. the three small files (shipped in data/flash-next/)
@@ -374,11 +381,17 @@ rm -rf models/Qwen3.8-Flash-Next-W4A16-AutoRound
 rm models/Qwen3.8-Flash-Next-QE-INT4/model-00016-of-00017.safetensors
 ```
 
+The Hugging Face download differs from this build in one step: its shared expert and n-gram key/value projections
+are INT4 calibrated with GPTQ on our own calibration text instead of round-to-nearest (next-token KL against BF16 on
+the reference set in [Quality](../README.md#quality): 0.119 for the download; with round-to-nearest for those two
+classes we measured 0.145). Without `--int8` the DeltaNet projections are INT4 as well, which is the 1.3.4 format
+(0.267; about 4-5 % faster decode, up to 9 % at one request, about 1 GB smaller).
+
 `convert_flash_next.py` links the n-gram shard of the download (`model-00016-of-00017.safetensors`, 102 GB) into the
 converted directory; `convert_ngram_int8.py` reads it once. The engine uses the INT8 table when
 `ngram_int8.safetensors` is present. Skip step 5 to keep the BF16 table (`FLASH_NGRAM=bf16`, needs the shard and
 102 GB of pinned RAM). In Docker, a kept BF16 shard link must resolve inside the container: mount the download at the
-same absolute path too. The converted directory is about 67 GB plus 52 GB for the INT8 table.
+same absolute path too. The converted directory is about 68 GB plus 52 GB for the INT8 table.
 
 The three small files are optional (without them: full-vocabulary drafting, cold groups chosen by index):
 
@@ -429,7 +442,9 @@ The log shows one line per vector (`steering: <file>, mode=â€¦, layers lo..hi â€
   behaviour change it is meant to cause), `mode` (`"add"` or `"project"`, the default mode). Optional: `name`,
   `description`, `scale` (default 1), `layer_range` `[lo, hi]`, `per_layer_strength` `{"L": alpha}`, `modes`
   (`{"<other mode>": {"layer_range", "scale", "per_layer_strength"}}`), `hidden_size`, `compatibility.model`
-  (checkpoint directory name), `vector_file_sha256` (checked when present), `dir` (only `"per-layer"`).
+  (one checkpoint or a list: matched against the checkpoint's `qengine_checkpoint` in its `config.json`, e.g.
+  `bpx03/Qwen3.8-Flash-Next-QEngine@1.3.4.1`; checkpoints without that field are matched by directory name),
+  `vector_file_sha256` (checked when present), `dir` (only `"per-layer"`).
 
 Per row and per layer `L` in the selected range, with `h` the residual after layer `L`:
 
@@ -439,8 +454,12 @@ Per row and per layer `L` in the selected range, with `h` the residual after lay
 
 The engine refuses a file with another architecture or GGUF version, a wrong shape or dtype, non-finite values,
 missing or repeated layers, a missing sidecar or one without `direction` / `effects.intended`, an unknown mode, a
-negative project strength, a sha256 mismatch, or a vector measured on another checkpoint (`QE_STEER_MODEL_CHECK=0`
-skips the name check).
+negative project strength, a sha256 mismatch, a name already loaded, or a vector measured on another checkpoint
+(`QE_STEER_MODEL_CHECK=0` skips that check). A refused vector is not loaded, and the server starts without it: one
+`[steering] WARN` line in the log says which file and why, and `GET /v1/steering` and `/api/stats` (`steering`) list it
+under `dropped`. A vector asked for explicitly (`QE_STEER_DEFAULT`, Docker `QE_STEERING=<name>` or `1`, a lone
+`QE_STEER` file) that cannot be loaded stops the start with one message instead; a request naming a dropped vector
+gets a 400 with the reason. Own vectors: add the checkpoint's `qengine_checkpoint` to `compatibility.model`.
 
 ### Per-request selection
 
@@ -556,8 +575,8 @@ greedy agreement and MTP acceptance, needles found at 5K-200K tokens.
 | Prefill errors, NaN or garbage output only on long prompts, only on P2P | The P2P link may corrupt data in ways the startup check did not catch. | `FLASH_COMM=ce` (copy engine) as a workaround; compare with `FLASH_COMM=push` and `FLASH_COMM=pull` to find which P2P direction is at fault; `FLASH_COMM=host` as the last resort. Please report it with the `[comm]` startup lines. |
 | `[qflash] FAULT non-finite values in the forward ...`; the request gets an error (HTTP 500 or an `error` event in a stream) | The output-head guard (`FLASH_GUARD=1`, default) caught non-finite values before they became tokens. The request fails, its conversation is dropped from the cache, the server goes on. | Note the prompt and the log lines and report them. The same fault repeated (same tokens, position and step) counts once; more than `FLASH_GUARD_MAX` (default 4) distinct faults within 5 minutes stop the process so a supervisor can restart it. `FLASH_GUARD=2` only logs, `FLASH_GUARD=3` stops at the first fault (for debugging), `0` turns the guard off. |
 | Non-finite values that appear only in long-prompt prefill | Possibly the prefill attention with block selection. | Diagnostic only: `FLASH_ATTN_PFSEL=0` uses the per-row prefill attention kernel (slower at long prompts). If that fixes it, please report it. |
-| `graph instantiate out of memory (N MB free): dropped K cached graphs, retrying` | A CUDA graph for a new conversation shape did not fit next to the expert cache. The engine dropped its cached graphs and retried. | Nothing; graphs are rebuilt as needed. |
-| `graph instantiate still out of memory (...): this step and the next 64 new shapes run without graphs` | The retry did not fit either; those steps run without a graph (same output, slower only for those steps). | If it shows up often, raise `FLASH_EC_MARGIN_MB` on that card (e.g. `512`), at a small cost in decode and prefill speed. |
+| `graph instantiate out of memory (N MB free): dropped K cached graphs, retrying` | A CUDA graph for a new conversation shape did not fit next to the expert cache. The engine dropped its cached graphs and retried. Since 1.3.4.1 the graphs have their own room (`FLASH_GRAPH_MB`), so this should be rare. | Nothing; graphs are rebuilt as needed. If it repeats, raise `FLASH_GRAPH_MB`. |
+| `graph instantiate still out of memory (...): this step and the next 64 new shapes run without graphs` | The retry did not fit either; those steps run without a graph (same output, slower only for those steps). | If it shows up often, raise `FLASH_GRAPH_MB` (default 256 per card, e.g. `384`), at a small cost in decode and prefill speed. |
 | `graph instantiate out of memory ...: freed the 64 MB emergency reserve, retrying`, then `dropped K of N cached graphs (least recently used), retrying` / `still out of memory: dropped the other ...` | Since 1.3.4 the engine first gives up a small reserve (`FLASH_OOM_RESERVE_MB`, default 64 per card; taken back only once there is clearly room again), then drops the least recently used half of its cached graphs, then the rest, before it runs a step without a graph. A graph launch that runs out of memory uses the reserve too. | Nothing; `FLASH_GRAPH_LRU_FRAC=1` drops all graphs at once, `FLASH_OOM_RESERVE_MB=0` turns the reserve off. |
 | `collective timeout (host): engine job '<name>' not finished after 120 s ...; ranks still in it: ...`, exit code 75 | An engine step did not finish: a card or the driver stalled (`FLASH_RUN_TIMEOUT_S`). The open requests get an error (`[fatal] the engine is ending the process ...`), then the process ends so that it can be restarted. | Check `dmesg` for Xid lines; report the log with the line. Profiling the server with a tool that is not detected: `FLASH_RUN_TIMEOUT_S=0`. |
 | `[hang] the scheduler has not advanced for N s ...` followed by stacks, exit code 75 | The server's watchdog (`QE_HANG_S`) saw no progress. Open requests got an error at once and new ones are refused; the stacks (gdb when installed and no thread is stuck in the driver, nvidia-smi) are bounded by `QE_HANG_DIAG_S` (30 s), then the process exits. | Report the log; it holds the stacks. |

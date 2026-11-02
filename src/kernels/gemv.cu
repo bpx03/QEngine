@@ -1191,6 +1191,29 @@ void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cuda
     else gemv_w8p_kernel<4><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, xp, y, ldy, m);
 }
 
+// pre-quantized INT8 (row-major int8 [N][K], bf16 scales [N][K/128], as quantize_w8 computes them) -> the W8 layout;
+// the same fragment index math as quantize_w8_kernel, so a checkpoint storing quantize_w8's values loads bit-identical
+__global__ void tile_w8_kernel(const int8_t* __restrict__ src, const bf16* __restrict__ ssrc, int N, int K,
+                               uint8_t* __restrict__ q, bf16* __restrict__ s) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * K) return;
+    const int row = (int)(i / K), k = (int)(i % K);
+    const int rt = row >> 4, rr = row & 15;
+    const int ks = k >> 4, col = k & 15;
+    const int tq = (col & 7) >> 1, half = col >> 3, odd = col & 1;
+    const int ln = (rr & 7) * 4 + tq;
+    const int ai = (half * 2 + (rr >> 3)) * 2 + odd;
+    const size_t base = (((size_t)rt * (K >> 5) + (ks >> 1)) * 32 + ln) * 16 + (ks & 1) * 8;
+    q[base + ai] = (uint8_t)src[i];
+    if ((k & 127) == 0) s[((size_t)rt * (K >> 7) + (k >> 7)) * 16 + rr] = ssrc[(size_t)row * (K >> 7) + (k >> 7)];
+}
+
+void tile_w8(const int8_t* src, const bf16* ssrc, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st) {
+    CHECK(n % 16 == 0 && k % 128 == 0, "tile_w8 %d %d", n, k);
+    const size_t e = (size_t)n * k;
+    tile_w8_kernel<<<(unsigned)((e + 255) / 256), 256, 0, st>>>(src, ssrc, n, k, (uint8_t*)dst_q, dst_s);
+}
+
 void quantize_w8(const bf16* src, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st) {
     CHECK(n % 16 == 0 && k % 128 == 0, "quantize_w8 %d %d", n, k);
     const size_t warps = (size_t)n * (k / 128);

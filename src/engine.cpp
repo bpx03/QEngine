@@ -244,6 +244,8 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         steer_json_ = qsteer::steer_info_json(steer_, steer_def_);
         for (auto& x : steer_) std::vector<float>().swap(x.w);
         printf("steering: %d vector(s), default %s\n", nv, steer_def_ >= 0 ? steer_[steer_def_].name.c_str() : "off");
+    } else {
+        steer_json_ = qsteer::steer_info_json(steer_, steer_def_);  // no vector: still lists the dropped ones
     }
     set_steering(-2, 1.f, -1, -1, -1);
     CUDA_CHECK(cudaSetDevice(workers_[0]->device));

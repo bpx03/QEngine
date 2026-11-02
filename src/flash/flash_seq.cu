@@ -9,6 +9,7 @@
 //    key rings (IDX_TAIL positions by position mod IDX_TAIL, every QSA layer + MTP). With `pend`: the deferred-commit
 //    inputs of the last forward (conv / recurrence / PLE rows) and the step counter whose parity picks the recurrence
 //    buffer - a sequence saved after a speculative step resumes with its pending rows exactly as if it never left.
+#include <cstring>
 #include "../env.h"
 #include "flash.h"
 #include <map>
@@ -280,16 +281,19 @@ void Worker::use_slot(int s, int base) {
 }
 
 // every cached graph executable of this card except *keep (decode / MTP / speculative / constrained of the bound
-// slot, stashed per-slot sets, batched, prefill). Map entries stay with nullptr (= seen: captured again on the next
-// use), so the references and iterators the callers hold stay valid. Syncs first: an in-flight graph frees its
-// memory only when it completes.
-int Worker::drop_graphs(const cudaGraphExec_t* keep, double frac) {
-    CUDA_CHECK(cudaStreamSynchronize(st_));
-    std::vector<std::pair<unsigned long long, cudaGraphExec_t*>> all;
+// slot, stashed per-slot sets, batched, prefill) with its LRU tick. Destroyed ones keep their map entries with nullptr
+// (= seen: captured again on the next use), so the references and iterators the callers hold stay valid. The
+// destroyers sync first: an in-flight graph frees its memory only when it completes.
+// Two tiers (review F4): the prefill-side graphs (single-sequence / batched / multi prefill, ~5x the size of a decode
+// graph, one prompt length each, and their replay saves a small share of a long step) sort before every decode-side
+// graph (decode / MTP / speculative / constrained / batched decode, launched every step): an LRU over the whole set
+// would cycle through the decode graphs once their set outgrows the budget.
+void Worker::graph_list(const cudaGraphExec_t* keep, std::vector<std::pair<unsigned long long, cudaGraphExec_t*>>& all) {
+    unsigned long long tier = 1ull << 62;  // decode side (ticks never get near 2^62)
     auto d = [&](cudaGraphExec_t& x) {
         if (x && &x != keep) {
             auto it = xuse_.find(x);
-            all.push_back({it == xuse_.end() ? 0ull : it->second, &x});
+            all.push_back({tier | (it == xuse_.end() ? 0ull : it->second), &x});
         }
     };
     for (auto& a : graph_) for (auto& b : a) for (auto& c : b) d(c);
@@ -299,9 +303,71 @@ int Worker::drop_graphs(const cudaGraphExec_t* keep, double frac) {
         for (auto& a : gs.g) for (auto& b : a) for (auto& c : b) d(c);
         for (auto& a : gs.mg) for (auto& b : a) for (auto& c : b) d(c);
         for (auto& a : gs.sg) for (auto& b : a) for (auto& c : b) for (auto& x : c) d(x);
-        for (auto* c : {&gs.pg, &gs.pbg}) for (auto& kv : *c) d(kv.second);
     }
-    for (auto* c : {&cgraph_, &bgraphs_, &pgraphs_, &pbgraphs_, &pmgraphs_}) for (auto& kv : *c) d(kv.second);
+    for (auto* c : {&cgraph_, &bgraphs_}) for (auto& kv : *c) d(kv.second);
+    tier = 0;  // prefill side
+    for (auto& gs : gstash_) for (auto* c : {&gs.pg, &gs.pbg}) for (auto& kv : *c) d(kv.second);
+    for (auto* c : {&pgraphs_, &pbgraphs_, &pmgraphs_}) for (auto& kv : *c) d(kv.second);
+}
+
+void Worker::graph_forget(cudaGraphExec_t x) {
+    xuse_.erase(x);
+    if (auto it = xbytes_.find(x); it != xbytes_.end()) {
+        gbytes_ -= std::min(gbytes_.load(), it->second);
+        xbytes_.erase(it);
+    }
+}
+
+// the prefill-side graphs, then the decode-side ones, least recently launched first (never *keep), until the estimated total plus `need` fits the budget
+int Worker::graph_fit(size_t need, const cudaGraphExec_t* keep, bool pf_only) {
+    if (!gbudget_ || gbytes_ + need <= gbudget_) return 0;
+    CUDA_CHECK(cudaStreamSynchronize(st_));  // an in-flight graph frees its memory only when it completes
+    std::vector<std::pair<unsigned long long, cudaGraphExec_t*>> all;
+    graph_list(keep, all);
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    if (pf_only) {  // a prefill-side graph may only replace prefill-side ones (tier 0): no room there -> -1, run eagerly
+        size_t pf = 0;
+        for (auto& [tick, px] : all)
+            if (!(tick >> 62))
+                if (auto it = xbytes_.find(*px); it != xbytes_.end()) pf += it->second;
+        if (gbytes_ - std::min(gbytes_.load(), pf) + need > gbudget_) return -1;
+    }
+    int n = 0;
+    for (auto& [tick, px] : all) {
+        if (gbytes_ + need <= gbudget_) break;
+        if (pf_only && (tick >> 62)) break;
+        cudaGraphExec_t& x = *px;
+        graph_forget(x);
+        CUDA_CHECK(cudaGraphExecDestroy(x));
+        x = nullptr;
+        n++;
+    }
+    graphs_evicted_ += n;
+    gfit_ += n;
+    return n;
+}
+
+int Worker::graph_drop_pf(const cudaGraphExec_t* keep) {
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    std::vector<std::pair<unsigned long long, cudaGraphExec_t*>> all;
+    graph_list(keep, all);
+    int n = 0;
+    for (auto& [tick, px] : all)
+        if (!(tick >> 62)) {
+            graph_forget(*px);
+            CUDA_CHECK(cudaGraphExecDestroy(*px));
+            *px = nullptr;
+            n++;
+        }
+    graphs_evicted_ += n;
+    return n;
+}
+
+// every cached graph executable of this card except *keep (see graph_list), or the least recently launched fraction
+int Worker::drop_graphs(const cudaGraphExec_t* keep, double frac) {
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+    std::vector<std::pair<unsigned long long, cudaGraphExec_t*>> all;
+    graph_list(keep, all);
     size_t n = all.size();
     xheld_ = n;
     if (frac < 1.0) {  // the least recently launched first (never launched = oldest)
@@ -311,7 +377,7 @@ int Worker::drop_graphs(const cudaGraphExec_t* keep, double frac) {
     }
     for (size_t i = 0; i < n; i++) {
         cudaGraphExec_t& x = *all[i].second;
-        xuse_.erase(x);
+        graph_forget(x);
         CUDA_CHECK(cudaGraphExecDestroy(x));
         x = nullptr;
     }
@@ -374,10 +440,56 @@ bool Worker::oom_reserve_free() {
     return true;
 }
 
+// nodes of a graph including the bodies of child-graph nodes: {all, kernel nodes}
+static void graph_nodes(cudaGraph_t g, size_t& all, size_t& kern) {
+    size_t n = 0;
+    if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess || !n) { (void)cudaGetLastError(); return; }
+    std::vector<cudaGraphNode_t> v(n);
+    if (cudaGraphGetNodes(g, v.data(), &n) != cudaSuccess) { (void)cudaGetLastError(); return; }
+    for (cudaGraphNode_t x : v) {
+        all++;
+        cudaGraphNodeType t;
+        if (cudaGraphNodeGetType(x, &t) != cudaSuccess) { (void)cudaGetLastError(); continue; }
+        if (t == cudaGraphNodeTypeKernel) kern++;
+        else if (t == cudaGraphNodeTypeGraph) {
+            cudaGraph_t c = nullptr;
+            if (cudaGraphChildGraphNodeGetGraph(x, &c) == cudaSuccess && c) graph_nodes(c, all, kern);
+            else (void)cudaGetLastError();
+        }  // (a conditional node's body is not reachable through the runtime API: not counted)
+    }
+}
+
 // graph instantiation with little free memory (graph_oom.h, club-3090#1846: 4 slots, the expert cache sized to the
 // 256 MB margin, many conversation shapes): on OOM drop every other cached graph and retry once; if that fails too
 // the caller runs the step eagerly and the next graph_oom::kCoolSteps missing graphs are not captured. Never aborts.
-bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
+bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind) {
+    static const bool glog = env_int("FLASH_GRAPH_LOG", 0) != 0;
+    size_t nodes = gextra_nodes_, knodes = 0;  // + conditional bodies captured into this graph (lk_chain, review F3)
+    gextra_nodes_ = 0;
+    graph_nodes(g, nodes, knodes);
+    const size_t need = graph_oom::est_bytes(nodes, knodes);
+    *e = nullptr;
+    // larger than the whole budget (review F2): evicting would wipe every other graph and still not fit, and the next
+    // instantiate would wipe this one again. Nothing is evicted; this step runs without a graph (the caller runs the
+    // captured work eagerly; run_cached does not capture that key again)
+    gbig_last_ = gbudget_ && need > gbudget_;
+    if (gbig_last_) {
+        if (gbig_++ == 0)
+            fprintf(stderr, "[flash] GPU%d: a %s graph (%zu nodes, est %.0f MB) is larger than the graph budget (%.0f MB, "
+                    "FLASH_GRAPH_MB%s): such steps run without a CUDA graph\n", dev_, kind, nodes, need / 1048576.0,
+                    gbudget_ / 1048576.0, card_workers_ > 1 ? " split between the workers of the card" : "");
+        return false;
+    }
+    const bool pf_side = !strcmp(kind, "prefill") || !strcmp(kind, "pf-batch") || !strcmp(kind, "pf-multi");
+    const bool pf_only = pf_side && pf_window() > 0;
+    pf_noroom_last_ = false;
+    const int nfit = graph_fit(need, e, pf_only);  // the budget first: the oldest graphs make room
+    if (nfit < 0) {  // a prompt-shaped graph would have to evict decode graphs: this step runs without a graph
+        pf_noroom_++;
+        pf_noroom_last_ = true;
+        return false;
+    }
+    const double gf0 = glog ? free_bytes() / 1048576.0 : 0.0;
     static const graph_oom::Inject inj = [] {
         graph_oom::Inject x;
         x.at = graph_oom::parse_list(env_str("FLASH_TEST_GRAPH_OOM"));
@@ -394,6 +506,19 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
         graph_oom_++;
         const double f0 = free_bytes() / 1048576.0;
         oom_ok_ = 0;
+        if (pf_only) {  // a prompt-shaped graph: only prefill-side graphs make room, once; the reserve and the decode
+                        // graphs stay for decode-side instantiates
+            const int n = graph_drop_pf(e);
+            fprintf(stderr, "[flash] GPU%d: %s graph instantiate out of memory (%.0f MB free): dropped %d prefill-side graphs, "
+                    "retrying\n", dev_, kind, f0, n);
+            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+            if (r != cudaErrorMemoryAllocation) goto done;
+            (void)cudaGetLastError();
+            *e = nullptr;
+            pf_noroom_++;
+            pf_noroom_last_ = true;
+            return false;
+        }
         // the emergency reserve first (it exists for this; taken back only with real headroom), then the least
         // recently launched half of the graphs (issue #3 D4), then every other graph: their memory goes back to the
         // driver's pool (not shown as free), the next instantiate gets it
@@ -435,6 +560,15 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g) {
 done:
     CUDA_CHECK(r);
     xuse_[*e] = ++xtick_;  // the newest graph is not the first LRU victim before its first launch
+    xbytes_[*e] = need;
+    gbytes_ += need;
+    gpeak_ = std::max(gpeak_.load(), gbytes_.load());
+    if (glog) {
+        const double gf1 = free_bytes() / 1048576.0;
+        fprintf(stderr, "[graph] GPU%d %s: %zu nodes (%zu kernels), est %.1f MB, free %.1f -> %.1f MB (%+.1f), %zu live, "
+                "est total %.1f / %.0f MB%s\n", dev_, kind, nodes, knodes, need / 1048576.0, gf0, gf1, gf1 - gf0, xuse_.size(),
+                gbytes_.load() / 1048576.0, gbudget_ / 1048576.0, nfit ? (" (" + std::to_string(nfit) + " LRU graphs destroyed first)").c_str() : "");
+    }
     if (!oom_res_ && oom_res_bytes_ && ++oom_ok_ >= kRetakeAfter) oom_reserve_take(true);
     return true;
 }

@@ -2,9 +2,9 @@
 
 QEngine is a source-available inference engine for two models on NVIDIA RTX 3090 cards:
 
-- **Qwen3.8-Flash-Next** (INT4, the AutoRound checkpoint by Intel, converted for QEngine): a sparse
-  mixture-of-experts model with 512 routed experts, 262K context (up to 1M opt-in) and image input. Runs on 2 or more
-  cards (tuned for 3 and 2).
+- **Qwen3.8-Flash-Next** (routed experts INT4 from Intel's AutoRound checkpoint, the parts every token passes through
+  in INT8 or calibrated INT4; converted for QEngine): a sparse mixture-of-experts model with 512 routed experts, 262K
+  context (up to 1M opt-in) and image input. Runs on 2 or more cards (tuned for 3 and 2).
 - **Qwen3.8-27B** (INT4, the RedHatAI W4A16 checkpoint plus its MTP head): a dense model with 262K context and image
   input. Tuned for 3 cards, also runs on 2, and on 1 as an experiment.
 
@@ -15,14 +15,21 @@ and handles the API, tool calls, structured output, scheduling and caching.
 **Measured on our machine** (3× RTX 3090, 24 GB, PCIe 4.0 x16, GPU P2P on; "2 cards" are two of its cards), with
 the default settings:
 
-| Qwen3.8-Flash-Next, server, output tok/s | 3 cards | 2 cards |
+| Qwen3.8-Flash-Next on 3 cards, server, output tok/s | 1.3.4.1 (default weights) | with the 1.3.4 weights |
 |---|---:|---:|
-| single-stream decode, narrative / code | 307 / 388 | 210 / 248 |
-| prefill, 10K / 90K-token prompt (tok/s) | 5,960 / 6,410 | 3,760 / 5,179 |
-| 8 / 16 agents at once (total output) | 941 / 1,104 | 390 / 468 |
+| single-stream decode, narrative / code | 292 / 368 | 300 / 390 |
+| prefill, 10K / 90K-token prompt (tok/s) | 6,061 / 6,675 | 5,940 / 6,749 |
+| 8 agents at once (total output) | 897 | 944 |
 
-(QEngine 1.3.1, October 30, 2026; method under [Benchmarks](#benchmarks). The 27B's numbers are there too. 1.3.4
-keeps this speed: 3 cards, 90K-token prefill 13.01 s against 13.10 s for 1.3.3, same `flash_run` command.)
+(November 2, 2026, both columns on the same day with the same desktop load on GPU1; method under
+[Benchmarks](#benchmarks), where the 2-card and the 27B numbers are too. The 1.3.4.1 weights are about twice as close
+to the BF16 model ([Quality](#quality)); they cost this decode speed.)
+
+**What is new in 1.3.4.1:** new default Flash-Next weights (the DeltaNet projections in INT8, the shared expert and
+the n-gram projections calibrated; KL against BF16 0.119 instead of 0.267), the CUDA-graph room under agent load
+(`FLASH_GRAPH_MB`), and a steering vector that cannot be loaded no longer stops the server
+([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4.1)). The 1.3.4 weights stay available
+(`--revision v1.3.4`, see [Model files](#qwen38-flash-next)).
 
 **What is new in 1.3.4** (details in the [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4)):
 
@@ -83,8 +90,9 @@ memory to the machine, from 64 GB up; see [Host memory](#host-memory-flash-next)
 ### 1. Get a model
 
 ```bash
-# Qwen3.8-Flash-Next, ready to run (~128 GB): converted weights, INT8 n-gram table and three small files
+# Qwen3.8-Flash-Next, ready to run (~129 GB): converted weights, INT8 n-gram table and three small files
 hf download bpx03/Qwen3.8-Flash-Next-QEngine --local-dir models/Qwen3.8-Flash-Next-QE-INT4
+# (the previous, 1.3.4 weights: add --revision v1.3.4; see "Model files" under Models)
 
 # Qwen3.8-27B (incl. its MTP head); two small tuned files are fetched automatically at the first start
 hf download RedHatAI/Qwen3.8-27B-INT4 --local-dir models/Qwen3.8-27B-INT4
@@ -105,7 +113,7 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 ```
 
 - Without `QE_MODEL` the container serves `/app/models/Qwen3.8-27B-INT4`.
-- Images: `latest` / `1.3.4` (text only, ~0.3 GB) and `vision` / `1.3.4-vision` (with the image encoder, ~3 GB).
+- Images: `latest` / `1.3.4.1` (text only, ~0.4 GB download) and `vision` / `1.3.4.1-vision` (with the image encoder, ~3.2 GB download).
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -383,7 +391,8 @@ and limits pinned host memory, which the archive and Flash-Next's host-resident 
 4-stream hyper-connections and a per-layer n-gram embedding table. What the engine does:
 
 - experts split over the cards in 128-wide groups (3 cards: 176/160/176, so the middle card can drive a desktop;
-  `--split` sets one weight per card); INT4 expert GEMV / GEMM, dense parts INT4 or INT8;
+  `--split` sets one weight per card); INT4 expert GEMV / GEMM, dense parts INT4 or INT8 (stored that way in the
+  checkpoint, or converted to INT8 at load where the file carries BF16; see the precision table below);
 - an expert cache: the least-used expert groups live in pinned host memory and are copied into free VRAM while hot;
 - attention KV in FP8, split by position over the cards, with the indexer's top-512 block selection beyond 2K
   tokens; 262,144 tokens of context per conversation;
@@ -393,7 +402,35 @@ and limits pinned host memory, which the archive and Flash-Next's host-resident 
 - prefix reuse, checkpoints and a host-RAM archive of conversations; image input (`--vision 1`); structured output.
 
 **Model files.** The [Hugging Face download](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine) is ready to
-run. To build the directory yourself from Intel's checkpoint (169 GB download), see
+run. Since 1.3.4.1 its default revision stores the DeltaNet projections (in_proj_qkv / z / out_proj) as INT8 (group
+128) and has the shared expert and the n-gram key/value projections calibrated with GPTQ (INT4); the routed experts
+are unchanged. That brings the model about twice as close to BF16 (see
+[Quality](#quality)) and costs decode speed: about 5 % with 8 conversations, about 4 % single-stream on the club-3090 bench and up to
+9 % at one request in the concurrency test (the DeltaNet projections are read on every step, 0.35 GB more per card);
+prefill speed is unchanged. The download is about 1 GB larger. The engine reads the format from the files, so the previous weights
+still work as they are (QEngine 1.3.4 and older stop at load on the new files with `tensor not found:
+...linear_attn.in_proj_qkv.weight_packed`: update QEngine, or download `--revision v1.3.4`):
+
+```bash
+hf download bpx03/Qwen3.8-Flash-Next-QEngine --revision v1.3.4 --local-dir models/Qwen3.8-Flash-Next-QE-INT4-v1.3.4
+server/run.sh 8080 --model models/Qwen3.8-Flash-Next-QE-INT4-v1.3.4       # Docker: -e QE_MODEL=/app/models/...-v1.3.4
+```
+
+**What runs in which precision** (1.3.4.1 default weights; the files store exactly these formats except where noted):
+
+| part | precision | note |
+|---|---|---|
+| routed experts (512 per layer) | INT4, group 128 | Intel's AutoRound quantization, repacked bit-exact |
+| DeltaNet projections (in_proj_qkv / z / out_proj) | INT8, group 128 | 1.3.4 weights: INT4 |
+| shared expert, n-gram key / value projections | INT4, group 128 | calibrated with GPTQ (1.3.4 weights: round-to-nearest) |
+| attention q / k / v / o, lm_head, router, hyper-connection mix matrices | INT8, group 128 | BF16 in the files, converted at load |
+| embeddings, n-gram table | BF16 / INT8 | the n-gram table ships as INT8 |
+| norms, gates, DeltaNet a / b and conv, indexer | BF16 | |
+| activations, accumulation | BF16 / FP16, FP32 accumulation | prefill GEMMs use INT8 activations |
+| attention KV cache | FP8 (E4M3) | |
+| MTP draft head | INT8, group 128 (experts and shared expert INT4) | attention and fc BF16 in the files, converted at load |
+
+To build the directory yourself from Intel's checkpoint (169 GB download), see
 [docs/advanced.md](docs/advanced.md#build-the-flash-next-model-directory-yourself).
 
 **Context up to 1M tokens (opt-in)**: `FLASH_KV=ram server/run.sh 8080 --model <dir> --max-ctx 1M` turns on the
@@ -577,8 +614,12 @@ turn the model made up.
 - A request that produces no tokens fails with an error instead of waiting forever.
 - Flash-Next's output guard fails a request whose forward produced non-finite values, instead of emitting garbage;
   the server goes on.
-- When VRAM runs short for a new CUDA graph, Flash-Next gives up a small reserve, then drops its least recently used
-  graphs, then runs the step without a graph; it does not stop.
+- Flash-Next keeps VRAM for its CUDA graphs (`FLASH_GRAPH_MB`, 256 MB per card, next to the expert cache) and frees
+  its least recently used graphs to stay within it, prompt-processing graphs first (`/api/stats` -> `graphs` shows the
+  use per card). A prompt-shaped graph is kept only when its shape came back within the last 64 prompt steps, and it
+  never pushes out the decode graphs (it runs without a graph instead), so many different prompt lengths do not slow
+  decoding down. If VRAM still runs short for a new graph, it gives up a small
+  reserve, then drops cached graphs, then runs the step without a graph; it does not stop.
 - A start that finds the GPUs still held by a previous engine waits up to `QE_GPU_LOCK_WAIT_S` (60 s), then names the
   processes holding them.
 
@@ -596,7 +637,7 @@ turn the model made up.
   (Flash-Next): once per conversation and again only when the count grows. Such turns make the model end later turns
   empty, so they are left out (`--drop-empty-turns 0` keeps them). This is not an error.
 - `/api/stats` counts thinking budgets, forced closes, empty replies and retries, history drops, and shows the parallel
-  mode.
+  mode and the CUDA-graph memory per card.
 
 **Monitoring.** Live dashboard and Prometheus metrics on `http://127.0.0.1:9393/` (`--metrics-port`), terminal
 monitor `server/qetop.py`.
@@ -638,6 +679,8 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `FLASH_COMM` | `auto` | prefill transfer path: `auto`, `p2p`, `ce`, `host` (also `pull` / `push`) |
 | `FLASH_MAX_SEQS` | `16` | conversations served at once (1 to 16); fewer leave more VRAM for the expert cache |
 | `FLASH_EC_MARGIN_MB` | `256` | VRAM per card left free next to the expert cache; e.g. `256,2048,256` when GPU1 drives a desktop |
+| `FLASH_GRAPH_MB` | `256` | VRAM per card for cached CUDA graphs: 128 MB of it (at most half of `FLASH_EC_MARGIN_MB`) comes out of that margin, the rest is kept on top; `0` = graphs share the margin (1.3.4) |
+| `FLASH_PFGRAPH_WINDOW` | `64` | a prompt-shaped graph is captured only when its shape was used within the last N prompt steps, and never evicts a decode graph; `0` = off |
 | `FLASH_KV` | `vram` | `ram`: KV cache in pinned host RAM |
 | `FLASH_KV_RAM_TOKENS` | `1M` | with `FLASH_KV=ram`: KV tokens of all conversations together (`K` / `M` / `G`) |
 | `FLASH_KV_ARCHIVE_GB` | `48` (less on smaller machines) | host-RAM archive of conversations; `0` = off; a set value wins over the [host-RAM plan](#host-memory-flash-next) |
@@ -665,6 +708,14 @@ the patched driver unless noted), one NUMA node; "2 cards" are two of its cards.
 describe that machine; your numbers depend on the cards, links, driver and host.
 
 ### Qwen3.8-Flash-Next
+
+**1.3.4.1** (November 2, 2026; 3 cards, P2P, the club-3090 `rebench-full.sh` setup: 8 slots, thinking on, effort low,
+vision on; in brackets the 1.3.4 weights on the same day with the same desktop load on GPU1): single-stream decode
+narrative / code 292.4 / 368.4 tok/s (CV 2.7 / 2.2 %; 300.0 / 389.9), prefill 10K / 90K 6,061 / 6,675 tok/s (5,940 /
+6,749), decode at 10K / 90K depth 294 / 275 tok/s (318 / 282), 1 / 2 / 4 requests at once 273 / 382 / 555 tok/s total
+(293 / 407 / 566), 8 agents at once (`vllm bench serve`, ~500-token real-text prompts, 2,000 output tokens) 897 tok/s
+(944 with the 1.3.4 weights, same day), verify-stress 8/8, soak PASS. `flash_run`: 10K / 90K-token prefill 1.561 /
+14.995 s (1.554 / 14.96 s). 2 cards (0, 2): 8 agents at once 370 tok/s, a 262K-token prompt and image traffic pass.
 
 Measured during the 1.3.1 release validation (October 30, 2026). Single-stream decode and prefill: club-3090
 `scripts/bench.sh` (thinking off); agents: `vllm bench serve` as the client, ~500-token real-text prompts, 2,000
@@ -706,24 +757,45 @@ context; 1 card ~104 tok/s with one conversation (~112K tokens of context), ~96 
 
 ### Quality
 
+**Closeness to BF16.** Next-token KL divergence against the official BF16 model on a public reference set (21 cases,
+32,359 positions: prose, code, Japanese, Chinese, SQL, agent turns and WikiText-2), scored with the set's own
+`compare.py`; every position through QEngine's decode path (forwards of up to 16 tokens) on 3 cards (November 2,
+2026). The last column scores the last 512 positions of the long cases after the context before them went through
+the server's batched prefill (our own harness, not part of the command below). Lower is closer to BF16:
+
+| Flash-Next weights | mean KL | top-1 agreement | WikiText-2 KL | KL, context by batched prefill (last 512 positions) |
+|---|---:|---:|---:|---:|
+| 1.3.4.1 default | 0.119 | 89.1 % | 0.141 | 0.146 |
+| 1.3.4 (`--revision v1.3.4`) | 0.267 | 83.3 % | 0.329 | 0.358 |
+
+To measure it yourself (3 cards; ~32 GB download, ~65 GB of scratch space):
+
+```bash
+hf download jyohukuchan/qwen38-flash-next-bf16-logits --repo-type dataset \
+  --revision 5294aa9ab94b0956742fc4c6528c21c1c3c08e42 --local-dir data/kl-ref \
+  --include "reference/*" "corpus/*" compare.py vocab.json manifest.json
+python3 tools/flash_kl_ref.py --model models/Qwen3.8-Flash-Next-QE-INT4 --ref data/kl-ref --work /path/to/scratch
+```
+
 club-3090 8-pack (benchlocal, 150 scenarios, 4,096-token answer budget per scenario): Flash-Next on 3 cards, vision
-on, the club's launch settings; three full runs of a 1.3.4 release candidate (November 1, 2026), each on a fresh
-server, against the single 1.3.1 run in the club-3090 results (October 2026). Scenarios passed: run 1 / 2 / 3, mean
-pass@1, mean pass@3 (up to 3 attempts per scenario):
+on, the club's launch settings; three full runs with the 1.3.4.1 default weights (November 2, 2026), each on a fresh
+server, against the means of the three 1.3.4 release-candidate runs with the 1.3.4 weights (November 1, 2026).
+Scenarios passed: run 1 / 2 / 3, mean pass@1, mean pass@3 (up to 3 attempts per scenario):
 
-| pack | N | thinking off: runs | mean | pass@3 | 1.3.1 off | thinking on: runs | mean | pass@3 | 1.3.1 on |
+| pack | N | thinking off: runs | mean | pass@3 | 1.3.4 mean | thinking on: runs | mean | pass@3 | 1.3.4 mean |
 |---|---:|---|---:|---:|---:|---|---:|---:|---:|
-| toolcall | 15 | 13 / 13 / 13 | 13.0 | 14.0 | 13 | 14 / 14 / 14 | 14.0 | 14.0 | 14 |
-| instructfollow | 15 | 12 / 12 / 11 | 11.7 | 13.7 | 9 | 15 / 14 / 15 | 14.7 | 15.0 | 12 |
-| structoutput | 15 | 14 / 13 / 13 | 13.3 | 14.0 | 13 | 14 / 14 / 13 | 13.7 | 14.0 | 13 |
-| dataextract | 15 | 12 / 12 / 10 | 11.3 | 13.3 | 9 | 13 / 11 / 11 | 11.7 | 14.0 | 13 |
-| reasonmath | 15 | 13 / 14 / 14 | 13.7 | 14.3 | 14 | 13 / 13 / 15 | 13.7 | 15.0 | 14 |
-| bugfind | 15 | 13 / 14 / 15 | 14.0 | 15.0 | 15 | 14 / 14 / 15 | 14.3 | 15.0 | 15 |
-| hermesagent | 20 | 13 / 13 / 10 | 12.0 | 15.0 | 13 | 17 / 15 / 14 | 15.3 | 16.3 | 16 |
-| cli | 40 | 29 / 25 / 23 | 25.7 | 32.3 | 24 | 34 / 31 / 29 | 31.3 | 33.3 | 29 |
-| **total** | 150 | 119 / 116 / 109 | **114.7** | 131.7 | 110 | 134 / 126 / 126 | **128.7** | 136.7 | 126 |
+| toolcall | 15 | 14 / 13 / 12 | 13.0 | 14.0 | 13.0 | 14 / 13 / 14 | 13.7 | 14.0 | 14.0 |
+| instructfollow | 15 | 11 / 12 / 9 | 10.7 | 13.7 | 11.7 | 15 / 13 / 15 | 14.3 | 15.0 | 14.7 |
+| structoutput | 15 | 13 / 13 / 14 | 13.3 | 13.7 | 13.3 | 14 / 13 / 12 | 13.0 | 13.7 | 13.7 |
+| dataextract | 15 | 12 / 12 / 11 | 11.7 | 13.0 | 11.3 | 11 / 12 / 11 | 11.3 | 13.3 | 11.7 |
+| reasonmath | 15 | 14 / 13 / 15 | 14.0 | 14.3 | 13.7 | 14 / 14 / 14 | 14.0 | 14.3 | 13.7 |
+| bugfind | 15 | 14 / 14 / 15 | 14.3 | 15.0 | 14.0 | 15 / 15 / 15 | 15.0 | 15.0 | 14.3 |
+| hermesagent | 20 | 12 / 13 / 15 | 13.3 | 15.7 | 12.0 | 13 / 14 / 14 | 13.7 | 17.7 | 15.3 |
+| cli | 40 | 29 / 27 / 24 | 26.7 | 33.0 | 25.7 | 32 / 28 / 29 | 29.7 | 33.0 | 31.3 |
+| **total** | 150 | 119 / 117 / 115 | **117.0** | 132.3 | 114.7 | 128 / 122 / 124 | **124.7** | 136.0 | 128.7 |
 
-No empty replies, loop-guard triggers or engine errors in the three runs.
+Thinking off is 2.3 points higher on average, thinking on 4 points lower; the run ranges overlap (1.3.4 total: 119
+/ 116 / 109 thinking off, 134 / 126 / 126 thinking on), and three runs cannot separate the two versions. No empty replies, loop-guard triggers or engine errors in the three runs.
 
 AutomationBench sales (Zapier, 100 tasks, a 1.3.4 pre-release build with default settings, Flash-Next on 3 cards,
 16 at once, November 1, 2026): 47 % of tasks passed, mean partial credit 0.78; the 5 zero-score tasks were wrong

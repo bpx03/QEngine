@@ -646,11 +646,14 @@ class Generator:
         # parallel mode of the engine (FLASH_PAR / the boot-time pick: mode, why, probe numbers)
         par_info = getattr(self.engine, "par_info", None)
         host_mem = getattr(self.engine, "host_mem", None)  # the host-RAM plan of the boot (src/host_budget.h)
+        graph_info = getattr(self.engine, "graph_info", None)  # cached CUDA graphs per card (FLASH_GRAPH_MB)
         self.metrics.snapshot = lambda: dict(snap(), agents=self.agents.stats(), sched=dict(self.sched),
                                              loop_guard=self.guard_stats(),
                                              parallel=par_info() if par_info else {"mode": "tp"},
                                              host_memory=host_mem() if host_mem else {},
-                                             thinking=self.think_snapshot(), history=self.drop_log.stats())
+                                             graphs=graph_info() if graph_info else {},
+                                             thinking=self.think_snapshot(), history=self.drop_log.stats(),
+                                             steering=self.steer_stats())
         if args.metrics_port:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if env_str("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
@@ -835,6 +838,12 @@ class Generator:
               f"{', note appended to the tool result' if guard.get('note') else ''}", flush=True)
         diag("LOOP_GUARD", f"conversation {guard['conv']} session {guard['session']} turns {guard['turns']} "
              f"presence {guard['presence']:.2f} note {int(bool(guard.get('note')))}")
+
+    def steer_stats(self):
+        """/api/stats steering: loaded vector names, the default, and the vectors dropped at start (with the reason)"""
+        st = getattr(self, "steer", None) or {}
+        return {"enabled": bool(st.get("vectors")), "default": st.get("default"), "default_active": st.get("default") is not None,
+                "vectors": [v.get("name") for v in st.get("vectors", [])], "dropped": st.get("dropped", [])}
 
     def guard_stats(self):
         with self.seg_lock:

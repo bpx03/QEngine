@@ -4,7 +4,9 @@
 // residual 4 x 2560 replicated in fp32.
 #include <string>
 #include <vector>
+#include <array>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <thread>
 #include <atomic>
@@ -201,6 +203,8 @@ struct Layer {
     HcW hca, hcm;
     // DeltaNet
     W4 dn_in, dn_out;      // in rows [q kl*128][k kl*128][v vl*128][z vl*128]
+    W8 dn_in8, dn_out8;    // the same as INT8 g128 at load, used instead of W4 when the checkpoint carries the BF16
+                           // tensors (in_proj_qkv + in_proj_z / out_proj ".weight", qfn-quant precision choice)
     W16 dn_ab;             // rows [b vl][a vl] (32)
     bf16* conv_w = nullptr;  // [ch][4]
     float *A = nullptr, *dtb = nullptr;
@@ -524,7 +528,8 @@ public:
     void reset_slot(int s);  // zero the recurrent state of slot s
     // instantiate (graph_oom.h): on OOM drop every cached graph and retry; false = no graph, the caller runs the
     // captured work eagerly (it never ran)
-    bool inst_graph(cudaGraphExec_t* e, cudaGraph_t g);
+    // kind: the cache it goes to (FLASH_GRAPH_LOG=1 prints nodes and the free-memory drop of every instantiate)
+    bool inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind = "?");
     bool launch_graph(cudaGraphExec_t& e);  // false: out of memory, every graph dropped, run eagerly (flash_seq.cu)
     int glaunch_calls_ = 0;
     int drop_all_graphs(const cudaGraphExec_t* keep) { return drop_graphs(keep, 1.0); }  // map entries stay (= seen)
@@ -535,6 +540,33 @@ public:
                                                                     // drop_graphs); erased with every destroyed exec
     unsigned long long xtick_ = 0;
     size_t xheld_ = 0;  // cached graphs seen by the last drop_graphs (before it dropped)
+    // graph memory budget (graph_oom.h): every cached graph's device memory is estimated at its instantiate from its
+    // nodes, and the least recently launched graphs are destroyed before a new one would take the estimated total past
+    // gbudget_ (the room the expert budget kept for graphs at load, FLASH_GRAPH_MB; 0 = no budget)
+    // (several workers on one card: each gets FLASH_GRAPH_MB / their count, the room was kept once per card)
+    // gbytes_ / gpeak_ / gfit_ and the counters below are atomics: qe_graph_info reads them from the server thread
+    std::unordered_map<cudaGraphExec_t, size_t> xbytes_;
+    size_t gbudget_ = 0;
+    std::atomic<size_t> gbytes_{0}, gpeak_{0};
+    std::atomic<long long> gfit_{0};  // graphs destroyed to stay in the budget
+    std::atomic<long long> gbig_{0};  // graphs larger than the whole budget: run eagerly, nothing evicted for them
+    bool gbig_last_ = false;          // the last inst_graph refused its graph for that reason
+    std::set<std::pair<const void*, long long>> gbig_keys_;  // run_cached keys refused that way: run eagerly
+    size_t gextra_nodes_ = 0;  // nodes of conditional bodies captured since the last instantiate (lk_chain; not reachable
+                               // through the runtime API, added to the next graph's estimate)
+    void graph_forget(cudaGraphExec_t x);  // before cudaGraphExecDestroy: its LRU tick and its bytes
+    void graph_list(const cudaGraphExec_t* keep, std::vector<std::pair<unsigned long long, cudaGraphExec_t*>>& all);
+    int graph_fit(size_t need, const cudaGraphExec_t* keep, bool pf_only = false);
+    // prefill-side graph admission (FLASH_PFGRAPH_WINDOW): a prompt-shaped key is captured only when it came back
+    // within the last N prefill-side calls, and a prefill-side graph never evicts a decode-side one (runs eagerly)
+    static int pf_window() { static const int w = env_int("FLASH_PFGRAPH_WINDOW", 64); return w; }  // 0 = off
+    std::map<const void*, std::map<long long, unsigned long long>> pf_seen_;   // key -> pf_calls_ stamp of its last use
+    std::map<std::pair<const void*, long long>, unsigned long long> pf_cool_;  // key refused for room -> stamp
+    unsigned long long pf_calls_ = 0;   // every call of a prefill-side graph cache
+    bool pf_noroom_last_ = false;       // inst_graph: the last refusal was "no room among the prefill-side graphs"
+    std::atomic<long long> pf_eager_{0};   // prefill-side steps run eagerly by the window (/api/stats graphs pf_eager)
+    std::atomic<long long> pf_noroom_{0};  // ... refused for room (decode graphs keep the budget; pf_noroom)
+    int graph_drop_pf(const cudaGraphExec_t* keep);  // drop every prefill-side graph except *keep
     // emergency VRAM reserve (FLASH_OOM_RESERVE_MB, default 64, inside the margin; with no host-registration plan it
     // is added to the margin): freed first when an instantiate or a launch runs out of memory, then one more try;
     // taken again only with real headroom after kRetakeAfter good instantiates / launches (flash_seq.cu)
@@ -941,7 +973,7 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     void xb_add(int kind, size_t bytes) { if (pf_) xb_[xb_base_ + kind] += bytes; }
     unsigned long long graph_tick_ = 0;
   public:
-    long long graphs_evicted_ = 0, graph_oom_ = 0, graph_eager_ = 0;  // LRU evictions, instantiate OOMs, failed retries
+    std::atomic<long long> graphs_evicted_{0}, graph_oom_{0}, graph_eager_{0};  // LRU evictions, instantiate OOMs, failed retries
     graph_oom::Cool gcool_;
     int ginst_calls_ = 0;  // instantiate calls of this card (FLASH_TEST_GRAPH_OOM)
     int graphs_live() const {
@@ -984,9 +1016,11 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
 
     Plan p_;
     bool dev_first_ = true;  // the first worker on its card (per-card registrations, see the constructor)
+    int card_workers_ = 1;
     double card_share_ = 1.0;  // the part of the card's free memory this worker's expert cache takes (several stages on a card)
   public:
     void set_card_share(double f) { card_share_ = std::clamp(f, 0.05, 1.0); }
+    void set_card_workers(int n) { card_workers_ = std::max(1, n); }  // workers on this card (the graph budget is split)
   private:
     int dev_, max_ctx_, rows_ = 0;  // owned KV rows per card (the pool: logical rows when streaming)
     // KV streaming (FLASH_KV_STREAM): rows_ = logical pool rows (FLASH_KV_STREAM_CTX positions, host memory), srows_ =
@@ -1286,6 +1320,29 @@ private:
 };
 
 // expert cache statistics of all cards: per decode launch misses summed over the cards (steps aligned)
+// cached CUDA graphs since the start (graph budget FLASH_GRAPH_MB, review F5): the largest card's estimated total and
+// peak against its budget, graphs destroyed to stay in the budget, graphs too large for it, instantiate OOMs, steps
+// run without graphs after a failed retry (all cards). Atomic reads: also called from the server thread.
+inline std::string graph_summary(const std::vector<Worker*>& W) {
+    std::map<int, std::array<long long, 3>> card;  // dev -> {est bytes, peak bytes, budget bytes}
+    long long fit = 0, big = 0, oom = 0, eager = 0;
+    for (const Worker* w : W) {
+        if (!w) continue;
+        auto& c = card[w->device()];
+        c[0] += (long long)w->gbytes_.load(std::memory_order_relaxed);
+        c[1] += (long long)w->gpeak_.load(std::memory_order_relaxed);
+        c[2] += (long long)w->gbudget_;
+        fit += w->gfit_.load(std::memory_order_relaxed); big += w->gbig_.load(std::memory_order_relaxed);
+        oom += w->graph_oom_.load(std::memory_order_relaxed); eager += w->graph_eager_.load(std::memory_order_relaxed);
+    }
+    long long est = 0, peak = 0, bud = 0;
+    for (auto& [d, c] : card) { est = std::max(est, c[0]); peak = std::max(peak, c[1]); bud = std::max(bud, c[2]); }
+    char b[256];
+    snprintf(b, sizeof b, "graphs: est %.0f MB (peak %.0f) of %.0f MB per card, %lld destroyed for the budget, %lld too big, "
+             "%lld instantiate OOM, %lld eager", est / 1048576.0, peak / 1048576.0, bud / 1048576.0, fit, big, oom, eager);
+    return b;
+}
+
 inline std::string ec_summary(std::vector<Worker*>& W) {
     long long st = 0, t = 0, ms = 0, pt = 0, pm = 0, cp = 0, ek = 0, ef = 0, ekp = 0;
     int nc = 0, res = 0, live = 0, slots = 0;
@@ -1309,7 +1366,7 @@ inline std::string ec_summary(std::vector<Worker*>& W) {
              st, st ? (double)ms / st : 0.0, so.empty() ? 0 : so[so.size() / 2], so.empty() ? 0 : so[so.size() * 9 / 10],
              so.empty() ? 0 : so.back(), t ? 100.0 * (t - ms) / t : 100.0, t - ms, t, pt ? 100.0 * (pt - pm) / pt : 100.0,
              pt - pm, pt, cp, ek, ekp, ef, res, nc, live, slots, bw);
-    return b;
+    return std::string(b) + "; " + graph_summary(W);
 }
 
 }  // namespace flash

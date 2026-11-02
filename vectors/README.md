@@ -14,7 +14,13 @@ without that the server runs exactly as if this directory did not exist. In Dock
 
 Projects out a refusal direction from the residual stream: the model declines far fewer requests.
 Removing refusals removes a safety behaviour; you are responsible for the output. It is OFF by default.
-It is valid only for Qwen3.8-Flash-Next (QE INT4); the 27B refuses it at start (other hidden size).
+It is valid only for Qwen3.8-Flash-Next (the 1.3.4 and the 1.3.4.1 checkpoint); the 27B refuses it at start (other
+hidden size).
+
+**Your own vectors.** Since 1.3.4.1 a checkpoint carries its identity in `config.json` (`qengine_checkpoint`, for the
+1.3.4.1 Flash-Next files `bpx03/Qwen3.8-Flash-Next-QEngine@1.3.4.1`), and the engine matches it against the sidecar's
+`compatibility.model` (a string or a list). Add that id to the `compatibility.model` of your own sidecars to use them
+with the 1.3.4.1 files; checkpoints without the field are still matched by directory name.
 
 Use (Docker): `QE_STEERING=1`. With it on, every request is steered unless it sends
 `"steering": false` (or picks another loaded vector by name); `GET /v1/steering` lists the vectors.

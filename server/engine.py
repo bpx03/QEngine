@@ -37,6 +37,7 @@ SIGS = {
     "qe_pool_tokens": (c_i64, [c_void_p]),
     "qe_kv_in_ram": (c_int, [c_void_p]),
     "qe_host_mem_info": (c_int, [c_void_p, c_char_p, c_int]),
+    "qe_graph_info": (c_int, [c_void_p, c_char_p, c_int]),
     "qe_can_admit": (c_int, [c_void_p, c_int]),
     "qe_pause_for": (c_int, [c_void_p, c_int, c_int]),
     "qe_set_limit": (None, [c_void_p, c_int, c_int]),
@@ -123,7 +124,7 @@ GROUPS = {
     "grammar": ("qe_mask_buffer", "qe_spec_io", "qe_constrain", "qe_constrained", "qe_vocab"),
     "vision": ("qe_start_mm", "qe_start_begin"),
 }
-SINGLE = ("qe_par_info", "qe_host_mem_info", "qe_set_exit_hook", "qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_kv_in_ram", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
+SINGLE = ("qe_par_info", "qe_host_mem_info", "qe_graph_info", "qe_set_exit_hook", "qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_kv_in_ram", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
           "qe_reset", "qe_set_lookahead")
 
 
@@ -222,6 +223,18 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             except ValueError:
                 self._host_mem = {}
         return self._host_mem
+
+    def graph_info(self):
+        """Cached CUDA graphs per card (JSON of qe_graph_info: estimated MB now / peak, the FLASH_GRAPH_MB budget,
+        graphs destroyed for the budget, too big for it, instantiate OOMs, eager fallbacks); {} without it."""
+        if "qe_graph_info" not in self.fns:
+            return {}
+        buf = ctypes.create_string_buffer(4096)
+        n = self.lib.qe_graph_info(self.h, buf, 4096)
+        try:
+            return json.loads(buf.value.decode()) if n >= 0 else {}
+        except ValueError:
+            return {}
 
     EXIT_HOOK = ctypes.CFUNCTYPE(None, ctypes.c_char_p)
 

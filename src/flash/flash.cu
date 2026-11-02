@@ -816,6 +816,36 @@ W8 load_w8(int n, int k, const std::vector<Bf16Block>& blocks, Worker* w, void* 
     CUDA_CHECK(cudaStreamSynchronize(s));
     return out;
 }
+// pre-quantized INT8 rows (row-major int8 + bf16 group-128 scales, as the converter writes them from quantize_w8) -> W8
+struct I8Block {
+    const int8_t* q;   // row-major, ld elements
+    const bf16* s;     // [rows][ld / 128]
+    int ld, rows, cols;
+    int dr, dc;        // destination row / col offset (dc % 128 == 0, source column offset already in q / s)
+};
+W8 load_w8i(int n, int k, const std::vector<I8Block>& blocks, Worker* w, void* (Worker::*alloc)(size_t), cudaStream_t s) {
+    std::vector<int8_t> hq((size_t)n * k, 0);
+    std::vector<bf16> hs((size_t)n * (k / 128), __float2bfloat16(0.f));
+    for (auto& b : blocks) {
+        CHECK(b.ld % 128 == 0 && b.cols % 128 == 0 && b.dc % 128 == 0, "load_w8i: block not aligned to 128");
+        for (int i = 0; i < b.rows; i++) {
+            memcpy(&hq[(size_t)(b.dr + i) * k + b.dc], b.q + (size_t)i * b.ld, b.cols);
+            memcpy(&hs[(size_t)(b.dr + i) * (k / 128) + b.dc / 128], b.s + (size_t)i * (b.ld / 128), b.cols / 128 * 2);
+        }
+    }
+    int8_t* dq = (int8_t*)g_s1.get(hq.size());
+    bf16* ds = (bf16*)g_s2.get(hs.size() * 2);
+    CUDA_CHECK(cudaMemcpyAsync(dq, hq.data(), hq.size(), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(ds, hs.data(), hs.size() * 2, cudaMemcpyHostToDevice, s));
+    W8 out;
+    out.n = n;
+    out.k = k;
+    out.q = (uint4*)(w->*alloc)(w8_qbytes(n, k));
+    out.s = (bf16*)(w->*alloc)((size_t)n * (k / 128) * 2);
+    tile_w8(dq, ds, n, k, const_cast<uint4*>(out.q), const_cast<bf16*>(out.s), s);
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    return out;
+}
 W16 load_w16(int n, int k, const std::vector<Bf16Block>& blocks, Worker* w, void* (Worker::*alloc)(size_t), cudaStream_t s) {
     std::vector<bf16> h((size_t)n * k, __float2bfloat16(0.f));
     for (auto& b : blocks)
@@ -917,11 +947,72 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         L.hcm = hc_from(st, pre + "mlp_hyper_connection.", true);
         if (!L.full) {
             const std::string d = pre + "linear_attn.";
+            // a checkpoint may carry the GDN projections in BF16 (then INT8 g128 at load, like QSA) or packed INT4
+            // a checkpoint may carry the GDN projections as INT8 g128 (int8 ".weight" + bf16 ".weight_scale", the values
+            // quantize_w8 computes: loaded as they are), as BF16 (INT8 g128 at load, the same values) or packed INT4
+            const bool in8 = st.has(d + "in_proj_qkv.weight"), out8 = st.has(d + "out_proj.weight");
+            const long long NQKV = 2LL * LNK * DK + LNV * DV, NZ = (long long)LNV * DV;
+            auto chk = [&](const std::string& nm, long long r, long long c) {  // BF16 [r, c] or I8 [r, c] + BF16 scales [r, c/128]
+                const TensorInfo& t = T(st, nm + ".weight");
+                if (t.dtype == "I8") {
+                    CHECK(t.shape == std::vector<long long>({r, c}) && t.nbytes == (size_t)(r * c) && st.has(nm + ".weight_scale"),
+                          "flash: %s: expected I8 [%lld, %lld] + weight_scale", nm.c_str(), r, c);
+                    const TensorInfo& ts = T(st, nm + ".weight_scale");
+                    CHECK(ts.dtype == "BF16" && ts.shape == std::vector<long long>({r, c / 128}) && ts.nbytes == (size_t)(r * (c / 128) * 2),
+                          "flash: %s.weight_scale: expected BF16 [%lld, %lld]", nm.c_str(), r, c / 128);
+                    return true;
+                }
+                CHECK(t.dtype == "BF16" && t.shape == std::vector<long long>({r, c}) && t.nbytes == (size_t)(r * c * 2),
+                      "flash: %s: expected BF16 or I8 [%lld, %lld]", nm.c_str(), r, c);
+                if (st.has(nm + ".weight_scale")) fprintf(stderr, "[flash] warning: %s.weight_scale ignored (BF16 weight)\n", nm.c_str());
+                return false;
+            };
+            bool in_i8 = false, out_i8 = false;
+            if (in8 || st.has(d + "in_proj_z.weight")) {
+                CHECK(in8 && st.has(d + "in_proj_z.weight"), "flash: %s carries only one of in_proj_qkv / in_proj_z unpacked", d.c_str());
+                in_i8 = chk(d + "in_proj_qkv", NQKV, H);
+                CHECK(chk(d + "in_proj_z", NZ, H) == in_i8, "flash: %s in_proj_qkv / in_proj_z: mixed BF16 / INT8", d.c_str());
+            }
+            if (out8) out_i8 = chk(d + "out_proj", H, NZ);
+            if (in8 && in_i8) {
+                const int8_t* qkv = (const int8_t*)T(st, d + "in_proj_qkv.weight").data;
+                const int8_t* z = (const int8_t*)T(st, d + "in_proj_z.weight").data;
+                const bf16* sq = B(st, d + "in_proj_qkv.weight_scale");
+                const bf16* sz = B(st, d + "in_proj_z.weight_scale");
+                const int G = H / 128;
+                L.dn_in8 = load_w8i(2 * kl * DK + 2 * vl * DV, H,
+                                    {{qkv + (size_t)p_.k0 * DK * H, sq + (size_t)p_.k0 * DK * G, H, kl * DK, H, 0, 0},
+                                     {qkv + (size_t)(LNK * DK + p_.k0 * DK) * H, sq + (size_t)(LNK * DK + p_.k0 * DK) * G, H, kl * DK, H, kl * DK, 0},
+                                     {qkv + (size_t)(2 * LNK * DK + p_.v0 * DV) * H, sq + (size_t)(2 * LNK * DK + p_.v0 * DV) * G, H, vl * DV, H, 2 * kl * DK, 0},
+                                     {z + (size_t)p_.v0 * DV * H, sz + (size_t)p_.v0 * DV * G, H, vl * DV, H, 2 * kl * DK + vl * DV, 0}},
+                                    this, A, st_);
+            } else if (in8) {
+                const bf16* qkv = B(st, d + "in_proj_qkv.weight");
+                const bf16* z = B(st, d + "in_proj_z.weight");
+                L.dn_in8 = load_w8(2 * kl * DK + 2 * vl * DV, H,
+                                   {{qkv + (size_t)p_.k0 * DK * H, H, kl * DK, H, 0, 0},
+                                    {qkv + (size_t)(LNK * DK + p_.k0 * DK) * H, H, kl * DK, H, kl * DK, 0},
+                                    {qkv + (size_t)(2 * LNK * DK + p_.v0 * DV) * H, H, vl * DV, H, 2 * kl * DK, 0},
+                                    {z + (size_t)p_.v0 * DV * H, H, vl * DV, H, 2 * kl * DK + vl * DV, 0}},
+                                   this, A, st_);
+            } else {
+            CHECK(st.has(d + "in_proj_qkv.weight_packed"), "flash: %s: no in_proj_qkv weights (neither INT4 packed nor INT8 / BF16): "
+                  "a checkpoint for another QEngine version?", d.c_str());
             L.dn_in = load_w4(st, {{d + "in_proj_qkv", p_.k0 * DK, p_.k1 * DK},
                                    {d + "in_proj_qkv", LNK * DK + p_.k0 * DK, LNK * DK + p_.k1 * DK},
                                    {d + "in_proj_qkv", 2 * LNK * DK + p_.v0 * DV, 2 * LNK * DK + p_.v1 * DV},
                                    {d + "in_proj_z", p_.v0 * DV, p_.v1 * DV}},
                               0, -1, false, this, A, st_);
+            }
+            static_assert(DV % 128 == 0, "out_proj column slices must start on a 128 group");
+            if (out8 && out_i8)  // columns v0*DV .. v1*DV of [H, LNV*DV]: the scale columns start at v0*DV/128
+                L.dn_out8 = load_w8i(H, vl * DV, {{(const int8_t*)T(st, d + "out_proj.weight").data + (size_t)p_.v0 * DV,
+                                                   B(st, d + "out_proj.weight_scale") + (size_t)p_.v0 * DV / 128, LNV * DV, H, vl * DV, 0, 0}},
+                                     this, A, st_);
+            else if (out8)
+                L.dn_out8 = load_w8(H, vl * DV, {{B(st, d + "out_proj.weight") + (size_t)p_.v0 * DV, LNV * DV, H, vl * DV, 0, 0}},
+                                    this, A, st_);
+            else
             L.dn_out = load_w4(st, {{d + "out_proj", 0, H}}, p_.v0 * DV, p_.v1 * DV, false, this, A, st_);
             L.dn_ab = load_w16((2 * vl + 15) / 16 * 16, H, {{B(st, d + "in_proj_b.weight") + (size_t)p_.v0 * H, H, vl, H, 0, 0},
                                        {B(st, d + "in_proj_a.weight") + (size_t)p_.v0 * H, H, vl, H, vl, 0}},
@@ -2094,6 +2185,7 @@ void Worker::load_deferred_groups() {
         const int at = p_.pp() ? dev_ : p_.rank;
         for (std::string x; std::getline(ss, x, ',') && i <= at; i++) margin_mb = atof(x.c_str());
     }
+    const double user_mb = margin_mb;  // FLASH_EC_MARGIN_MB of this card
     const long long fr = (long long)free_bytes();
     // host memory registered after load (archive slabs + pinned prefixes, in the background): its GPU page tables
     // take 2 MB per GB on every card, outside the old margin (issue #3: 56 GB -> 112 MB of the 256 MB margin)
@@ -2107,6 +2199,18 @@ void Worker::load_deferred_groups() {
     // there is one; without it (archive off, little host RAM) it is added here, so the runtime allocations keep the
     // full margin of 1.3.2 (review 2026-11-01 #4)
     if (hostreg_mb <= 0) margin_mb += (double)oom_reserve_mb();
+    // the cached CUDA graphs' working set (graph_oom.h): its own room, kept by the graph budget (graph_fit). Up to
+    // 1.3.4 the graphs lived in FLASH_EC_MARGIN_MB; part of it (graph_oom::kGraphInMarginMb, at most half the margin)
+    // is charged to the graph room, the rest is added (review F6: the full 256 MB on top cost 2 cards 1.6 % decode)
+    // (kept once per card: the last worker loaded on a card leaves the margin free, so several workers on one card
+    // share it, review F1)
+    const long long graph_mb = std::max(0LL, env_ll("FLASH_GRAPH_MB", graph_oom::kGraphMbDefault));
+    gbudget_ = ((size_t)graph_mb << 20) / (size_t)card_workers_;
+    const double graph_add = std::max(0.0, (double)graph_mb - std::min((double)graph_oom::kGraphInMarginMb, user_mb / 2));
+    margin_mb += graph_add;
+    if (graph_mb > 0 && p_.rank == 0)
+        fprintf(stderr, "[flash] expert budget: %lld MB per card for the cached CUDA graphs (FLASH_GRAPH_MB), %.0f MB of it on "
+                "top of FLASH_EC_MARGIN_MB\n", graph_mb, graph_add);
     // + per layer: gmap, allocation rounding (2 MiB), the cache table (8 B per group)
     const long long other = (long long)nshared * GRP_BYTES + (long long)ec_defer_l_.size() * (2 << 20) + (long long)gs.size() * 8;
     long long nres = (long long)((fr - (long long)(margin_mb * 1048576.0) - other) * card_share_) / (long long)GRP_BYTES;
@@ -3087,7 +3191,8 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
     const int ch = 2 * kl * DK + vl * DV, ld = ch + vl * DV;
     static const int pfx = env_int("FLASH_PFX", 0);  // debug: bit0 GDN, bit1 MoE pf paths off
     if (pf_ && !(pfx & 1)) {  // prefill: tensor-core GEMMs, rows committed at once
-        gemm_w4(L.dn_in, x_, H, proj_, ld, m, st_);
+        if (L.dn_in8.q) rows8(L.dn_in8, x_, H, proj_, ld, m, st_);
+        else gemm_w4(L.dn_in, x_, H, proj_, ld, m, st_);
         KCHK("dn pf in");
         gemv_w16_rows(L.dn_ab, x_, H, proj2_, 2 * vl, m, st_);
         KCHK("dn pf ab");
@@ -3123,7 +3228,8 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
                                                    posd_ + 1, stepc_, o, m, true);
         k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_);
         KCHK("dn pf");
-        gemm_w4(L.dn_out, ab_, vl * DV, part_, H, m, st_);
+        if (L.dn_out8.q) rows8(L.dn_out8, ab_, vl * DV, part_, H, m, st_);
+        else gemm_w4(L.dn_out, ab_, vl * DV, part_, H, m, st_);
         return;
     }
     static const bool abpe = env_int("FLASH_DNAB_PAR", 1);
@@ -3134,7 +3240,8 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
         gemv_w16(L.dn_ab, x_, H, proj2_, 2 * vl, m, pfs_);
         CUDA_CHECK(cudaEventRecord(pfe1_, pfs_));
     }
-    gemv_w4h(L.dn_in, xh_, H, proj_, ld, m, st_);
+    if (L.dn_in8.q) gemv_w8_rows(L.dn_in8, x_, H, proj_, ld, m, st_);
+    else gemv_w4h(L.dn_in, xh_, H, proj_, ld, m, st_);
     if (!abp) gemv_w16(L.dn_ab, x_, H, proj2_, 2 * vl, m, st_);
     float* cv = qbuf_;
     k_dn_conv_d<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend, posd_ + 1, cv, m);
@@ -3144,9 +3251,15 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
     k_dn_rec_d<<<dim3(vl, 16), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, L.S, L.rec_pend,
                                                posd_ + 1, stepc_, o, m);
     KCHK("k_dn_rec_d");
+    if (L.dn_out8.q) {
+        k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_);
+        KCHK("k_dn_out");
+        gemv_w8_rows(L.dn_out8, ab_, vl * DV, part_, H, m, st_);
+    } else {
     k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, vl * DV);
     KCHK("k_dn_out");
     gemv_w4h(L.dn_out, ah_, vl * DV, part_, H, m, st_);
+    }
     KCHK("dn_out gemv");
 }
 
@@ -4083,11 +4196,38 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
         xb_key_[xk] = d;
         if (undo) memcpy(xb_, xb0, sizeof(xb0));
     };
+    // a key whose graph is larger than the whole graph budget (inst_graph, review F2) is not captured again
+    if (graphs && !gbig_keys_.empty() && gbig_keys_.count(xk)) { fn(); xb_keep(false); return; }
+    // prefill-side caches (prompt-shaped keys): every call is counted and stamps its key; a key is captured only when
+    // its previous use lies within the last FLASH_PFGRAPH_WINDOW prefill-side calls, and a key refused for room waits a
+    // window before the next capture try. One-off prompt lengths run eagerly and never evict decode graphs.
+    const int pfw = pf_window();
+    const bool pfc = graphs && !dump_ && !cap_ && pfw > 0 && (&cache == &pgraphs_ || &cache == &pbgraphs_ || &cache == &pmgraphs_);
+    unsigned long long pf_now = 0, pf_last = 0;
+    if (pfc) {
+        auto& seen = pf_seen_[&cache];
+        pf_now = ++pf_calls_;
+        if (auto sk = seen.find(key); sk != seen.end()) pf_last = sk->second;
+        seen[key] = pf_now;
+        if (seen.size() > 4096)  // bounded: entries older than the window cannot admit anything
+            for (auto sk = seen.begin(); sk != seen.end();) sk = pf_now - sk->second > (unsigned long long)pfw ? seen.erase(sk) : std::next(sk);
+    }
     if (!graphs || dump_ || cap_ || it == cache.end()) {
         if (graphs && !dump_ && !cap_) cache[key] = nullptr;  // seen once
         fn();
         xb_keep(false);
         return;
+    }
+    if (pfc && !it->second) {
+        auto ck = pf_cool_.find(xk);
+        const bool cool = ck != pf_cool_.end() && pf_now - ck->second <= (unsigned long long)pfw;
+        if (!pf_last || pf_now - pf_last > (unsigned long long)pfw || cool) {
+            if (!cool) pf_eager_++;
+            else pf_noroom_++;
+            fn();
+            xb_keep(false);
+            return;
+        }
     }
     // LRU bound (FLASH_PFGRAPH_CAP, default 4 per cache): every prompt length is its own key, so a server that sees
     // many lengths would otherwise keep instantiating graphs (device memory) until it runs out
@@ -4104,7 +4244,7 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
             unsigned long long best = ~0ull;
             for (auto& kv : cache)
                 if (kv.second && use[kv.first] < best) { best = use[kv.first]; victim = kv.first; }
-            xuse_.erase(cache[victim]);  // (a recycled handle value must not inherit the old tick)
+            graph_forget(cache[victim]);  // (a recycled handle value must not inherit the old tick)
             CUDA_CHECK(cudaGraphExecDestroy(cache[victim]));
             cache[victim] = nullptr;
             graphs_evicted_++;
@@ -4116,9 +4256,12 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
         xb_keep(true);  // captured, not run: counted at the launch below
         CUDA_CHECK(cudaStreamEndCapture(st_, &g));
         // little free memory: every cached graph of the card is dropped and the instantiate retried (flash_seq.cu)
-        const bool ok = inst_graph(&it->second, g);
+        const char* kind = &cache == &pgraphs_ ? "prefill" : &cache == &pbgraphs_ ? "pf-batch" : &cache == &pmgraphs_ ? "pf-multi" : "cached";
+        const bool ok = inst_graph(&it->second, g, kind);
         CUDA_CHECK(cudaGraphDestroy(g));
         if (!ok) {  // still no room: this key runs eagerly (the captured work never ran)
+            if (gbig_last_) gbig_keys_.insert(xk);
+            if (pfc && pf_noroom_last_) pf_cool_[xk] = pf_now;  // no new capture try for a window
             fn();
             return;
         }
@@ -5799,6 +5942,12 @@ void Worker::lk_chain() {
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
     chain();
     CUDA_CHECK(cudaStreamEndCapture(st_, &body));
+    {  // the body is instantiated with the outer graph but not reachable through the runtime API: counted for its
+       // estimate here (review F3)
+        size_t nb = 0;
+        if (cudaGraphGetNodes(body, nullptr, &nb) == cudaSuccess) gextra_nodes_ += nb;
+        else (void)cudaGetLastError();
+    }
     st_ = s0;
     pfs_ = ps0;
 }
@@ -5981,7 +6130,7 @@ void Worker::spec_launch(int k, bool lookup) {
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             spec_body(k, lookup);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            inst_graph(&ge, g);  // OOM: drops every cached graph and retries, else no graph (flash_seq.cu)
+            inst_graph(&ge, g, "spec");  // OOM: drops every cached graph and retries, else no graph (flash_seq.cu)
             CUDA_CHECK(cudaGraphDestroy(g));
         }
         if (!ev0_) { CUDA_CHECK(cudaEventCreate(&ev0_)); CUDA_CHECK(cudaEventCreate(&ev1_)); }
@@ -6007,7 +6156,7 @@ void Worker::spec_launch_con(int kv, int kd) {
         CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
         spec_body(kv, false, kd);
         CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-        inst_graph(&ge, g);
+        inst_graph(&ge, g, "spec-con");
         CUDA_CHECK(cudaGraphDestroy(g));
     }
     if (!ev0_) { CUDA_CHECK(cudaEventCreate(&ev0_)); CUDA_CHECK(cudaEventCreate(&ev1_)); }
@@ -6111,7 +6260,7 @@ void Worker::forward_mtp(const int* tokens, int pos, int m, bool chain, int* out
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             body_mtp(m, chain);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            inst_graph(&ge, g);  // OOM: drops every cached graph and retries, else no graph (flash_seq.cu)
+            inst_graph(&ge, g, "mtp");  // OOM: drops every cached graph and retries, else no graph (flash_seq.cu)
             CUDA_CHECK(cudaGraphDestroy(g));
         }
         if (!(ge && launch_graph(ge))) body_mtp(m, chain);
@@ -6148,7 +6297,7 @@ void Worker::forward(const int* tokens, int pos, int m, const bf16* ple_rows, in
             CUDA_CHECK(cudaStreamBeginCapture(st_, cudaStreamCaptureModeThreadLocal));
             body(m);
             CUDA_CHECK(cudaStreamEndCapture(st_, &g));
-            inst_graph(&gm, g);
+            inst_graph(&gm, g, "decode");
             CUDA_CHECK(cudaGraphDestroy(g));
         }
         if (!(gm && launch_graph(gm))) body(m);

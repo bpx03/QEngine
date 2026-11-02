@@ -447,7 +447,8 @@ void Worker::ple_b(Layer& L, int li, int m, int rps) {
 void Worker::gdn_b(Layer& L, int li, int m, int rps) {
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV, ld = ch + vl * DV;
-    gemv_w4h(L.dn_in, xh_, H, proj_, ld, m, st_);
+    if (L.dn_in8.q) gemv_w8_rows(L.dn_in8, x_, H, proj_, ld, m, st_);
+    else gemv_w4h(L.dn_in, xh_, H, proj_, ld, m, st_);
     gemv_w16(L.dn_ab, x_, H, proj2_, 2 * vl, m, st_);
     float* cv = qbuf_;
     k_dn_conv_b<<<dim3((ch + 255) / 256, m / rps), 256, 0, st_>>>(proj_, ld, ch, L.conv_w, tab(TB_CH, li), tab(TB_CP, li), rslot_, bpn_,
@@ -461,8 +462,13 @@ void Worker::gdn_b(Layer& L, int li, int m, int rps) {
     } else
     k_dn_rec_b<<<dim3(vl, 16, m / rps), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, tab(TB_S, li), tab(TB_RP, li),
                                                        rslot_, bpn_, stepcs_, o, rps);
+    if (L.dn_out8.q) {
+        k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_);
+        gemv_w8_rows(L.dn_out8, ab_, vl * DV, part_, H, m, st_);
+    } else {
     k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, vl * DV);
     gemv_w4h(L.dn_out, ah_, vl * DV, part_, H, m, st_);
+    }
     KCHK("gdn_b");
 }
 
@@ -706,7 +712,7 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
                 batch_body(nseg, k);
                 CUDA_CHECK(cudaStreamEndCapture(st_, &g));
                 // OOM: every cached graph of the card is dropped and the instantiate retried (flash_seq.cu)
-                if (!inst_graph(&it->second, g)) {
+                if (!inst_graph(&it->second, g, "batch")) {
                     batch_body(nseg, k);  // the captured work never ran
                     ran = true;
                 }
