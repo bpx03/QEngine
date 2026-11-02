@@ -234,9 +234,7 @@ static double h2d_gbs(int dev, size_t bytes) {
     (void)cudaGetLastError();
     return 3.0 * bytes / s / 1e9;
 }
-#ifndef QE_GIT_HASH
-#define QE_GIT_HASH "unknown"
-#endif
+extern "C" const char* qe_internal_build_id();  // src/build_id.cpp (generated at build time; C linkage: global name)
 #ifndef QE_CUDA_ARCHS
 #define QE_CUDA_ARCHS "unknown"
 #endif
@@ -250,7 +248,7 @@ std::string box_report(const std::vector<int>& devs_in) {
     cudaDriverGetVersion(&drv);
     std::string o;
     char b[512];
-    snprintf(b, sizeof b, "[box] build %s, CUDA archs %s, runtime %d, driver API %d, kernel driver: %s\n", QE_GIT_HASH, QE_CUDA_ARCHS, rt,
+    snprintf(b, sizeof b, "[box] build %s, CUDA archs %s, runtime %d, driver API %d, kernel driver: %s\n", qe_internal_build_id(), QE_CUDA_ARCHS, rt,
              drv, rd1("/proc/driver/nvidia/version").c_str());
     o += b;
     for (int d : devs) {

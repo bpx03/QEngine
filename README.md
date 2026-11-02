@@ -15,15 +15,18 @@ and handles the API, tool calls, structured output, scheduling and caching.
 **Measured on our machine** (3× RTX 3090, 24 GB, PCIe 4.0 x16, GPU P2P on; "2 cards" are two of its cards), with
 the default settings:
 
-| Qwen3.8-Flash-Next on 3 cards, server, output tok/s | 1.3.4.1 (default weights) | with the 1.3.4 weights |
+| Qwen3.8-Flash-Next on 3 cards, server, output tok/s | 1.3.4.2 | 1.3.4.1 |
 |---|---:|---:|
-| single-stream decode, narrative / code | 292 / 368 | 300 / 390 |
-| prefill, 10K / 90K-token prompt (tok/s) | 6,061 / 6,675 | 5,940 / 6,749 |
-| 8 agents at once (total output) | 897 | 944 |
+| single-stream decode, narrative / code | 314 / 401 | 292 / 368 |
+| prefill, 10K / 90K-token prompt (tok/s) | 6,137 / 6,877 | 6,061 / 6,675 |
+| 8 agents at once (total output) | 1,022 | 897 |
 
-(November 2, 2026, both columns on the same day with the same desktop load on GPU1; method under
-[Benchmarks](#benchmarks), where the 2-card and the 27B numbers are too. The 1.3.4.1 weights are about twice as close
-to the BF16 model ([Quality](#quality)); they cost this decode speed.)
+(November 2, 2026, both columns on the same day with the same desktop load on GPU1, default weights; method under
+[Benchmarks](#benchmarks), where the 2-card and the 27B numbers are too.)
+
+**What is new in 1.3.4.2:** faster Flash-Next decode (+14 % with 8 agents, +7 to +12 % single-stream; one
+conversation's output bit for bit as 1.3.4.1), the web dashboard's agents table and `qetop` work again, and both
+show the running version and build ([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4.2)).
 
 **What is new in 1.3.4.1:** new default Flash-Next weights (the DeltaNet projections in INT8, the shared expert and
 the n-gram projections calibrated; KL against BF16 0.119 instead of 0.267), the CUDA-graph room under agent load
@@ -113,7 +116,7 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 ```
 
 - Without `QE_MODEL` the container serves `/app/models/Qwen3.8-27B-INT4`.
-- Images: `latest` / `1.3.4.1` (text only, ~0.4 GB download) and `vision` / `1.3.4.1-vision` (with the image encoder, ~3.2 GB download).
+- Images: `latest` / `1.3.4.2` (text only, ~0.4 GB download) and `vision` / `1.3.4.2-vision` (with the image encoder, ~3.2 GB download).
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -124,7 +127,8 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 - Port 8080: the API. Port 9393: monitoring dashboard, `/api/stats`, Prometheus `/metrics`.
 - Compose: `QE_MODELS_DIR=/path/to/models docker compose up -d` (see `docker-compose.yml`).
 - Build it yourself: `docker build -t qengine .` (with vision), `--build-arg VISION=0` (text only),
-  `--build-arg CUDA_ARCHS=86` (RTX 3090 code only, faster build).
+  `--build-arg CUDA_ARCHS=86` (RTX 3090 code only, faster build), `--build-arg REVISION=$(git rev-parse HEAD)` (the
+  build hash the monitoring headers show; without it they say `build unknown`).
 
 ### 2b. Or build from source
 
@@ -640,7 +644,7 @@ turn the model made up.
   mode and the CUDA-graph memory per card.
 
 **Monitoring.** Live dashboard and Prometheus metrics on `http://127.0.0.1:9393/` (`--metrics-port`), terminal
-monitor `server/qetop.py`.
+monitor `server/qetop.py`. Both show the running version and build in the header (e.g. `QEngine 1.3.4.2 (build abc1234)`).
 
 ## Settings
 
@@ -681,6 +685,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `FLASH_EC_MARGIN_MB` | `256` | VRAM per card left free next to the expert cache; e.g. `256,2048,256` when GPU1 drives a desktop |
 | `FLASH_GRAPH_MB` | `256` | VRAM per card for cached CUDA graphs: 128 MB of it (at most half of `FLASH_EC_MARGIN_MB`) comes out of that margin, the rest is kept on top; `0` = graphs share the margin (1.3.4) |
 | `FLASH_PFGRAPH_WINDOW` | `64` | a prompt-shaped graph is captured only when its shape was used within the last N prompt steps, and never evicts a decode graph; `0` = off |
+| `FLASH_ATTN_DMIN` | `16` | decode attention of batched steps (more than one wave of blocks): a row uses one key split per N key tiles (at most 8), so short contexts do not pay for 8 splits; `0` = always 8 splits |
 | `FLASH_KV` | `vram` | `ram`: KV cache in pinned host RAM |
 | `FLASH_KV_RAM_TOKENS` | `1M` | with `FLASH_KV=ram`: KV tokens of all conversations together (`K` / `M` / `G`) |
 | `FLASH_KV_ARCHIVE_GB` | `48` (less on smaller machines) | host-RAM archive of conversations; `0` = off; a set value wins over the [host-RAM plan](#host-memory-flash-next) |
@@ -708,6 +713,14 @@ the patched driver unless noted), one NUMA node; "2 cards" are two of its cards.
 describe that machine; your numbers depend on the cards, links, driver and host.
 
 ### Qwen3.8-Flash-Next
+
+**1.3.4.2** (November 2, 2026; 3 cards, P2P, the club-3090 `rebench-full.sh` setup: 8 slots, thinking on, effort low,
+vision on; in brackets 1.3.4.1 on the same day with the same desktop load on GPU1): single-stream decode narrative /
+code 314.3 / 401.4 tok/s (292.4 / 368.4), prefill 10K / 90K 6,137 / 6,877 tok/s (6,061 / 6,675), decode at 10K / 90K
+depth 328 / 307 tok/s (294 / 275), 1 / 2 / 4 requests at once 288 / 414 / 581 tok/s total (273 / 382 / 555), soak
+median decode 359.9 tok/s (333.9), 8 agents at once (`vllm bench serve`, ~500-token real-text prompts, 2,000 output
+tokens) 1,022 tok/s (897), verify-stress 8/8, soak PASS. 2 cards (0, 2): 8 agents at once 359 tok/s, a 262K-token
+prompt and image traffic pass.
 
 **1.3.4.1** (November 2, 2026; 3 cards, P2P, the club-3090 `rebench-full.sh` setup: 8 slots, thinking on, effort low,
 vision on; in brackets the 1.3.4 weights on the same day with the same desktop load on GPU1): single-stream decode

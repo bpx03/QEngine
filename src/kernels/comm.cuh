@@ -9,6 +9,7 @@
 // The sequence counter lives in device memory and is advanced by the last block of every
 // collective, so replays of a captured graph stay in lock-step across GPUs.
 constexpr int kCommSlots = 4;
+constexpr int kAgWords = 8192;  // P2P small all-gather: values per sender and slot (allgather_small n <= 8192)
 constexpr int kCommBlocks = 8;  // more blocks polling host memory saturates PCIe reads
 
 struct Comm {
@@ -31,6 +32,11 @@ struct Comm {
     // instead of 7 w + e; changes the order of the norm's sum of squares (same for every m)
     bool coal = true;
     uint4* pll[4] = {nullptr, nullptr, nullptr, nullptr};
+    // P2P small all-gather (allgather_small, QE_AG_LL): 8-byte words (value bits, 32-bit call tag) pushed into every
+    // peer's [2 slots][ngpu senders][kAgWords] receive words, polled locally (no fence / flag round trip)
+    // Invariant: the tag is the call's ctr.seq and the words are never cleared, so ctr.seq of the CommCounters used with
+    // this Comm must never go back (a new CommCounters on an existing Comm needs pag zeroed first).
+    uint2* pag[4] = {nullptr, nullptr, nullptr, nullptr};
     // prefill reduce-scatter over P2P: rows sent to their owner [ngpu senders][rs_own][h] bf16 and
     // the owners' sums [rs_rows][h] bf16, both in the receiving GPU's memory
     uint2* prs1[4] = {nullptr, nullptr, nullptr, nullptr};

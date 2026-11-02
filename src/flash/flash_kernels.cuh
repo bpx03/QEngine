@@ -488,12 +488,20 @@ __global__ void __launch_bounds__(128) k_hcd_s(const uint4* __restrict__ q, cons
 // k_hcd_s for batched steps (m > 8): block = (group pair wi, 7 of the 21 row tiles), one warp per tile. The pair's
 // 256 inputs of every row (R + inj * y, fp16) are staged in shared memory once per block instead of being loaded and
 // converted by each of the 21 tile warps. Per-warp arithmetic and outputs as k_hcd_s (bit-identical).
+#ifdef HC_PROF  // bench/hc_bench.cu: per-block phase timestamps
+__device__ unsigned long long g_hcprof[4096][4];
+__device__ __forceinline__ unsigned long long gtimer() { unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t; }
+#define HCPROF(i) do { if (threadIdx.x == 0) g_hcprof[blockIdx.y * gridDim.x + blockIdx.x][i] = gtimer(); } while (0)
+#else
+#define HCPROF(i) do {} while (0)
+#endif
 constexpr int HCDX_TW = 7, HCDX_LD = 2 * 128 + 8;  // tiles per block (21 = 3 x 7), padded row (halves)
 template <int NT>
-__global__ void __launch_bounds__(32 * HCDX_TW) k_hcd_x(const uint4* __restrict__ q, const bf16* __restrict__ s, const float* __restrict__ R,
+__global__ void __launch_bounds__(32 * HCDX_TW, 2) k_hcd_x(const uint4* __restrict__ q, const bf16* __restrict__ s, const float* __restrict__ R,
                                                         float* __restrict__ P, int m, const float* __restrict__ y = nullptr,
                                                         const float* __restrict__ injp = nullptr) {
     __shared__ __align__(16) __half xs[8 * NT][HCDX_LD];
+    HCPROF(0);
     const int wi = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = blockIdx.y * HCDX_TW + warp;
     const int gi0 = wi * HCD_GPW, br = gi0 / HCD_GPS, pq = (gi0 % HCD_GPS) / HCD_GPW;
@@ -505,30 +513,50 @@ __global__ void __launch_bounds__(32 * HCDX_TW) k_hcd_x(const uint4* __restrict_
     for (int a = 0; a < HCD_GPW; a++)
 #pragma unroll
         for (int i = 0; i < 4; i++) w[a][i] = __ldg(qp + (size_t)((gi0 + a) * 4 + i) * 32);
-#pragma unroll 4
-    for (int idx = threadIdx.x; idx < 8 * NT * 128; idx += 32 * HCDX_TW) {  // pairs of columns
-        const int tok = idx >> 7, kk = (idx & 127) * 2;
-        float2 v = make_float2(0.f, 0.f);
-        if (tok < m) {
-            const int k = gi0 * 128 + kk;
-            v = *reinterpret_cast<const float2*>(R + (size_t)tok * RW + k);
-            if (y) {
-                const float ij = injp[tok * HC + br];
-                const float2 yv = *reinterpret_cast<const float2*>(y + (size_t)tok * H + k - br * H);
-                v.x += ij * yv.x; v.y += ij * yv.y;
+    // staging in XC-iteration chunks: every load of a chunk is issued before its first use (2 round trips instead of
+    // ~18 dependent ones) with registers left for 2 blocks per SM; same values and arithmetic as one load-convert loop
+    constexpr int XN = 8 * NT * 128, XIT = (XN + 32 * HCDX_TW - 1) / (32 * HCDX_TW), XC = (XIT + 1) / 2;
+    const bf16* sp = s + (size_t)r * groups * 16;
+    float sgv[HCD_GPW], sg8v[HCD_GPW];  // scales with the weights (not after the barrier)
+#pragma unroll
+    for (int a = 0; a < HCD_GPW; a++) { sgv[a] = __bfloat162float(sp[(gi0 + a) * 16 + g]); sg8v[a] = __bfloat162float(sp[(gi0 + a) * 16 + g + 8]); }
+#pragma unroll
+    for (int c0 = 0; c0 < XIT; c0 += XC) {
+        float2 xv[XC], yv[XC];
+        float ijv[XC];
+#pragma unroll
+        for (int u = 0; u < XC; u++) {  // pairs of columns
+            const int idx = threadIdx.x + (c0 + u) * 32 * HCDX_TW, tok = idx >> 7, kk = (idx & 127) * 2;
+            xv[u] = make_float2(0.f, 0.f);
+            yv[u] = make_float2(0.f, 0.f);
+            ijv[u] = 0.f;
+            if (c0 + u < XIT && idx < XN && tok < m) {
+                const int k = gi0 * 128 + kk;
+                xv[u] = *reinterpret_cast<const float2*>(R + (size_t)tok * RW + k);
+                if (y) {
+                    ijv[u] = injp[tok * HC + br];
+                    yv[u] = *reinterpret_cast<const float2*>(y + (size_t)tok * H + k - br * H);
+                }
             }
         }
-        *reinterpret_cast<uint32_t*>(&xs[tok][kk]) = f2h2(v.x, v.y);
+#pragma unroll
+        for (int u = 0; u < XC; u++) {
+            const int idx = threadIdx.x + (c0 + u) * 32 * HCDX_TW, tok = idx >> 7, kk = (idx & 127) * 2;
+            if (c0 + u >= XIT || idx >= XN) break;
+            float2 v = xv[u];
+            if (y && tok < m) { v.x += ijv[u] * yv[u].x; v.y += ijv[u] * yv[u].y; }
+            *reinterpret_cast<uint32_t*>(&xs[tok][kk]) = f2h2(v.x, v.y);
+        }
     }
     __syncthreads();
-    const bf16* sp = s + (size_t)r * groups * 16;
+    HCPROF(1);
     float acc[NT][4];
 #pragma unroll
     for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
 #pragma unroll
     for (int a = 0; a < HCD_GPW; a++) {
         const int gi = gi0 + a;
-        const float sg = __bfloat162float(sp[gi * 16 + g]), sg8 = __bfloat162float(sp[gi * 16 + g + 8]);
+        const float sg = sgv[a], sg8 = sg8v[a];
         float c[NT][4];
 #pragma unroll
         for (int j = 0; j < NT; j++) c[j][0] = c[j][1] = c[j][2] = c[j][3] = 0.f;
@@ -565,9 +593,14 @@ __global__ void __launch_bounds__(32 * HCDX_TW) k_hcd_x(const uint4* __restrict_
             pb[g] = acc[j][1]; pb[g + 8] = acc[j][3];
         }
     }
+#ifdef HC_PROF
+    __syncthreads();
+#endif
+    HCPROF(2);
 }
 // per row: u = the 20 group partials summed in order, ss = sum of squares of each stream, rinv, h = silu(z / 4) (fp16),
 // inj (as k_hc_mid_pf). grid m, 512 threads.
+static_assert(H % 512 == 0, "k_hc_mid_dec: 512-column passes without a tail");
 __global__ void __launch_bounds__(512) k_hc_mid_dec(const float* __restrict__ P, float* __restrict__ R,
                                                     __half* __restrict__ hh, float* __restrict__ rinv, float* __restrict__ inj,
                                                     const float* __restrict__ y = nullptr, const float* __restrict__ injo = nullptr,
@@ -634,15 +667,25 @@ __global__ void __launch_bounds__(512) k_hc_mid_dec(const float* __restrict__ P,
                 rr[i * H + tid + j * 512] = x;
                 q2[i] += x * x;
             }
-    } else
-    for (int d = tid; d < H; d += 512) {
-        const float yv = y ? y[(size_t)t * H + d] : 0.f;
+    } else {
+        // every load of the row first (5 x (4 + 1) independent loads per thread), then the update and the sums in the
+        // former order (bit-identical): the rolled loop waited one load round trip per 512 columns
+        float v[HC][H / 512], yv[H / 512];
 #pragma unroll
-        for (int i = 0; i < HC; i++) {
-            float v = rr[i * H + d];
-            if (y) { v += io[i] * yv; rr[i * H + d] = v; }
-            q2[i] += v * v;
+        for (int j = 0; j < H / 512; j++) {
+            const int d = tid + j * 512;
+            yv[j] = y ? y[(size_t)t * H + d] : 0.f;
+#pragma unroll
+            for (int i = 0; i < HC; i++) v[i][j] = rr[i * H + d];
         }
+#pragma unroll
+        for (int j = 0; j < H / 512; j++)
+#pragma unroll
+            for (int i = 0; i < HC; i++) {
+                float x = v[i][j];
+                if (y) { x += io[i] * yv[j]; rr[i * H + tid + j * 512] = x; }
+                q2[i] += x * x;
+            }
     }
 #pragma unroll
     for (int i = 0; i < HC; i++) {
@@ -715,21 +758,40 @@ __global__ void __launch_bounds__(256) k_hcu(const uint4* __restrict__ q, const 
         } else if (blockIdx.x == gridDim.x - 1)
             for (int i = threadIdx.x; i < m * H; i += 256) yzero[i] = 0.f;
     }
-    __shared__ __half hs[8 * NT][LOWRANK + 8];
+    HCPROF(0);
+    __shared__ __align__(16) __half hs[8 * NT][LOWRANK + 8];
     __shared__ float rinv[8 * NT][HC];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int T = blockIdx.x * 8 + warp;
     uint4 w[HCU_KS / 2];  // weights first: their DRAM latency overlaps the prologue
+    float rr[NT][4];      // the epilogue's R values, loaded with the weights (same values, read before any write of R)
     if (T < HCU_TILES) {
         const uint4* qp = q + (size_t)T * (HCU_KS / 2) * 32 + lane;
 #pragma unroll
         for (int i = 0; i < HCU_KS / 2; i++) w[i] = __ldg(qp + (size_t)i * 32);
+        const int g0 = lane >> 2, t40 = lane & 3, i0 = g0 & 3;
+#pragma unroll
+        for (int j = 0; j < NT; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int dd = (e >> 1) * 2 + (g0 >> 2), tok = 8 * j + 2 * t40 + (e & 1);
+                rr[j][e] = tok < m ? R[(size_t)tok * RW + i0 * H + T * 4 + dd] : 0.f;
+            }
     }
     if (hhg) {  // h and rinv precomputed (k_hc_mid_dec)
         if (tid < m * HC) rinv[tid / HC][tid % HC] = rinvg[tid];
-        for (int idx = tid; idx < m * LOWRANK / 2; idx += 256) {
-            const int t = idx / (LOWRANK / 2), j = idx % (LOWRANK / 2);
-            reinterpret_cast<__half2*>(&hs[t][0])[j] = reinterpret_cast<const __half2*>(hhg + (size_t)t * LOWRANK)[j];
+        // 16-byte copies, all loads of the thread issued first (one round trip; rows are 640 / 656 bytes: aligned)
+        constexpr int HV = LOWRANK / 8, HIT = (8 * NT * HV + 255) / 256;
+        uint4 hv[HIT];
+#pragma unroll
+        for (int it = 0; it < HIT; it++) {
+            const int idx = tid + it * 256;
+            if (idx < m * HV) hv[it] = reinterpret_cast<const uint4*>(hhg + (size_t)(idx / HV) * LOWRANK)[idx % HV];
+        }
+#pragma unroll
+        for (int it = 0; it < HIT; it++) {
+            const int idx = tid + it * 256;
+            if (idx < m * HV) reinterpret_cast<uint4*>(&hs[idx / HV][0])[idx % HV] = hv[it];
         }
     } else {
     if (tid < m * HC) rinv[tid / HC][tid % HC] = rsqrtf(ss[tid] / H + EPS);
@@ -745,6 +807,7 @@ __global__ void __launch_bounds__(256) k_hcu(const uint4* __restrict__ q, const 
     }
     for (int idx = tid; idx < (8 * NT - m) * (LOWRANK + 8); idx += 256) hs[m + idx / (LOWRANK + 8)][idx % (LOWRANK + 8)] = __float2half_rn(0.f);
     __syncthreads();
+    HCPROF(1);
     if (T >= HCU_TILES) return;
     const int g = lane >> 2, t4 = lane & 3;
     const __half* sp = s + (size_t)T * HCU_G * 16;
@@ -779,6 +842,7 @@ __global__ void __launch_bounds__(256) k_hcu(const uint4* __restrict__ q, const 
             acc[j][0] += c[j][0] * sg; acc[j][1] += c[j][1] * sg; acc[j][2] += c[j][2] * sg8; acc[j][3] += c[j][3] * sg8;
         }
     }
+    HCPROF(2);
     // rows g (dd = g / 4, stream g % 4) and g + 8 (dd = 2 + g / 4); tokens 8 j + 2 t4 (+1)
     const int i = g & 3;
 #pragma unroll
@@ -789,7 +853,7 @@ __global__ void __launch_bounds__(256) k_hcu(const uint4* __restrict__ q, const 
             const int dd = (e >> 1) * 2 + (g >> 2), tok = 8 * j + 2 * t4 + (e & 1);
             const int d = T * 4 + dd;
             const float gate = sigm(acc[j][(e >> 1) * 2 + (e & 1)]);
-            v[e] = tok < m ? gate * R[(size_t)tok * RW + i * H + d] * rinv[tok][i] * (1.f + __bfloat162float(nw[i * H + d])) : 0.f;
+            v[e] = tok < m ? gate * rr[j][e] * rinv[tok][i] * (1.f + __bfloat162float(nw[i * H + d])) : 0.f;
         }
 #pragma unroll
         for (int e = 0; e < 4; e++) {
@@ -1427,7 +1491,7 @@ __host__ __device__ __forceinline__ int QPC(const Plan& p) { return NQ / p.ngpu;
 __host__ __device__ __forceinline__ int xper(const Plan& p) { return QPC(p) * (HD + 2); }
 __host__ __device__ __forceinline__ int qper(const Plan& p) { return QPC(p) * HD; }
 // grid (peers, blocks per peer): the last block of a peer raises its flag
-__device__ __forceinline__ void xsend_done(Xchg& xc, int peer, unsigned s, const Plan& p) {
+__device__ __forceinline__ void xsend_done(const Xchg& xc, int peer, unsigned s, const Plan& p) {
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
@@ -1695,7 +1759,7 @@ __global__ void k_xpar_align(unsigned* a, unsigned* b) {
         *b += (XSLOT - *b % XSLOT) % XSLOT;
     }
 }
-__global__ void k_xsend(const float* __restrict__ part, int m, Xchg xc, Plan p) {
+__global__ void k_xsend(const float* __restrict__ part, int m, const __grid_constant__ Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
     float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * xper(p);
@@ -1708,7 +1772,7 @@ __global__ void k_xsend(const float* __restrict__ part, int m, Xchg xc, Plan p) 
 }
 // wait for the peers' partials, combine with the own one, * sigmoid(gate) -> bf16 input of o_proj
 __global__ void k_qsa_comb2(const float* __restrict__ part, int m, const float* __restrict__ proj, int ld,
-                            bf16* __restrict__ out, int ldo, Xchg xc, Plan p, int gate_off) {
+                            bf16* __restrict__ out, int ldo, const __grid_constant__ Xchg xc, Plan p, int gate_off) {
     __shared__ unsigned s_s;
     if (threadIdx.x == 0) {
         const unsigned s = *xc.seq + 1;
@@ -2088,7 +2152,7 @@ __global__ void k_idx_local(float* __restrict__ scores, const int* __restrict__ 
 // every card sends its local top keys of all rows to both peers ([2 slots][ngpu][MAXM][IDX_TOPB] keys)
 // pace > 0 (test, slow-link emulation of the SM-store path): the stores are spread over bytes * pace ns, so they are in
 // flight (and tax the card's other kernels) as long as on a link of 1 / pace GB/s
-__global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Plan p, float pace = 0.f,
+__global__ void k_idx_send(const unsigned* __restrict__ loc, int m, const __grid_constant__ Xchg xc, Plan p, float pace = 0.f,
                            unsigned long long* busy = nullptr) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
@@ -2135,7 +2199,7 @@ __global__ void k_idx_send(const unsigned* __restrict__ loc, int m, Xchg xc, Pla
 }
 // k_idx_send over gridDim.y blocks per peer with 16-byte stores (perf F.2: the single 256-thread block per peer moved
 // the 2 MB of a 512-row chunk at ~7 GB/s); the last block of a peer raises its flag (xsend_done, scnt counters)
-__global__ void k_idx_send16(const unsigned* __restrict__ loc, int m, Xchg xc, Plan p) {
+__global__ void k_idx_send16(const unsigned* __restrict__ loc, int m, const __grid_constant__ Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
     uint4* dst = reinterpret_cast<uint4*>(reinterpret_cast<unsigned*>(xc.recv[peer]) +
@@ -2147,7 +2211,7 @@ __global__ void k_idx_send16(const unsigned* __restrict__ loc, int m, Xchg xc, P
 // global threshold = IDX_TOPB-th largest of the ngpu x IDX_TOPB gathered keys (ngpu <= kMaxTp); compact this card's selected blocks
 // (score key >= threshold) into sel[t][0..nsel[t]). One block per row; the last block bumps the exchange.
 __global__ void k_idx_select(const float* __restrict__ scores, const unsigned* __restrict__ loc, const int* __restrict__ pos0,
-                             Plan p, int lbmax, Xchg xc, int* __restrict__ sel, int* __restrict__ nsel,
+                             Plan p, int lbmax, const __grid_constant__ Xchg xc, int* __restrict__ sel, int* __restrict__ nsel,
                              const int* __restrict__ rpos = nullptr, bool skeys = false, KvPool kp = KvPool(),
                              const int* __restrict__ rbase = nullptr, int* __restrict__ psel = nullptr) {
     __shared__ unsigned keys[kMaxTp * IDX_TOPB];  // ngpu <= kMaxTp (make_plan)
@@ -2269,7 +2333,7 @@ __global__ void k_sel_win(const int* __restrict__ sel, const int* __restrict__ n
 
 // QSA variant B: q is computed for the local heads only; every card sends its 8 heads' q rows ([MAXM][8][HD]) to
 // both peers (receive buffer [2 slots][ngpu][MAXM][8][HD]); the attention waits for the peer's flag per block.
-__global__ void k_qxsend(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
+__global__ void k_qxsend(const float* __restrict__ qb, int m, const __grid_constant__ Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
     float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * qper(p);
@@ -2282,7 +2346,7 @@ __global__ void k_qxsend(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
 // fp16 exchange formats (prefill chunks, tensor-core attention only): q heads as fp16 * 1/16 ([t][8][HD] halves in the
 // slot), partials as the normalized output in fp16 + (max, sum) fp32: a record of XP16 floats per (row, head)
 constexpr int XP16 = HD / 2 + 4;  // 128 floats of halves, m, l, pad (16-byte aligned records)
-__global__ void k_qxsend16(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
+__global__ void k_qxsend16(const float* __restrict__ qb, int m, const __grid_constant__ Xchg xc, Plan p) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
     __half* dst = reinterpret_cast<__half*>(xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * qper(p));
@@ -2297,7 +2361,7 @@ __global__ void k_qxsend16(const float* __restrict__ qb, int m, Xchg xc, Plan p)
 }
 // FLASH_QX_LOCAL: the q heads of owner `peer` (computed on this card into qb) in the fp16 format of k_qxsend16, into this
 // card's own receive slot of that owner; the last block of an owner raises this card's own flag word for it
-__global__ void k_qxlocal16(const float* __restrict__ qb, int m, Xchg xc, Plan p) {
+__global__ void k_qxlocal16(const float* __restrict__ qb, int m, const __grid_constant__ Xchg xc, Plan p) {
     const int owner = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1;
     __half* dst = reinterpret_cast<__half*>(xc.recv[p.rank] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p));
@@ -2319,7 +2383,7 @@ __global__ void k_qxlocal16(const float* __restrict__ qb, int m, Xchg xc, Plan p
     }
 }
 // ahead: exchanges of this kind sent but not yet consumed here (pipelined QSA chunks, prefill-r3)
-__global__ void k_xsend16(const float* __restrict__ part, int m, Xchg xc, Plan p, int ahead = 0) {
+__global__ void k_xsend16(const float* __restrict__ part, int m, const __grid_constant__ Xchg xc, Plan p, int ahead = 0) {
     const int peer = blockIdx.x >= (unsigned)p.rank ? blockIdx.x + 1 : blockIdx.x;
     const unsigned s = *xc.seq + 1 + ahead;
     float* dst = xc.recv[peer] + ((size_t)(s & (XSLOT - 1)) * p.ngpu + p.rank) * XROWS * xper(p);
@@ -2339,7 +2403,7 @@ __global__ void k_xsend16(const float* __restrict__ part, int m, Xchg xc, Plan p
 }
 // as k_qsa_comb2 with the peers' partials in the fp16 format
 __global__ void k_qsa_comb16(const float* __restrict__ part, int m, const float* __restrict__ proj, int ld,
-                             bf16* __restrict__ out, int ldo, Xchg xc, Plan p, int gate_off) {
+                             bf16* __restrict__ out, int ldo, const __grid_constant__ Xchg xc, Plan p, int gate_off) {
     __shared__ unsigned s_s;
     if (threadIdx.x == 0) {
         const unsigned s = *xc.seq + 1;
@@ -2389,7 +2453,7 @@ __global__ void k_qsa_comb16(const float* __restrict__ part, int m, const float*
 // as k_qsa_attn, q of a peer's head from the receive buffer (after its flag); the last block bumps the q exchange
 __global__ void k_qsa_attn_b(const float* __restrict__ qb, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
                              const float* __restrict__ ks, const float* __restrict__ vs, const int* __restrict__ pos0,
-                             float* __restrict__ out, Plan p, Xchg xq, const int* __restrict__ sel,
+                             float* __restrict__ out, Plan p, const __grid_constant__ Xchg xq, const int* __restrict__ sel,
                              const int* __restrict__ nsel, int lbmax, const int* __restrict__ kvb0 = nullptr) {
     __shared__ float qs[HD];
     __shared__ float wm[8], wl[8];
@@ -2470,7 +2534,7 @@ __global__ void k_qsa_attn_b(const float* __restrict__ qb, const uint8_t* __rest
 __global__ void __launch_bounds__(256) k_qsa_attn_rows(const float* __restrict__ qb, const uint8_t* __restrict__ kc,
                                                        const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                        const float* __restrict__ vs, const int* __restrict__ pos0,
-                                                       float* __restrict__ out, Plan p, Xchg xq, const int* __restrict__ sel,
+                                                       float* __restrict__ out, Plan p, const __grid_constant__ Xchg xq, const int* __restrict__ sel,
                                                        const int* __restrict__ nsel, int lbmax, int m,
                                                        const int* __restrict__ kvb0 = nullptr) {
     __shared__ unsigned s_s;
@@ -2554,7 +2618,7 @@ __device__ __forceinline__ uint32_t ta_f8x2(unsigned short v) {
 __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ qb, const uint8_t* __restrict__ kc,
                                                      const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                      const float* __restrict__ vs, const int* __restrict__ pos0,
-                                                     float* __restrict__ out, Plan p, Xchg xq, int m,
+                                                     float* __restrict__ out, Plan p, const __grid_constant__ Xchg xq, int m,
                                                      const int* __restrict__ kvb0 = nullptr) {
     extern __shared__ __align__(16) unsigned char ta_sm[];
     if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
@@ -2736,7 +2800,7 @@ template <int RG, bool Q16 = false>  // 16-row groups per block (block = 2 heads
 __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restrict__ qb, const uint8_t* __restrict__ kc,
                                                       const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                       const float* __restrict__ vs, const int* __restrict__ pos0,
-                                                      AttnDst dst, Plan p, Xchg xq, int m,
+                                                      const __grid_constant__ AttnDst dst, Plan p, const __grid_constant__ Xchg xq, int m,
                                                       const int* __restrict__ kvb0 = nullptr, KvMap km = KvMap()) {
     extern __shared__ __align__(16) unsigned char ta_sm[];
     const size_t rb0 = kvb0 ? (size_t)*kvb0 : 0;
@@ -2967,7 +3031,7 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
     }
 }
 // merge the key splits 1..S-1 into split 0 (dst.o[0]): grid (NQ, m), HD threads
-__global__ void k_attn_merge(AttnDst dst, int S) {
+__global__ void k_attn_merge(const __grid_constant__ AttnDst dst, int S) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const size_t off = ((size_t)t * NQ + h) * (HD + 2);
     float M = -INFINITY;
@@ -2996,17 +3060,47 @@ constexpr int QD_KEYS = 16, QD_SROW = HD + 8;
 constexpr size_t QD_SMEM = (size_t)4 * 2 * QD_KEYS * QD_SROW * 2 + 4 * 2 * QD_KEYS * 4;
 __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, const uint8_t* __restrict__ kc,
                                                  const uint8_t* __restrict__ vc, const float* __restrict__ ks,
-                                                 const float* __restrict__ vs, const int* __restrict__ pos0, AttnDst dst,
-                                                 Plan p, Xchg xq, const int* __restrict__ sel, const int* __restrict__ nsel,
+                                                 const float* __restrict__ vs, const int* __restrict__ pos0, const __grid_constant__ AttnDst dst,
+                                                 Plan p, const __grid_constant__ Xchg xq, const int* __restrict__ sel, const int* __restrict__ nsel,
                                                  int lbmax, const int* __restrict__ rpos = nullptr,
                                                  const int* __restrict__ rbase = nullptr, bool q16 = false,
-                                                 KvMap km = KvMap(), const int* __restrict__ psel = nullptr) {
+                                                 KvMap km = KvMap(), const int* __restrict__ psel = nullptr, int mint = 0) {
     // q16: the peers' q rows arrived as fp16 (k_qxsend16: q / 16, the same values this kernel converts to)
+    // mint > 0: the row uses Se = clamp(key tiles / mint, 1, S) of the S key splits (a short key list in 8 splits is
+    // mostly per-block overhead: q loads, 16 KB of partials per block, the merge); blocks z >= Se only mark their
+    // partial empty (M = -inf, which k_attn_merge skips). Se = S (long lists) gives the same work split as mint = 0.
     extern __shared__ __align__(16) unsigned char qd_sm[];
     __shared__ unsigned s_s;
     __shared__ float wm[4][16], wl[4][16];
-    const int kvh = blockIdx.x, t = blockIdx.y, z = blockIdx.z, S = gridDim.z;
+    const int kvh = blockIdx.x, t = blockIdx.y, z = blockIdx.z, S0 = gridDim.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    constexpr int HPG0 = NQ / NKV;
+    // the row's key list (batched rows: the row's own position and KV region)
+    const int pos = rpos ? rpos[t] : *pos0 + t;
+    const int ns = sel ? nsel[t] : -1;
+    const int nrows_all = owned_upto(p, pos);
+    const int rc = ns < 0 ? nrows_all : owned_upto(p, IDX_R * ((pos + 1) / IDX_R) - 1);
+    const int nit = ns < 0 ? nrows_all : ns * IDX_R + (nrows_all - rc);
+    const int ntile = (nit + QD_KEYS - 1) / QD_KEYS;
+    const int S = mint > 0 ? max(1, min(S0, ntile / mint)) : S0;
+    if (z >= S) {  // unused split of a short key list: empty partial, then the completion count as every block
+        if (threadIdx.x < HPG0) {
+            float* out = dst.o[z] + ((size_t)t * NQ + kvh * HPG0 + threadIdx.x) * (HD + 2);
+            out[HD] = -INFINITY;
+            out[HD + 1] = 0.f;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned s = *xq.seq + 1;
+            __threadfence();
+            if (atomicAdd(xq.done, 1u) == gridDim.x * gridDim.y * gridDim.z - 1) {
+                *xq.done = 0;
+                *xq.seq = s;
+                __threadfence();
+            }
+        }
+        return;
+    }
     __half* Ks = reinterpret_cast<__half*>(qd_sm) + (size_t)warp * 2 * QD_KEYS * QD_SROW;
     __half* Vs = Ks + QD_KEYS * QD_SROW;
     float* kss = reinterpret_cast<float*>(reinterpret_cast<__half*>(qd_sm) + (size_t)4 * 2 * QD_KEYS * QD_SROW) + warp * 2 * QD_KEYS;
@@ -3057,16 +3151,9 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
             qa[kk][3] = ld2(q1, q1h, c + 8);
         }
     }
-    // the row's key list (batched rows: the row's own position and KV region)
-    const int pos = rpos ? rpos[t] : *pos0 + t;
     const size_t rb0 = rbase ? (size_t)rbase[t] : 0;
     if (rbase && !km.pt) { const size_t rb = rb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
-    const int ns = sel ? nsel[t] : -1;
-    const int nrows_all = owned_upto(p, pos);
-    const int rc = ns < 0 ? nrows_all : owned_upto(p, IDX_R * ((pos + 1) / IDX_R) - 1);
-    const int nit = ns < 0 ? nrows_all : ns * IDX_R + (nrows_all - rc);
     auto key_row = [&](int it) { return ns < 0 ? it : (it < ns * IDX_R ? sel[(size_t)t * lbmax + it / IDX_R] * IDX_R + it % IDX_R : rc + it - ns * IDX_R); };
-    const int ntile = (nit + QD_KEYS - 1) / QD_KEYS;
     const int tile0 = z * ntile / S, tile1 = (z + 1) * ntile / S;
     float o[HD / 8][4];
 #pragma unroll
@@ -3893,14 +3980,67 @@ __global__ void __launch_bounds__(512) k_jobs(int m, const int* __restrict__ gma
             j++;
         }
     };
-    if (c) emit(e, base + inc - c, false);
+    if (!jrow) {  // dense row weights per job (m <= 8 path): one thread per expert
+        if (c) emit(e, base + inc - c, false);
+        if (e == 0) {
+            int ns = 0;
+            for (int g = 0; g < NGRP; g++) ns += shg[g] >= 0;
+            emit(NE, total, true);
+            *njobs = total + ns;
+            atomicAdd(&g_jobstat[m][0], (unsigned long long)(total + ns));
+            atomicAdd(&g_jobstat[m][1], 1ull);
+        }
+        return;
+    }
+    static_assert(MAXM <= 32, "k_jobs: the row lists use one warp lane per row");
+    // grouped rows: the job records per expert (thread e), then the compacted row lists by one warp per expert
+    // (ballot over the m <= 32 rows keeps the row order; the same lists and weights as emit())
+    __shared__ int jst[NE + 1], jct[NE + 1], hl[NE + 1], nhit;
+    if (e == 0) nhit = 0;
+    __syncthreads();
+    auto rec = [&](int j, int li) {
+        const char* b = grp_ptr(groups, li, ndev, ct, coldcnt);
+        MoeJob jb;
+        jb.gq = reinterpret_cast<const uint4*>(b);
+        jb.gs = reinterpret_cast<const __half*>(b + GG_Q);
+        jb.dq = reinterpret_cast<const uint4*>(b + GG_Q + GG_S);
+        jb.ds = reinterpret_cast<const __half*>(b + GG_Q + GG_S + GD_Q);
+        jobs[j] = jb;
+    };
+    if (c) {
+        int j = base + inc - c;
+        jst[e] = j; jct[e] = c;
+#pragma unroll
+        for (int g = 0; g < NGRP; g++) if (gm[g] >= 0) rec(j++, gm[g]);
+        hl[atomicAdd(&nhit, 1)] = e;  // (order of the list does not matter: each expert writes its own jobs)
+    }
     if (e == 0) {
-        int ns = 0;
-        for (int g = 0; g < NGRP; g++) ns += shg[g] >= 0;
-        emit(NE, total, true);
+        int ns = 0, j = total;
+        for (int g = 0; g < NGRP; g++) if (shg[g] >= 0) { rec(j++, shg[g]); ns++; }
+        jst[NE] = total; jct[NE] = ns;
+        if (ns) hl[atomicAdd(&nhit, 1)] = NE;
         *njobs = total + ns;
         atomicAdd(&g_jobstat[m][0], (unsigned long long)(total + ns));
         atomicAdd(&g_jobstat[m][1], 1ull);
+    }
+    __syncthreads();
+    for (int h = warp; h < nhit; h += 16) {
+        const int ex = hl[h];
+        const bool shared = ex == NE;
+        const int tt = lane;
+        float w = 0.f;
+        bool hit = false;
+        if (tt < m) {
+            if (shared) { w = shw[tt]; hit = true; }
+            else { const int k = ksel[ex][tt]; if (k >= 0) { w = wsel[tt][k]; hit = true; } }
+        }
+        const unsigned msk = __ballot_sync(0xffffffffu, hit);
+        const int nr = __popc(msk), pos = __popc(msk & ((1u << lane) - 1u));
+        for (int q = 0; q < jct[ex]; q++) {
+            const int j = jst[ex] + q;
+            if (hit) { jrow[j * (MAXM + 1) + 1 + pos] = tt; jw[j * MAXM + pos] = w; }
+            if (lane == 0) jrow[j * (MAXM + 1)] = nr;
+        }
     }
 }
 

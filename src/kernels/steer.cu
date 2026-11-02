@@ -7,7 +7,7 @@ namespace {
 
 constexpr int kFixT = 512;
 
-__global__ void __launch_bounds__(kFixT) steer_fix_kernel(float* __restrict__ resid, int h, SteerArg a,
+__global__ void __launch_bounds__(kFixT) steer_fix_kernel(float* __restrict__ resid, int h, const __grid_constant__ SteerArg a,
                                                           const bf16* __restrict__ norm_w, float eps,
                                                           bf16* __restrict__ xn, __half* __restrict__ xh) {
     const int row = blockIdx.x, h4 = h >> 2;

@@ -49,6 +49,9 @@ and uses the default too. In Docker pass them with `-e`.
 | `FLASH_OOM_RESERVE_MB` | `64` | Emergency VRAM per card, given up before a step runs without a CUDA graph; taken back once there is clearly room. | `0` = off. |
 | `FLASH_PIN_VRAM_MB_PER_GB` | `2` | VRAM per GB of host memory registered after start (archive, pinned prompts), kept out of the expert cache (the driver maps registered host memory with 2 MB of GPU page tables per GB on every card). | `0` = the pre-1.3.3 budget. |
 | `FLASH_CE_PREWAIT` | `1` | With `FLASH_COMM=ce`: one GPU block waits for the other cards' attention data before the kernel that uses it, only where a kernel runs next to the transfers; `2` = always. | `0` only for debugging. |
+| `QE_AR_SPLIT` | `1` | Decode all-reduces without a fused norm (Flash-Next) spread each row over several 128-thread blocks, so more SMs send and poll; same results. | `0` restores one block per row (only for debugging). |
+| `QE_AG_LL` | `1` | With peer access (both models): the small all-gathers of each decode step (argmax, top-k, lookup agreement) go GPU to GPU as tagged words instead of through host memory; same results. | `0` restores the host-memory path (only for debugging). |
+| `FLASH_QX16_DEC` | `1` | Decode and MTP steps send the attention queries to the other cards as fp16 (the values the attention kernel uses anyway, so results are identical); half the bytes. | `0` sends fp32 (only for debugging). |
 
 Server-side: `--prefill-chunk` (2048) is the prefill chunk while other requests decode, `--prefill-chunk-idle`
 (4096 for Flash-Next) the chunk when nothing else runs.
@@ -290,9 +293,10 @@ Per-request statistics lines, e.g.:
 Drafts count MTP and lookup drafts; the mean acceptance length is tokens per verify step. The prompt line counts the
 tokens actually computed (cached prefix tokens excluded).
 
-`/api/stats` counters (monitoring port): `thinking` (`requests_with_budget`, `forced_budget`, `forced_max_tokens`,
+`/api/stats` counters (monitoring port): `version` and `build` (the release, e.g. `1.3.4.2`, and the engine's build hash;
+since 1.3.4.2, shown in the qetop and dashboard headers), `thinking` (`requests_with_budget`, `forced_budget`, `forced_max_tokens`,
 `forced_failed`, `empty_replies`, `empty_stop`, `empty_length`, `empty_after_forced_close`, `empty_retried`,
-`empty_retry_recovered`, `empty_retry_exhausted`), `history` (reasoning-only turns left out), `parallel` (Flash-Next
+`empty_retry_recovered`, `empty_retry_exhausted`), `history_drops` (reasoning-only turns left out; since 1.3.4.2, earlier `history`), `parallel` (Flash-Next
 mode, reason, probe numbers), `graphs` (Flash-Next cached CUDA graphs per card: `est_mb`, `peak_mb`, `budget_mb`,
 `budget_evictions`, `evicted`, `too_big`, `oom`, `eager`, `pf_eager` (prompt steps run without a graph because their
 shape did not come back within `FLASH_PFGRAPH_WINDOW`), `pf_noroom` (prompt steps without a graph because the decode

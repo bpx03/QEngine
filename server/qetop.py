@@ -80,7 +80,8 @@ def view(s, width=140, note=None):
     last_pre = next((j.get("prefill_tps") for j in act + s["recent"] if j.get("prefill_tps")), None)
     power = sum(g["power"] for g in s["gpus"])
 
-    head = Text.assemble(("qengine ", "bold"), (f"{s.get('name', '')}  ", "cyan"),
+    ver = f"{s['version']} (build {s.get('build', 'unknown')}) " if s.get("version") else ""  # older servers: none
+    head = Text.assemble(("QEngine ", "bold"), (ver, "bold"), (f"{s.get('name', '')}  ", "cyan"),
                          (f"{_('działa')} {dur(se['uptime_s'])} · {_('start nr')} {s['runs']}", "grey62"),
                          (f"   {note[0]}", note[1]) if note else ("   l PL/EN · Ctrl+R reset · q", "grey35"))
     al = (s.get("agents") or {}).get("alarm")

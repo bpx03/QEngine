@@ -53,6 +53,9 @@ COPY --from=build /src/build/libqengine.so ./build/libqengine.so
 # Qwen3.8-Flash-Next engine (preview): picked by the server when QE_MODEL points to a Flash-Next directory
 COPY --from=build /src/build/libqflash.so ./build/libqflash.so
 COPY LICENSE ./
+# the release version and the engine's build hash, shown in /api/stats (qetop, web dashboard) and the start-up log
+COPY VERSION ./
+COPY --from=build /src/build/qe_build.txt ./build/qe_build.txt
 # included activation-steering vectors (refusal_projection, Flash-Next only); loaded only with QE_STEERING != 0 (vectors/README.md)
 COPY vectors ./vectors
 

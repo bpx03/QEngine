@@ -265,8 +265,11 @@ def main():
     h3 = drop_lines(hist3)
     assert len(h3) == 1 and "has 3 assistant turn(s)" in h3[0] and "(was 2)" in h3[0], h3
     assert drop_lines(hist3 + [{"role": "assistant", "content": ANSWER}, {"role": "user", "content": "x"}]) == []
-    hs = gen.metrics.snapshot()["history"]
+    snap = gen.metrics.snapshot()
+    hs = snap["history_drops"]
     assert hs["requests"] == 4 and hs["turns"] == 10 and hs["logged"] == 2, hs
+    # the dashboards' throughput chart (qetop, dashboard.html) reads "history" as the per-second list
+    assert isinstance(snap["history"], list), type(snap["history"])
     print("  HF #50 log:", h1[0], "|", h3[0], "| /api/stats", hs)
 
     # 19. ignore_eos (benchmarks): exactly max_tokens of raw continuation, no forced close for the answer tail

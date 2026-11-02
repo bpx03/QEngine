@@ -7,6 +7,7 @@ services:
       context: .
       args:
         VISION: "${QE_VISION_BUILD:-1}"
+        REVISION: "${QE_REVISION:-unknown}"  # QE_REVISION=$(git rev-parse HEAD): the build hash in the monitoring headers
     image: qengine:latest
     container_name: qengine
     restart: unless-stopped

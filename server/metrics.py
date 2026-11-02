@@ -49,7 +49,7 @@ class Metrics:
         self.cur = self._bucket(int(self.t0))
         self.jobs = {}  # id -> live info (queued / prefill / decode)
         self.last_done = collections.deque(maxlen=12)
-        self.ended = collections.deque()  # (t, frozen job view) of requests finished in the last 5 s
+        self.ended = collections.deque()  # (t, frozen job view) of requests finished in the last 10 s
         self.engine = {}
         self.gpus = []
         self.step_ms = collections.deque(maxlen=200)
@@ -129,7 +129,7 @@ class Metrics:
     def finished(self, job, error=None):
         with self.lock:
             j = self.jobs.pop(id(job), None)
-            if j:  # dashboards keep showing it (greyed, stats frozen) for 5 s
+            if j:  # dashboards keep showing it (greyed, stats frozen) for 10 s
                 self.ended.append((time.time(), self._job_view(j, time.time())))
             if error is not None:
                 self.session["errors"] += 1
@@ -256,7 +256,7 @@ class Metrics:
             jobs = []
             for j in self.jobs.values():
                 jobs.append(self._job_view(j, now))
-            while self.ended and self.ended[0][0] < now - 5:
+            while self.ended and self.ended[0][0] < now - 10:
                 self.ended.popleft()
             sm = sorted(self.step_ms)
             return {

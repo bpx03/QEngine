@@ -281,7 +281,9 @@ extern "C" double qe_bench_allreduce2(const char* devices, int n, int iters, int
     std::stringstream ss(devices);
     for (std::string x; std::getline(ss, x, ',');) devs.push_back(std::stoi(x));
     const int ng = devs.size();
-    Comm c = comm_create(ng, n, 5120);
+    const int H = env_int("QE_BENCH_H", 5120);       // hidden size (QFN: 2560)
+    const bool nonorm = env_int("QE_BENCH_NONORM", 0);  // QFN decode: plain add, no fused norm
+    Comm c = comm_create(ng, n, H);
     comm_enable_p2p(c, devs.data());
     std::vector<double> us(ng);
     std::vector<std::thread> th;
@@ -308,8 +310,8 @@ extern "C" double qe_bench_allreduce2(const char* devices, int n, int iters, int
             bf16* xn;
             bf16* nw;
             CUDA_CHECK(cudaMalloc(&xn, n * 2));
-            CUDA_CHECK(cudaMalloc(&nw, 5120 * 2));
-            CUDA_CHECK(cudaMemset(nw, 0, 5120 * 2));
+            CUDA_CHECK(cudaMalloc(&nw, H * 2));
+            CUDA_CHECK(cudaMemset(nw, 0, H * 2));
             CUDA_CHECK(cudaMemset(part, 0, n * 4));
             __half* xh = nullptr;   // QE_BENCH_XH=1: also write the XH copy (gemv_h16.cuh) like the engine
             if (env_int("QE_BENCH_XH", 0)) CUDA_CHECK(cudaMalloc(&xh, n * 2));
@@ -320,7 +322,8 @@ extern "C" double qe_bench_allreduce2(const char* devices, int n, int iters, int
             CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
             comm_begin_unit(ctr, st);
             for (int i = 0; i < 100; i++)
-                allreduce_add(resid, part, n / 5120, 5120, c, r, ctr, st, nw, 1e-6f, xhmode == 2 ? nullptr : xn, ll ? i : -1, false, xh);
+                allreduce_add(resid, part, n / H, H, c, r, ctr, st, nonorm ? nullptr : nw, 1e-6f,
+                              nonorm || xhmode == 2 ? nullptr : xn, ll ? i : -1, false, nonorm ? nullptr : xh);
             CUDA_CHECK(cudaStreamEndCapture(st, &g));
             CUDA_CHECK(cudaGraphInstantiate(&ge, g, 0));
             CUDA_CHECK(cudaGraphLaunch(ge, st));

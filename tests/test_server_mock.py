@@ -55,6 +55,8 @@ def build_mock(tier0):
     so = os.path.join(TMP, "mock0.so" if tier0 else "mock1.so")
     cmd = ["gcc", "-O2", "-shared", "-fPIC", "-o", so, os.path.join(HERE, "mock_engine.c")]
     subprocess.check_call(cmd + (["-DMOCK_TIER0"] if tier0 else []))
+    with open(os.path.join(TMP, "qe_build.txt"), "w") as f:  # what the build writes next to the library
+        f.write("abcdef0123\n")
     return so
 
 
@@ -212,7 +214,16 @@ def run(tier0):
                                              "messages": [{"role": "user", "content": "q10"}]}).json()
     assert r["choices"][0]["message"]["content"] == "" and r["choices"][0]["finish_reason"] == "stop", r
     assert len(prompts()) == n0 + 7 and gen.think["empty_retried"] == 4, prompts()[n0:]
-    th = gen.metrics.snapshot()["thinking"]  # /api/stats thinking
+    st = gen.metrics.snapshot()
+    th = st["thinking"]  # /api/stats thinking
+    # /api/stats version + build (qetop and web dashboard header): the VERSION file at the tree root, the build hash
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION")) as f:
+        assert st["version"] == f.read().strip(), st["version"]
+    tree = ", tree "  # added in a git tree at another commit than the library's build (always here: a mock build)
+    assert st["build"] == "abcdef0" or st["build"].startswith("abcdef0" + tree), st["build"]
+    v = app.version_info(  # a library copied out of its build dir: the hash from its file name
+        "/nonexistent/libqflash-1234567abcd.so")[1]
+    assert v == "1234567" or v.startswith("1234567" + tree), v
     assert th["empty_retried"] == 4 and th["empty_retry_recovered"] == 1 and th["empty_retry_exhausted"] == 1, th
     print("  empty replies sampled again: tool call on the 3rd try, 3 empty tries passed through, seeded not retried")
     print("  engine fallbacks:", ", ".join(gen.engine.missing_optional()))

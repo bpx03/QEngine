@@ -20,6 +20,7 @@ body { margin: 0; background: var(--bg); color: var(--ink);
        font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
 header { display: flex; align-items: baseline; gap: 16px; padding: 14px 20px; flex-wrap: wrap; }
 header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+header .ver { font-size: 14px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
 header .sub { color: var(--muted); }
 #status { margin-left: auto; font-weight: 600; }
 #lang, #theme { font: inherit; font-size: 12px; font-weight: 700; color: var(--ink); background: var(--panel);
@@ -79,7 +80,7 @@ td.num, th.num { text-align: right; }
 </head>
 <body>
 <header>
-  <h1>qengine</h1><span class="sub" id="sub">—</span>
+  <h1>QEngine <span class="ver" id="ver"></span></h1><span class="sub" id="sub">—</span>
   <span id="status" class="off" data-i18n="connecting">connecting…</span>
   <button id="reset" data-i18n="reset">reset session</button>
   <button id="lang" title="language / język">PL</button>
@@ -245,6 +246,7 @@ function drawChart(hist) {
 
 function render(s) {
   const r = s.rate, se = s.session, gl = s.global, en = s.engine || {};
+  $("ver").textContent = s.version ? `${s.version} (build ${s.build || "unknown"})` : "";  // older servers: none
   $("sub").textContent = `${s.name || ""} · ${t("running")} ${dur(se.uptime_s)} · ${t("run_no")} ${s.runs}`;
   $("k-tps").textContent = fmt(r.tok_s_10);
   $("k-tps1").textContent = fmt(r.tok_s_1);

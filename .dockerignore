@@ -1,4 +1,4 @@
-# only what the image needs: CMakeLists.txt, src/, server/, vectors/, requirements.txt, LICENSE
+# only what the image needs: CMakeLists.txt, src/, server/, vectors/, requirements.txt, LICENSE, VERSION
 *
 !CMakeLists.txt
 !src/
@@ -6,5 +6,6 @@
 !vectors/
 !requirements.txt
 !LICENSE
+!VERSION
 **/__pycache__
 **/*.pyc

@@ -509,7 +509,7 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     d.o[0] = attn_x_;
     for (int z = 1; z < dec_split_; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
     k_qsa_dec<<<dim3(NKV, m, dec_split_), 128, QD_SMEM, st_>>>(qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, posd_, d, p_, xq, isel_, insel_, lbmax,
-                                                               rp, rb, false, kvmap(L), kvs_ && m <= MAXM ? psel_ : nullptr);
+                                                               rp, rb, false, kvmap(L), kvs_ && m <= MAXM ? psel_ : nullptr, qd_mint(m, dec_split_));
     if (dec_split_ > 1) k_attn_merge<<<dim3(NQ, m), HD, 0, st_>>>(d, dec_split_);
     KCHK("qsa_b attn");
     Xchg xc;

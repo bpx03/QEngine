@@ -12,6 +12,7 @@ import hashlib
 import asyncio
 import collections
 import faulthandler
+import functools
 import json
 import os
 import re
@@ -40,6 +41,63 @@ from think_budget import BudgetError, ThinkControl, ThinkIds, empty_reply, reque
 from model_profile import DroppedTurnLog, Profile, drop_empty_turns, merge_leading_system
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+
+
+def _hash7(h):
+    """a git hash cut to 7 characters, a "-dirty" suffix kept"""
+    m = re.fullmatch(r"([0-9a-f]{7,40})(-dirty)?", h)
+    return m.group(1)[:7] + (m.group(2) or "") if m else h
+
+
+def _tree_hash():
+    """HEAD of the server's own git tree (+ "-dirty": tracked files changed), or "" outside one (also when ROOT is a
+    tree without .git unpacked inside another repository)"""
+    def git(*a):
+        return subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True, timeout=3).stdout.strip()
+    try:
+        top = git("rev-parse", "--show-toplevel")
+        if not top or os.path.realpath(top) != os.path.realpath(ROOT):
+            return ""
+        h = git("rev-parse", "--short=7", "HEAD")
+        return h + ("-dirty" if h and git("status", "--porcelain", "-uno") else "")
+    except Exception:
+        return ""
+
+
+@functools.lru_cache(maxsize=None)
+def _version_info(lib):
+    try:
+        with open(os.path.join(ROOT, "VERSION")) as f:
+            version = f.read().strip()
+    except OSError:
+        version = ""
+    build = ""
+    try:  # written by the build next to the libraries (CMakeLists.txt target qe_build_id; the Docker image copies it)
+        with open(os.path.join(os.path.dirname(lib), "qe_build.txt")) as f:
+            build = f.read().strip()
+    except OSError:
+        pass
+    if build in ("", "unknown"):  # a library copied out of its build: libqflash-<hash>.so
+        m = re.search(r"-([0-9a-f]{7,40})\.so$", os.path.basename(lib))
+        build = m.group(1) if m else ""
+    tree = _tree_hash()
+    if not build and not tree:  # an old build directory without qe_build.txt, named qengine-<hash>
+        m = re.fullmatch(r"qengine-([0-9a-f]{7,40})", os.path.basename(os.path.realpath(ROOT)))
+        build = m.group(1) if m else ""
+    build = _hash7(build) if build else "unknown"
+    if tree and tree != build:  # the library was built from other code than the tree the server runs from
+        build = f"{build}, tree {tree}"
+    return version or "dev", build
+
+
+def version_info(lib=None):
+    """(version, build) of this install for the start-up log and /api/stats (qetop, web dashboard); computed once per
+    library. version: the VERSION file at the tree root (bumped by the release flow; in the git tree, the public
+    export and the Docker image), else "dev". build: the hash the loaded engine library was built from (qe_build.txt
+    next to it, else a -<hash>.so file name), "unknown" if neither; ", tree <hash>" is added when the server's git
+    tree is at another commit or has uncommitted changes."""
+    return _version_info(os.path.realpath(lib or os.path.join(ROOT, "build", "libqengine.so")))
+
 
 # QE_STEP_PROF=1: per-step host timing of the single-sequence decode loop (ctypes step call, metrics,
 # feed = detokenize + parser hand-off, check_done, the rest of the loop iteration), one JSON line per
@@ -643,17 +701,23 @@ class Generator:
         self.agents = Tracker(override=getattr(args, "main_agent_re", None))
         self.sched = {"main_pauses": 0, "main_cutins": 0, "backfills": 0}
         snap = self.metrics.snapshot
+        version, build = version_info(getattr(self.engine, "lib_path", None))  # qetop / dashboard header
         # parallel mode of the engine (FLASH_PAR / the boot-time pick: mode, why, probe numbers)
         par_info = getattr(self.engine, "par_info", None)
         host_mem = getattr(self.engine, "host_mem", None)  # the host-RAM plan of the boot (src/host_budget.h)
         graph_info = getattr(self.engine, "graph_info", None)  # cached CUDA graphs per card (FLASH_GRAPH_MB)
-        self.metrics.snapshot = lambda: dict(snap(), agents=self.agents.stats(), sched=dict(self.sched),
-                                             loop_guard=self.guard_stats(),
-                                             parallel=par_info() if par_info else {"mode": "tp"},
-                                             host_memory=host_mem() if host_mem else {},
-                                             graphs=graph_info() if graph_info else {},
-                                             thinking=self.think_snapshot(), history=self.drop_log.stats(),
-                                             steering=self.steer_stats())
+        def wrapped():
+            base = snap()
+            extra = dict(agents=self.agents.stats(), sched=dict(self.sched), loop_guard=self.guard_stats(),
+                         parallel=par_info() if par_info else {"mode": "tp"},
+                         host_memory=host_mem() if host_mem else {},
+                         graphs=graph_info() if graph_info else {},
+                         thinking=self.think_snapshot(), history_drops=self.drop_log.stats(),
+                         steering=self.steer_stats(), version=version, build=build)
+            clash = base.keys() & extra.keys()  # a shadowed metrics key breaks the dashboards (see history_drops)
+            assert not clash, f"/api/stats keys shadow metrics keys: {sorted(clash)}"
+            return dict(base, **extra)
+        self.metrics.snapshot = wrapped
         if args.metrics_port:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if env_str("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
@@ -2650,19 +2714,13 @@ def start_log(args):
     if not lf or lf in ("0", "off", "none"):
         return
     import logtee
-    import subprocess
     import sys
     path = logtee.default_path(args.served_name or "qengine") if lf == "auto" else os.path.expanduser(lf)
-    try:
-        build = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short=7", "HEAD"], capture_output=True,
-                               text=True, timeout=3).stdout.strip()
-    except Exception:
-        build = ""
-    build = build or os.path.basename(os.path.realpath(ROOT))
+    version, build = version_info(args.engine_lib or env_str("QE_LIB"))
     env = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items())
                    if k.startswith(("QE_", "FLASH_", "CUDA_VISIBLE", "CUDA_MODULE")))
     try:
-        logtee.install(path, args.log_mb, 3, f"==== qengine server start: pid {os.getpid()}, build {build} "
+        logtee.install(path, args.log_mb, 3, f"==== qengine server start: QEngine {version}, pid {os.getpid()}, build {build} "
                                              f"({os.path.realpath(ROOT)}), log {path}\n"
                                              f"argv: {' '.join(sys.argv)}\nenv: {env}")
     except Exception as ex:  # never keep the server from starting
@@ -2672,6 +2730,7 @@ def start_log(args):
 def main():
     args = parse_args()
     start_log(args)
+    print("QEngine %s (build %s)" % version_info(args.engine_lib or env_str("QE_LIB")), flush=True)
     if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
         import assets
         assets.ensure(args.model)

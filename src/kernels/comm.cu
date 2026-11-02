@@ -584,7 +584,7 @@ __global__ void __launch_bounds__(512) ar_finish_kernel(float* __restrict__ resi
                                                         int h, const bf16* __restrict__ norm_w, float eps,
                                                         bf16* __restrict__ xn, int8_t* __restrict__ xq,
                                                         float* __restrict__ xsc, int* __restrict__ ctr, bool wxn,
-                                                        const SteerArg sa) {
+                                                        const __grid_constant__ SteerArg sa) {
     __shared__ float s_w[16];  // 512 threads as the fused tail: identical summation order
     const int r = blockIdx.x, h4 = h >> 2;
     // stream-K work counter of the W4A8 GEMM that consumes these rows next on this stream (replaces a
@@ -921,16 +921,20 @@ __device__ __forceinline__ void steer_vals7(const float* __restrict__ w, float s
         }
 }
 
-template <int MODE>
-__global__ void __launch_bounds__(kLL16Threads) allreduce_ll16_kernel(
-    float* __restrict__ resid, const float* __restrict__ partial, int h, Comm c, int rank,
+// NT < kLL16Threads (QE_AR_SPLIT): a row's words over gridDim.y blocks of NT threads (w = blockIdx.y NT + tid), for
+// all-reduces without the fused norm and steering (the QFN decode adds into y): more SMs issue the P2P stores and
+// polls; the per-word arithmetic is the same (bit-identical).
+template <int MODE, int NT = kLL16Threads>
+__global__ void __launch_bounds__(NT) allreduce_ll16_kernel(
+    float* __restrict__ resid, const float* __restrict__ partial, int h, const __grid_constant__ Comm c, int rank,
     CommCounters ctr, int idx, const bf16* __restrict__ norm_w, float eps,
-    bf16* __restrict__ xn, __half* __restrict__ xh, const SteerArg sa) {
-    __shared__ float s_w[kLL16Threads / 32];
+    bf16* __restrict__ xn, __half* __restrict__ xh, const __grid_constant__ SteerArg sa) {
+    constexpr bool kFull = NT == kLL16Threads;
+    __shared__ float s_w[NT / 32];
     const int row = blockIdx.x, tid = threadIdx.x;
     float ssc = 0.f;
     int smode = 0;
-    const float* sdir = steer_dir(sa, row, h, ssc, smode);  // layer-output steering of this row (steer.cuh), or null
+    const float* sdir = kFull ? steer_dir(sa, row, h, ssc, smode) : nullptr;  // layer-output steering of this row (steer.cuh), or null
     const unsigned ep = *ctr.epoch;
     const uint32_t tag = ((ep * 1024u + idx) % 65535u + 1u) << 16;  // never 0
     const int slot = ((ep & 1) << 1) | (idx & 1);
@@ -945,7 +949,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_ll16_kernel(
     };
     const float* pr = partial + (size_t)row * h;
     float* rr = resid + (size_t)row * h;
-    const int w = tid;
+    const int w = blockIdx.y * NT + tid;
     const bool on = w < hw;
     // value e of word w: 7 w + e (master, MODE 0) or w + hw e (QE_AR_COAL: coalesced across the warp)
     const bool coal = MODE != 0 && c.coal;
@@ -1028,6 +1032,9 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_ll16_kernel(
             acc[e] = r;
             q += r * r;
         }
+    if constexpr (!kFull) {
+        return;
+    } else {
     if (sdir) steer_vals7(sdir, ssc, smode, acc, cidx, on, h, rr, q);
     if (!norm_w) return;
 #pragma unroll
@@ -1036,7 +1043,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_ll16_kernel(
     __syncthreads();
     float tot = 0.f;
 #pragma unroll
-    for (int x = 0; x < kLL16Threads / 32; x++) tot += s_w[x];
+    for (int x = 0; x < NT / 32; x++) tot += s_w[x];
     const float rs = rsqrtf(tot / h + eps);
     bf16* o = xn + (size_t)row * h;
     if (on)
@@ -1048,6 +1055,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_ll16_kernel(
             if (xn) o[i] = __float2bfloat16(v);
             if (xh) store_xh(xh + (size_t)row * h, i, v);
         }
+    }  // kFull
 }
 
 
@@ -1106,7 +1114,7 @@ __device__ __forceinline__ void dec9(uint4 a, uint32_t (&b)[kCE]) {
 __global__ void __launch_bounds__(kLL16Threads) allreduce_llc_kernel(
     float* __restrict__ resid, const float* __restrict__ partial, int h, Comm c, int rank,
     CommCounters ctr, int idx, const bf16* __restrict__ norm_w, float eps,
-    bf16* __restrict__ xn, __half* __restrict__ xh, const SteerArg sa) {
+    bf16* __restrict__ xn, __half* __restrict__ xh, const __grid_constant__ SteerArg sa) {
     extern __shared__ float s_sum[];  // [h]
     __shared__ float s_w[kLL16Threads / 32];
     const int row = blockIdx.x, tid = threadIdx.x;
@@ -1420,6 +1428,34 @@ __global__ void allgather_kernel(const float* __restrict__ src, int n, float* __
     bump_seq(ctr, s);
 }
 
+// P2P form of allgather_kernel (same output): every value goes to each peer as an 8-byte word (bits, tag s), where s
+// is the call's sequence number (the same on every rank, never 0, increasing: no clearing needed); the receiver polls
+// its own memory. 2 slots (s & 1): a peer reaches call s + 2 only after this rank sent s + 1, i.e. finished reading s.
+__global__ void allgather_ll_kernel(const float* __restrict__ src, int n, float* __restrict__ out, const __grid_constant__ Comm c, int rank,
+                                    CommCounters ctr) {
+    __shared__ unsigned s_seq;
+    if (threadIdx.x == 0) s_seq = *ctr.seq + 1;
+    __syncthreads();
+    const unsigned s = s_seq;
+    auto reg = [&](int owner, int sender) { return c.pag[owner] + ((size_t)(s & 1u) * c.ngpu + sender) * kAgWords; };
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = src[i];
+        for (int g = 0; g < c.ngpu; g++)
+            if (g != rank) st_ll(reg(g, rank) + i, __float_as_uint(v), s);
+        out[rank * n + i] = v;
+    }
+    for (int g = 0; g < c.ngpu; g++) {
+        if (g == rank) continue;
+        const uint2* rb = reg(rank, g);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            uint2 u = ld_ll(rb + i);
+            for (unsigned ws = 0; u.y != s;) { u = ld_ll(rb + i); QE_WD_POLL(ws, kWdAllgather, g, s, u.y); }
+            out[g * n + i] = __uint_as_float(u.x);
+        }
+    }
+    bump_seq(ctr, s);
+}
+
 }  // namespace
 
 Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
@@ -1465,6 +1501,8 @@ bool comm_enable_p2p(Comm& c, const int* devices) {
         }
         CUDA_CHECK(cudaMalloc(&c.pll[i], bytes));
         CUDA_CHECK(cudaMemset(c.pll[i], 0, bytes));
+        CUDA_CHECK(cudaMalloc(&c.pag[i], (size_t)2 * c.ngpu * kAgWords * sizeof(uint2)));
+        CUDA_CHECK(cudaMemset(c.pag[i], 0, (size_t)2 * c.ngpu * kAgWords * sizeof(uint2)));
         c.rs_rows = c.max_elems / c.ll_hidden;
         c.rs_own = (c.rs_rows + c.ngpu - 1) / c.ngpu;
         CUDA_CHECK(cudaMalloc(&c.prs1[i], (size_t)c.ngpu * c.rs_own * c.ll_hidden * 2));
@@ -1494,7 +1532,7 @@ bool comm_enable_p2p(Comm& c, const int* devices) {
 void comm_free_p2p(Comm& c, const int* devices) {
     for (int i = 0; i < c.ngpu; i++) {
         cudaSetDevice(devices[i]);
-        for (void* q : {(void*)c.pll[i], (void*)c.prs1[i], (void*)c.prs2[i], (void*)c.pflags[i], (void*)c.pxn[i],
+        for (void* q : {(void*)c.pll[i], (void*)c.pag[i], (void*)c.prs1[i], (void*)c.prs2[i], (void*)c.pflags[i], (void*)c.pxn[i],
                         (void*)c.pxq[i], (void*)c.pxsc[i], (void*)c.cfl[i], (void*)c.pstage[i]})
             if (q) cudaFree(q);
         c.cfl[i] = nullptr;
@@ -1503,6 +1541,7 @@ void comm_free_p2p(Comm& c, const int* devices) {
         c.pxq[i] = nullptr;
         c.pxsc[i] = nullptr;
         c.pll[i] = nullptr;
+        c.pag[i] = nullptr;
         c.prs1[i] = c.prs2[i] = nullptr;
         c.pflags[i] = nullptr;
     }
@@ -1547,6 +1586,10 @@ void allreduce_finish(float* resid, int m, int h, const Comm& c, int rank, const
 static bool ar_rsum() {
     static const bool on = env_int("QE_AR_RSUM", 1);
     return on;
+}
+static bool ar_split() {  // QE_AR_SPLIT: LL16 rows without the fused norm over 128-thread blocks (1, default) or one block
+    static const bool v = env_int("QE_AR_SPLIT", 1) != 0;
+    return v;
 }
 static int ar_rs_min() {  // min rows of the decode reduce-scatter + all-gather (MODE 2)
     static const int v = env_int("QE_AR_RS_MIN", 3);  // m >= 3: fewer bytes beat the extra hop (ar_bench)
@@ -1593,7 +1636,16 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
             if (mode == 2 && lossless > 0 && m >= lossless)
                 allreduce_llc_kernel<<<m, kLL16Threads, h * sizeof(float), st>>>(resid, partial, h, c, rank, ctr, ll_idx,
                                                                              norm_w, eps, xn, xh, S), fused = true;
-            else if (mode == 2)
+            // QE_AR_SPLIT (default 1): without the norm / steering / xn / xh outputs, a row runs on blocks of 128
+            // threads (bench/ll16_floor.cu replica m=4 5.50 -> 4.87 us); 0: one 768-thread block per row
+            else if (mode >= 1 && ar_split() && !norm_w && !xn && !xh && S.li < 0) {
+                const dim3 g(m, ((h + 6) / 7 + 127) / 128);
+                if (mode == 2)
+                    allreduce_ll16_kernel<2, 128><<<g, 128, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx, norm_w, eps, xn, xh, S);
+                else
+                    allreduce_ll16_kernel<1, 128><<<g, 128, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx, norm_w, eps, xn, xh, S);
+                fused = true;
+            } else if (mode == 2)
                 allreduce_ll16_kernel<2><<<m, kLL16Threads, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx,
                                                                      norm_w, eps, xn, xh, S), fused = true;
             else if (mode == 1)
@@ -2231,7 +2283,9 @@ void allgather_small(const float* src, int n, float* out, const Comm& c, int ran
                      const CommCounters& ctr, cudaStream_t st) {
     CHECK(n <= 8192 && n <= c.max_elems, "allgather too large");
     if (qe_fault_skip(rank, "ar")) return;  // test only (QE_FAULT_SKIP_AR_RANK)
-    allgather_kernel<<<1, 256, 0, st>>>(src, n, out, c, rank, ctr);
+    static const bool ll = env_int("QE_AG_LL", 1) != 0;  // P2P tagged words (0: the flag protocol through host memory)
+    if (ll && c.p2p && c.pag[0] && n <= kAgWords) allgather_ll_kernel<<<1, 256, 0, st>>>(src, n, out, c, rank, ctr);
+    else allgather_kernel<<<1, 256, 0, st>>>(src, n, out, c, rank, ctr);
 }
 
 #include "comm_probe.cuh"

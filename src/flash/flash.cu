@@ -166,6 +166,16 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
         else if (nt_ == 3) KERNEL<3><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                       \
         else KERNEL<4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                                     \
     } while (0)
+// decode attention: key tiles per used split (FLASH_ATTN_DMIN; 0: always all dec_split_ splits). Only for launches of
+// more than one wave (NKV x rows x splits blocks > 2 per SM: batched steps, lookup steps): there the unused splits of
+// short key lists are overhead; a one-wave launch (c=1 MTP, 64 blocks) keeps every split (measured: DMIN on c=1 at
+// 32K / 128K was 1-2 % slower). Depends only on launch constants (graph-safe).
+static int qd_mint(int rows, int splits) {
+    static const int v = env_int("FLASH_ATTN_DMIN", 16);
+    static int nsm = 0;
+    if (!nsm) { int d; CUDA_CHECK(cudaGetDevice(&d)); CUDA_CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d)); }
+    return NKV * rows * splits > 2 * nsm ? v : 0;
+}
 // W16 GEMV over any row count (<= 64 rows per call; ksplit: partial slices at y + s * ystride)
 static const bool g_rows_gemm = env_int("FLASH_ROWS_GEMM", 1);  // smem-staged GEMM (N % 64 == 0)
 static const int g_rows_min = env_int("FLASH_ROWS_GEMV", MAXM + 1);  // 0: off
@@ -3343,7 +3353,11 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 if (sr == p_.rank && sns > 0) k_spin<<<1, 1, 0, st_>>>(sns);
             }
             // block selection reads q in k_qsa_dec, which takes the peers' rows as fp16 too (x16o)
-            const bool q16 = x16 || (x16o && sel_on_ && dec_k_ && mr <= XROWS && !(pf_ && env_str("FLASH_DEC_NOPF")));
+            // decode / MTP rows (mr <= 8, always k_qsa_dec): the peers' q as fp16 too (FLASH_QX16_DEC, default 1): k_qsa_dec
+            // converts fp32 q to the same fp16 (q / 16) values, so the result is bit-identical with half the bytes
+            static const bool qx16_dec = env_int("FLASH_QX16_DEC", 1);
+            const bool q16 = x16 || (x16o && sel_on_ && dec_k_ && mr <= XROWS && !(pf_ && env_str("FLASH_DEC_NOPF"))) ||
+                             (qx16_dec && dec_k_ && mr <= 8 && !(pf_ && env_str("FLASH_DEC_NOPF")));
             // staged prefill transfers (FLASH_COMM ce / host): the rows go into the outbox, then by copies
             const int qpar = xstage_ ? (++xq_k_) & (XSLOT - 1) : 0;  // the consumers' slot s & (XSLOT - 1)
             const bool qstg = xstage_ && xout_ && mr > 8;
@@ -3361,7 +3375,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 qs = pfs_;
             }
             // FLASH_QX_LOCAL: the peers' heads' q from this card's own x rows into its receive slot (+ its own flags)
-            const bool qloc = qx_on_ && L.qx.q && pf_ && q16 && t0 == 0 && mr == m && !qside;
+            const bool qloc = qx_on_ && L.qx.q && pf_ && q16 && mr > 8 && t0 == 0 && mr == m && !qside;  // (mr > 8: not the decode fp16 term)
             if (qloc) {
                 const int nqx = (NQ - ql) * HD;
                 rows8(L.qx, x_, H, qxb_, nqx, m, st_);
@@ -3532,7 +3546,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 for (int z = 1; z < S; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
                 k_qsa_dec<<<dim3(NKV, mr, S), 128, QD_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq,
                                                                   sel_on_ ? isel_ : nullptr, insel_, lbmax, nullptr, rbcur_, q16, kvmap(L),
-                                                                  kvs_ && mr <= MAXM ? psel_ : nullptr);
+                                                                  kvs_ && mr <= MAXM ? psel_ : nullptr, mr <= MAXM ? qd_mint(mr, S) : 0);
                 if (S > 1) k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S);
                 static const bool qcmp = env_int("FLASH_QPF_CMP", 0);
                 if (qcmp && pf_ && sel_on_ && mr > MAXM && attnB_ && S == 1) {  // debug: k_qsa_pfsel shadow vs k_qsa_dec (eager)

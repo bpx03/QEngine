@@ -626,7 +626,7 @@ __host__ __device__ constexpr size_t qpf_raw_bytes() { return (size_t)QP_NST * (
 // CE path (FLASH_COMM=ce): the peers' q flags of the exchange about to be consumed, waited for by one thread here instead
 // of in every k_qsa_pfsel block. A pfsel block takes a whole SM; blocks spinning on flags while holding every SM
 // deadlocked against the copy-engine exchanges and their wait kernels (hang / watchdog trap, qfn_prefill_r4).
-__global__ void k_qpf_qwait(Xchg xq, Plan p) {
+__global__ void k_qpf_qwait(const __grid_constant__ Xchg xq, Plan p) {
     if (threadIdx.x != 0) return;
     const unsigned s = *xq.seq + 1;
     for (int g = 0; g < p.ngpu; g++)
@@ -701,7 +701,7 @@ template <bool PVH, bool QKH>  // fp16-accumulate P.V (per 16-key tile, flushed 
 __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restrict__ qb, const uint8_t* __restrict__ kc,
                                                             const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                             const float* __restrict__ vs, const int* __restrict__ pos0,
-                                                            AttnDst dst, Plan p, Xchg xq, const int* __restrict__ sel,
+                                                            const __grid_constant__ AttnDst dst, Plan p, const __grid_constant__ Xchg xq, const int* __restrict__ sel,
                                                             const int* __restrict__ nsel, int lbmax, int m,
                                                             const int* __restrict__ rbase, bool q16, int dbg = 0,
                                                             QpUnion qu = QpUnion(), int ngrp = 0, KvMap km = KvMap()) {

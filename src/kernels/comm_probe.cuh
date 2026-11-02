@@ -340,6 +340,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
             if (c.prs1[0]) real.push_back({"reduce-scatter rows", (void**)c.prs1, (size_t)ng * c.rs_own * hw * 2});
             if (c.prs2[0]) real.push_back({"all-reduce sums", (void**)c.prs2, (size_t)c.rs_rows * hw * 2});
             if (c.pstage[0]) real.push_back({"CE staging rows", (void**)c.pstage, (size_t)c.rs_rows * hw * 2});
+            if (c.pag[0]) real.push_back({"all-gather receive words", (void**)c.pag, (size_t)2 * ng * kAgWords * sizeof(uint2)});
             size_t real_mb = 0;
             for (int i = 0; i < ng; i++)
                 for (int j = 0; j < ng; j++) {
