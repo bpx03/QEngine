@@ -1,5 +1,7 @@
 # QEngine
 
+![QEngine 1.3.4.2 vs 1.3.4.1: Qwen3.8-Flash-Next on 3x RTX 3090, club-3090 rebench-full](docs/img/qengine-1.3.4.2.jpg)
+
 QEngine is a source-available inference engine for two models on NVIDIA RTX 3090 cards:
 
 - **Qwen3.8-Flash-Next** (routed experts INT4 from Intel's AutoRound checkpoint, the parts every token passes through
