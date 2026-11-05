@@ -31,6 +31,8 @@ FAMILIES = {
         lib="build/libqengine.so", vision=True, prefill_chunk_idle=0,
         drop_empty_turns=False,   # HF #50 cleanup: off (would change 27B prompts)
         merge_system=False,       # server-side merge of leading system messages (syssafe does it)
+        sampling_thinking=dict(temperature=0.6, top_p=0.95, top_k=20),
+        sampling_instruct=dict(temperature=0.7, top_p=0.80, top_k=20),
     ),
     "qwen38-flash-next": dict(
         served_name="qwen3.8-flash-next-qengine",
@@ -40,6 +42,8 @@ FAMILIES = {
         lib="build/libqflash.so", vision=True,
         prefill_chunk_idle=4096,  # a prompt alone on the server: the engine's big batch (prefill-r3)
         drop_empty_turns=True, merge_system=True,
+        sampling_thinking=dict(temperature=None, top_p=None, top_k=None),   # generation_config (1.0 / 0.95)
+        sampling_instruct=dict(temperature=0.7, top_p=0.80, top_k=20),      # the family card's non-thinking rec
     ),
 }
 
@@ -63,15 +67,22 @@ class Profile:
     def is_flash(self):
         return self.family == "qwen38-flash-next"
 
-    def sampling(self, temperature=None, top_p=None, top_k=None, min_p=None):
-        """Server defaults for requests without them: command line > family > generation_config."""
+    def sampling(self, temperature=None, top_p=None, top_k=None, min_p=None, thinking=True):
+        """Server defaults for requests without them: command line > the family's per-MODE
+        recommendation (thinking vs enable_thinking=false) > generation_config. A recommendation
+        field of None falls through to the next tier, so a family can pin only the modes (or the
+        fields) it has a recommendation for."""
         g = self.gen
-        t = temperature if temperature is not None else self.defaults["temperature"]
+        rec = (self.defaults.get("sampling_thinking") if thinking
+               else self.defaults.get("sampling_instruct")) or {}
+        t = temperature if temperature is not None else rec.get("temperature", self.defaults.get("temperature"))
         if t is None:
             t = g.get("temperature", 1.0)
+        tp = top_p if top_p is not None else rec.get("top_p")
+        tk = top_k if top_k is not None else rec.get("top_k")
         return {"temperature": float(t),
-                "top_p": float(top_p or g.get("top_p") or 0.95),
-                "top_k": int(top_k or g.get("top_k") or 20),
+                "top_p": float(tp if tp is not None else (g.get("top_p") or 0.95)),
+                "top_k": int(tk if tk is not None else (g.get("top_k") or 20)),
                 "min_p": float(min_p if min_p is not None else g.get("min_p", 0.0))}
 
     def tokenizer_json(self, override=None):

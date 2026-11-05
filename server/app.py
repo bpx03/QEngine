@@ -654,6 +654,13 @@ class Generator:
         print("sampling defaults (when the request has none): temperature %.2f, top_p %.2f, top_k %d, min_p %.2f"
               % (args.temperature, self.sampling_defaults["top_p"], self.sampling_defaults["top_k"],
                  self.sampling_defaults["min_p"]), flush=True)
+        # non-thinking requests: their own recommendation set, --temperature-instruct/--top-p-instruct
+        # on top (applied in begin_start when the request's enable_thinking is false)
+        self.sampling_instruct = prof.sampling(args.temperature_instruct, args.top_p_instruct,
+                                               args.top_k, args.min_p, thinking=False)
+        print("sampling defaults, non-thinking requests: temperature %.2f, top_p %.2f, top_k %d"
+              % (self.sampling_instruct["temperature"], self.sampling_instruct["top_p"],
+                 self.sampling_instruct["top_k"]), flush=True)
         self.vision = None
         if args.vision:  # before the engine, so that its KV cache planning sees the memory used
             from vision import VisionEncoder
@@ -1533,11 +1540,21 @@ class Job:
     def begin_start(self):
         g, e, p = self.gen, self.gen.engine, self.p
         temp = p.get("temperature")
-        temp = g.args.temperature if temp is None else temp
+        # requests that run WITHOUT thinking fall back to the non-thinking sampling set. The
+        # mode comes from the SAME resolution the rendering uses (template_kwargs: the request's
+        # chat_template_kwargs, the Anthropic thinking:{type:disabled} field, the --think default)
+        think = template_kwargs(p, g.args.think).get("enable_thinking")
+        inst = getattr(g, "sampling_instruct", None) or {}
+        non_think = think is False and inst
+        if temp is None:
+            temp = inst.get("temperature", g.args.temperature) if non_think else g.args.temperature
         # top_p / top_k / min_p the client does not send (Claude Code sends none): the model's
         # recommended values (generation_config.json, --top-p / --top-k). Sampling at temperature
         # 1 without them (top_p 1, top_k 40) lets tail tokens break tool-call syntax.
         d = g.sampling_defaults
+        if non_think:
+            d = dict(d)
+            d.update({k: v for k, v in inst.items() if k != "temperature"})
         self.max_new = p.get("max_tokens") or (e.max_t - len(self.ids) - 16)
         self.stops = [s for s in (p.get("stop") or []) if s]
         self.t0 = time.time()
@@ -2596,6 +2613,11 @@ def parse_args(argv=None):
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
     ap.add_argument("--temperature", type=float, default=None,
                     help="default when request has none (27B 0.6, Flash-Next generation_config 1.0)")
+    ap.add_argument("--temperature-instruct", type=float, default=None,
+                    help="default when the request runs WITHOUT thinking (enable_thinking false); "
+                         "unset = the family's non-thinking recommendation")
+    ap.add_argument("--top-p-instruct", type=float, default=None,
+                    help="default top_p when the request runs WITHOUT thinking; unset = the recommendation")
     ap.add_argument("--top-p", type=float, default=None, help="default when request has none (generation_config)")
     ap.add_argument("--top-k", type=int, default=None, help="default when request has none (generation_config)")
     ap.add_argument("--min-p", type=float, default=None, help="default when request has none (generation_config)")
