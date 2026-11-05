@@ -197,6 +197,7 @@ int numa_nodes();
 // memory policy of [p, p + n) (page aligned, before the first touch): one node preferred, several interleaved; no-op on
 // a single-node machine or with an empty list
 void numa_place(void* p, size_t n, const std::vector<int>& nodes);
+std::vector<int> qe_numa_override();  // QE_NUMA env (comm_probe.cuh); empty when unset
 // Probes every GPU pair (SM stores into peer memory, copy-engine peer copies, copies staged through pinned host memory;
 // a few ms each), reads the topology (P2P performance rank, NUMA nodes), logs them and picks the prefill transfer path:
 // env (FLASH_COMM / QE_COMM) = auto | p2p | ce | host. staged: the engine has the CE / host-staged prefill collectives

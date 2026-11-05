@@ -2119,6 +2119,12 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         fprintf(stderr, "[qflash] NUMA: %s; cold experts on each GPU's node, n-gram table %s\n", nl.c_str(),
                 ng_nodes.size() > 1 ? "interleaved over the GPUs' nodes" : "on the GPUs' node");
     }
+    if (std::vector<int> ov = qe_numa_override(); !ov.empty()) {  // QE_NUMA: manual nodes (sysfs -1 machines)
+        ng_nodes = ov;
+        std::string js;
+        for (size_t i = 0; i < ov.size(); i++) js += (i ? "," : "") + std::to_string(ov[i]);
+        fprintf(stderr, "[qflash] NUMA: QE_NUMA=%s overrides sysfs; n-gram table over these nodes\n", js.c_str());
+    }
     double ng_secs = 0;
     size_t ng_bytes = 0;
     std::promise<void> ng_prom;
@@ -2153,8 +2159,8 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                 madvise((void*)(lo & ~(uintptr_t)4095), hi - (lo & ~(uintptr_t)4095), MADV_RANDOM);
         }
         char* pin = !pinned ? (char*)lo
-                  : fpath.empty() ? pin_host((const void*)lo, hi - lo, 32, true, ng_nodes)
-                                  : pin_host_file(fpath, foff, hi - lo, (const void*)lo, 32, ng_nodes);
+                  : fpath.empty() ? pin_host((const void*)lo, hi - lo, env_int("QE_PIN_THREADS", 32), true, ng_nodes)
+                                  : pin_host_file(fpath, foff, hi - lo, (const void*)lo, env_int("QE_PIN_THREADS", 32), ng_nodes);
         for (int i = 0; i < 128; i++) {
             const char* h = pin + ((uintptr_t)tens(i).data - lo);
             void* dp = (void*)h;

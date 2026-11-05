@@ -143,6 +143,22 @@ int gpu_numa_node(int device) {
     return v.empty() ? -1 : atoi(v.c_str());
 }
 
+// QE_NUMA (e.g. "0,1,2,3"): NUMA nodes for the host-pinned buffers - the n-gram table, the cold
+// experts, the host-staged comm buffers - as a manual override for machines whose sysfs numa_node
+// is absent (-1): the per-GPU node lookup then leaves every buffer on default first-touch
+// placement, silently. Several nodes interleave the pages (numa_place), one prefers them.
+// Negative entries and duplicates are dropped. Empty: the sysfs behavior, unchanged.
+std::vector<int> qe_numa_override() {
+    std::vector<int> v;
+    for (int n : env_int_list("QE_NUMA")) {
+        if (n < 0) continue;
+        bool dup = false;
+        for (int x : v) dup |= x == n;
+        if (!dup) v.push_back(n);
+    }
+    return v;
+}
+
 // negotiated PCIe link width of a GPU (lanes; -1 unknown). The width holds at idle, the speed does not (idle cards
 // drop to 2.5 GT/s), so only the width is read.
 int gpu_link_width(int device) {

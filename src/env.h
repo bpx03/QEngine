@@ -13,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 // The value of `name`, or nullptr when it is unset, empty or only whitespace.
 inline const char* env_str(const char* name) {
@@ -72,6 +73,32 @@ inline double env_double(const char* name, double def) {
     if (end == e || errno == ERANGE || !qe_env_detail::tail_ok(end)) {
         qe_env_detail::warn(name, e, "a number");
         return def;
+    }
+    return v;
+}
+
+// The comma-separated ints of `name` (e.g. "0,1,2,3"), for switches that take a list (QE_NUMA).
+// Unset, empty or whitespace-only: {} (the scalar helpers' rule). A token that does not parse as an
+// integer warns once per name and is skipped; the rest of the list still applies.
+inline std::vector<int> env_int_list(const char* name) {
+    std::vector<int> v;
+    const char* e = env_str(name);
+    if (!e) return v;
+    const char* p = e;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (!*p) break;
+        errno = 0;
+        char* end = nullptr;
+        const long val = strtol(p, &end, 10);
+        bool ok = end != p && errno != ERANGE && val >= INT_MIN && val <= INT_MAX;
+        for (const char* q = end; ok && *q && *q != ','; ++q)
+            if (!isspace((unsigned char)*q)) ok = false;
+        if (ok)
+            v.push_back((int)val);
+        else
+            qe_env_detail::warn(name, e, "a comma-separated int list");
+        while (*p && *p != ',') ++p;  // the next token (or the end)
     }
     return v;
 }

@@ -41,6 +41,30 @@ int main() {
     EXPECT(env_int("QE_T", 64) == 64 && env_ll("QE_T", 0) == 99999999999ll);
     setenv("QE_T", "1e3", 1);
     EXPECT(env_double("QE_T", 0) == 1000.0);
+    unsetenv("QE_LIST");
+    EXPECT(env_int_list("QE_LIST").empty());
+    setenv("QE_LIST", "", 1);
+    EXPECT(env_int_list("QE_LIST").empty());
+    setenv("QE_LIST", "0,1,2,3", 1);
+    {
+        const std::vector<int> v = env_int_list("QE_LIST");
+        EXPECT(v.size() == 4 && v[0] == 0 && v[1] == 1 && v[2] == 2 && v[3] == 3);
+    }
+    setenv("QE_LIST", " 0 , 1,,2 ", 1);  // blanks between commas
+    {
+        const std::vector<int> v = env_int_list("QE_LIST");
+        EXPECT(v.size() == 3 && v[0] == 0 && v[2] == 2);
+    }
+    setenv("QE_LIST", "0,x,2", 1);  // junk token: warning + skipped, the rest applies
+    {
+        const std::vector<int> v = env_int_list("QE_LIST");
+        EXPECT(v.size() == 2 && v[0] == 0 && v[1] == 2);
+    }
+    setenv("QE_LIST", "-1,3", 1);  // negatives parse; callers filter them
+    {
+        const std::vector<int> v = env_int_list("QE_LIST");
+        EXPECT(v.size() == 2 && v[0] == -1 && v[1] == 3);
+    }
     unsetenv("QE_T");
     if (fails) return 1;
     printf("env_unit: ok\n");

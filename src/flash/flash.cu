@@ -1254,7 +1254,8 @@ void Worker::view_groups(Layer& L, int li) {
                       "flash: mode A shared expert views without peer access need a pinned host copy of the other cards' resident "
                       "experts (%.1f GB more for GPU%d's layer %d), MemAvailable %.1f GB, margin %.1f GB: not enough host memory. "
                       "Use FLASH_PAR=tp, or enable P2P", b / 1e9, rd, LI, qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9);
-                h = pin_host(nullptr, b, 4, false, {gpu_numa_node(rd)});
+                h = pin_host(nullptr, b, env_int("QE_PIN_THREADS", 4), false,
+                             [&] { auto v = qe_numa_override(); return v.empty() ? std::vector<int>{gpu_numa_node(rd)} : v; }());
                 CUDA_CHECK(cudaMemcpy(h, T.groups, b, cudaMemcpyDeviceToHost));
                 host_bytes_ += b;
             }
@@ -1293,7 +1294,9 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
     L.ndev = nl;
     if (nh) {
         char* hp;
-        hp = pin_host(nullptr, (size_t)nh * GRP_BYTES, 4, false, {gpu_numa_node(dev_)});  // the card's NUMA node
+        std::vector<int> hnodes = qe_numa_override();        // QE_NUMA: manual nodes (sysfs -1 machines)
+        if (hnodes.empty()) hnodes = {gpu_numa_node(dev_)};  // the card's NUMA node
+        hp = pin_host(nullptr, (size_t)nh * GRP_BYTES, env_int("QE_PIN_THREADS", 4), false, hnodes);
         CUDA_CHECK(cudaHostGetDevicePointer((void**)&L.hgroups, hp, 0));
         L.hgroups_h = hp;
         host_bytes_ += (size_t)nh * GRP_BYTES;
@@ -4407,7 +4410,11 @@ void Worker::alloc_staging() {
         const size_t cap = (b + PG - 1) / PG * PG;
         void* q = nullptr;
         CHECK(posix_memalign(&q, PG, cap) == 0 && q, "staging: out of host memory");
-        numa_place(q, cap, {gpu_numa_node(dev_)});
+        {  // QE_NUMA override, else the card's node
+            std::vector<int> hnodes = qe_numa_override();
+            if (hnodes.empty()) hnodes = {gpu_numa_node(dev_)};
+            numa_place(q, cap, hnodes);
+        }
         memset(q, 0, cap);
         CUDA_CHECK(cudaHostRegister(q, cap, cudaHostRegisterPortable));
         return (char*)q;
