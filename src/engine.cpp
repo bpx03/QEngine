@@ -2343,6 +2343,7 @@ void Engine::disk_init() {
     // v3: archives written before the KV-pool compaction fix (23781c9) may hold overwritten rows
     fp << "v3|" << (realpath(model_dir_.c_str(), rp) ? rp : model_dir_.c_str());
     if (env_str("QE_MTP_FILE")) fp << "|mtp:" << env_str("QE_MTP_FILE");
+    if (env_str("QE_KV_SCALES")) fp << "|kvs:" << env_str("QE_KV_SCALES");  // FP8 KV scales from a side file
     for (const char* f : {"/model.safetensors", "/model_mtp.safetensors"}) {
         struct stat stt;
         if (stat((model_dir_ + f).c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;

@@ -153,7 +153,8 @@ class PpEngine {
     // the decode steps, so a decode step waits at most for one micro-batch per stage; the server polls the jobs.
     struct SrvJob {
         int slot = 0, base = 0;
-        std::vector<int> ids;          // the whole prompt (what the devices embed)
+        std::vector<int> ids;          // the whole prompt, content ids (n-gram rows; a text prompt: what the devices embed)
+        std::vector<int> dev, r3;      // image prompt: device ids (image rows -> rows of the image table), (t, h, w) per row
         int i0 = 0, n = 0;             // its rows [i0, n) go through the pipeline; the last row is sampled (next) and drafted
         bool mtp = false;
         std::vector<int> cuts;         // micro-batch ends, ascending, the last = n (checkpoint positions are cuts)

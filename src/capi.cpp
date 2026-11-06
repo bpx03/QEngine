@@ -14,6 +14,35 @@ void qe_repack_w4(const int32_t* q, const bf16* s, int n, int k, void* dq, void*
     repack_w4(q, s, n, k, (uint4*)dq, (bf16*)ds, 0);
 }
 void qe_repack_w16(const bf16* w, int n, int k, void* dw) { repack_w16(w, n, k, (uint4*)dw, 0); }
+// ---- Q8 (INT8 layer weights, q8_layout.h; tests/test_q8.py) ----
+// compressed-tensors 8-bit (int32 [n][k/4], u = w + 128) -> Q8 (dq: n * k bytes, ds: W4 scale layout)
+void qe_repack_q8(const int32_t* q, const bf16* s, int n, int k, void* dq, void* ds) {
+    repack_q8(q, s, n, k, (uint4*)dq, (bf16*)ds, 0);
+}
+// gate/up row interleave of an 8-bit compressed-tensors matrix (GLU layout, before qe_repack_q8)
+void qe_glu_rows8(const int32_t* q, const bf16* s, int n, int k, int32_t* dq, bf16* ds) {
+    glu_interleave_rows(q, s, n, k, dq, ds, 0, 8);
+}
+// decode GEMV of a Q8 matrix: h16 = 1 the XH path (x packed into xh_ws here), 0 the bf16 path; glu: y is the bf16
+// act buffer [m][n / 2] (yh: optional XH copy, H16 only)
+void qe_gemv_q8(const void* q, const void* s, int n, int k, const bf16* x, float* y, int m, int glu, int h16,
+                void* xh_ws, void* yh) {
+    W4 w{(const uint4*)q, (const bf16*)s, n, k, glu != 0, 8};
+    gemv_workspace_init();
+    if (h16) {
+        xh_pack(x, k, k, m, (__half*)xh_ws, k, 0);
+        gemv_w4h(w, (const __half*)xh_ws, k, y, glu ? n / 2 : n, m, 0, (__half*)yh, glu ? n / 2 : n);
+    } else {
+        gemv_w4(w, x, k, y, glu ? n / 2 : n, m, 0);
+    }
+}
+// prefill GEMM of a Q8 matrix: G > 0 W8A8 with activation group G and candidate ci (0..3); G = 0 gemm_w4's own
+// choice (W8A8 by QE_PREFILL_INT8 / QE_PREFILL_INT8_G, the fp16-accumulate path with QE_PREFILL_INT8=0)
+void qe_gemm_q8(const void* q, const void* s, int n, int k, const bf16* x, float* y, int t, int glu, int G, int ci) {
+    W4 w{(const uint4*)q, (const bf16*)s, n, k, glu != 0, 8};
+    if (G > 0) gemm_w4_i8(w, x, k, y, glu ? n / 2 : n, t, 0, G, ci, 0);
+    else gemm_w4(w, x, k, y, glu ? n / 2 : n, t, 0);
+}
 
 void qe_gemv_w4(const void* q, const void* s, int n, int k, const bf16* x, float* y, int m) {
     W4 w{(const uint4*)q, (const bf16*)s, n, k};

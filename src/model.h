@@ -454,6 +454,7 @@ private:
     int* pos_mb_ = nullptr;  // position of the second micro-batch
     AttnShape layer_shape(const Layer* L, int win = 0) const;  // ash_ + kv format/scales (nullptr = MTP)
     bool kv_fp8_ = true;
+    bool has_q8_ = false;  // an INT8 checkpoint: some layer matrices in the Q8 layout (load_w4)
     float mtp_ks_ = 0.f, mtp_vs_ = 0.f;  // fp8 scales of the MTP layer cache (max over layers)
     float mtp_sc_mul_ = env_double("QE_MTP_SCALE", 1.f);
     bool mtp_fp8() const {

@@ -824,7 +824,7 @@ class Generator:
         # structured output (response_format): llguidance matchers, masks written into the engine
         self.grammars = None
         print(f"engine parallel mode: {self.engine.par.get('mode', 'tp')} ({self.engine.par.get('why', '')})", flush=True)
-        if self.vision is not None and not self.engine.has("vision"):  # (mode B: no image input on the pipeline stages)
+        if self.vision is not None and not self.engine.has("vision"):  # (PP x TP: no image input)
             print(f"--vision ignored: {self.engine.refused.get('vision', 'the engine has no image input')}", flush=True)
             self.vision = None
         if self.engine.has("grammar"):
@@ -3115,7 +3115,9 @@ def parse_args(argv=None):
     if args.mtp_file:
         os.environ["QE_MTP_FILE"] = args.mtp_file
     elif env_str("QE_MTP_FILE") is None and os.path.exists(ft):
-        os.environ["QE_MTP_FILE"] = ft
+        import assets  # 27B INT8 checkpoints keep their own head unless QE_INT8_MTP_FT=1 (Flash-Next's D2 has INT8 groups too: unchanged)
+        if args.profile.is_flash or assets.use_mtp_ft(args.model):
+            os.environ["QE_MTP_FILE"] = ft
     if args.disk_cache:  # (also the directory of the start-up cache, comm_cache.h: on Flash-Next too)
         os.environ["QE_DISK_CACHE"] = args.disk_cache
         os.environ["QE_DISK_CACHE_GB"] = str(args.disk_cache_gb)
@@ -3156,6 +3158,9 @@ def main():
     refuse_disk_cache_on_flash(args)
     if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
         import assets
+        why = assets.check_27b_format(args.model)
+        if why:
+            sys.exit(print(f"[server] {why}", flush=True) or 3)
         assets.ensure(args.model)
     try:  # kill -USR1 <pid>: Python stacks of every thread (the native ones: gdb -p <pid>)
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
