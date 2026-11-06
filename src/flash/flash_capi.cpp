@@ -2277,6 +2277,9 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             e->steer_json = steer_info_json(e->steer, e->steer_def);
             qe_set_steering_ex(e, -1, 1.f, -1, -1, -1);
         }
+        // The setenvs below can move environ, and the n-gram thread reads the environment (here, in pin_host_file and in
+        // whatever CUDA reads): it finishes first (issue #11). No cost: the stages wait for it anyway before they load.
+        if (par == flash_pp::Par::PP) ng_done.wait();
         if (par == flash_pp::Par::PP && env_set("QE_P2P") && !env_int("QE_P2P", 1) && !env_set("FLASH_PP_P2P"))
             setenv("FLASH_PP_P2P", "0", 1);  // (QE_P2P=0: the stages' hop through pinned host memory too)
         if (par == flash_pp::Par::PP && !env_set("FLASH_PP_H2D_GBPS"))  // (the micro-batch planner's host link)

@@ -1,6 +1,6 @@
 """No device used, < 10 s: libqflash sets its environment defaults when it is loaded, before any thread exists (issue
 #11: a setenv in flash::Worker::Worker, which runs on one thread per card, moved environ under another card's getenv).
-- Worker::Worker has no setenv (source check, needs no build);
+- Worker::Worker has no setenv, and qe_create's pp setenvs wait for the n-gram thread (source checks, need no build);
 - QE_GEMM_TUNE after loading build/libqflash.so: 0 when unset or empty, a value set by the user is kept. The library is
   only loaded, with CUDA_VISIBLE_DEVICES empty; skipped when it, or the CUDA libraries it links to, can't be loaded.
   python tests/test_flash_load_env.py
@@ -30,6 +30,13 @@ def test_no_setenv_in_worker_ctor():
     assert "setenv(" not in body, "a setenv in Worker::Worker races the other cards' getenv (issue #11)"
 
 
+def test_pp_setenvs_wait_for_ngram_thread():
+    src = open(os.path.join(ROOT, "src", "flash", "flash_capi.cpp")).read()
+    start = src.index("std::thread ng_th([&] {")
+    first = min(src.index(name, start) for name in ('setenv("FLASH_PP_P2P"', 'setenv("FLASH_PP_H2D_GBPS"', 'setenv("FLASH_LOOKUP"'))
+    assert "ng_done.wait();" in src[start:first], "qe_create's pp setenvs run while the n-gram thread reads the environment (issue #11)"
+
+
 def load(value):
     env = {k: v for k, v in os.environ.items() if k != "QE_GEMM_TUNE"}
     env["CUDA_VISIBLE_DEVICES"] = ""
@@ -56,5 +63,6 @@ def test_defaults_at_load():
 
 if __name__ == "__main__":
     test_no_setenv_in_worker_ctor()
+    test_pp_setenvs_wait_for_ngram_thread()
     test_defaults_at_load()
     print("ok")
