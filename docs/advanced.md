@@ -94,7 +94,7 @@ How Flash-Next shares the cards; the [README](../README.md#parallel-mode-flash-n
 | `FLASH_PPB_DSHARE` | `0.5` | `pp`: the decoders' share of the time while a prompt is prefilled. |
 | `FLASH_BOX_REPORT` | on for 4+ cards and `pptp` | Logs a `[box]` report at start (build, CUDA archs, driver, per-card PCIe / NUMA / host rate, per-pair peer access and copy rate) for remote diagnosis. `1` turns it on everywhere. |
 
-In `pp`, image input is refused, steering vectors are not loaded (also when `auto` picks `pp` on 4 or more cards),
+In `pp`, image input works since 1.3.5.1 (experimental, lightly tested); `pptp` refuses it. `FLASH_COMM` does not apply to plain `pp`: its stages have no per-layer exchanges, and the rows hop between stages as copies, over P2P or through pinned host memory (`FLASH_PP_P2P`, shown by the `pipeline boundary` start-up line). In `pptp` it applies inside the TP groups. Steering vectors are not loaded (also when `auto` picks `pp` on 4 or more cards),
 `FLASH_KV=ram` makes a 2- or 3-card server run `tp` instead and refuses the start on 4 or more cards, activation
 capture is refused and lookup drafts are off. Structured output and the thinking budget work; a constrained step runs
 through the stages as a batch of one.

@@ -369,9 +369,10 @@ static void comm_select_decode(Comm& c, const int* devices, bool staged, bool pr
     c.dxfer = x;
     c.dcal = cal;
     if (cal) {
-        fprintf(stderr, "[comm] decode collectives: auto, timed on real decode steps at the end of the start-up (P2P SM stores "
-                        "vs pinned host memory); the rule alone would pick %s (%s: %s)\n",
-                x == kXferHost ? "host memory" : "P2P", d.why, rule.why);
+        if (!c.pp_stages)  // (FLASH_PAR=pp: no calibration, the engine logs that at the end of the start-up)
+            fprintf(stderr, "[comm] decode collectives: auto, timed on real decode steps at the end of the start-up (P2P SM stores "
+                            "vs pinned host memory); the rule alone would pick %s (%s: %s)\n",
+                    x == kXferHost ? "host memory" : "P2P", d.why, rule.why);
         return;
     }
     char mb[200] = "";
@@ -1005,9 +1006,10 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
     if (const char* e = env_str("QE_COMM_PULLM")) pm = (unsigned)strtoul(e, nullptr, 16), pairs += " (QE_COMM_PULLM override)";  // test: mixed pairs
     c.pullm = x == kXferP2P && staged ? pm : 0u;
     CUDA_CHECK(cudaSetDevice(prev));
+    const char* tp_only = c.pp_stages ? "no per-layer exchanges in the pipeline stages (rows hop over the boundaries below); TP would use " : "";
     if (c.pullm || (x == kXferP2P && staged && ng > 1 && c.p2p))
-        fprintf(stderr, "[comm] prefill transfers: %s, pairs %s (%s=%s, %s)\n", comm_path_name(x), pairs.c_str(), env, want.c_str(), why);
+        fprintf(stderr, "[comm] prefill transfers: %s%s, pairs %s (%s=%s, %s)\n", tp_only, comm_path_name(x), pairs.c_str(), env, want.c_str(), why);
     else
-    fprintf(stderr, "[comm] prefill transfers: %s (%s=%s, %s)\n", comm_path_name(x), env, want.c_str(), why);
+    fprintf(stderr, "[comm] prefill transfers: %s%s (%s=%s, %s)\n", tp_only, comm_path_name(x), env, want.c_str(), why);
     return x;
 }

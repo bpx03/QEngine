@@ -25,6 +25,8 @@ the default settings:
 
 (1.3.5, November 6, 2026; method under [Benchmarks](#benchmarks).)
 
+**What is new in 1.3.5.1 (experimental, not `latest`):** image input in `FLASH_PAR=pp`, and start-up log lines that say what the pipeline modes really do. Lightly tested, so feedback is welcome. The stable version is 1.3.5.
+
 **What is new in 1.3.5:** mostly fixes, from every open issue and my own code reviews: a use-after-free in the 27B archive, disk cache fixes, a reply parser that no longer depends on where a decode step ends, stop strings that no longer leak, one eviction order for both models, and memory taken by other programs no longer takes the server down. New: 27B context up to 1M (`--max-ctx`, opt-in), sparse attention for long prompts (`--lsa`, opt-in), faster Flash-Next prefill, and a decode transport that picks itself per machine. `--disk-cache` on Flash-Next now stops the start with an error ([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.5)).
 
 **What is new in 1.3.4.3:** the default thinking budget can be set per reasoning effort
@@ -126,7 +128,7 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 ```
 
 - Without `QE_MODEL` the container serves `/app/models/Qwen3.8-27B-INT4`.
-- Images: `latest` / `1.3.5` (text only, ~0.4 GB download) and `vision` / `1.3.5-vision` (with the image encoder, ~3.2 GB download).
+- Images: `latest` / `1.3.5` (text only, ~0.4 GB download) and `vision` / `1.3.5-vision` (with the image encoder, ~3.2 GB download). Experimental: `1.3.5.1` and `1.3.5.1-vision`.
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`; `QE_DEVICES`, if set, wins over `QE_GPUS`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -283,7 +285,7 @@ always `tp`. Settings of the pick and the pipeline: [docs/advanced.md](docs/adva
 | mostly long uncached prompts (RAG, long documents, short answers) | `FLASH_PAR=pp`, or `FLASH_PAR_AUTO_P=32768` to let `auto` decide on that basis |
 | uneven or mixed cards | leave `auto`: it calibrates each card and picks `pp` with a split by speed when that wins |
 | 4 or more cards | leave `auto` (= `pp`); exactly 4 cards with P2P between all of them: try `FLASH_PAR=tp` ([why](#4-or-more-cards)); if your cards pair up on P2P, try `FLASH_PAR=pptp FLASH_PP_MAP=0,1\|2,3` |
-| image input, steering vectors or `FLASH_KV=ram` needed | `FLASH_PAR=tp` (2-3 cards) |
+| steering vectors or `FLASH_KV=ram` needed | `FLASH_PAR=tp` (2-3 cards) |
 
 ```bash
 FLASH_PAR=pp server/run.sh 8080 --model models/Qwen3.8-Flash-Next-QE-INT4
@@ -319,7 +321,7 @@ decode most. The prompts and method differ from the headline table, so compare r
 third of its compute (a test setting), the split moved 4 layers off it: prefill about 30 % and decode 13 % faster than
 an equal split.
 
-**What `pp` and `pptp` do not serve**: image input (refused with a clear message), steering vectors (not loaded),
+**What `pp` and `pptp` do not serve**: image input in `pptp` (refused with a clear message; `pp` serves images since 1.3.5.1, experimental), steering vectors (not loaded),
 `FLASH_KV=ram` (on 2 or 3 cards the server runs `tp` instead and logs it; on 4 or more cards the start is refused with
 a message), activation capture; lookup drafts are off. Structured output and the thinking budget work as in `tp`
 (a constrained step runs through the stages as a batch of one).

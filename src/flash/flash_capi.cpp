@@ -1816,6 +1816,8 @@ static void ppb_submit(FE* e, FE::Pf& pf) {
     j->slot = pf.slot;
     j->base = e->sl[pf.slot].base;
     j->ids = pf.ids;
+    j->dev = pf.dev;
+    j->r3 = pf.r3;
     j->i0 = pf.i;
     j->n = pf.n;
     j->mtp = e->k > 0;
@@ -2284,6 +2286,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         e->comm = comm_create(e->ng, ARU_MAX * H, H);
         comm_enable_p2p(e->comm, e->devs.data());
         e->comm.dcal_want = true;  // decode collectives: timed on real decode steps at the end of qe_create (decode_calibrate)
+        e->comm.pp_stages = par == flash_pp::Par::PP;  // (log text; auto picks below and says so there)
         comm_select_path(e->comm, e->devs.data(), "FLASH_COMM", true);  // probe + prefill transfer path (before the workers)
     }
     {  // the host -> card link (expert staging): sizes the prefill batches on slow links (flash.h probe_host_link)
@@ -2364,9 +2367,11 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                               po.pp_req[i], po.pp_agg[i]);
         }
         static const char* const kPath[3] = {"P2P", "copy engine", "host-staged"};
-        fprintf(stderr, "[qflash] parallel mode: %s (%s); probe: %d cards, peer access %s, TP exchanges %s (+%.3f ms/token, +%.1f ms/step), "
-                "host link %.1f GB/s%s\n", flash_pp::par_name(par), why.c_str(), e->ng, in.p2p ? "yes" : "no",
-                kPath[std::clamp(in.tp_path, 0, 2)], po.x_ms_tok, po.x_ms_step, in.h2d / 1e9, est);
+        fprintf(stderr, "[qflash] parallel mode: %s (%s); probe: %d cards, peer access %s, TP exchanges %s%s (+%.3f ms/token, +%.1f ms/step), "
+                "host link %.1f GB/s%s\n", flash_pp::par_name(par), why.c_str(), e->ng, pptp ? "per group" : in.p2p ? "yes" : "no",  // (PP x TP: no card-wide probe, the stage lines below say)
+                par == flash_pp::Par::PP && !pptp ? "(not used in this mode) would be " : "", pptp ? "per group" : kPath[std::clamp(in.tp_path, 0, 2)], po.x_ms_tok, po.x_ms_step, in.h2d / 1e9, est);
+        if (par == flash_pp::Par::PP && !forced && e->ng <= 3)  // (auto: the [comm] lines above were printed before this pick)
+            fprintf(stderr, "[comm] the prefill transfers above are the TP path: the pipeline stages have no per-layer exchanges\n");
         for (char& ch : why) if (ch == '"' || ch == '\\' || (unsigned char)ch < 0x20) ch = '\'';  // (JSON below: review server F9)
         char js[1400];
         snprintf(js, sizeof js, "{\"mode\": \"%s\", \"forced\": %s, \"why\": \"%s\", \"cards\": %d, \"peer_access\": %s, \"tp_exchange_path\": \"%s\", "
@@ -2796,8 +2801,8 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         }
     }
     if (e->comm.dcal && (e->ppb || !e->comm.p2p)) {  // mode B: the stages have their own 1-card comms (review L4)
-        fprintf(stderr, "[comm] decode collectives: no calibration (%s), P2P SM stores\n",
-                e->ppb ? "pipeline mode B: its stages do not use the TP collectives" : "no peer access");
+        if (e->ppb) fprintf(stderr, "[comm] decode collectives: none across cards, no calibration (pipeline mode B: its stages do not use the TP collectives)\n");
+        else fprintf(stderr, "[comm] decode collectives: no calibration (%s), P2P SM stores\n", "no peer access");
         comm_free_decode_host(e->comm);
         e->comm.dcal = false;
     }
@@ -2930,8 +2935,8 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     }
     int img_cnt = 0;
     for (int i = 0; i < n; i++) img_cnt += ids[i] >= kImgToken;
-    if (img_cnt && e->ppb) {
-        fprintf(stderr, "[qflash] start: image prompts are not supported with FLASH_PAR=pp (pipeline stages); run with FLASH_PAR=tp\n");
+    if (img_cnt && e->ppb && e->ppb->nstage() != e->ng) {
+        fprintf(stderr, "[qflash] start: image prompts are not supported with FLASH_PAR=pptp; run with FLASH_PAR=tp or pp\n");
         return QE_START_BAD_INPUT;
     }
     if (img_cnt != img_rows || (img_cnt && (!img || !rope3))) {
@@ -3149,6 +3154,9 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         for (auto& x : e->pfs)
             if (x.img_n) base = std::max(base, x.img0 + x.img_n);
         if ((size_t)(base + img_cnt) > e->img_cap) {
+            // (mode B: the micro-batches of other prompts in the stage queues read the old table until it is replaced)
+            if (e->ppb)
+                for (auto& x : e->pfs) e->ppb_quiesce(x.slot, false);
             const size_t cap = std::max<size_t>(base + img_cnt, 2 * e->img_cap);
             bf16* t = nullptr;
             CUDA_CHECK(cudaSetDevice(e->devs[0]));

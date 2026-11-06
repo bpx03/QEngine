@@ -172,8 +172,8 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         self.max_t = L.qe_max_context(self.h)
         self.pool_tokens = L.qe_pool_tokens(self.h) if "qe_pool_tokens" in self.fns else self.max_t
         self.kv_in_ram = bool(L.qe_kv_in_ram(self.h)) if "qe_kv_in_ram" in self.fns else False
-        # parallel mode of the run (FLASH_PAR / the boot-time pick); mode B (pipeline stages) serves no
-        # images: those requests are refused with a clear message instead of reaching the engine
+        # parallel mode of the run (FLASH_PAR / the boot-time pick); PP x TP serves no images: those
+        # requests are refused with a clear message instead of reaching the engine
         self.par = {"mode": "tp"}
         if "qe_par_info" in self.fns:
             buf = ctypes.create_string_buffer(2048)
@@ -181,15 +181,17 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             raw = buf.value.decode(errors="replace")
             try:
                 self.par = json.loads(raw or "{}") or {"mode": "tp"}
-            except ValueError as ex:  # (review server F9: never silently tp, mode B must keep vision off)
+            except ValueError as ex:  # (review server F9: never silently tp, PP x TP must keep vision off)
                 m = re.search(r'"mode":\s*"(\w+)"', raw)
                 self.par = {"mode": m.group(1) if m else "tp"}
+                if '"pptp"' in raw:
+                    self.par["pptp"] = True
                 print(f"WARNING engine parallel-mode info is not valid JSON ({ex}); mode {self.par['mode']} from the "
                       f"raw text: {raw[:300]!r}", flush=True)
-        if self.par.get("mode") == "pp":  # (grammar-constrained steps run as batches of one through the stages)
+        if self.par.get("mode") == "pp" and "pptp" in self.par:
             self.caps["vision"] = False
-            self.refused = {"vision": "image input is not supported with FLASH_PAR=pp (pipeline stages); run the server "
-                                      "with FLASH_PAR=tp"}
+            self.refused = {"vision": "image input is not supported with FLASH_PAR=pptp; run the server with "
+                                      "FLASH_PAR=tp or pp"}
         else:
             self.refused = {}
         n = L.qe_num_slots(self.h) if "qe_num_slots" in self.fns else 1

@@ -824,7 +824,7 @@ class Generator:
         # structured output (response_format): llguidance matchers, masks written into the engine
         self.grammars = None
         print(f"engine parallel mode: {self.engine.par.get('mode', 'tp')} ({self.engine.par.get('why', '')})", flush=True)
-        if self.vision is not None and not self.engine.has("vision"):  # (mode B: no image input on the pipeline stages)
+        if self.vision is not None and not self.engine.has("vision"):  # (PP x TP: no image input)
             print(f"--vision ignored: {self.engine.refused.get('vision', 'the engine has no image input')}", flush=True)
             self.vision = None
         if self.engine.has("grammar"):
