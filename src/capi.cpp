@@ -149,6 +149,11 @@ void qe_gemv_w16(const void* wp, int n, int k, const bf16* x, float* y, int m) {
 
 extern "C" {
 
+// RoPE / YaRN table of the attention layers (rope_table_host; host only, tests/test_rope_table.py): out[33]
+void qe_rope_table(double factor, double theta, int rot_dim, int native_ctx, float* out) {
+    rope_table_host(factor, theta, rot_dim, native_ctx, out);
+}
+
 // devices: comma separated CUDA ordinals, e.g. "0,1,2"; split: optional weights "1,1,1"
 void* qe_create(const char* model_dir, const char* devices, int max_t, const char* split) {
     std::vector<int> devs;
@@ -164,7 +169,9 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         for (std::string x; std::getline(s2, x, ',');) w.push_back(std::stod(x));
     }
     try {
-        return new Engine(model_dir, devs, max_t, w);
+        Engine* en = new Engine(model_dir, devs, max_t, w);
+        en->decode_calibrate();  // QE_DECODE_COMM=auto: the decode collectives' path by real decode steps
+        return en;
     } catch (std::runtime_error& ex) {  // a refused steering vector (QE_STEER / QE_STEER_DIR): no engine
         fprintf(stderr, "qengine: %s\n", ex.what());
         return nullptr;
@@ -405,6 +412,7 @@ extern "C" double qe_bench_attn_seg(int nseg, int ctx, int m, int iters, int cmi
     std::vector<void*> bufs;
     auto al = [&](size_t b, int v) { void* p; CUDA_CHECK(cudaMalloc(&p, b)); CUDA_CHECK(cudaMemset(p, v, b)); bufs.push_back(p); return p; };
     bf16* qn_w = (bf16*)al(512, 0); bf16* kn_w = (bf16*)al(512, 0); float* invf = (float*)al(1024, 0);
+    { const float one = 1.f; CUDA_CHECK(cudaMemcpy(invf + 32, &one, 4, cudaMemcpyHostToDevice)); }  // attention factor
     for (int i = 0; i < nseg; i++) {
         AttnSeg& c = g.c[i];
         c.proj = (float*)al((size_t)m * ld * 4, 0);
@@ -752,6 +760,7 @@ extern "C" double qe_test_ll_alias(const char* devices, int hi, int lo, int dela
             CUDA_CHECK(cudaMalloc(&ctr.bar, 8)); CUDA_CHECK(cudaMemset(ctr.bar, 0, 8));
             CUDA_CHECK(cudaMalloc(&ctr.ss, kCommBlocks * kMaxBatchRows * 4));
             CUDA_CHECK(cudaMalloc(&ctr.epoch, 4)); CUDA_CHECK(cudaMemset(ctr.epoch, 0, 4));
+            comm_bind_ll_scrub(ctr, c, r);
             comm_begin_unit(ctr, st);  // epoch 1
             for (int i = 0; i < 3; i++) allreduce_add(resid, pa, hi, h, c, r, ctr, st, nullptr, 0.f, nullptr, i, false);
             for (int u = 0; u < 127; u++) {  // epochs 2..128: only rows < lo
@@ -1119,7 +1128,8 @@ extern "C" double qe_bench_kvsplit(const char* devices, int ctx, int nseq, int r
             bf16 *qn, *kn; float* inv_freq;
             CUDA_CHECK(cudaMalloc(&qn, 256 * 2)); CUDA_CHECK(cudaMemset(qn, 0, 512));
             CUDA_CHECK(cudaMalloc(&kn, 256 * 2)); CUDA_CHECK(cudaMemset(kn, 0, 512));
-            CUDA_CHECK(cudaMalloc(&inv_freq, 32 * 4)); CUDA_CHECK(cudaMemset(inv_freq, 0, 128));
+            CUDA_CHECK(cudaMalloc(&inv_freq, 33 * 4)); CUDA_CHECK(cudaMemset(inv_freq, 0, 128));
+            { const float one = 1.f; CUDA_CHECK(cudaMemcpy(inv_freq + 32, &one, 4, cudaMemcpyHostToDevice)); }  // attention factor
             float *resid, *part; bf16 *xn, *nw;
             CUDA_CHECK(cudaMalloc(&resid, (size_t)M * H * 4));
             CUDA_CHECK(cudaMalloc(&part, (size_t)M * H * 4));
@@ -1442,4 +1452,183 @@ extern "C" long long qe_test_dn_core2_plain(int m, int cur0, int lanes, int seed
     CUDA_CHECK(cudaMemcpy(sb.data(), B.S[0], sb.size() * 4, cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < sa.size(); i++) bad += memcmp(&sa[i], &sb[i], 4) != 0;
     return bad;
+}
+
+// ---- LSA microbenchmark: one card, layout 0 (kv0 whole, kv1 416 of 1024), m rows at p0 = ctx.
+// lists: real per-row pool lists from a QE_LSA_DUMP (<prefix>_list.bin / _nlist.bin, kLsaListMax per row) or null
+// (synthetic: 1,024 random pools per row, half shared within 8-row tiles). Random fp8 K / V, random q.
+// res: [0] union + attention + combine us, [1] selection us (random unit centroids / index queries),
+// [2] mean union pools per tile and head, [3] splits
+#include "kernels/lsa.cuh"
+extern "C" int qe_bench_lsa(int ctx, int m, const char* list_prefix, int iters, double* res) {
+    AttnShape s{};
+    s.nq = 12; s.nkv = 2;
+    s.kv_qb[0] = 0; s.kv_qe[0] = 6; s.kv_qb[1] = 6; s.kv_qe[1] = 12;
+    for (int h = 0; h < 12; h++) s.q2kv[h] = h < 6 ? 0 : 1;
+    s.kv_pm[0] = PosMap{1024, 1024, 0}; s.kv_pm[1] = PosMap{1024, 416, 416};
+    s.max_t = (ctx + m + 1023) / 1024 * 1024 + 1024;
+    s.fp8 = 1; s.ks = 0.03f; s.vs = 0.03f;
+    const size_t rows = head_rows(s, 2, s.max_t);
+    void *kc, *vc;
+    CUDA_CHECK(cudaMalloc(&kc, rows * 256));
+    CUDA_CHECK(cudaMalloc(&vc, rows * 256));
+    pattn_fill(kc, rows * 256, 0, 1.f, 1, 0);
+    pattn_fill(vc, rows * 256, 0, 1.f, 2, 0);
+    bf16* q; float* proj; bf16* out; int* pos; float* work;
+    CUDA_CHECK(cudaMalloc(&q, (size_t)m * 12 * 256 * 2));
+    pattn_fill(q, (size_t)m * 12 * 256, 1, 1.f, 3, 0);
+    CUDA_CHECK(cudaMalloc(&proj, (size_t)m * 12 * 512 * 4));
+    CUDA_CHECK(cudaMemset(proj, 0, (size_t)m * 12 * 512 * 4));
+    CUDA_CHECK(cudaMalloc(&out, (size_t)m * 12 * 256 * 2));
+    const size_t wf = attention_prefill_work_floats(5 * 1024, 12);
+    CUDA_CHECK(cudaMalloc(&work, wf * 4));
+    CUDA_CHECK(cudaMalloc(&pos, 4));
+    CUDA_CHECK(cudaMemcpy(pos, &ctx, 4, cudaMemcpyHostToDevice));
+    int* closed;
+    CUDA_CHECK(cudaMalloc(&closed, 4));
+    const int cl = (ctx + m) / kLsaBlk;
+    CUDA_CHECK(cudaMemcpy(closed, &cl, 4, cudaMemcpyHostToDevice));
+    std::vector<unsigned> hl((size_t)m * kLsaListMax, 0);
+    std::vector<int> hn(m, 0);
+    std::mt19937 rng(7);
+    if (list_prefix && *list_prefix) {
+        FILE* f = fopen((std::string(list_prefix) + "_list.bin").c_str(), "rb");
+        FILE* g = fopen((std::string(list_prefix) + "_nlist.bin").c_str(), "rb");
+        CHECK(f && g, "lsa bench: lists %s", list_prefix);
+        CHECK(fread(hl.data(), 4, hl.size(), f) == hl.size() && fread(hn.data(), 4, m, g) == (size_t)m, "lsa bench: list size");
+        fclose(f); fclose(g);
+    } else {
+        const int np = std::max(1, (ctx - 512) / 4);
+        for (int t0 = 0; t0 < m; t0 += 8) {
+            std::vector<unsigned> shared(512);
+            for (auto& x : shared) x = 1 + rng() % (np - 1);
+            for (int r = t0; r < std::min(m, t0 + 8); r++) {
+                std::vector<unsigned> v(shared);
+                while (v.size() < 1024) v.push_back(1 + rng() % (np - 1));
+                std::sort(v.begin(), v.end());
+                v.erase(std::unique(v.begin(), v.end()), v.end());
+                for (size_t e = 0; e < v.size() && e < (size_t)kLsaListMax; e++) hl[(size_t)r * kLsaListMax + e] = v[e] << 4 | 15u;
+                hn[r] = std::min<int>(v.size(), kLsaListMax);
+            }
+        }
+    }
+    unsigned* list; int* n;
+    CUDA_CHECK(cudaMalloc(&list, hl.size() * 4));
+    CUDA_CHECK(cudaMalloc(&n, m * 4));
+    CUDA_CHECK(cudaMemcpy(list, hl.data(), hl.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(n, hn.data(), m * 4, cudaMemcpyHostToDevice));
+    void* uscr;
+    const size_t ub = lsa_union_bytes(m, 2);
+    CUDA_CHECK(cudaMalloc(&uscr, ub));
+    const int max_pos = std::max(ctx + m, 262144);
+    cudaEvent_t a, b;
+    cudaEventCreate(&a); cudaEventCreate(&b);
+    for (int i = 0; i < 2; i++)
+        lsa_attend(q, kc, vc, s, proj, 12 * 512, pos, closed, m, max_pos, list, n, uscr, out, work, wf, 0);
+    cudaEventRecord(a);
+    for (int i = 0; i < iters; i++)
+        lsa_attend(q, kc, vc, s, proj, 12 * 512, pos, closed, m, max_pos, list, n, uscr, out, work, wf, 0);
+    cudaEventRecord(b);
+    cudaEventSynchronize(b);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a, b);
+    res[0] = ms * 1e3 / iters;
+    {   // mean union size
+        const int tiles = (m + 7) / 8;
+        std::vector<int> uc((size_t)tiles * 2);
+        const char* base = (const char*)uscr + (size_t)tiles * 2 * kLsaUnionMax * 4 * 2;
+        CUDA_CHECK(cudaMemcpy(uc.data(), base, uc.size() * 4, cudaMemcpyDeviceToHost));
+        double t = 0;
+        for (int x : uc) t += x;
+        res[2] = t / uc.size();
+    }
+    // selection on random data: centroids of the visible blocks, index queries
+    const int V = (ctx + m) / kLsaBlk * kLsaBpb;
+    LsaLayer L;
+    CUDA_CHECK(cudaMalloc(&L.cent, (size_t)V * kLsaDim * 2));
+    CUDA_CHECK(cudaMalloc(&L.mem, (size_t)V * 4));
+    {
+        std::vector<bf16> hc((size_t)V * kLsaDim);
+        std::normal_distribution<float> nd;
+        for (int b2 = 0; b2 < V; b2++) {
+            float v[kLsaDim], nn = 0;
+            for (int d = 0; d < kLsaDim; d++) v[d] = nd(rng), nn += v[d] * v[d];
+            for (int d = 0; d < kLsaDim; d++) hc[(size_t)b2 * kLsaDim + d] = __float2bfloat16(v[d] / std::sqrt(nn));
+        }
+        // QE_LSA_BENCH_TIES=N (review 4, R4-M2): N bit-identical centroids right below 100 best ones, so the exact
+        // fallback (QE_LSA_FORCE_FALLBACK=1) has N ties at its threshold key
+        const int ties = std::min(V - 100, env_int("QE_LSA_BENCH_TIES", 0));
+        if (ties > 0) {
+            std::vector<bf16> best(kLsaDim), tie(kLsaDim);
+            for (int d = 0; d < kLsaDim; d++) best[d] = __float2bfloat16(d == 0 ? 1.f : 0.f), tie[d] = __float2bfloat16(d < 2 ? 0.6f : 0.f);
+            for (int b2 = 0; b2 < 100 + ties; b2++)
+                std::copy((b2 < 100 ? best : tie).begin(), (b2 < 100 ? best : tie).end(), hc.begin() + (size_t)b2 * kLsaDim);
+        }
+        CUDA_CHECK(cudaMemcpy(L.cent, hc.data(), hc.size() * 2, cudaMemcpyHostToDevice));
+        std::vector<unsigned> hm(V, 0xFFFF0100u);  // 2 pools
+        if (ties > 0)  // each bucket its own 2 pools (so a bucket listed twice shows as a duplicate pool)
+            for (int b2 = 0; b2 < V; b2++) {
+                const unsigned j = (unsigned)(b2 % kLsaBpb);
+                hm[b2] = 0xFFFF0000u | (2 * j + 1) << 8 | 2 * j;
+            }
+        CUDA_CHECK(cudaMemcpy(L.mem, hm.data(), hm.size() * 4, cudaMemcpyHostToDevice));
+    }
+    bf16* iq;
+    CUDA_CHECK(cudaMalloc(&iq, (size_t)m * kLsaDim * 2));
+    {
+        std::vector<bf16> hq((size_t)m * kLsaDim);
+        std::normal_distribution<float> nd;
+        for (int r = 0; r < m; r++) {
+            float v[kLsaDim], nn = 0;
+            for (int d = 0; d < kLsaDim; d++) v[d] = nd(rng), nn += v[d] * v[d];
+            for (int d = 0; d < kLsaDim; d++) hq[(size_t)r * kLsaDim + d] = __float2bfloat16(v[d] / std::sqrt(nn));
+            if (env_int("QE_LSA_BENCH_TIES", 0) > 0)  // every row: the 100 best, then the ties, then the random rest
+                for (int d = 0; d < kLsaDim; d++) hq[(size_t)r * kLsaDim + d] = __float2bfloat16(d < 2 ? 0.7f : 0.f);
+        }
+        CUDA_CHECK(cudaMemcpy(iq, hq.data(), hq.size() * 2, cudaMemcpyHostToDevice));
+    }
+    const size_t sb = lsa_select_scratch_bytes(max_pos, 128, kLsaBpbMax);
+    void* scr;
+    CUDA_CHECK(cudaMalloc(&scr, sb));
+    unsigned* l2; int* n2;
+    CUDA_CHECK(cudaMalloc(&l2, (size_t)m * kLsaListMax * 4));
+    CUDA_CHECK(cudaMalloc(&n2, m * 4));
+    lsa_select(iq, m, V, pos, closed, L, scr, sb, l2, n2, 0);
+    cudaEventRecord(a);
+    for (int i = 0; i < iters; i++) lsa_select(iq, m, V, pos, closed, L, scr, sb, l2, n2, 0);
+    cudaEventRecord(b);
+    cudaEventSynchronize(b);
+    cudaEventElapsedTime(&ms, a, b);
+    res[1] = ms * 1e3 / iters;
+    {   // determinism (review 4): the selected (pool, mask) set of every row, hashed order-free, over QE_LSA_BENCH_RUNS
+        // more runs; res[3] = the first run's hash, res[4] = runs that differ from it, res[5] = rows with a duplicate
+        const int runs = env_int("QE_LSA_BENCH_RUNS", 0);
+        std::vector<unsigned> h2((size_t)m * kLsaListMax);
+        std::vector<int> hn2(m);
+        unsigned long long first = 0;
+        int differ = 0, dups = 0;
+        for (int it = 0; it <= runs; it++) {
+            if (it) lsa_select(iq, m, V, pos, closed, L, scr, sb, l2, n2, 0);
+            CUDA_CHECK(cudaMemcpy(h2.data(), l2, h2.size() * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hn2.data(), n2, m * 4, cudaMemcpyDeviceToHost));
+            unsigned long long hsh = 1469598103934665603ull;
+            for (int r = 0; r < m; r++) {
+                std::vector<unsigned> v(h2.begin() + (size_t)r * kLsaListMax, h2.begin() + (size_t)r * kLsaListMax + hn2[r]);
+                std::sort(v.begin(), v.end());
+                if (std::adjacent_find(v.begin(), v.end(), [](unsigned a2, unsigned b2) { return a2 >> 4 == b2 >> 4; }) != v.end()) dups++;
+                for (unsigned x : v) hsh = (hsh ^ x) * 1099511628211ull;
+                hsh = (hsh ^ (unsigned)hn2[r]) * 1099511628211ull;
+            }
+            if (!it) first = hsh;
+            else differ += hsh != first;
+        }
+        res[3] = (double)(first & 0xFFFFFFFFull);
+        res[4] = differ;
+        res[5] = dups;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (void* p : {(void*)kc, (void*)vc, (void*)q, (void*)proj, (void*)out, (void*)work, (void*)pos, (void*)closed,
+                    (void*)list, (void*)n, uscr, (void*)L.cent, (void*)L.mem, (void*)iq, scr, (void*)l2, (void*)n2})
+        cudaFree(p);
+    return 0;
 }

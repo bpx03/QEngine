@@ -3277,14 +3277,17 @@ static size_t tl_alloc(void** p, size_t bytes, const char* what) {
     thread_local int calls = 0;
     const bool fake = inj > 0 && ++calls == inj;
     cudaError_t r = fake ? cudaErrorMemoryAllocation : cudaMalloc(p, bytes);
-    if (r == cudaErrorMemoryAllocation && dev >= 0 && dev < kTlDevs && g_oom_hook[dev]) {
+    // the engine frees memory (Flash-Next: resident expert groups to host memory, then its cached graphs) and the
+    // growth is retried while the hook still frees something (VRAM taken by another process can need several rounds)
+    for (int t = 0; t < 8 && r == cudaErrorMemoryAllocation && dev >= 0 && dev < kTlDevs && g_oom_hook[dev]; t++) {
         (void)cudaGetLastError();
         const int n = g_oom_hook[dev](g_oom_ctx[dev]);
         fprintf(stderr, "[gemm] GPU%d %s: out of memory growing to %.1f MB: %s, retrying%s\n", dev, what, bytes / 1048576.0,
-                n >= 0 ? (std::to_string(n) + " cached graphs dropped").c_str() : "inside a graph capture, nothing dropped",
+                n > 0 ? "memory freed by the engine" : n == 0 ? "nothing left to free" : "inside a graph capture, nothing freed",
                 fake ? " (QE_TEST_TL_OOM)" : "");
         fflush(stderr);
         r = cudaMalloc(p, bytes);
+        if (n <= 0) break;
     }
     CUDA_CHECK(r);
     return bytes;
@@ -3998,8 +4001,9 @@ using TuneKey = std::tuple<int, int, int, bool>;
 using TuneMap = std::map<TuneKey, std::pair<int, int>>;
 thread_local std::map<int, TuneMap> tl_tuned;  // device ordinal -> choices (this thread's copy)
 thread_local bool tl_tune_defer = false;       // gemm_tune_defer: save once at the end of a batch
+bool g_tune_default = true;                    // gemm_tune_default
 bool gemm_tune_on() {
-    static const bool on = env_int("QE_GEMM_TUNE", 1);
+    static const bool on = env_set("QE_GEMM_TUNE") ? env_int("QE_GEMM_TUNE", 1) != 0 : g_tune_default;
     return on;
 }
 
@@ -4225,6 +4229,8 @@ void gemm_tune_set_model(const std::string& model) {
     s.on = true;
     s.loaded = false;
 }
+
+void gemm_tune_default(bool on) { g_tune_default = on; }
 
 void gemm_tune_defer(bool on) {
     tl_tune_defer = on;

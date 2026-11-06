@@ -139,6 +139,7 @@ extern "C" unsigned long long qe_check_attn_seg(int nseg, int ctx, int m) {
     std::vector<void*> bufs;
     auto al = [&](size_t b, int v) { void* p; CUDA_CHECK(cudaMalloc(&p, b)); CUDA_CHECK(cudaMemset(p, v, b)); bufs.push_back(p); return p; };
     bf16* qn_w = (bf16*)al(512, 0); bf16* kn_w = (bf16*)al(512, 0); float* invf = (float*)al(1024, 0);
+    { const float one = 1.f; CUDA_CHECK(cudaMemcpy(invf + 32, &one, 4, cudaMemcpyHostToDevice)); }  // q factor (native)
     for (int i = 0; i < nseg; i++) {
         AttnSeg& c = g.c[i];
         c.proj = (float*)al((size_t)m * ld * 4, 0);

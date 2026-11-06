@@ -10,6 +10,12 @@ struct Config {
     int hidden = 0, inter = 0, vocab = 0, layers = 0;
     int n_q = 0, n_kv = 0, head_dim = 0, rot_dim = 0;
     double rope_theta = 0;
+    int native_ctx = 262144;  // max_position_embeddings: the trained context
+    // set by the Engine before the Workers are made: positions the KV structures hold (native_ctx, or the YaRN
+    // context) and the YaRN factor (0: native RoPE; QE_YARN / --max-ctx above native_ctx)
+    int max_pos = 262144;
+    double yarn = 0;
+    double yarn_cfg = 0;  // config.json rope_parameters rope_type yarn: its factor (0: rope_type default)
     int lin_nk = 0, lin_nv = 0, lin_dk = 0, lin_dv = 0, conv_k = 0;
     float eps = 1e-6f;
     int mtp_layers = 0;
@@ -21,6 +27,14 @@ struct Config {
     int n_lin() const { return layers - n_full(); }
     static Config load(const std::string& model_dir);
 };
+
+// RoPE table of the attention layers (model.cpp set_rope, unit test qe_rope_table): out[0..31] the inverse frequencies
+// of the 32 rotary pairs, out[32] the factor on the rotary dims of q (1 native; YaRN: mscale^2, so the scores equal
+// mscale on q and k while the cached K keeps its calibrated range). factor <= 1: native RoPE (the double pow as
+// before). YaRN (vLLM / HF definition): NTK-by-parts blend over the rotary dim, interpolated 1 / (factor base^(2i/d))
+// for the low frequencies, extrapolated for the high ones, a linear ramp between the correction dims of beta_fast 32 /
+// beta_slow 1 (floor / ceil), mscale 0.1 ln(factor) + 1, base^(2i/d) in fp32 as the references. lo / hi: correction dims
+void rope_table_host(double factor, double theta, int rot_dim, int native_ctx, float* out, double* lo = nullptr, double* hi = nullptr);
 
 struct Range {
     int b = 0, e = 0;

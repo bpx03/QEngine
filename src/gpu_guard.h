@@ -53,6 +53,33 @@ inline void mkdirs(const std::string& path) {
         if (i == path.size() || path[i] == '/') mkdir(path.substr(0, i).c_str(), 0755);
 }
 
+// the processes that held this process's GPU locks before it (the previous QEngine server on these cards): pid and
+// whether it was visible here at the time (another PID namespace, e.g. a container: not). The start-up waits keep
+// waiting while such a holder is still tearing down (gpu_others.h big_holder, review R6-L5)
+struct PrevHolder {
+    unsigned pid = 0;
+    bool visible = false;
+};
+inline std::vector<PrevHolder>& prev_holders() {
+    static std::vector<PrevHolder> v;
+    return v;
+}
+// this process's PID namespace ("pid:[inode]"; empty: unknown)
+inline std::string self_pidns() {
+    char b[64] = {0};
+    const ssize_t n = readlink("/proc/self/ns/pid", b, sizeof b - 1);
+    return n > 0 ? std::string(b, n) : "";
+}
+// the PID namespace the lock holder recorded (second line "pidns pid:[inode]"; empty: an older lock file)
+inline std::string holder_ns(int fd) {
+    char buf[256] = {0};
+    const ssize_t n = pread(fd, buf, sizeof buf - 1, 0);
+    const std::string s = n > 0 ? std::string(buf, n) : "";
+    const size_t a = s.find("\npidns ");
+    if (a == std::string::npos) return "";
+    const size_t b = s.find('\n', a + 7);
+    return s.substr(a + 7, b == std::string::npos ? std::string::npos : b - (a + 7));
+}
 inline std::string holder_pid(int fd) {
     char buf[64] = {0};
     const ssize_t n = pread(fd, buf, sizeof buf - 1, 0);
@@ -98,6 +125,19 @@ inline std::string acquire(const std::vector<int>& devs) {
         const std::string path = dir + "/gpu-" + id + ".lock";
         const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (fd < 0) continue;  // no lock directory: no guard (never stop a start for it)
+        {  // (who held it before: recorded for the start-up waits)
+            const std::string hp = holder_pid(fd);
+            if (!hp.empty() && hp.find_first_not_of("0123456789") == std::string::npos && hp.size() < 10 &&
+                (unsigned)std::stoul(hp) != (unsigned)getpid()) {
+                PrevHolder h;
+                h.pid = (unsigned)std::stoul(hp);
+                // (a holder that recorded our own PID namespace and has no /proc entry has exited: "visible", i.e. we
+                // can tell; only one in another namespace is hidden, review R7-L9)
+                const std::string ns = holder_ns(fd), me = self_pidns();
+                h.visible = access(("/proc/" + hp).c_str(), F_OK) == 0 || (!ns.empty() && ns == me);
+                prev_holders().push_back(h);
+            }
+        }
         int dying = 0;
         if (flock(fd, LOCK_EX | LOCK_NB) != 0 && (dying = dying_holder(fd)) != 0) {
             // the previous engine is still ending (a core dump being written, stuck in the driver after a crash): wait
@@ -125,6 +165,10 @@ inline std::string acquire(const std::vector<int>& devs) {
             const size_t nl = who.find('\n');
             std::string pid = nl == std::string::npos ? who : who.substr(0, nl);
             std::string cmd = nl == std::string::npos ? "" : who.substr(nl + 1);
+            if (cmd.compare(0, 6, "pidns ") == 0) {  // (the namespace line)
+                const size_t n2 = cmd.find('\n');
+                cmd = n2 == std::string::npos ? "" : cmd.substr(n2 + 1);
+            }
             while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == ' ')) cmd.pop_back();
             for (int fd2 : mine) {  // give back what this call took
                 for (size_t i = 0; i < held.size(); i++)
@@ -134,7 +178,7 @@ inline std::string acquire(const std::vector<int>& devs) {
                    "); stop it first or pick other GPUs (QE_DEVICES / CUDA_VISIBLE_DEVICES); QE_ALLOW_SHARED_GPU=1 "
                    "skips this check";
         }
-        const std::string me = std::to_string(getpid()) + "\n" + self_cmdline() + "\n";
+        const std::string me = std::to_string(getpid()) + "\npidns " + self_pidns() + "\n" + self_cmdline() + "\n";
         if (ftruncate(fd, 0) == 0 && pwrite(fd, me.data(), me.size(), 0) < 0) {}
         held.push_back({id, fd});
         mine.push_back(fd);

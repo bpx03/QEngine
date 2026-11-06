@@ -32,6 +32,7 @@ it (EffortRules, probed from the template at start-up: Qwen3.8 high = xhigh, oth
 others = max), else the `default:` / `*:` entry, else no budget.
 """
 from qe_env import env_int, env_str
+from content_markers import OUT_MARK
 
 THINK_START, THINK_END = "<think>", "</think>"
 # the wrap-up the model reads as its own last thought (a known technique: a plain "out of time, answer now"
@@ -286,6 +287,8 @@ def budget_source(body, kw, default=0, rules=None):
             kw["enable_thinking"] = False
             return None, "request"
         return b, "request"
+    if kw.get("enable_thinking") is False:  # thinking off (request, --think 0): no server budget (review L3)
+        return None, "none"
     return BudgetMap.parse(default).resolve(kw.get("reasoning_effort"), rules)
 
 
@@ -300,6 +303,7 @@ class ThinkIds:
     def __init__(self, tok):
         self.start = tok.token_to_id(THINK_START)
         self.end = tok.token_to_id(THINK_END)
+        self.tok, self.spaces = tok, {}
         self.ok = self.start is not None and self.end is not None
         body = env_str("QE_THINK_WRAP", WRAP).strip()
         enc = lambda s: tok.encode(s, add_special_tokens=False).ids  # noqa: E731
@@ -311,6 +315,13 @@ class ThinkIds:
             for p, ids in d.items():  # the close must be the delimiter token itself, exactly once at the end
                 if not self.ok or ids.count(self.end) != 1 or len(ids) < 2 or ids[-2] != self.end:
                     self.ok = False
+
+    def is_space(self, t):
+        """The token is whitespace only: does not begin the answer (app.Parser, fresh)."""
+        v = self.spaces.get(t)
+        if v is None:
+            v = self.spaces[t] = not self.tok.decode([t], skip_special_tokens=False).strip()
+        return v
 
     def open_at_end(self, ids, im_start):
         """The prompt leaves the reply inside <think> (the generation prompt `<think>\\n`, or a prefilled
@@ -332,6 +343,7 @@ class ThinkControl:
         self.job, self.budget, self.ti, self.can_force = job, budget, ti, can_force
         self.src = src or ("request" if budget is not None else "none")  # where the budget came from (budget_source)
         self.open = ti.open_at_end(job.ids, job.gen.im_start)
+        self.fresh = True       # no answer text yet: as app.Parser, only here a real <think> opens a block
         self.n = 0              # thinking tokens so far (the forced wrap-up included)
         self.forced = None      # why the thinking was closed by the server: "budget" / "max_tokens"
         self.fz, self.fi = None, 0  # forced tokens in flight, how many emitted
@@ -352,8 +364,10 @@ class ThinkControl:
                     self.open = False
                 else:
                     self.n += 1
-            elif t == self.ti.start:  # the model re-opened a think block: it counts against the same budget
+            elif self.fresh and t == self.ti.start:  # the model re-opened a think block: it counts against the same budget
                 self.open = True
+            elif self.fresh and not self.ti.is_space(t):  # the answer began: a later <think> is text (a close there would be too)
+                self.fresh = False
 
     def after(self, toks):
         """After the job fed a step's tokens (not finished): advance a forced close in flight or start one."""
@@ -451,12 +465,16 @@ def empty_reply(job, tail_tokens=8):
     end-of-turn right after the thinking (the model chose to stop) from a cut-off (max_tokens / a forced close)."""
     if job.finish not in ("stop", "length"):
         return None
-    text = job.text_all
-    if "<tool_call>" in text:
+    # the real tag tokens (marked in job.text_mk, server/content_markers.py), not the same strings quoted as text
+    text = getattr(job, "text_mk", "") or ""
+    call, end_tag = OUT_MARK + "tool_call>", OUT_MARK + "/think>"
+    if not text and job.text_all:  # a job without the marked text (tests): the plain tags
+        text, call, end_tag = job.text_all, "<tool_call>", THINK_END
+    if call in text:
         return None
     tc = job.tc
-    if THINK_END in text:
-        answer = text.rsplit(THINK_END, 1)[1]
+    if end_tag in text:
+        answer = text.rsplit(end_tag, 1)[1]
     else:
         answer = "" if tc is not None else text  # the reply opened inside <think> and never closed it
     if answer.strip():

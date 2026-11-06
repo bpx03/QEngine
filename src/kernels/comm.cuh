@@ -26,7 +26,8 @@ struct Comm {
     // receive buffer in its own memory, [4 slots][ngpu senders][kMaxBatchRows][hidden / 7] uint4,
     // and each GPU polls its local buffer; nullptr / p2p = false: the host-memory path above
     bool p2p = false;
-    // P2P LL16 receive words are cleared after they are read (QE_LL_NOCLEAR=1: off, for the alias test)
+    // P2P LL16 receive words are cleared after they are read, host words periodically (comm_bind_ll_scrub); QE_LL_NOCLEAR=1:
+    // both off, for the alias test
     bool clear = true;
     // LL16 value mapping of the rounded-sum protocols: value e of word w is w + hw e (coalesced loads/stores)
     // instead of 7 w + e; changes the order of the norm's sum of squares (same for every m)
@@ -80,11 +81,48 @@ struct Comm {
     // (already elapsed when the spin starts). lemu 0: off.
     unsigned long long* lbusy[4] = {nullptr, nullptr, nullptr, nullptr};
     float lemu = 0.f, lreal = 0.f;
+    // decode collectives' path (comm_select_path, QE_DECODE_COMM): kXferP2P = the LL16 / all-gather words are SM stores
+    // into the peers' memory (pll / pag); kXferHost = the same protocol (same kernels, the reader clears what it read)
+    // with every rank's receive words in pinned host memory (hpll / hpag), so no SM store crosses a peer link. Boards
+    // with a severe P2P co-run tax (club-3090 #1926: SM stores 26-31x) decode faster through host memory.
+    int dxfer = 0;
+    uint4* hpll[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint2* hpag[4] = {nullptr, nullptr, nullptr, nullptr};
+    bool hview = false;      // this Comm is a comm_decode_view (its pll / pag are the host words)
+    bool hfence = false;     // host view: fence the reader's clears once per thread (comm_host_fence)
+    bool dcal_want = false;  // set by the engine before comm_select_path: it times real decode steps on both paths
+    bool dcal = false;       // auto with both candidates allocated: the engine's start-up calibration picks (flash_capi)
+    bool dcal_fresh = false; // QE_DECODE_COMM=remeasure: the calibration ignores its start-up cache (and rewrites it)
 };
 // test only: the slow-link emulation spin after `bytes` of peer copies on st (no-op unless FLASH_TEST_LINK_GBPS)
 void comm_link_emul(const Comm& c, int rank, size_t bytes, cudaStream_t st, int kind = 0);
 constexpr int kCeSlots = 16;
 constexpr int kXferP2P = 0, kXferCE = 1, kXferHost = 2;
+// whether the host view fences the reader's clears (one system fence per thread after its last consume):
+// QE_DECODE_HOST_FENCE, default 1 (a late clear could overtake the reader's later stores under PCIe relaxed ordering,
+// which user space cannot rule out); 0: off. The calibration's host legs run with it, so a host pick has paid for it
+bool comm_host_fence();
+// the Comm the decode collectives use: c itself, or (dxfer == kXferHost) a copy whose LL16 / all-gather receive words
+// are the host-memory ones (the kernels are the P2P ones: same arithmetic, bit-identical results)
+inline Comm comm_decode_view(const Comm& c) {
+    if (c.dxfer != kXferHost || !c.p2p || !c.hpll[0]) return c;
+    Comm v = c;
+    for (int i = 0; i < 4; i++) v.pll[i] = c.hpll[i], v.pag[i] = c.hpag[i];
+    v.dxfer = kXferP2P;  // (a view is never viewed again)
+    v.hview = true;
+    v.hfence = comm_host_fence();
+    return v;
+}
+// test only: QE_DECODE_TEST_STORE_US, a spin of that many us after every decode all-reduce that runs as SM stores into
+// the peers (emulates the co-run stall of a board with a high P2P tax, so the start-up calibration can be checked)
+float comm_test_store_us();
+void comm_test_spin(cudaStream_t st);  // the QE_DECODE_TEST_STORE_US spin (no-op without it): callers on the P2P-store path
+// pinned host memory on a NUMA node (the reader's), mapped on every card (unified addressing: host pointer = device
+// pointer, checked); comm_host_free undoes it
+void* comm_host_alloc(size_t bytes, int node);
+void comm_host_free(void* p);
+// free the host-memory decode words (after the calibration picked P2P for every mode); c.dxfer becomes P2P
+void comm_free_decode_host(Comm& c);
 
 // Owner-finished deferred prefill all-reduce: the owner of a row (reduce-scatter) also adds the
 // sum to ITS residual rows, applies the norm and writes the normed row - int8 for the W4A8 GEMM
@@ -107,7 +145,18 @@ struct CommCounters {  // per GPU, device memory
     // early consumer (QE_EARLY_GEMV): when set, the LL16 all-reduce publishes
     // ready[idx] = epoch * 1024 + idx + 1 after all its rows are written ([1024..2047]: arrival counters)
     unsigned* ready = nullptr;
+    // no peer access (comm_bind_ll_scrub): the host LL words, which comm_begin_unit clears every kLLScrubUnits units
+    uint2* ll_host = nullptr;
+    int ll_rank = 0, ll_ngpu = 0, ll_hidden = 0;
 };
+
+// The host path's LL words have up to 3 readers, so no reader can clear them as the P2P path does. A word left unwritten
+// (m dropped) keeps its 16-bit tag, and the tag of a later collective equals it only if the two are >= 64 units apart.
+// So every rank clears its own words every 32 units, at a unit start, after a barrier
+// (no reader is left on any word). A peer that is ahead sees old words at most 32 units old, or zeros, or the new word.
+constexpr unsigned kLLScrubUnits = 32;  // a power of 2, < 64
+// Only without peer access and with QE_LL_NOCLEAR unset; a no-op otherwise. Call once per rank, before the first unit.
+void comm_bind_ll_scrub(CommCounters& ctr, const Comm& c, int rank);
 
 Comm comm_create(int ngpu, int max_elems, int ll_hidden);
 // Enable peer access between all GPUs and allocate the P2P receive buffers (QE_P2P=0 or no peer
@@ -116,6 +165,8 @@ bool comm_enable_p2p(Comm& c, const int* devices);
 void comm_free_p2p(Comm& c, const int* devices);
 // Starts a launch unit for the LL protocol: LL collectives inside it are numbered 0, 1, ...
 void comm_begin_unit(const CommCounters& ctr, cudaStream_t st);
+// comm_begin_unit and one more counter in the same kernel (the 27B per-set exchange epoch, review round 5 T7)
+void comm_begin_unit2(const CommCounters& ctr, unsigned* xep, cudaStream_t st);
 
 // resid[m][h] += sum_g partial_g  (fixed summation order -> bitwise identical on all GPUs).
 // sa (optional, steer.cuh): the activation steering of the rows' layer output, applied after the sum and before the

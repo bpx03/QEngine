@@ -349,3 +349,7 @@ bool qe_fault_skip(int rank, const char* kind) {
 
 // the server's fatal-exit hook (see run_exit_hook); nullptr removes it
 extern "C" __attribute__((visibility("default"))) void qe_set_exit_hook(void (*f)(const char*)) { g_exit_hook.store(f); }
+
+void qe_wd_slow(int delta) {
+    if (g_wd) __atomic_add_fetch(const_cast<unsigned*>(&g_wd->slow), (unsigned)delta, __ATOMIC_SEQ_CST);
+}

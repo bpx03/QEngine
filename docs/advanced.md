@@ -33,7 +33,10 @@ and uses the default too. In Docker pass them with `-e`.
 | variable | default | what it does | when to change it |
 |---|---|---|---|
 | `FLASH_KV_CACHE_BLOCKS` | `16384` | With `FLASH_KV=ram`: the VRAM cache of recently used KV blocks (4 positions each), sized to the running conversations: up to 886 MB per card while long contexts run, ~3 MB idle; the unused part is used by the expert cache. | Lower it only if decode next to very long contexts matters more than their prefill. |
-| `FLASH_EC_RECLAIM_S` | `30` | KV cache in VRAM: a conversation idle this many seconds moves to the host-RAM archive while other requests decode, so the expert cache gets its VRAM back; its next turn is restored from host memory. Never the main agent thread; nothing moves with `FLASH_KV_ARCHIVE_GB=0`. | `0` keeps idle conversations in VRAM. |
+| `FLASH_EC_RECLAIM_S` | auto | KV cache in VRAM: an idle conversation moves to the host-RAM archive so the expert cache gets its VRAM back; its next turn is restored from host memory (measured: under 0.05 s up to 128K, about 0.1 s at 240K). By default the wait depends on pressure: while the expert cache holds less than 90 % of its slots, another conversation is decoding and the idle conversations are what keeps the cache short, an idle conversation leaves after `FLASH_EC_RECLAIM_FAST_S` seconds, otherwise after 30 s. Setting this variable fixes the wait to that many seconds. The active main agent thread (see `FLASH_MAIN_STALE_S`) leaves only under that pressure, after `FLASH_EC_RECLAIM_MAIN_S`. A conversation leaves only through a complete archive write. When the archive is full, under that pressure this move may evict what is older in the eviction order (see `FLASH_MAIN_STALE_S`, each loss is logged), never anything newer and never the conversation being moved; when the write still does not fit, the oldest such conversation leaves VRAM anyway, one per check, and if it has no earlier state in the archive it is lost with a log line and recomputed when it returns; an active main stays in VRAM instead. Without that pressure it evicts nothing and the conversation stays in VRAM. Nothing moves with `FLASH_KV_ARCHIVE_GB=0`. | `0` keeps idle conversations in VRAM. |
+| `FLASH_EC_RECLAIM_FAST_S` | `2` | The idle wait used while the expert cache is short of slots (see `FLASH_EC_RECLAIM_S`). | A larger value keeps idle conversations in VRAM longer under pressure. |
+| `FLASH_EC_RECLAIM_MAIN_S` | `30` | The idle wait for the active main agent thread, used only under the pressure described for `FLASH_EC_RECLAIM_S`, and only when its own region frees at least 1/16 of the pool. Its next turn is restored from host memory. | `0` keeps an active main thread in VRAM until a request needs the room. |
+| `FLASH_MAIN_STALE_S` | `300` | A conversation holding a main agent thread's turn counts as an active main for this many seconds after its last use. One order frees memory everywhere (archive room, host RAM, VRAM slots, idle reclaim): least recently used whole conversation first, active mains after all the others. This is an order, not a guarantee: an active main goes when nothing else is left, and the loss is logged with its tokens and bytes. An idle main never makes a request wait: it moves to the archive, or is lost with a log line if nothing fits. A generating conversation never leaves VRAM; its archive copy may be dropped, since its slot holds the state. | A larger value keeps old sessions' main threads longer. |
 | `--burst-wait` (server) | `5` | ms: on an idle server the first request waits until none has arrived for this long (at most 30 ms), so a burst of requests shares one prefill batch. | `0` starts at once. |
 | `FLASH_KV_RAM_LAZY` | `0` | With `FLASH_KV=ram`: `0` pins the whole host-RAM pool at start; `1` pins it in 443 MB slabs per card as the conversations grow (only on GPUs that can use registered host memory directly; otherwise the pool is pinned at start). | `1` if the pinned RAM should grow only with use. |
 | `FLASH_MAX_PREFILLS` | `8` | Prompts that may be in the prefill at the same time. While several are waiting, they share prefill batches (the expert weights are read once for all of them). | Rarely; lower it to limit how many requests start prefilling together. |
@@ -48,6 +51,10 @@ and uses the default too. In Docker pass them with `-e`.
 | `FLASH_PREFIX_GB` | `8` | Host RAM for pinned system prompts: the KV and state at the end of each agent kind's system prompt (and tools) are kept outside the conversation archive, so a new agent of that kind starts after its system prompt even when the archive is full (a 20K-token system prompt takes about 0.4 GB). Used only as prefixes appear; the least recently used one gives way when it is full. Needs the archive (`FLASH_KV_ARCHIVE_GB` > 0). | Lower it on a machine short of RAM; `0` turns it off. |
 | `FLASH_CKPT_MIN` | `512` | A conversation gets a checkpoint where it diverges from a cached one at least this many tokens in (prefix reuse across conversations). | Rarely. |
 | `FLASH_DETERMINISTIC` | `0` | `1`: fixed-order reductions in prefill, so a run repeats exactly. Slower. | For reproducible runs of one conversation, together with `FLASH_LOOKUP=0`. |
+| `FLASH_ATTN_CHUNK` | `0` | `1`: the same request gives the same text whatever shares a step and whatever state the machine is in. By default the text can differ between runs at near-ties; I measured no sign of lower quality from that, and the KL numbers in the README are taken at the default. It does not improve KL. Cost, measured on one build (3 cards): 8 agents at once -8.6 % (2 runs each), a burst of 8 short prompts about +125 ms to the first token, because they are prefilled one after another, and -2.3 % on 8 short concurrent sequences with no server. | `1` when you compare runs, reproduce a report or run tests. |
+| `FLASH_PF_SP_MIN` | `80` with peer access, `513` without | A prompt prefilled on its own uses the sequence-parallel path (the one shared prefill batches use) from this many tokens per batch; with peer access it is faster from about 80 tokens (200 tokens: 57 vs 64 ms, 500 tokens: 94 vs 115 ms on 3 cards). Without peer access the exchanges cost more and the other path wins (96 tokens: 40 vs 46 ms), so `513`, one more than a prefill batch, keeps it off. | `513` restores the earlier choice with peer access. |
+| `FLASH_DEC_INV` | `1` | Decode and verify steps of more than 8 rows (lookup drafts) use the same attention kernel and exchange as shorter steps, so a row's result does not depend on how many rows share the step; no cost measured. | `0` restores the earlier kernels, which changes the output against the default; only to compare with an older build. |
+| `FLASH_PF_MULTI_MIN` | `0` (`FLASH_PF_SP_MIN` with `FLASH_ATTN_CHUNK=1`) | Prompt pieces shorter than this are prefilled on their own instead of sharing a prefill batch. | Follows `FLASH_ATTN_CHUNK`; rarely by hand. |
 | `FLASH_GUARD` | `1` | Output-head guard: a request whose forward produced non-finite values fails with an error instead of emitting tokens. `2` only logs, `3` stops at the first fault (debugging), `0` = off. | Rarely. |
 | `FLASH_OOM_RESERVE_MB` | `64` | Emergency VRAM per card, given up before a step runs without a CUDA graph; taken back once there is clearly room. | `0` = off. |
 | `FLASH_PIN_VRAM_MB_PER_GB` | `2` | VRAM per GB of host memory registered after start (archive, pinned prompts), kept out of the expert cache (the driver maps registered host memory with 2 MB of GPU page tables per GB on every card). | `0` = the pre-1.3.3 budget. |
@@ -55,6 +62,15 @@ and uses the default too. In Docker pass them with `-e`.
 | `QE_AR_SPLIT` | `1` | Decode all-reduces without a fused norm (Flash-Next) spread each row over several 128-thread blocks, so more SMs send and poll; same results. | `0` restores one block per row (only for debugging). |
 | `QE_AG_LL` | `1` | With peer access (both models): the small all-gathers of each decode step (argmax, top-k, lookup agreement) go GPU to GPU as tagged words instead of through host memory; same results. | `0` restores the host-memory path (only for debugging). |
 | `FLASH_QX16_DEC` | `1` | Decode and MTP steps send the attention queries to the other cards as fp16 (the values the attention kernel uses anyway, so results are identical); half the bytes. | `0` sends fp32 (only for debugging). |
+| `FLASH_VRAM_CHECK_MS` | `200` | How often a running server looks at the cards' free memory, to react when another program takes VRAM. | Rarely. |
+| `FLASH_VRAM_CHUNK_MB` | `32` | Resident expert groups are held in chunks of this size, so they can move to host memory and back at the same address when another program takes VRAM. | Rarely. |
+| `FLASH_VRAM_STEP_MB` | `256` | The most memory one such move handles at a time, which bounds the host time per step. | Rarely. |
+| `FLASH_IDX_TC` | `1` | Prefill block scores of the attention index on tensor cores. `0`: the older fp32 kernel, which is slower. | `0` only to rule the feature out while debugging. |
+| `FLASH_RQ_TA` | `0` | Weight-block width of the DeltaNet projection kernel: `0` picks one per shape; `2`, `3` or `4` forces it. Results are bit-identical for every width. | Only for kernel measurements. |
+| `FLASH_MOE_WIN` | `1` | Large prefill batches sum the expert outputs in order, in windows. `0`: the older unordered sums, whose output can differ from run to run. | `0` only to rule the feature out while debugging. |
+| `FLASH_HCD_KS` | `2` | Key split of the prefill's hyper-connection down step. `2` keeps greedy output the same across server restarts; `4` is the older split, whose output can differ from run to run. | `4` only to rule the feature out while debugging. |
+| `FLASH_MOE_DN_FX` | follows `FLASH_ATTN_CHUNK` | Decode expert sums in exact fixed point, part of what `FLASH_ATTN_CHUNK=1` does. | Rarely on its own. |
+| `FLASH_GRAPH_PRIO` | `0` | Opt-in: CUDA graph replays keep their stream priorities. `1`: prefill batches of at least `FLASH_GRAPH_PRIO_MIN` rows (`4096`); `2`: every graph. Off by default: long prefills get faster, but in the server the decode after them stayed about 20 % slower. | Only when you serve long prompts one at a time and decode speed does not matter. |
 
 Server-side: `--prefill-chunk` (2048) is the prefill chunk while other requests decode, `--prefill-chunk-idle`
 (4096 for Flash-Next) the chunk when nothing else runs.
@@ -232,14 +248,126 @@ Memory for one 1M-token conversation:
   same block cache, and the expert cache shrinks by about 5.6 GB per card (from 15.8 to 10.1 GB). Short-request
   decode on such a server was about 2 % slower (283 vs 289 tok/s).
 
+#### Qwen3.8-27B
+
+Qwen3.8-27B is also trained for 262,144 tokens, and its model card gives the same YaRN recipe (factor 4, original
+context 262,144). QEngine applies it the same way, only on request, with the KV cache in VRAM:
+
+```bash
+server/run.sh 8080 --model models/Qwen3.8-27B-INT4 --max-ctx 1M
+```
+
+- A `--max-ctx` above 262,144 turns YaRN on with factor `context / 262,144`. `QE_YARN=<factor>` sets it directly
+  and `QE_YARN=0` turns it off. The default (262,144, native RoPE) is unchanged, bit for bit.
+- YaRN changes the 16 attention layers and the MTP layer. The DeltaNet layers have no positions.
+- The context is capped by the KV pool in VRAM (34,816 bytes per token over all cards): on 3 cards the pool holds
+  about 1.2M tokens, so one 1M conversation fits. On 2 cards use `--max-ctx 512K`: the pool holds about 580,000
+  tokens. A larger `--max-ctx` is lowered at start to what one conversation can reach in the pool, and the YaRN
+  factor with it (logged), since static YaRN should be no larger than needed.
+- A `config.json` edited as the model card describes (`rope_type: yarn`, `factor`, `original_max_position_embeddings`)
+  is honoured: YaRN with that factor on every request; `QE_YARN` overrides it.
+- Archives in the disk cache (`--disk-cache`) record the YaRN factor: a server with another factor or native RoPE
+  does not reuse them.
+- At 16K the outputs with YaRN on matched those with it off (a needle, a 160-token continuation, a coding answer
+  worded slightly differently). As with Flash-Next, use it only on a server meant for long documents.
+
+Measured on 3 RTX 3090 cards (November 3, 2026), `--max-ctx 1M` (factor 4), needle in the middle of source-code text:
+
+| prompt | needle found | prompt time | decode, single stream |
+|---:|---|---:|---:|
+| 524,288 tokens | yes | 225 s (2.3K tok/s) | 155 tok/s |
+| 1,040,000 tokens | yes | 736 s (1.4K tok/s) | 106 tok/s |
+
+##### Sparse attention for long prompts (opt-in)
+
+**Trade-off.** You gain speed on long prompts: a 512K prompt about 2× faster, 1M about 3×, decode at 1M about 2×.
+Below a prompt position of ~64K and a context of ~192K nothing changes, because the full attention runs there. You
+give up exactness: each token reads 2,048 to 4,096 of its keys, which carry about 60–80 % of the full attention
+weight in our measurement on real prompts. We checked it on two retrieval tasks at 128K and 512K and one needle at
+1M, where it gave the same answers as the full attention; we did not run RULER or measure reasoning quality over
+long documents. Only one conversation at a time benefits, the KV pool is about 0.5 GB per card smaller, and it needs
+P2P and the FP8 KV cache, up to 1.87M tokens. It builds on YaRN (above), which is static for the whole server: keep
+long documents on a server of their own.
+
+At these lengths most of the 27B prompt time is attention: every token reads every key before it, which is two
+thirds of the prompt time at 512K and four fifths at 1M. `--lsa MAP` switches the 16 attention layers to sparse
+attention after Latent Sparse Attention ([arXiv 2610.42147](https://arxiv.org/abs/2610.42147), a design by
+Prefrontal AI and ETH Zürich; QEngine has its own CUDA kernels for it). Every 4 keys get a 64-dimensional index key
+from the released index map; a token scores them and attends to the best ones, the 512 most recent keys and the
+first 4 tokens, with one list for all heads. The selection runs on the GPUs. Two ways to group the keys:
+
+- `--max-ctx` below 1M: blocks of 4 consecutive keys, 2,048 selected keys per token (block-sparse).
+- `--max-ctx 1M`: buckets of about 8 keys grouped by content inside each 512-key block (D-LSA), 4,096 selected keys
+  per token.
+- `QE_LSA_MODE=block` or `dlsa` picks one (for example `block` on a 1M server whose prompts stay near 512K).
+
+```bash
+# the distilled index map released with the paper (GitHub release d-lsa-weights-v1 of
+# Prefrontal-AI/latent-sparse-attention, Apache-2.0, 6.3 MB): convert it once to safetensors. The converter loads
+# only tensors (torch.load with weights_only, which runs no pickled code from torch 2.6 on; it refuses older torch)
+# (-I ignores the user site: run it in an environment where torch is installed, e.g. a venv)
+python3 -I tools/lsa/convert_map.py qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt models/lsa-27b.safetensors
+server/run.sh 8080 --model models/Qwen3.8-27B-INT4 --max-ctx 1M --lsa models/lsa-27b.safetensors
+```
+
+Measured on 3 RTX 3090 cards (November 3, 2026), same prompts as above, `--max-ctx 1M`:
+
+| prompt | prompt time without / with `--lsa` | decode, single stream, without / with `--lsa` |
+|---:|---:|---:|
+| 524,288 tokens | 225 s / 114 s (D-LSA), 103 s (block) | 155 / 234 tok/s (both) |
+| 1,040,000 tokens | 736 s / 239 s (D-LSA) | 106 / 227 tok/s |
+
+It is lossy: a token reads a few thousand of its keys. In our retrieval check (8 hidden key-value facts and 2
+chains of variables in one 128K and one 512K document, greedy) both modes gave the same answers as the full
+attention. For the D-LSA mode the paper reports, on Qwen3.8-27B, long-context scores (RULER, and its own PaperTrail
+set) within 5 points of full attention up to 1M tokens (its setup: BF16 KV cache, YaRN factor 40); it does not cover
+the block mode, which uses the same index map without the paper's training for blocks.
+
+- Prompt rows before position 65,536 and decode steps below 196,608 tokens of context use the full attention,
+  which is faster there (`QE_LSA_PF_MIN`, `QE_LSA_DEC_MIN`).
+- One conversation at a time uses it: the index belongs to the conversation whose long prompt (past position
+  65,536) came last, and only a long prompt of another conversation takes it over. Short requests (also in the same
+  slot), batched decode steps and requests that run on a pinned shared system prompt use the full attention and
+  leave the index alone. The conversation keeps its index when it comes back from the archive (after an eviction
+  or a pause) with its tokens unchanged.
+- With two long conversations taking turns, the one that does not hold the index decodes with the full attention,
+  and each switch rebuilds the index from the KV cache (logged as `LSA: index moves`): 0.6 s for a 246K-token
+  conversation in our measurement, so about 2.6 s at 1M.
+- About 0.5 GB per card at `--max-ctx 1M` (index and selection buffers; block mode below 1M up to twice the index);
+  the KV pool is that much smaller (one 1M conversation still fits on 3 cards). The mode and the buffers follow
+  `--max-ctx` and what the pool can hold: on 2 cards `--max-ctx 1M` is lowered to what the pool holds (560,128 tokens
+  in our measurement on two 24 GB cards), and the
+  sparse attention then runs in block mode with buffers for that context.
+- Needs peer access (P2P) between the cards (up to 4), the FP8 KV cache (the default), a context of at most
+  1,874,943 tokens, a card split that keeps each group of query heads sharing a KV head on one card (the default
+  splits do; `QE_KV_SPLIT=0` on 3 cards or uneven `QE_SPLIT` weights do not), and room in the KV pool for one
+  conversation above the native 262,144 tokens. Otherwise the server starts with `LSA off: <reason>` in its log and
+  uses the full attention.
+
 ### Qwen3.8-27B
 
 | variable | default | what it does |
 |---|---|---|
+| `QE_YARN` | auto | YaRN RoPE factor: unset = `--max-ctx` / 262,144 above 262,144 (else native RoPE, or the factor of a `rope_type: yarn` config.json); `<factor>` sets it (also at 262,144); `0` = native RoPE. See [Context up to 1M tokens](#context-up-to-1m-tokens-yarn-opt-in). |
+| `QE_LSA` | off | Path of a D-LSA index map (safetensors): sparse attention in the 16 attention layers for long contexts (`--lsa` sets it). See [Sparse attention for long prompts](#sparse-attention-for-long-prompts-opt-in). |
+| `QE_LSA_PF_MIN` | `65536` | With `QE_LSA`: prompt rows from this position on attend sparsely; before it the full attention runs (faster there, exact). |
+| `QE_LSA_DEC_MIN` | `196608` | With `QE_LSA`: decode steps from this context length on attend sparsely. |
+| `QE_LSA_MODE` | auto | With `QE_LSA`: `block` (4-key blocks, 2,048 keys per token; default below `--max-ctx 1M`) or `dlsa` (content buckets, 4,096 keys; default from 1M). |
+| `QE_LSA_STATS` | `0` | `1`: with `QE_LSA`, print how many rows took the exact fallback since the last report. | To see whether a workload leaves the sparse path. |
+| `QE_LSA_TC`, `QE_LSA_FASTSEL`, `QE_LSA_FB_SPLIT` | `1` | With `QE_LSA`: the tensor-core attention kernel, the fast selection and the split fallback in decode. `0` uses the slower variant of each. | `0` only to rule one out while debugging. |
+| `QE_LSA_SEL_ROWS` | `64` | With `QE_LSA`: rows per pass of the older selection path and of the fallback scoring. | Rarely. |
+| `QE_LSA_QK16` | `0` | With `QE_LSA`: `1` computes Q K^T in fp16. No faster in our measurements, with twice the error. | Only for kernel measurements. |
 | `QE_POOL_TOKENS` | auto | KV pool size in tokens (default: all free memory). |
 | `QE_POOL_MIN_HEAD` | `2048` | Least headroom in tokens a conversation's KV region grows by when the pool is tight (or 1/16 of the conversation, if larger). |
 | `QE_ADMIT_HEADROOM` | `8192` | KV tokens reserved per running sequence when admitting a new one. |
+| `QE_VRAM_CHECK_MS` | `200` | How often a running server looks at the cards' free memory, to react when another program takes VRAM. |
+| `QE_VRAM_CHUNK_MB` | `64` | The KV pool is held in chunks of this size, so it can shrink and grow back when another program takes VRAM and gives it up. |
+| `QE_SLOT_FIT_LOG` | `0` | `1`: log how the sequence slots were fitted to the memory at start. |
+| `FLASH_MAIN_STALE_S` | `300` | The same setting as on Flash-Next, for the host-RAM archive: least recently used whole conversation first, a main thread used within this many seconds after all the others; it goes when nothing else is left, logged with its tokens and bytes. |
 | `QE_P2P` | auto | `0` forces the host-memory communication path (every collective through pinned host memory). |
+| `QE_DECODE_COMM` | `auto` | decode collectives: `p2p` = SM stores into the peers' memory, `host` = through pinned host memory (prefill keeps its path); `remeasure` = auto without the start-up cache; see the `[comm] decode collectives` line. |
+| `QE_COMM_CACHE` | `1` | start-up cache of the link probe and the decode calibration: `0` off, `refresh` measure again and rewrite. |
+| `QE_DECODE_HOST_FENCE` | `1` | host-memory decode path: one system fence per thread after its reads (PCIe relaxed ordering safety); `0` off. |
 | `QE_MTP_FILE` | auto | MTP head file (default: `model_mtp_ft.safetensors` from the model directory, else the copy the server downloaded into `~/.cache/qengine/assets`). |
 | `QE_TOKEN_RANK_FILE` | auto | Token ranking of the MTP draft vocabulary (default: `<model dir>/token_rank.bin`, else the server's downloaded copy in `~/.cache/qengine/assets`). |
 | `QE_FETCH_ASSETS` | `1` | `0`: the server does not download missing `model_mtp_ft.safetensors` / `token_rank.bin` from the latest release (it only logs a warning). |
@@ -276,15 +404,17 @@ Pick cards that do not drive a desktop: a display takes 1-2 GB of VRAM and the K
 | `--merge-system` | Flash-Next `1`, 27B `0` | merge several leading system messages into one |
 | `--mtp-k` | 27B `7`, Flash-Next `3` | most MTP drafts per step (adaptive below that) |
 | `--loop-guard-tokens` | `600` | end a reply whose last N tokens are one short fragment repeated; `0` = off |
-| `--loop-guard-turns` / `QE_LOOP_GUARD_TURNS` | `3` | cross-turn loop guard after N identical (reply, result) turns (tool calls must match exactly, ids included); `0` = off |
+| `--loop-guard-turns` / `QE_LOOP_GUARD_TURNS` | `3` | cross-turn loop guard after N turns that repeat earlier (reply, tool result) turns, one call or a cycle (tool calls must match exactly, ids included, Bash `description` ignored; results must be the same non-empty text, in full); guarded at N, 2N and 4N turns, then every 24 turns; `0` = off |
+| `--loop-guard-think` / `QE_LOOP_GUARD_THINK` | `2048` | a guarded turn of a request without thinking is generated with reasoning on, at most N reasoning tokens on top of `max_tokens` (stop sequences apply to the answer only); `0` = off |
 | `--loop-guard-penalty` / `QE_LOOP_GUARD_PENALTY` | `1.5` | presence penalty of a guarded turn (2.0 from twice the turn count) |
 | `--loop-guard-note` / `QE_LOOP_GUARD_NOTE` | `1` | append a short server note to the latest tool result of a guarded turn; `0` = off |
+| `QE_GEN_TURNS_TOKENS` | `8000000` | token ids of recent generated turns kept (about 32 MB), so an old turn that holds a real control token tokenizes the same when the client resends it, instead of being prefilled again |
 | `QE_THINK_WRAP` | the default sentence | the wrap-up sentence before a forced `</think>` |
 | `QE_STATS_LOG` | `1` | per-request statistics lines; `0` = off |
 | `--log-file` / `QE_LOG_FILE` | `auto` | persistent log path (`''` or `0` = off) |
 | `--log-mb` / `QE_LOG_MB` | `64` | size before the log is rotated (3 old files kept) |
 | `--stats-file` | `~/.cache/qengine/stats.json` | all-time monitoring totals |
-| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | 27B persistent prompt cache, its size, and the idle seconds before live conversations are saved; steered conversations are not saved |
+| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | 27B persistent prompt cache, its size, and the idle seconds before live conversations are saved; steered conversations are not saved. Flash-Next has no disk cache: the flag stops the start with an error (for the start-up cache directory set `QE_DISK_CACHE`) |
 
 Per-request statistics lines, e.g.:
 
@@ -318,23 +448,34 @@ graphs keep the room); a fast-growing `budget_evictions` under steady traffic me
 | `QE_HANG_PERSIST_S` | `3600` | watchdog limit while the 27B saves conversations to `--disk-cache` |
 | `QE_EXIT_HOOK_S` | `5` | on a fatal engine error, the time the server gets to send the open requests their error |
 | `FLASH_RUN_TIMEOUT_S` | `120` | Flash-Next engine step monitor; off by itself under `ncu`, `nsys`, `compute-sanitizer` or a debugger unless set; `0` = off |
-| `QE_START_RETRY_S` | `60` | how long a start refused for lack of room waits for a running conversation to finish |
+| `QE_GRAPH_RESERVE_MB` | `128` | 27B: VRAM per card kept for CUDA graphs. When another process takes all free VRAM, the engine uses it instead of stopping; `0` turns it off |
+| `QE_START_RETRY_S` | `60` | how long a start refused for lack of room waits for a running conversation to finish; then it ends with an error |
+| `QE_NO_ROOM_S` | `10` | how long a queued request that fits nowhere waits with nothing running (27B: the KV pool shrank because another process took VRAM); then it ends with an error, and the server keeps serving; `0` = no deadline |
 | `QE_NO_PROGRESS_STEPS` / `QE_NO_PROGRESS_S` | `64` / `10` | a conversation without a token for this many steps and seconds (not paused) fails with an error; either `0` = off |
 | `QE_GPU_LOCK_WAIT_S` | `60` | at start, wait for a previous engine that is still exiting, also one in another container (the old name `FLASH_PIN_WAIT_S` is still read when this one is not set); `0` = fail at once |
 | `QE_ALLOW_SHARED_GPU` | `0` | `1` skips the one-engine-per-GPU lock (`~/.cache/qengine/locks/`) |
 | `QE_CORE_DUMP` | `0` | `1` keeps core dumps of a crash (off: writing the core of a process with tens of GB of pinned memory took minutes and held the GPUs); a crash prints native and Python stacks to the log either way |
-| `QE_MEM_MARGIN_GB` | max(8, 5 % of RAM) | host RAM the archives never take |
-| `QE_HOST_RESERVE_GB` | max(8, 8 % of RAM) | host-RAM plan at start-up (both models): RAM left to the system and the desktop when the n-gram table, the archive and the pinned prompts are sized ([Host memory](../README.md#host-memory-flash-next)) |
+| `QE_MEM_MARGIN_GB` | max(8, 5 % of RAM) | while serving: free RAM (`MemAvailable`) the archives keep; below it they stop growing and give memory back |
+| `QE_HOST_RESERVE_GB` | max(8, 8 % of RAM) | at start only, host-RAM plan (both models): RAM left to the system and the desktop when the n-gram table, the archive and the pinned prompts are sized ([Host memory](../README.md#host-memory-flash-next)) |
 | `QE_HOST_BASE_GB` | `6` | host-RAM plan: RAM counted for the server process (Python, vision encoder, CUDA) |
 
 **Host RAM safety.** The archives (`QE_KV_ARCHIVE_GB`, `FLASH_KV_ARCHIVE_GB`) never take the machine below
 `MemAvailable` minus `QE_MEM_MARGIN_GB`: pinning stops there and the archive's budget shrinks, with a log line
 (`archive: host memory low, budget capped at …`). When another process takes memory later, the archive gives it back
-(free pinned memory first, then archived conversations in eviction order) instead of the kernel's OOM killer ending
-the server. Pinning at start that finds no host memory (for example right after a crash) is retried for up to a
-minute, and the log names the processes holding the most memory. When the Flash-Next archive is full, finished and
-normal conversations go first; the main agent thread gives back its newest part first and keeps a prefix it resumes
-from.
+(free pinned memory first, then conversations in eviction order, one at a time until the host is above the margin)
+instead of the kernel's OOM killer ending the server. Pinning at start that finds no host memory (for example right after a crash) is retried for up to a
+minute, and the log names the processes holding the most memory. On Flash-Next, pinned system prompts go before an
+active main thread here. When the Flash-Next archive is full, whole conversations go in the same order (see
+`FLASH_MAIN_STALE_S`); nothing is trimmed, a conversation stays complete or goes.
+
+**Known limitation (Flash-Next): under host RAM pressure the archive can lose more than it gives back.** Pinned archive
+memory is held in 1 GB slabs, conversations share slabs, and a slab goes back to the system only when it is completely
+empty. So when another program takes host RAM and the archive must give back 1 GB, it may have to drop several
+conversations first; in simulation, 1.9 to 11.9 GB of conversations for 1 GB returned. The engine keeps serving, each
+dropped conversation is logged and is recomputed when it returns, and output stays correct. A full archive with RAM to
+spare doesn't do this, since new writes reuse the free room inside slabs. To avoid it, set `FLASH_KV_ARCHIVE_GB` so the
+archive stays below what your machine can spare with your other programs running (RAM minus their use minus
+`QE_MEM_MARGIN_GB`).
 
 
 ### How `FLASH_COMM=auto` / `QE_COMM=auto` choose a path
@@ -363,8 +504,63 @@ the real exchange buffers). Flash-Next then picks its prefill transfer path:
   over-reads a fast PCIe link (median 1.36, rarely up to ~2.2 on 3× RTX 3090 at x16, where P2P is the fastest path). `QE_COMM_XNUMA=0` lets `QE_COMM_TAX` decide on
   one node too; `QE_COMM_CORUN=0` skips the tax probe; `QE_COMM_PROBE=0` skips the bandwidth probe.
 
-The `[comm]` startup lines show the measurements, the data check and the reason for the choice. Decode keeps its
-path. For the 27B the prefill all-reduce runs on the copy engine already; `QE_COMM=p2p` selects the SM-store
+The `[comm]` startup lines show the measurements, the data check and the reason for the choice.
+
+**Decode collectives** (`QE_DECODE_COMM`, both engines): the decode all-reduces, the small all-gathers, the
+Flash-Next attention exchanges (q, partial outputs, indexer keys) and the 27B's split-head attention exchange (3 cards)
+go either as SM stores into the peers' memory
+(P2P) or through pinned host memory, with the same protocol and bit-identical results. `auto` measures: at the end
+of the start-up the engine runs a short dummy decode on each path (greedy, lookup off), with one sequence and with
+four batched sequences: `QE_DECODE_CAL_ROUNDS` (4) interleaved rounds of `QE_DECODE_CAL_STEPS` (12) steps per path,
+and keeps the faster path for each mode: host memory only when its median is faster by `QE_DECODE_CAL_MARGIN`
+(default 5 %) and it was faster in at least 3 of 4 rounds (a short phase of a slow step must not decide). It takes a
+few seconds and runs once per hardware and configuration (cached, see below). The attention exchanges of decode
+steps use host memory only when both modes picked it; when the picks differ, the host mode (with the attention
+exchanges on P2P, the combination that then runs) is timed in two more pairs interleaved with P2P legs and kept only
+if it wins both. Prefill exchanges keep their own path (the prefill
+probe). The calibration does not run in pipeline mode B or without peer access. The host path puts one system memory
+fence per thread after its reads, so a word cleared by its reader cannot overtake that reader's later writes under
+PCIe relaxed ordering; the calibration times it. `QE_DECODE_HOST_FENCE=0` removes it (only for a box known to run
+PCIe in strict order). The line reports both timings and the cost of the calibration. Neither the co-run tax nor an idle
+all-reduce benchmark predicts this: on 3× RTX 3090 at x16 the SM-store tax reads 12-16x and an idle all-reduce is
+2-3x slower through host memory, yet real decode is only 9-30 % slower there; on other boards host memory decodes
+faster. `QE_DECODE_CAL=0` uses the rule above instead (decode leaves P2P when the prefill rule does);
+`flash_run` always does. `QE_DECODE_COMM=p2p` or `host` forces the path; without peer access everything goes
+through host memory anyway.
+
+Rarely needed settings of this measurement: `QE_DECODE_CAL_WARM` (3) warm-up steps per leg, `QE_DECODE_CAL_K` (3)
+MTP drafts per step, `QE_DECODE_CAL_NB` (4, Flash-Next) sequences in the batched leg (`0` = none), `QE_DECODE_CAL_PAUSE_MS` (3000) the
+longest wait for background pinning to pause before it starts. The start-up cache key reads the trained PCIe link of each
+card for up to `QE_COMM_LINK_MS` (200). `QE_DECODE_HOST_MAX` (4.0) is the veto of the rule above, applied only when the
+diagnostic all-reduce benchmark runs (`QE_DECODE_BENCH=1`).
+
+**Start-up cache.** The link probe's bandwidth and co-run tax numbers and the decode calibration are stored in
+`$QE_DISK_CACHE` or `~/.cache/qengine` (in Docker the `/root/.cache/qengine` volume; without a volume each start
+measures again) and reused on the next start while nothing that can change them has changed: the engine build, the
+model, the number of cards and their order, each card's UUID, PCI address, link speed and width and NUMA node, peer
+access between the cards, the driver and CUDA versions, and the collectives' settings. The `[comm]` lines say when
+a number comes from the cache and when it was measured. The P2P data check runs at every start. `QE_COMM_CACHE=0`
+turns the cache off, `QE_COMM_CACHE=refresh` measures everything again and rewrites it, `QE_DECODE_COMM=remeasure`
+does that for the decode calibration only. Files are replaced atomically, so two servers starting at once are safe.
+A measurement is not stored when another process used the cards while it ran: NVML's per-process utilization,
+polled every `QE_COMM_BUSY_POLL_MS` (100) ms during the measurement, shows another process above `QE_COMM_BUSY_PCT`
+(2) % SM, memory bandwidth, encoder or decoder on one of them (a copy-only job counts too: an H2D stream at 27 GB/s
+reads 77-93 % "SM" there) (an idle desktop, browser or editor does not count; a WebGPU
+tab, a video decode, another server loading its weights or another CUDA job does); another compute context on a card
+(outside a container) counts at any load; or NVML cannot tell (no NVML, an error, a container where this server is
+not identifiable, or a poll that does not return within `QE_COMM_BUSY_JOIN_MS`, 2000 ms). NVML reports running
+processes only, so a job shorter than one poll can pass unseen; load on cards outside the set (shared root complex,
+host memory) is not seen. On a cached start no poll runs. Drivers without per-process
+utilization fall back to the process lists (other processes except the display's own clients; more names:
+`QE_COMM_CACHE_IGNORE=name,...`). A host pick that did not win every round is not
+stored either (the next start measures again; a P2P pick is). Entries expire after `QE_COMM_CACHE_DAYS` (30). The key also holds
+each card's power limit, clocks, clock offset, BAR1 size, the PCIe link as trained under load (polled for at most
+200 ms of copies),
+the IOMMU state, the model's real path and checkpoint, the requested context, and the engine settings that change a
+decode step. Locked clocks (`nvidia-smi -lgc`) are not readable (NVML and `nvidia-smi` report the VBIOS range), so after
+changing them run once with `QE_COMM_CACHE=refresh`.
+
+For the 27B the prefill all-reduce runs on the copy engine already; `QE_COMM=p2p` selects the SM-store
 all-reduce and `QE_COMM=host` turns peer access off.
 
 ## Build the Flash-Next model directory yourself
@@ -583,6 +779,7 @@ greedy agreement and MTP acceptance, needles found at 5K-200K tokens.
 |---|---|---|
 | `[comm] P2P data check FAILED (...)` at start | Data sent over P2P between two cards arrived corrupt on this machine (a PCIe / chipset problem, not a model problem). With `auto` the engine does not use the failing transport. | Nothing, if the server runs well with `auto`. If you force a path with `FLASH_COMM` / `QE_COMM`, prefer `ce`. Check `sudo dmesg \| grep -iE "aer\|pcie bus error"` for link errors. `QE_COMM_CHECK=0` turns the check off (default 4 rounds per pair and transport). |
 | Prefill errors, NaN or garbage output only on long prompts, only on P2P | The P2P link may corrupt data in ways the startup check did not catch. | `FLASH_COMM=ce` (copy engine) as a workaround; compare with `FLASH_COMM=push` and `FLASH_COMM=pull` to find which P2P direction is at fault; `FLASH_COMM=host` as the last resort. Please report it with the `[comm]` startup lines. |
+| Slow decode or poor scaling with concurrent requests on a board with a high P2P co-run tax (`[comm] co-run tax` / `probe GB/s` lines with store tax of 20x or more and load tax of about 3x) | Decode sends small messages several times per layer; on some boards SM stores into another card stall that card's other work far more than on fast x16 links. With `auto`, the engine times real decode steps on both paths at start-up and keeps the faster one. | The `[comm] decode collectives` line shows both measured paths and the pick. If the timings are close or your runs disagree, compare `QE_DECODE_COMM=host` and `p2p` at 1 and 4 concurrent requests and report both with the `[comm]` lines. `QE_P2P=0` also moves prefill to host staging, usually slower than the copy engine. |
 | `[qflash] FAULT non-finite values in the forward ...`; the request gets an error (HTTP 500 or an `error` event in a stream) | The output-head guard (`FLASH_GUARD=1`, default) caught non-finite values before they became tokens. The request fails, its conversation is dropped from the cache, the server goes on. | Note the prompt and the log lines and report them. The same fault repeated (same tokens, position and step) counts once; more than `FLASH_GUARD_MAX` (default 4) distinct faults within 5 minutes stop the process so a supervisor can restart it. `FLASH_GUARD=2` only logs, `FLASH_GUARD=3` stops at the first fault (for debugging), `0` turns the guard off. |
 | Non-finite values that appear only in long-prompt prefill | Possibly the prefill attention with block selection. | Diagnostic only: `FLASH_ATTN_PFSEL=0` uses the per-row prefill attention kernel (slower at long prompts). If that fixes it, please report it. |
 | `graph instantiate out of memory (N MB free): dropped K cached graphs, retrying` | A CUDA graph for a new conversation shape did not fit next to the expert cache. The engine dropped its cached graphs and retried. Since 1.3.4.1 the graphs have their own room (`FLASH_GRAPH_MB`), so this should be rare. | Nothing; graphs are rebuilt as needed. If it repeats, raise `FLASH_GRAPH_MB`. |
@@ -591,6 +788,8 @@ greedy agreement and MTP acceptance, needles found at 5K-200K tokens.
 | `collective timeout (host): engine job '<name>' not finished after 120 s ...; ranks still in it: ...`, exit code 75 | An engine step did not finish: a card or the driver stalled (`FLASH_RUN_TIMEOUT_S`). The open requests get an error (`[fatal] the engine is ending the process ...`), then the process ends so that it can be restarted. | Check `dmesg` for Xid lines; report the log with the line. Profiling the server with a tool that is not detected: `FLASH_RUN_TIMEOUT_S=0`. |
 | `[hang] the scheduler has not advanced for N s ...` followed by stacks, exit code 75 | The server's watchdog (`QE_HANG_S`) saw no progress. Open requests got an error at once and new ones are refused; the stacks (gdb when installed and no thread is stuck in the driver, nvidia-smi) are bounded by `QE_HANG_DIAG_S` (30 s), then the process exits. | Report the log; it holds the stacks. |
 | `[sched] start of N tokens refused after admission (KV pool full ...): requeued until a running sequence finishes` | A prompt that was admitted found no room when it started (for example its cached prefix is still being generated from). It tries again when a running sequence or prompt finishes, for up to `QE_START_RETRY_S` (60) seconds; when nothing is running the refusal is final at once. A prompt the engine rejects as invalid or too long fails at once with that message. | Nothing; it fails with "KV pool full" only if the pool stays full that long. |
+| `[sched] ERROR, the request ends, the server goes on: no room in the KV pool: ...` | A queued request fit nowhere with nothing running for `QE_NO_ROOM_S` (10 s). The line and the HTTP 500 say whether another process took the GPU memory (the pool is smaller than at start) or the request just doesn't fit, with the sizes and the free VRAM per card. | Free the GPU memory or shorten the request, then send it again. The server is still running. |
+| `stopping at a generated <\|im_start\|> after N tokens (prompt P): turn starts '...', ends '...'`; the reply ends with `stop` | The model began a new turn without closing its own (`<\|im_end\|>`), so the server ended the reply there instead of streaming a made-up turn. Markers quoted in the conversation's content are plain text, so the model does not copy this token from a pasted template or source. | Rare. If it repeats, report the log line (the first and last tokens of the reply show where it happened) with the prompt length. `"ignore_eos": true` turns off this stop together with the end-of-turn stop (benchmarks only). |
 | `engine error: no progress on slot ...` | A sequence produced no token for 64 steps and 10 s while not paused (`QE_NO_PROGRESS_STEPS`, `QE_NO_PROGRESS_S`; either `0` = off); the request fails with an error instead of waiting forever. | Report the log line (it includes the pool state). |
 | `qflash: ...: cudaErrorInitializationError ... a previous engine process still holds them ...` at start | CUDA could not be used: usually the previous engine is still exiting after a crash, or the driver is in an error state. The start waits up to `QE_GPU_LOCK_WAIT_S` (60) s for a previous engine that is still exiting, also one it cannot see (e.g. in another container). | Wait for the listed process to end; check `dmesg` for Xid lines; reboot if the GPUs stay busy. |
 | `[gemm] GPU<n> <buffer>: out of memory growing to ... MB: ..., retrying` | A GEMM workspace had to grow after start and did not fit; the engine dropped cached graphs and retried. | As above. |

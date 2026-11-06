@@ -17,6 +17,7 @@
 #include "kernels/ops.cuh"
 #include "kernels/sample.cuh"
 #include "kernels/spec.cuh"
+#include "kernels/lsa.cuh"
 #include "safetensors.h"
 
 struct FullAttnLayer {
@@ -154,9 +155,25 @@ public:
     void add_slot();  // a sequence slot without KV (see set_region)
     // KV pool: one allocation per GPU; slot regions at token offsets (same on every GPU)
     void alloc_pool(size_t tokens);
+    // the KV pool in VMM chunks (VRAM taken by other processes while serving, Engine::vram_tick): the chunks past a
+    // token ceiling are released and mapped again later; QE_VRAM_ADAPT=0: one plain allocation
+    bool pool_vmm() const { return !pool_ch_.empty(); }
+    void drop_graphs();  // (rebuilt on demand)
+    int drop_graphs_count() {  // the graphs dropped (0: none were cached)
+        const int n = (int)(graphs_.m.size() + spec_graphs_.m.size() + batch_graphs_.m.size());
+        drop_graphs();
+        return n;
+    }
+    size_t pool_release_above(size_t bytes);  // chunks wholly at / past `bytes` released; bytes freed
+    bool pool_map_upto(size_t bytes);         // chunks up to `bytes` mapped again; false: out of memory (partial)
+    size_t free_mem() const;
+    std::vector<unsigned long long> pool_ch_;  // per chunk: the handle, 0 = released
+    size_t pool_chunk_ = 0;
+    void reserve_graphs(size_t bytes);  // VRAM kept for graphs (instantiate gives it up in pieces)
     void set_region(int slot, size_t off, int cap);
     // rows [0, rows) (keys [split, split + rows)) of a region move from (off0, cap0) to (off1, cap1)
     void move_region(size_t off0, int cap0, size_t off1, int cap1, int split, int rows);
+    void move_pool_bytes(size_t dst_tok, size_t src_tok, size_t tokens);  // a prefix region's rows, token units (moves down)
     void clear_graphs(int slot);  // after its region moved: captured graphs hold the addresses
     // Slot reads keys [0, n) from the region at pool offset off (n rows, shared with other
     // slots); n = 0 detaches. Its own region then holds key k at row k - n.
@@ -176,7 +193,27 @@ public:
     void alloc_xchg();
     float* xchg_buf() const { return xbuf_; }
     unsigned* xchg_flags() const { return xflags_; }
+    // LSA (QE_LSA=<map.safetensors>): roles of this card in the index partials (set by the Engine from the
+    // final plan), the exchange peers, and the invalidation of a slot's bucket cache (its keys changed from `from`)
+    bool lsa_on() const { return lsa_on_; }
+    void lsa_set_roles(const LsaRoles& r) { lsa_roles_ = r; }
+    float* lsa_rx() const { return lsa_x_.rx; }
+    unsigned* lsa_rf() const { return lsa_x_.rf; }
+    void lsa_set_peer(int g, float* rx, unsigned* rf) { lsa_x_.prx[g] = rx; lsa_x_.prf[g] = rf; }
+    void lsa_invalidate(int slot, int from);
+    void lsa_invalidate_region(size_t off, int from);
+    void lsa_set_keep(int k) { lsa_keep_ = k; }  // restores up to this position equal the slot's previous tokens
+    void lsa_refuse(const std::string& why) { lsa_allowed_ = false; lsa_refusal_ = why; }
+    int lsa_owner() const { return lsa_slot_; }
+    bool lsa_detached() const { return lsa_detached_; }  // an index waiting for its conversation's tokens
+    void lsa_detach();
+    void lsa_reattach(int slot, int keep, bool log = true);
+    void lsa_mode(int slot, int pos);
+    void lsa_disable(const std::string& why);
     void set_xchg_peer(int j, float* buf, unsigned* flags);
+    float* xchg_bufH() const { return xbufH_; }
+    unsigned* xchg_flagsH() const { return xflagsH_; }
+    void set_xchg_peerH(int j, float* buf, unsigned* flags) { xpeer_bufH_[j] = buf, xpeer_flagsH_[j] = flags; }
     // the position maps of the plan may be set after load (shares chosen from the free memory)
     void set_plan(const CardPlan& p);
     void select_slot(int i);
@@ -209,6 +246,11 @@ public:
     // Lookup drafts on the GPU (QE_LOOKUP): the current sequence's token history on the device, appended and scanned
     // at the end of every single-sequence step graph; lk_dev_.lk = drafts for the next step.
     void lk_init(int cap, int mmin, int lmax);
+    void set_rope();                      // RoPE / YaRN table of cfg (rope_table_host) to the device
+    void size_ctx(int max_pos);           // context-sized buffers for a YaRN context (K-scale scratch)
+    size_t ctx_bytes_per_pos(int max_pos) const;  // their bytes per position (the pool plan for a YaRN context max_pos)
+    size_t ctx_fixed_bytes(int max_pos) const;  // allocated with them, independent of the context (LSA selection scratch)
+    void lsa_unsized(size_t reach);       // the reach fell to the native context: LSA off, the reason on stdout
     void lk_set_history(const int* ids, int n);  // + scan (synchronous)
     bool lk_on() const { return lk_dev_.hd != nullptr; }
     const int* lk_dev_ptr() const { return lk_dev_.lk; }
@@ -280,10 +322,15 @@ public:
     void upload_drafts(int i, const int* host, int n);
     size_t mask_words() const { return ((size_t)c_.vocab + 31) / 32; }
     bool constrained = false;
-    int mode() const { return (sampling ? 1 : 0) | (constrained ? 2 : 0) | (attn_rs_ ? 4 : 0); }
+    int mode() const { return (sampling ? 1 : 0) | (constrained ? 2 : 0) | (attn_rs_ ? 4 : 0) | (lsa_use_ ? 8 : 0); }
+    // LSA for the next forward (single sequence): set from the host-known position (QE_LSA_DEC_MIN / QE_LSA_PF_MIN);
+    // lsa_step clusters the slot's blocks before `pos` (eager, before the step's graph) and sets lsa_use_; only with
+    // bind (a prefill that uses LSA) may it take the bucket cache over from another slot
+    void lsa_step(int slot, int pos, bool bind = false);
     // attn_dec8d row split for the current step (set by the engine from the host-side length: one sequence
     // below kD8RsMax keys); part of the graph mode, results bit-identical either way
     bool attn_rs_ = false;
+    bool lsa_use_ = false;
     // Recurrent-state snapshots for prompt caching (delta-net states of the current slot +
     // conv histories). The KV cache is position-indexed and needs no copy.
     size_t snapshot_bytes() const;
@@ -315,6 +362,11 @@ public:
     float* logits_ = nullptr;
     size_t weight_bytes = 0, cache_bytes = 0;
 
+    // decode collectives' path per mode (0: single-sequence steps, 1: batched steps; kXfer*), QE_DECODE_COMM: set_dpath
+    // drops every cached graph (they hold the Comm of their capture); free_dhost: the host candidates go
+    bool decode_host_ready() const { return comm_.hpll[0] != nullptr; }
+    void set_dpath(int single, int batched, int xh = -1);  // xh: attention exchange on host (-1: both modes host)
+    void free_dhost();
 private:
     void* dalloc(size_t bytes, bool weight);
     struct RowSpec { std::string name; int r0, r1; };
@@ -447,15 +499,69 @@ private:
     unsigned* xflags_ = nullptr;
     float* xpeer_buf_[kMaxLocalKv] = {};
     unsigned* xpeer_flags_[kMaxLocalKv] = {};
+    // decode through host memory (both modes picked host, review M3): the same exchange with host-memory receive rows /
+    // flags (pinned on this card's NUMA node, mapped on every card), wired like the device ones
+    float* xbufH_ = nullptr;
+    unsigned* xflagsH_ = nullptr;
+    float* xpeer_bufH_[kMaxLocalKv] = {};
+    unsigned* xpeer_flagsH_[kMaxLocalKv] = {};
+    bool xh_ = false;
+    bool in_pf_ = false;  // inside a prefill (prefill_chunk / forward_prefill / Engine::prefill): device exchange set
+  public:
+    void set_in_pf(bool on) { in_pf_ = on; }
+  private:
+    // per-set exchange epochs (review rounds 4 S1 / 5 T2): whenever the host set exists, [0] counts the units of the
+    // device set and [1] those of the host set (xchg_set), each bumped only by its own units (begin_unit), so neither
+    // set's flags fall behind, whatever the path switches; without host candidates the shared CommCounters::epoch
+    unsigned* xep_[2] = {nullptr, nullptr};
+    void begin_unit(cudaStream_t st);
     int xridx_[kMaxLocalKv] = {}, xsidx_[kMaxLocalKv] = {};
     unsigned* xdone_ = nullptr;
     int xidx_ = 0;
     int pf_p0_ = -1;  // first position of the prefill chunk being run (attention_prefill picks int8 Q K^T from it)
+    // LSA state: one bucket cache (all full-attention layers) bound to lsa_slot_; closed blocks per layer (host, the
+    // same on every card); prefill rows at positions >= lsa_pf_min_ attend sparsely
+    bool lsa_on_ = false;
+    int lsa_slot_ = -1, lsa_pf_min_ = 0, lsa_dec_min_ = 0;
+    int* lsa_closed_dev_ = nullptr;  // [layers] the same counts on the device (read by the kernels)
+    int lsa_keep_ = 0;
+    bool lsa_ready_ = false, lsa_detached_ = false;
+    std::string lsa_path_;
+    void lsa_size(int max_pos);
+    bool lsa_allowed_ = true;
+    std::string lsa_refusal_;
+    std::set<int> lsa_split_logged_;
+    std::vector<int> lsa_closed_;
+    std::vector<LsaLayer> lsa_;
+    LsaRoles lsa_roles_;
+    LsaXchg lsa_x_;
+    float* lsa_part_ = nullptr;  // [kLsaXRows][64] partials
+    bf16* lsa_iq_ = nullptr;     // [kChunk][64]
+    bf16* lsa_ik_ = nullptr;     // [kLsaXRows][64]
+    unsigned* lsa_list_ = nullptr;  // [kChunk][kLsaListMax]
+    int* lsa_n_ = nullptr;
+    void* lsa_scr_ = nullptr;
+    void* lsa_uscr_ = nullptr;  // tile unions of the fast attention
+    size_t lsa_scr_bytes_ = 0;
+    void lsa_load(const std::string& path);
+    void lsa_catch_up(int ord, const Layer& L, const AttnShape& a, int keys);  // cluster the closed blocks before `keys`
+    bool lsa_prefill(int ord, const Layer& L, const AttnShape& a, int r0, int mb, const int* pos, const float* proj);
+    // sparse attention of m rows at device positions pos (any path: prefill micro-batch, small chunk, decode graph);
+    // vmax: upper bound of the visible buckets; out: attention output rows
+    void lsa_rows(int ord, const Layer& L, const AttnShape& a, const bf16* q, const int* pos, int m, int vmax,
+                  const float* proj, bf16* out);
+    void lsa_bind(int slot, int from);  // the slot about to run, its keys from `from` on (re)written
     double2* rtab_ = nullptr;
     void xchg_fill(AttnShape& a);  // exchange pointers / sequence of the next layer
     void move_bytes(char* dst, const char* src, size_t len);
     int cur_slot_ = -1;
     Comm comm_;
+    int dpath_[2] = {0, 0};  // decode path of single-sequence / batched steps
+    bool in_batch_ = false;  // inside run_spec_batch (its inner calls keep the batched path)
+    void dpath_use(int mode) {
+        if (!comm_.hpll[0] || (in_batch_ && mode == 0)) return;
+        comm_.dxfer = dpath_[mode];
+    }
     CommCounters ctr_;
     AttnShape ash_;
     DeltaShape dsh_;
@@ -487,7 +593,7 @@ private:
     float *conv_out_ = nullptr, *dno_ = nullptr, *attn_work_ = nullptr;
     float *dn_qk_ = nullptr, *dn_gb_ = nullptr;
     float* pattn_work_ = nullptr;  // prefill attention split-K partials
-    uint2* pattn_ksc_ = nullptr;   // prefill attention: per-key int8 K scales ([nkv][kPattnKscRows])
+    uint2* pattn_ksc_ = nullptr;   // prefill attention: per-key int8 K scales ([nkv][ash_.ksc_ld]: kPattnKscRows, size_ctx)
     float* pattn_kmu_ = nullptr;   // prefill attention: per-channel K sums ([nkv][256], K smoothing)
     PattnScratch pscr_;            // prefill attention: persistent windowed kernel scratch (in idle delta-net buffers)
     // per delta-net layer inputs kept by a verification pass for dn_replay
@@ -558,7 +664,11 @@ private:
     cudaGraphExec_t blaunch_[2] = {nullptr, nullptr};  // the last two launched (maybe in flight): never updated
     bool batch_update(const std::string& key, cudaGraph_t g, cudaGraphExec_t* out);
     long long bupd_ok_ = 0, bupd_fail_ = 0;
-    void instantiate(cudaGraphExec_t* ge, cudaGraph_t g);
+    bool instantiate(cudaGraphExec_t* ge, cudaGraph_t g);
+    static constexpr size_t kGraphReservePiece = (size_t)16 << 20;
+    static constexpr int kGraphCoolSteps = 64;   // steps without a capture after a graph found no memory
+    std::vector<void*> graph_reserve_;           // VRAM kept for graphs, given up in pieces (instantiate)
+    int graph_cool_ = 0;
     std::vector<void*> allocs_;  // everything from dalloc, freed by the destructor
     int *bout_ = nullptr, *bmout_ = nullptr;  // per-row argmax of a batched step / its MTP pass
     void forward_batch(const std::vector<int>& slots, const std::vector<int>& r0, const std::vector<int>& ms);

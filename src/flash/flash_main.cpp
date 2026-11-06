@@ -398,12 +398,11 @@ int main(int argc, char** argv) {
     if (pps.par != flash_pp::Par::TP) {
         // stage slots: each holds full-head DeltaNet state of the stage's layers (~3x a TP card's per slot); sized to the
         // run (mode B: FLASH_PP_SEQS sequences, mode A: one) unless FLASH_MAX_SEQS is set
-        if (!env_set("FLASH_MAX_SEQS"))
-            setenv("FLASH_MAX_SEQS", std::to_string(pps.par == flash_pp::Par::PP ? std::max(1, env_int("FLASH_PP_SEQS", 1)) : 1).c_str(), 1);
+        const int stage_seqs = env_set("FLASH_MAX_SEQS") ? 0 : pps.par == flash_pp::Par::PP ? std::max(1, env_int("FLASH_PP_SEQS", 1)) : 1;
         std::vector<const Worker*> vw;
         if (pps.views) vw.assign(W.begin(), W.end());
-        pps.S = pps.pptp ? pp_make_groups(pps.groups, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd)
-                         : pp_make_stages(devs, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd, vw);
+        pps.S = pps.pptp ? pp_make_groups(pps.groups, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd, stage_seqs)
+                         : pp_make_stages(devs, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd, vw, stage_seqs);
         pps.mb = pp_microbatch(pps.S, pps.bounds, (long long)prompt.size());
         int maxb = 0;
         for (Worker* w : pps.S) maxb = std::max(maxb, w->pf_batch((long long)prompt.size() + 64));
@@ -871,8 +870,9 @@ int main(int argc, char** argv) {
                 job = [&](int r) { int oo; W[r]->prefill(ch.data(), i, m, rows.data(), &oo, nullptr, nullptr); };
                 pool_run();
             }
-            for (int i = np0; i < n; i += 16) {
-                const int m = std::min(16, n - i);
+            static const int tfm = std::max(1, std::min(16, env_int("FLASH_TF_M", 16)));  // rows per decode forward
+            for (int i = np0; i < n; i += tfm) {
+                const int m = std::min(tfm, n - i);
                 std::vector<int> ch(ids.begin() + i, ids.begin() + i + m);
                 step2(ch, i, false, true, -1);
                 for (int r = 0; r < ng; r++) W[r]->copy_logits(lg[r].data(), m);

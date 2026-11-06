@@ -78,6 +78,18 @@ int main() {
         k = comm_check_pick(1, false, false);
         EXPECT(k.x == 1 && !k.why);
     }
+    {  // decode collectives (club-3090 #1926): follow the prefill rule; the microbench only vetoes a much slower host path
+        // our 3x3090: load tax 1.36 (pull), CE 1.04, 1 NUMA node, x16 -> prefill keeps P2P -> decode P2P, whatever the bench
+        const CommRule ours = comm_auto_rule(1.36f, 1.04f, cap, cap1, sev, false, true, false, false);
+        EXPECT(comm_decode_rule(ours.leave_p2p, 10.f, 5.f, 1.5f).x == 0);
+        EXPECT(comm_decode_rule(ours.leave_p2p, 0.f, 0.f, 1.5f).x == 0);
+        // the reporter: push chosen (load 4.3 < 0.7 x 13.1 GB/s), store tax 29 -> severe -> host unless host is > 4x
+        const CommRule rep = comm_auto_rule(29.f, 1.03f, cap, cap1, sev, false, true, false, false);
+        EXPECT(rep.leave_p2p);
+        EXPECT(comm_decode_rule(rep.leave_p2p, 14.5f, 36.9f, 4.f).x == 2);  // our box's idle ratio (2.5x): host
+        EXPECT(comm_decode_rule(rep.leave_p2p, 0.f, 0.f, 1.5f).x == 2);   // no microbench: the rule alone
+        EXPECT(comm_decode_rule(rep.leave_p2p, 10.f, 41.f, 4.f).x == 0);  // host pathologically slower: P2P kept
+    }
     if (fails) return 1;
     printf("comm_rule_unit: ok\n");
     return 0;

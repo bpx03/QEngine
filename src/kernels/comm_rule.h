@@ -78,3 +78,23 @@ inline bool comm_check_pull(bool want_pull, bool bad_ld, bool bad_st) {
     if (bad_st && !bad_ld) return true;
     return want_pull;
 }
+
+// Decode collectives' path under QE_DECODE_COMM=auto (club-3090 #1926): the LL16 all-reduce, the small all-gather and
+// the QSA exchanges are SM stores into the peers' memory (0, P2P) or the same protocol over pinned host memory (2).
+// The signal is the prefill rule above (comm_auto_rule on the receiver-load tax, the same probe): when it leaves P2P,
+// decode leaves the peer stores too, unless the start-up decode microbench (t_*: us per collective, summed over its
+// row counts; 0: not measured) has host memory pathologically slower (> host_max x P2P, default 4: idle, it cannot see
+// the co-run stalls; on our 3x3090 host reads 2.1-2.8x P2P). The SM-store tax alone does not
+// separate the boards: our 3x3090 (patched-driver P2P, x16 gen4) reads 12.7-15.5 with decode fastest over P2P, the
+// reporter's EPYC 7F52 (gen3 x16) 26-31 with decode ~2x faster at N=4 through host memory (QE_P2P=0), a club
+// maintainer's 2x3090 ~27; their receiver-load tax (ours 1.31-1.37, the reporter's 2.8-3.4) is what the rule reads.
+struct DecodeRule {
+    int x;  // 0 P2P, 2 host memory (the kXfer* values of comm.cuh)
+    const char* why;
+};
+inline DecodeRule comm_decode_rule(bool prefill_left_p2p, float t_p2p, float t_host, float host_max) {
+    if (!prefill_left_p2p) return {0, "the prefill rule keeps P2P"};
+    if (t_p2p > 0.f && t_host > host_max * t_p2p)
+        return {0, "the prefill rule leaves P2P, but host memory is markedly slower in the decode microbench"};
+    return {2, "the prefill rule leaves P2P"};
+}

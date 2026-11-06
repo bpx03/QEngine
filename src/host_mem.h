@@ -94,6 +94,31 @@ inline size_t available(bool fresh = false) {
     return last;
 }
 
+// Load-time guard of the big pins (Flash-Next pin_host / pin_host_file). A pin in flight has already lowered MemAvailable by
+// what it has touched: only its untouched part is still to come, so only that part counts against a pin starting next to it.
+inline std::atomic<size_t>& pin_untouched() {
+    static std::atomic<size_t> v{0};
+    return v;
+}
+// one pin of cap bytes: charged in full at the start, its touched part comes off as it is filled
+class PinCharge {
+public:
+    explicit PinCharge(size_t cap) : left_(cap) { before_ = pin_untouched().fetch_add(cap); }
+    ~PinCharge() { pin_untouched().fetch_sub(left_.exchange(0)); }
+    PinCharge(const PinCharge&) = delete;
+    PinCharge& operator=(const PinCharge&) = delete;
+    size_t others() const { return before_; }  // what the other pins in flight had not touched yet when this one started
+    void touched(size_t n) {
+        left_.fetch_sub(n);
+        pin_untouched().fetch_sub(n);
+    }
+private:
+    std::atomic<size_t> left_;
+    size_t before_ = 0;
+};
+// a pin fits when MemAvailable holds it, the rest of the other pins in flight, and 2 GB
+inline bool pin_fits(size_t avail, size_t cap, size_t others) { return avail >= cap + others + ((size_t)2 << 30); }
+
 inline size_t margin() {
     static const size_t m = [] {
         const double gb = env_double("QE_MEM_MARGIN_GB", -1.0);  // empty / unparsable: the default, not 0 GB
@@ -173,6 +198,13 @@ inline CgroupMem cgroup_mem() {
         if (p.empty()) break;
     }
     return r;
+}
+
+// what a pin may take now: MemAvailable, capped by this process's cgroup limit (past it the cgroup's OOM killer ends the load)
+inline size_t pin_available() {
+    const size_t a = available(true);
+    const CgroupMem c = cgroup_mem();
+    return c.limit > 0 ? std::min(a, (size_t)std::max(0.0, c.limit - c.anon)) : a;
 }
 
 // bytes the archive may still take from the host (0 at or below the margin)

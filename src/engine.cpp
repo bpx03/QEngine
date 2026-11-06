@@ -1,10 +1,17 @@
+#include <atomic>
+#include <cuda_profiler_api.h>
 #include "env.h"
 #include "engine.h"
+#include "kernels/watchdog.cuh"
+#include "kernels/gemv.cuh"
+#include "gpu_others.h"
 #include "host_budget.h"
 
 #include <sys/mman.h>
 #include "snap_policy.h"
+#include "kernels/comm_cache.h"
 
+#include <array>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -18,6 +25,11 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+extern std::atomic<bool> g_qe_loaded;
+static double vnow_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+size_t qe_release_load_scratch();  // model.cpp
+extern std::function<bool(Worker*, size_t)> g_pool_emergency;  // model.cpp
 
 GpuPool::GpuPool(const std::vector<int>& devices) : devices_(devices) {
     for (size_t i = 0; i < devices.size(); i++) threads_.emplace_back([this, i] { loop(i); });
@@ -73,9 +85,42 @@ void GpuPool::run(const std::function<void(int)>& job) {
 
 Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, int max_t,
                const std::vector<double>& split_weights) {
+    req_ctx_ = max_t;
     auto t0 = std::chrono::steady_clock::now();
     model_dir_ = model_dir;
     cfg_ = Config::load(model_dir);
+    {   // YaRN RoPE scaling (opt-in; model card: rope_type yarn, factor 4, original_max_position_embeddings 262144):
+        // a context above the native one turns it on with factor context / native (1M: 4, 512K: 2), at most 4M;
+        // QE_YARN=<factor> sets it (also at the native context), QE_YARN=0 keeps the native RoPE (positions above
+        // native_ctx are then outside the trained range). Default: native RoPE, 262,144, bit-identical
+        // A config.json with rope_type yarn (as the card describes) gives the factor like QE_YARN. plan_slots lowers a
+        // derived factor to the context the KV pool holds (yarn_auto_)
+        const int nat = cfg_.native_ctx;
+        double f = 0;
+        if (max_t > nat) {
+            max_t = std::min(max_t, 4 * 1024 * 1024);
+            f = (double)max_t / nat;
+            yarn_auto_ = true;
+        }
+        if (cfg_.yarn_cfg > 0 && !env_set("QE_YARN")) {
+            f = cfg_.yarn_cfg;
+            yarn_auto_ = false;
+            printf("config.json rope_type yarn: factor %.3f, original context %d\n", f, nat);
+        }
+        if (env_set("QE_YARN")) {
+            f = env_double("QE_YARN", 0);
+            yarn_auto_ = false;
+        }
+        cfg_.yarn = f > 1 ? f : 0;
+        if (max_t > nat && cfg_.yarn > 0 && max_t > cfg_.yarn * nat) {
+            const int was = max_t;
+            max_t = (int)(cfg_.yarn * nat);
+            printf("qengine: context %d lowered to %d (YaRN factor %.3f x %d)\n", was, max_t, cfg_.yarn, nat);
+        }
+        if (max_t > nat && cfg_.yarn == 0)
+            fprintf(stderr, "qengine: context %d with QE_YARN off: positions above %d are outside the trained range\n", max_t, nat);
+        cfg_.max_pos = std::max(nat, max_t);
+    }
     // QE_STEER / QE_STEER_DIR (src/steer.h): validated first; a refused vector throws (qe_create returns null)
     steer_ = qsteer::steer_load_env(cfg_.hidden, cfg_.layers, model_dir, &steer_def_);
     if (steer_.size() > 4096) throw std::runtime_error("steering: more than 4096 vectors");
@@ -188,6 +233,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     // startup probe + prefill transfer path (QE_COMM=auto|p2p|ce|host): the copy-engine prefill all-reduce stays the
     // default; p2p = SM-store all-reduce; host (or auto when host staging is markedly faster than both peer paths,
     // e.g. GPUs on different NUMA nodes behind slow links): no peer access, every collective through host memory
+    comm_.dcal_want = true;  // decode collectives: timed on real decode steps after the start-up (decode_calibrate)
     if (comm_select_path(comm_, devices.data(), "QE_COMM", false) == kXferHost && comm_.p2p) {
         comm_free_p2p(comm_, devices.data());
         printf("QE_COMM: collectives through pinned host memory (no peer access)\n");
@@ -221,15 +267,101 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         if (f) fclose(f);
     }
     pool_.reset(new GpuPool(devices));
+    if (env_str("QE_LSA")) {  // LSA refusals before anything is allocated: one behaviour (off, the reason on stdout)
+        std::string why;
+        if (!comm_.p2p) why = "it needs peer access (P2P) between the GPUs";
+        else if (devices.size() > 4) why = "it supports up to 4 GPUs";
+        else if (cfg_.n_kv != 4 || cfg_.head_dim != 256) why = "it needs the Qwen3.8-27B attention shape";
+        else if ([&] {  // each kv group's q heads counted on one card (each card rounds its group sums to bf16, as the
+                        // reference): QE_KV_SPLIT=0 on 3 cards (q 8/8/8) or uneven QE_SPLIT weights split a group
+                const int qpk = cfg_.n_q / cfg_.n_kv;
+                std::vector<int> gcard(cfg_.n_kv, -1);
+                for (size_t r = 0; r < plan_.size(); r++)
+                    for (int j = 0; j < plan_[r].q_heads.size(); j++) {
+                        const int h = plan_[r].q_heads.b + j;
+                        bool own = true;  // (a q head on several cards is counted on the lowest rank)
+                        for (size_t o = 0; o < r; o++)
+                            if (h >= plan_[o].q_heads.b && h < plan_[o].q_heads.e) own = false;
+                        if (!own) continue;
+                        int& c = gcard[h / qpk];
+                        if (c >= 0 && c != (int)r) return true;
+                        c = (int)r;
+                    }
+                return false;
+            }())
+            why = "a kv group's q heads are split across cards in this plan (QE_KV_SPLIT=0 on 3 GPUs, uneven QE_SPLIT)";
+        else
+            try {  // the map, here (a malformed file is a refusal, never a throw on a worker thread)
+                SafeTensors mp;
+                mp.open(env_str("QE_LSA"));
+                for (int i = 0; i < cfg_.layers; i++)
+                    if (cfg_.is_full[i])
+                        for (const char* w : {".W_Q_idx", ".W_K_idx"}) {
+                            const TensorInfo& t = mp.get(std::to_string(i) + w);
+                            if (t.dtype != "F32" || t.nbytes != (size_t)kLsaIn * kLsaDim * 4)
+                                throw std::runtime_error("tensor " + std::to_string(i) + w + " is not fp32 [768, 64]");
+                        }
+            } catch (const std::exception& e) {
+                why = std::string("map ") + env_str("QE_LSA") + ": " + e.what();
+            }
+        if (!why.empty())
+            for (auto& w : workers_) w->lsa_refuse(why);
+    }
     pool_->run([&](int r) { workers_[r]->load(st_, mtp_st_.get(), embed_); });
+    // the load's staging buffers (their room goes to the slots / the pool); QE_VRAM_ADAPT=0: kept, as before (review L3)
+    vram_adapt_ = env_int("QE_VRAM_ADAPT", 1) != 0;
+    scratch_freed_.assign(workers_.size(), 0);
+    if (vram_adapt_) pool_->run([&](int r) { scratch_freed_[r] = qe_release_load_scratch(); });
     // the stats exchange of a position-split head: each card writes into its peer's rows / flags
     for (size_t r = 0; r < workers_.size(); r++)
         for (int j = 0; j < plan_[r].kv_heads.size(); j++)
             if (plan_[r].kv_x[j] == 3) {
                 const Worker& peer = *workers_[plan_[r].kv_peer[j]];
                 workers_[r]->set_xchg_peer(j, peer.xchg_buf(), peer.xchg_flags());
+                workers_[r]->set_xchg_peerH(j, peer.xchg_bufH(), peer.xchg_flagsH());  // (null without host candidates)
             }
     plan_slots(max_t);
+    if (workers_[0]->lsa_on()) {  // LSA: who counts which q heads / kv positions in the index partials
+        const int qpk = cfg_.n_q / cfg_.n_kv;
+        int qcount = 0;
+        std::vector<int> kwhole(cfg_.n_kv, 0), ksplit(cfg_.n_kv, 0);
+        for (size_t r = 0; r < workers_.size(); r++) {
+            LsaRoles R;
+            const CardPlan& p = plan_[r];
+            for (int j = 0; j < p.q_heads.size(); j++) {
+                const int h = p.q_heads.b + j;
+                size_t own = r;
+                for (size_t o = 0; o < r; o++)
+                    if (h >= plan_[o].q_heads.b && h < plan_[o].q_heads.e) own = std::min(own, o);
+                if (own == r) R.qmask |= 1u << j, qcount++;
+                R.qg[j] = h / qpk;
+            }
+            for (int j = 0; j < p.kv_heads.size(); j++) {
+                const int g = p.kv_heads.b + j;
+                R.kg[j] = g;
+                if (!pm_full(p.kv_pm[j])) {
+                    R.kcount[j] = 1;  // a position-split head: this card's share
+                    ksplit[g]++;
+                    continue;
+                }
+                bool lower = false;  // a whole head: the lowest-rank card holding it
+                for (size_t o = 0; o < r; o++)
+                    for (int jj = 0; jj < plan_[o].kv_heads.size(); jj++)
+                        if (plan_[o].kv_heads.b + jj == g && pm_full(plan_[o].kv_pm[jj])) lower = true;
+                R.kcount[j] = !lower;
+                kwhole[g] += !lower;
+            }
+            CHECK(p.q_heads.size() <= 32 && p.kv_heads.size() <= kMaxLocalKv, "LSA roles: local heads");
+            workers_[r]->lsa_set_roles(R);
+            for (size_t g = 0; g < workers_.size(); g++)
+                if (g != r) workers_[r]->lsa_set_peer(g, workers_[g]->lsa_rx(), workers_[g]->lsa_rf());
+        }
+        // every q head counted once; every kv head either whole on one card or split (counted where owned), never both
+        CHECK(qcount == cfg_.n_q, "LSA roles: %d of %d q heads counted", qcount, cfg_.n_q);
+        for (int g = 0; g < cfg_.n_kv; g++)
+            CHECK((kwhole[g] == 1 && ksplit[g] == 0) || (kwhole[g] == 0 && ksplit[g] >= 2),
+                  "LSA roles: kv head %d counted %d whole / %d split", g, kwhole[g], ksplit[g]);
+    }
     if (!steer_.empty()) {  // activation steering vectors (validated above), on every GPU
         const int nv = steer_.size();
         std::vector<int> lo(nv), hi(nv);
@@ -263,7 +395,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     {  // host-RAM plan (host_budget.h): the archive and the pinned prefixes get what the host has left after the server,
         // the embeddings and the snapshot buffers, up to their defaults (32 + 8 GiB); QE_KV_ARCHIVE_GB / QE_PREFIX_GB win
         namespace hb = qe_hostbudget;
-        hb::In in;
+        hb::In in;  // (plan_wait updates in.avail)
         in.cards = (int)workers_.size();
         in.total = (double)qe_hostmem::total();
         in.avail = (double)qe_hostmem::available(true);
@@ -286,7 +418,14 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         in.arch_env = "QE_KV_ARCHIVE_GB";
         in.pref_env = "QE_PREFIX_GB";
         in.prefix_needs_archive = false;  // (27B: the pinned prefixes have their own budget)
-        const hb::Out o = hb::plan(in);
+        double waited = 0;
+        static std::vector<int> hb_devs;  // (busy(): a previous server alive on our cards, review N-L2)
+        hb_devs = devs_;
+        const hb::Out o = hb::plan_wait(in, [] { return (double)qe_hostmem::available(true); }, env_double("QE_RAM_WAIT_S", 20.0), &waited,
+                                        [] { return qe_gpu_others::big_holder(hb_devs.data(), (int)hb_devs.size()); });
+        if (waited > 0)
+            printf("host RAM plan: MemAvailable was short at start; waited %.0f s for it (QE_RAM_WAIT_S), now %.1f GB\n", waited,
+                   in.avail / 1e9);
         for (auto& w : o.warn) printf("host RAM plan: warning: %s\n", w.c_str());
         printf("%s\n", hb::line(in, o).c_str());
         fflush(stdout);
@@ -297,6 +436,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         prefix_budget_ = o.prefix == kp ? (size_t)((env_double("QE_PREFIX_GB", 8.0)) * (1ull << 30)) : (size_t)o.prefix;
     }
     if (env_set("QE_ARCHIVE_MIN")) archive_min_ = env_int("QE_ARCHIVE_MIN", archive_min_);
+    main_stale_s_ = env_double("FLASH_MAIN_STALE_S", main_stale_s_);
     if (env_set("QE_SHARE_PREFIX")) share_prefix_ = env_int("QE_SHARE_PREFIX", share_prefix_) != 0;
     pool_log_ = env_int("QE_POOL_LOG", 0);
     disk_init();
@@ -306,6 +446,12 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     alloc_thread_ = std::thread([this, sizes] {
         // errors (e.g. the process exiting while pinning) just end the background allocation
         for (int i = 0; i < max_snaps_ && !stop_alloc_; i++) {
+            for (;;) {  // (decode calibration, as HostPool: announce, then check)
+                snap_busy_ = true;
+                if (!snap_pause_ || stop_alloc_) break;
+                snap_busy_ = false;
+                usleep(20000);
+            }
             std::vector<void*> b;
             for (size_t sz : sizes) {
                 void* p;
@@ -315,7 +461,13 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             std::lock_guard<std::mutex> lk(snap_mu_);
             free_bufs_.push_back(std::move(b));
         }
+        snap_busy_ = false;
     });
+    {   // a little VRAM kept for graphs (Worker::reserve_graphs); taken from what stays free after the load, the pool keeps its size
+        const size_t mb = (size_t)std::max(0, env_int("QE_GRAPH_RESERVE_MB", 128));
+        if (mb) pool_->run([&](int r) { workers_[r]->reserve_graphs(mb << 20); });
+    }
+    g_qe_loaded = true;  // (Worker::dalloc: an out-of-memory after this is not a load-time stop)
 }
 
 Engine::~Engine() {
@@ -360,7 +512,34 @@ void Engine::plan_slots(int main_cap) {
         cap_tokens = sum;
     }
     CHECK(nslots >= 1 && nslots <= kMaxSegs, "slots %d (max %d)", nslots, kMaxSegs);
-    for (int i = 0; i < nslots; i++) {
+    // the slots' recurrent state (~110 / 164 MB per slot and card on 3 / 2 cards) before the pool: on a small card the
+    // count is lowered to what leaves a 32K-token pool and a 0.5 GB reserve (a smaller card starts with fewer
+    // concurrent conversations instead of stopping); measured on the first slot
+    std::vector<size_t> c0(workers_.size()), f0(workers_.size());
+    for (size_t r = 0; r < workers_.size(); r++) c0[r] = workers_[r]->cache_bytes, f0[r] = workers_[r]->free_bytes();
+    pool_->run([&](int r) { workers_[r]->add_slot(); });
+    seqs_.push_back(Seq{});
+    size_t slot_each = 0;
+    {
+        int fit_n = nslots;
+        for (size_t r = 0; r < workers_.size(); r++) {
+            // (the device's cost: the free memory a slot takes, allocation rounding of its small buffers included)
+            const size_t fr = workers_[r]->free_bytes();
+            const size_t per = std::max<size_t>({1, workers_[r]->cache_bytes - c0[r], f0[r] > fr ? f0[r] - fr : 0});
+            const size_t keep = (size_t)0.5e9 + (size_t)(32768 + 4096) * workers_[r]->slot_token_bytes();
+            fit_n = std::min<long long>(fit_n, 1 + (long long)((fr > keep ? fr - keep : 0) / per));
+            slot_each = std::max(slot_each, per);
+            if (env_int("QE_SLOT_FIT_LOG", 0))
+                printf("slot fit GPU%d: %.2f GB free after one slot, %.2f GB kept (reserve + 32K pool at %zu B/token), %.0f MB per slot -> %d\n",
+                       workers_[r]->device, fr / 1e9, keep / 1e9, workers_[r]->slot_token_bytes(), per / 1048576.0, fit_n);
+        }
+        if (fit_n < nslots && vram_adapt_) {
+            printf("sequence slots: %d -> %d to fit the cards' memory (%.0f MB of state per slot and card; QE_MAX_SEQS sets it)\n",
+                   nslots, std::max(1, fit_n), slot_each / 1048576.0);
+            nslots = std::max(1, fit_n);
+        }
+    }
+    for (int i = 1; i < nslots; i++) {
         pool_->run([&](int r) { workers_[r]->add_slot(); });
         seqs_.push_back(Seq{});
     }
@@ -390,8 +569,8 @@ void Engine::plan_slots(int main_cap) {
         // GPU2's of kv2 the cards hold 1 + x, 2 - x - y, 1 + y heads per token; every card's pool
         // fills when f_r / (heads_r) are equal: per = (f0 + f1 + f2) / 4 head-tokens; x = f0 / per - 1
         std::vector<double> f(workers_.size());
-        for (size_t r = 0; r < workers_.size(); r++) {
-            const size_t fr = workers_[r]->free_bytes(), res = reserve[r];
+        for (size_t r = 0; r < workers_.size(); r++) {  // (without the released load scratch: the shares master picks)
+            const size_t fr = workers_[r]->free_bytes() - std::min(workers_[r]->free_bytes(), scratch_freed_[r]), res = reserve[r];
             f[r] = fr > res ? (double)(fr - res) : 0.0;
         }
         const double per = (f[0] + f[1] + f[2]) / 4;
@@ -404,7 +583,12 @@ void Engine::plan_slots(int main_cap) {
             kvs_.a12 = b;
             kv_split_maps(plan_, kvs_);
             pool_->run([&](int r) { workers_[r]->set_plan(plan_[r]); });
-            return pool_fit();
+            size_t fit = SIZE_MAX;  // (pool_fit without the released load scratch, as above)
+            for (size_t r = 0; r < workers_.size(); r++) {
+                const size_t fr = workers_[r]->free_bytes() - std::min(workers_[r]->free_bytes(), scratch_freed_[r]), res = reserve[r];
+                fit = std::min(fit, (fr > res ? fr - res : 0) / workers_[r]->slot_token_bytes());
+            }
+            return fit;
         };
         int best_a = kvs_.to_a(x), best_b = kvs_.to_a(y);
         const int a0 = best_a, b0 = best_b;
@@ -464,10 +648,59 @@ void Engine::plan_slots(int main_cap) {
     // heads (kv-pos-split), so the pool is the smallest (free / bytes per token)
     // lookup drafts on the GPU (QE_LOOKUP=1): the current sequence's history on every card (1 MB), before the pool
     lk_on_ = has_mtp() && (env_int("QE_LOOKUP", 1));  // QE_LOOKUP=0: off
+    // a small card: the default reserve (1.5 GB per card outside the pool) is lowered, down to 0.5 GB, until the pool
+    // holds a 32K context (the runtime buffers then grow into less room; VRAM pressure: vram_tick). QE_RESERVE_GB set or
+    // QE_VRAM_ADAPT=0: kept as given. Before the YaRN reach, which sizes with the reserve too (review L6)
+    for (auto& w : workers_) slack_ = std::max(slack_, w->region_slack());
+    if (vram_adapt_ && !env_set("QE_RESERVE_GB") && pool_fit() < 32768 + slack_) {
+        for (double gb : {1.0, 0.5}) {
+            for (auto& r : reserve) r = std::min(r, (size_t)(gb * 1e9));
+            if (pool_fit() >= 32768 + slack_) break;
+        }
+        printf("KV pool: the cards' memory past the 1.5 GB reserve held fewer than 32K tokens: reserve lowered to %.1f GB per card "
+               "(QE_RESERVE_GB sets it)\n", reserve[0] / 1e9);
+    }
+    if (cfg_.max_pos > cfg_.native_ctx) {
+        // a context above the native one (YaRN): what one conversation can reach in the pool, with the buffers sized
+        // by the context (K-scale scratch, lookup histories) counted per position. A smaller reach lowers the context
+        // and, when the factor was derived from it, the factor (static YaRN rescales every position: no larger than
+        // needed); then the buffers are sized for the reach
+        // (the bytes per position follow the LSA mode of the context: a smaller reach can switch D-LSA to block, which
+        // needs more per position, so the reach is checked again for the lowered context)
+        auto reach_of = [&](int ctx) {
+            size_t reach = SIZE_MAX, slack = 0;
+            for (size_t r = 0; r < workers_.size(); r++) {
+                const size_t fx = reserve[r] + workers_[r]->ctx_fixed_bytes(ctx), fr = workers_[r]->free_bytes();
+                const size_t per = workers_[r]->slot_token_bytes() + workers_[r]->ctx_bytes_per_pos(ctx) +
+                                   (lk_on_ ? 4 * (nslots + 1) : 0);
+                reach = std::min(reach, (fr > fx ? fr - fx : 0) / per);
+                slack = std::max(slack, workers_[r]->region_slack());
+            }
+            reach = std::min(reach, cap_tokens);
+            return reach > slack + 1024 ? (reach - slack) / 1024 * 1024 : 0;
+        };
+        size_t reach = reach_of(cfg_.max_pos);
+        if (reach < (size_t)cfg_.max_pos && reach > (size_t)cfg_.native_ctx) reach = std::min(reach, reach_of((int)reach));
+        if (reach < (size_t)cfg_.max_pos) {
+            const int ctx = std::max(cfg_.native_ctx, (int)reach);
+            const double f = ctx > cfg_.native_ctx ? (double)ctx / cfg_.native_ctx : 0;
+            printf("qengine: context %d does not fit the KV pool (one conversation reaches %zu tokens): context %d%s",
+                   cfg_.max_pos, reach, ctx, yarn_auto_ ? "" : "\n");
+            if (yarn_auto_) printf(", YaRN factor %.3f -> %.3f\n", cfg_.yarn, f);
+            cfg_.max_pos = ctx;
+            main_cap = std::min(main_cap, ctx);
+            if (yarn_auto_ && f != cfg_.yarn) {
+                cfg_.yarn = f;
+                pool_->run([&](int r) { workers_[r]->set_rope(); });
+            }
+        }
+        if (cfg_.max_pos > cfg_.native_ctx) pool_->run([&](int r) { workers_[r]->size_ctx(cfg_.max_pos); });
+        else workers_[0]->lsa_unsized(reach);  // (LSA's buffers never sized: off, said once)
+    }
     if (lk_on_) {
         const int mmin = env_int("QE_LK_MIN", 24);  // shorter matches: MTP drafts as well (k up to 7)
         const int lmax = env_set("QE_LK_LMAX") ? std::max(1, std::min(kMaxLookupK, env_int("QE_LK_LMAX", kMaxLookupK))) : kMaxLookupK;
-        pool_->run([&](int r) { workers_[r]->lk_init(kMaxPos + 64, mmin, lmax); });
+        pool_->run([&](int r) { workers_[r]->lk_init(cfg_.max_pos + 64, mmin, lmax); });
         lkb_on_ = workers_[0]->lkb_on();
         lkb_rows_ = env_int("QE_LKB_ROWS", lkb_rows_);  // rows a batched step may grow to
         lkb_hold_ = env_int("QE_LKB_HOLD", lkb_hold_);  // steps without a find before MTP again
@@ -480,11 +713,49 @@ void Engine::plan_slots(int main_cap) {
         lkb_cool_.assign(nslots, 0);
     }
     const size_t fit = pool_fit();
-    for (auto& w : workers_) slack_ = std::max(slack_, w->region_slack());
+    reserve_min_ = *std::min_element(reserve.begin(), reserve.end());
     pool_tokens_ = std::min(fit, cap_tokens) / 1024 * 1024;
-    CHECK(pool_tokens_ >= 8192 + slack_, "not enough GPU memory for a KV cache");
-    max_ctx_ = (int)std::min<size_t>(std::min<size_t>(main_cap, kMaxPos), pool_tokens_ - slack_);
+    // If the model can load, the user may run it (user decision 2026-11-05): a small pool is a warning. The stop is only
+    // where nothing can run: the workers' run-ahead slack plus one prefill chunk
+    {
+        size_t fmin = SIZE_MAX;
+        for (auto& w : workers_) fmin = std::min(fmin, w->free_bytes());
+        const size_t hard = slack_ + kChunk;
+        if (pool_tokens_ < hard) {  // a clear stop, no abort
+            fprintf(stderr, "qengine: not enough GPU memory for a KV cache: %.2f GB free on the smallest card after the weights and %d "
+                    "sequence slots, %.1f GB of it kept as reserve; the pool would hold %zu tokens (at least %zu needed). Use fewer slots "
+                    "(QE_MAX_SEQS, about %.0f MB of state each per card), more cards, or cards with more memory\n", fmin / 1e9, nslots,
+                    reserve[0] / 1e9, pool_tokens_, hard, slot_each / 1048576.0);
+            fflush(stderr);
+            fflush(stdout);
+            _exit(3);
+        }
+        if (pool_tokens_ < 8192 + slack_)
+            fprintf(stderr, "qengine: WARNING: little GPU memory for a KV cache: the context is about %zu tokens (%.2f GB free on the "
+                    "smallest card, %d sequence slots); fewer slots (QE_MAX_SEQS) or more cards leave room for more\n",
+                    pool_tokens_ - slack_, fmin / 1e9, nslots);
+    }
+    max_ctx_ = (int)std::min<size_t>(std::min<size_t>(main_cap, cfg_.max_pos), pool_tokens_ - slack_);
     pool_->run([&](int r) { workers_[r]->alloc_pool(pool_tokens_); });
+    pool_tokens0_ = pool_tokens_;
+    if (vram_adapt_) {
+        // out of memory on a worker thread (a GEMM workspace, a buffer, a graph) while the engine thread waits for the step:
+        // the cached graphs of that card first, then the KV pool's chunks past every region (VRAM taken by others)
+        g_pool_emergency = [this](Worker* w, size_t need) {
+            for (size_t r = 0; r < workers_.size(); r++)
+                if (workers_[r].get() == w) return emergency_release((int)r, need) > 0;
+            return false;
+        };
+        pool_->run([&](int r) {
+            gemm_set_oom_hook([](void* c) -> int {
+                Worker* w = static_cast<Worker*>(c);
+                cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(w->stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) { (void)cudaGetLastError(); return -1; }
+                if (w->drop_graphs_count() > 0) return 1;
+                return g_pool_emergency && g_pool_emergency(w, (size_t)256 << 20) ? 1 : 0;  // (0: nothing freed, stop retrying)
+            }, workers_[r].get());
+        });
+    }
     use_slot(0);
     // the first conversation lands in slot 0: a region now keeps the warm-up graphs valid
     CHECK(ensure_cap(0, std::min<int>(65536, max_ctx_)), "KV pool");
@@ -733,6 +1004,11 @@ bool Engine::evict_one(int keep_slot, const std::vector<int>& protect) {
     use_slot(v);
     archive_slot(v);  // host memory / disk: a later request resumes it from there
     n_evict_++;
+    if (workers_[0]->lsa_on() && workers_[0]->lsa_owner() == v) {  // LSA: the index waits for this conversation
+        lsa_toks_ = seqs_[v].seq;
+        lsa_sk_ = seqs_[v].sk;
+        for (auto& w : workers_) w->lsa_detach();
+    }
     seqs_[v].pos = 0;
     seqs_[v].seq.clear();
     use_slot(keep_cur);
@@ -789,7 +1065,7 @@ bool Engine::pause_slot(int v) {
     // the rows are gone: nothing may copy them (q.seq / q.pos describe the region's contents).
     // The slot's device tokens, drafts and lookup history live outside the pool and stay: it
     // resumes with the same step it would have taken (greedy replies equal an undisturbed run)
-    paused_[v] = Paused{arch, q.pos, std::move(q.seq), n_release_, ++tick_};
+    paused_[v] = Paused{arch, q.pos, std::move(q.seq), n_release_ + n_room_, ++tick_};
     q.seq.clear();
     q.pos = 0;
     place(v, q.off, 0);
@@ -804,7 +1080,7 @@ bool Engine::unpause_slot(int v) {
     auto it = paused_.find(v);
     if (!q.paused || it == paused_.end()) return true;
     Paused& p = it->second;
-    p.seen = n_release_;
+    p.seen = n_release_ + n_room_;
     const int need = std::min(p.pos + 2 * (kMaxSpecK + 1) + 1, max_ctx_);
     // hysteresis: only when the room left keeps every running sequence's floor (min_cap) too, so
     // that none of them has to pause a conversation again right away. Idle conversations and
@@ -822,24 +1098,35 @@ bool Engine::unpause_slot(int v) {
         }
         for (auto& pr : pres_)
             if (pr.refs > 0) held += units(pr.n);
-        if (held + deficit + units(min_cap(need) - q.split) > pool_tokens_) return false;
+        // a pool shrunk under VRAM pressure grows back first, as far as memory is free (review N-H1)
+        if (held + deficit + units(min_cap(need) - q.split) > pool_tokens_ && pool_tokens_ < pool_tokens0_)
+            pool_regrow_now(held + deficit + units(min_cap(need) - q.split));
+        // (a pool shrunk under VRAM pressure keeps it paused: a VRAM wait, the reply's deadline applies, review R5-M2)
+        // (a VRAM wait only when the shrink is what keeps it out: it would fit the pool at its start size; replies
+        // worth more holding the room is a preemption wait without a deadline, review R6-L1)
+        const size_t want = held + deficit + units(min_cap(need) - q.split);
+        if (want > pool_tokens_) return q.vwait = pool_tokens_ < pool_tokens0_ && want <= pool_tokens0_, false;
     }
-    if (!ensure_cap(v, need, {}, FREE)) return false;
+    if (!ensure_cap(v, need, {}, FREE)) return q.vwait = pool_tokens_ < pool_tokens0_, false;  // (room held by the shrink)
     finish();
     const int keep_cur = cur_;
     use_slot(v);
     KvArchive* a = p.arch;
     pool_->run([&](int r) {
         void* b = a->ram->at(r).get();
+        workers_[r]->lsa_set_keep(a->n);  // the same conversation back into its own slot: its LSA index stays valid
         workers_[r]->archive_xfer(v, q.split, a->n, a->n, &b, kArchiveChunk, false, true);
+        workers_[r]->lsa_set_keep(0);
     });
     if (keep_cur >= 0 && keep_cur != v) use_slot(keep_cur);
     a->hold--;
     a->used = ++tick_;
+    a->last_s = mono_s();
     q.pos = p.pos;
     q.seq = std::move(p.seq);
     paused_.erase(it);
     q.paused = false;
+    q.vwait = false;
     q.rb_epoch = -1;
     n_unpause_++;
     if (pool_log_) printf("pool: slot %d resumed at %d tokens in [%zu +%d)\n", v, q.pos, q.off, q.max_t), fflush(stdout);
@@ -969,7 +1256,7 @@ void Engine::slot_info(int i, long long* out) const {
     const Seq& q = seqs_.at(i);
     const auto p = paused_.find(i);
     out[0] = q.off; out[1] = q.max_t; out[2] = p != paused_.end() ? p->second.pos : q.pos; out[3] = q.active;
-    out[4] = q.used; out[5] = q.prio; out[6] = q.paused;
+    out[4] = q.used; out[5] = q.prio; out[6] = q.vwait ? 2 : q.paused;  // (2: paused / waiting under VRAM pressure)
 }
 
 int Engine::num_pinned() const {
@@ -1031,7 +1318,7 @@ bool Engine::pause_for(int n, int prio) {
     return true;
 }
 
-bool Engine::can_admit(int n) const {
+bool Engine::can_admit(int n) {
     const size_t ah = admit_headroom();
     bool slot = false;
     size_t used = 0;
@@ -1043,7 +1330,10 @@ bool Engine::can_admit(int n) const {
         else used += units(std::min<size_t>((size_t)q.pos - q.split + ah, max_ctx_));
     }
     for (auto& p : pres_) used += units(p.n);
-    return slot && n <= max_ctx_ && used + units(std::min<size_t>((size_t)n + ah, max_ctx_)) <= pool_tokens_;
+    const size_t need = used + units(std::min<size_t>((size_t)n + ah, max_ctx_));
+    if (slot && n <= max_ctx_ && need > pool_tokens_ && pool_tokens_ < pool_tokens0_)
+        pool_regrow_now(need);  // (a pool shrunk under VRAM pressure: back first, as far as the memory is free again)
+    return slot && n <= max_ctx_ && need <= pool_tokens_;
 }
 
 unsigned* Engine::mask_buffer(int slot) {
@@ -1204,13 +1494,31 @@ Engine::HostPool::~HostPool() {
 // Slabs are malloc'ed, pre-faulted on the CPU and then page-locked with cudaHostRegister
 // (portable): ~15 GB/s and no stall of the GPUs, whereas cudaHostAlloc (2.3 GB/s) blocks every
 // CUDA call of the other threads for the duration (a 4 GB slab: 0.6-2.4 s).
+bool Engine::HostPool::pause(bool on) {  // true: no slab in flight (or released)
+    pause_ = on;
+    if (!on) return true;
+    // the slab in flight (a 4 GB memset + register: 0.6-2.4 s), at most QE_DECODE_CAL_PAUSE_MS (3000)
+    const int n = std::max(0, env_int("QE_DECODE_CAL_PAUSE_MS", 3000)) / 10;
+    for (int i = 0; i < n && busy_; i++) usleep(10000);
+    if (busy_) fprintf(stderr, "[comm] decode calibration: archive pinning still busy after %d ms (timings may be noisy)\n", n * 10);
+    return !busy_;
+}
 void Engine::HostPool::start(size_t budget, size_t slab) {
     if (!budget || !slab) return;
     th_ = std::thread([this, budget, slab] {
         const auto t0 = std::chrono::steady_clock::now();
         size_t total = 0;
         bool held = false;
+        struct Busy { std::atomic<bool>& f; ~Busy() { f = false; } } busy{busy_};
         while (!stop_ && total < budget) {
+            // (decode calibration) announce the slab, then check the pause (seq_cst: pause() sees busy_ or this sees
+            // pause_), so no slab starts unseen
+            for (;;) {
+                busy_ = true;
+                if (!pause_ || stop_) break;
+                busy_ = false;
+                usleep(20000);
+            }
             const size_t sz = std::min(slab, budget - total);
             // never below the host's margin (host_mem.h): wait while it lacks two slabs (the archive's own
             // pressure release gives slabs back; re-pinning needs the extra slab, no ping-pong)
@@ -1219,6 +1527,7 @@ void Engine::HostPool::start(size_t budget, size_t slab) {
                     printf("archive pool: pinning held at %.1f GB (MemAvailable %.1f GB, margin %.1f GB)\n", total / 1e9,
                            qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9), fflush(stdout);
                 held = true;
+                busy_ = false;  // (waiting for room, no pinning: a pause need not wait for it)
                 for (int i = 0; i < 20 && !stop_; i++) usleep(100000);
                 std::lock_guard<std::mutex> l(mu_);
                 total = pinned_;  // slabs released meanwhile
@@ -1237,7 +1546,13 @@ void Engine::HostPool::start(size_t budget, size_t slab) {
             if (thp) madvise(p, sz, MADV_HUGEPAGE);
             memset(p, 0, sz);  // fault the pages in without the driver
             if (stop_) { ::free(p); return; }
-            if (cudaHostRegister(p, sz, cudaHostRegisterPortable) != cudaSuccess) {
+            cudaError_t rr;
+            {
+                // (no QeWdSlow here: a background registration of 1 GB slabs, minutes long at boot, would keep the device
+                // watchdog from catching a real hang; reviews Flash-Next M6 / 27B L5)
+                rr = cudaHostRegister(p, sz, cudaHostRegisterPortable);
+            }
+            if (rr != cudaSuccess) {
                 cudaGetLastError();
                 ::free(p);
                 fprintf(stderr, "archive pool: pinning stopped at %.1f GB\n", total / 1e9);
@@ -1377,10 +1692,6 @@ void Engine::disk_forget(KvArchive& a) {
     a.disk.reset();
 }
 
-// Free host memory for `need` more bytes of an archive of priority `prio`: finished
-// conversations first, then least recently used; the main thread's archives (prio 2) only make
-// room for another main-thread archive. Pinned prefixes are not part of the budget. false: no
-// room (the caller skips archiving). An archive that is also on disk only loses its memory copy.
 size_t Engine::ram_budget() {
     const size_t cap = std::min(archive_budget_, archive_used_ + hpool_.pinned_free() + qe_hostmem::headroom());
     if (cap < archive_budget_) {
@@ -1396,8 +1707,9 @@ size_t Engine::ram_budget() {
 }
 
 // memory pressure from outside (another process grew): below the margin, free pinned slabs go back to the host
-// first, then archives in ram_make_room's order (any prio, the main thread's last)
+// first, then archives in ram_make_room's order
 void Engine::mem_guard() {
+    vram_tick();  // (also when idle: the server calls this every second; a shrunk pool grows back without requests, H1)
     if (!archive_budget_) return;
     if (!qe_hostmem::deficit()) return;
     const size_t d = qe_hostmem::deficit(true);
@@ -1417,17 +1729,31 @@ void Engine::mem_guard() {
            u0 / 1e9, archive_used_ / 1e9, p0 / 1e9, hpool_.pinned_bytes() / 1e9), fflush(stdout);
 }
 
+qe_arch::Rank Engine::arch_rank(const KvArchive& a, double now) const {
+    return {qe_arch::active_main(a.prio, a.last_s, now, main_stale_s_), a.last_s, a.used};
+}
+
+// Whether a write of `need` bytes fits once everything it may evict is gone. older_than (an optional write): it may evict
+// only what goes before the writer in the order.
+bool Engine::ram_fits(size_t need, const qe_arch::Rank* older_than) {
+    const double now = mono_s();
+    const size_t can = qe_arch::can_free(archives_, [&](const KvArchive& a) { return arch_rank(a, now); }, older_than);
+    return archive_used_ - can + need <= ram_budget();
+}
+
+// Free host memory for `need` more bytes of an archive, in the one order (archive_order.h): least recently used
+// conversation first, an active main after all the others; it goes too when nothing else is left. Pinned prefixes are not
+// part of the budget. false: no room (the caller skips archiving). An archive that is also on disk only loses its memory copy.
 bool Engine::ram_make_room(size_t need, int prio, size_t limit) {
     if (limit == (size_t)-1) limit = ram_budget();
     while (archive_used_ + need > limit) {
-        auto lru = archives_.end();
-        for (auto it = archives_.begin(); it != archives_.end(); ++it) {
-            if (!it->ram || it->pinned || it->hold) continue;
-            if (it->prio >= 2 && prio < 2) continue;
-            if (lru == archives_.end() || it->prio < lru->prio || (it->prio == lru->prio && it->used < lru->used))
-                lru = it;
-        }
+        const double now = mono_s();
+        auto rank = [&](const KvArchive& a) { return arch_rank(a, now); };
+        auto lru = qe_arch::victim(archives_, rank);
         if (lru == archives_.end()) return false;
+        if (rank(*lru).main)
+            printf("archive: active main evicted, nothing else left: %d tokens, %.2f GB, for %.2f GB (used %.2f of %.2f GB)\n", lru->n,
+                   lru->total / 1e9, need / 1e9, archive_used_ / 1e9, limit / 1e9), fflush(stdout);
         if (pool_log_)
             printf("archive: drop %d tokens prio %d (%.2f GB) for %.2f GB of prio %d (used %.2f of %.2f GB)\n", lru->n,
                    lru->prio, lru->total / 1e9, need / 1e9, prio, archive_used_ / 1e9, limit / 1e9), fflush(stdout);
@@ -1457,6 +1783,142 @@ void Engine::disk_make_room(size_t need) {
     }
 }
 
+// Drop the archives that an archive of toks[0, n) covers. born_after: spare shorter ones created later than this tick
+// (a background archive took its checkpoints at bg_prepare, so it does not hold theirs).
+void Engine::drop_covered(long long sk, const int* toks, int n, unsigned long long born_after) {
+    for (auto it = archives_.begin(); it != archives_.end();) {
+        auto nx = std::next(it);
+        if (it->sk == sk && it->n <= n && !it->pinned && !it->hold && std::equal(it->toks.begin(), it->toks.begin() + it->n, toks) &&
+            !(it->born > born_after && it->n < n)) {
+            if (!it->path.empty()) {  // a finished file stays until the new archive's file is written (disk_flush_covered)
+                std::lock_guard<std::mutex> l(it->disk->mu);
+                if (it->disk->done && it->disk->ok) {
+                    covered_files_.push_back(it->path);
+                    disk_used_ -= it->total;
+                    it->path.clear();
+                }
+            }
+            if (it->path.empty()) it->disk.reset();
+            drop_archive(it);
+        }
+        it = nx;
+    }
+}
+
+// The checkpoint states an archive of the first n positions of q keeps, newest first, at most kMaxSubs, and past the cap
+// the longest at or below the system-prompt end (q.hint), so a new conversation of that kind still reuses it. They stay
+// readable through ArchSub::hold after the archives they came from are gone.
+std::vector<Engine::ArchSub> Engine::archive_subs(const Seq& q, int n) {
+    const int ng = workers_.size();
+    // checkpoint states inside [0, n): live snapshots, and those of the archives this one
+    // supersedes (e.g. the system-prompt state of a conversation restored after a restart)
+    std::vector<ArchSub> subs;
+    auto have = [&](int p) {
+        for (auto& x : subs) if (x.pos == p) return true;
+        return false;
+    };
+    for (auto& sn : snaps_)
+        if (sn.sk == q.sk && sn.pos >= 512 && sn.pos < n && !have(sn.pos) &&
+            std::equal(sn.toks.begin(), sn.toks.begin() + sn.pos, q.seq.begin())) {
+            ArchSub x{sn.pos, {}, nullptr, false};
+            for (int r = 0; r < ng; r++) x.src.push_back((const char*)sn.bufs[r]);
+            subs.push_back(std::move(x));
+        }
+    std::vector<std::list<KvArchive>::iterator> superseded;
+    for (auto it = archives_.begin(); it != archives_.end(); ++it)
+        if (it->sk == q.sk && it->n <= n && !it->pinned && !it->hold &&
+            std::equal(it->toks.begin(), it->toks.begin() + it->n, q.seq.begin()))
+            superseded.push_back(it);
+    auto add_sub = [&](std::list<KvArchive>::iterator it, size_t si) {  // false: its file cannot be read
+        ArchSub x{it->subs[si], {}, it->ram, (bool)it->ram};
+        if (!x.hold) {  // on disk only: read just this state
+            bool ok = false;
+            {
+                std::unique_lock<std::mutex> l(it->disk->mu);
+                it->disk->cv.wait(l, [&] { return it->disk->done; });
+                ok = it->disk->ok;
+            }
+            const int fd = ok ? open(it->path.c_str(), O_RDONLY) : -1;
+            if (fd < 0) return false;
+            x.hold = std::make_shared<Bufs>(&hpool_);
+            size_t o = it->data_off;
+            for (int r = 0; r < ng && ok; r++) {
+                const size_t sb = workers_[r]->snapshot_bytes();
+                x.hold->add(sb);
+                ok = read_all(fd, x.hold->back().get(), sb,
+                              o + workers_[r]->archive_bytes(0, it->n) + si * sb);
+                o += it->sizes[r];
+            }
+            close(fd);
+            if (!ok) return false;
+            for (int r = 0; r < ng; r++) x.src.push_back(x.hold->at(r).get());
+        } else {
+            for (int r = 0; r < ng; r++)
+                x.src.push_back(it->ram->at(r).get() + workers_[r]->archive_bytes(it->split, it->n) +
+                                si * workers_[r]->snapshot_bytes());
+        }
+        subs.push_back(std::move(x));
+        return true;
+    };
+    for (auto it : superseded)
+        for (size_t si = 0; si < it->subs.size(); si++)
+            if (!have(it->subs[si]) && !add_sub(it, si)) break;
+    // the system-prompt state may only be in an archive this one does not cover (the conversation that was restored from
+    // it, a branch of its own) or in the pinned prefix: it is a prefix of this conversation all the same. Only for what can
+    // reach a file (split 0; an attached conversation resumes from the prefix itself). RAM before a file at one position.
+    if (!q.split) {
+        int sys_pos = 0;
+        for (auto& x : subs)
+            if (x.pos <= q.hint) sys_pos = std::max(sys_pos, x.pos);
+        struct Cand { int pos; bool ram; std::list<KvArchive>::iterator it; int si; };
+        std::vector<Cand> cands;
+        auto usable = [&](std::list<KvArchive>::iterator it, int p) {
+            return p > sys_pos && p <= q.hint && p < n && std::equal(it->toks.begin(), it->toks.begin() + p, q.seq.begin());
+        };
+        for (auto it = archives_.begin(); it != archives_.end(); ++it) {
+            if (it->sk != q.sk) continue;
+            if (it->pinned && it->ram && usable(it, it->n)) cands.push_back({it->n, true, it, -1});
+            for (size_t si = 0; si < it->subs.size(); si++)
+                if (usable(it, it->subs[si])) cands.push_back({it->subs[si], (bool)it->ram, it, (int)si});
+        }
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.pos != b.pos ? a.pos > b.pos : a.ram > b.ram; });
+        for (auto& c : cands) {
+            if (c.si < 0) {  // a pinned prefix: its state comes first in its buffer
+                ArchSub x{c.pos, {}, c.it->ram, false};
+                for (int r = 0; r < ng; r++) x.src.push_back(c.it->ram->at(r).get());
+                subs.push_back(std::move(x));
+                break;
+            }
+            if (add_sub(c.it, c.si)) break;
+        }
+    }
+    std::sort(subs.begin(), subs.end(), [](const ArchSub& a, const ArchSub& b) { return a.pos > b.pos; });
+    if ((int)subs.size() > kMaxSubs) {
+        auto sys = std::find_if(subs.begin(), subs.end(), [&](const ArchSub& x) { return x.pos <= q.hint; });
+        if (sys != subs.end() && sys - subs.begin() >= kMaxSubs) subs[kMaxSubs - 1] = std::move(*sys);
+        subs.resize(kMaxSubs);
+    }
+    return subs;
+}
+
+// The archive budget is short, so making room may take an archive these states are in: copy them out, so that its memory
+// really goes before the new archive is allocated.
+void Engine::stage_subs(std::vector<ArchSub>& subs) {
+    const int ng = workers_.size();
+    for (auto& x : subs) {
+        if (!x.whole) continue;
+        auto own = std::make_shared<Bufs>(&hpool_);
+        for (int r = 0; r < ng; r++) {
+            const size_t sb = workers_[r]->snapshot_bytes();
+            own->add(sb);
+            memcpy(own->back().get(), x.src[r], sb);
+            x.src[r] = own->back().get();
+        }
+        x.hold = std::move(own);
+        x.whole = false;
+    }
+}
+
 // Save the selected slot's context (KV of [0, pos) and the delta-net state at pos, plus the
 // states of up to kMaxSubs checkpoints inside it) before the slot is overwritten.
 void Engine::archive_slot(int slot, bool force) {
@@ -1476,64 +1938,11 @@ void Engine::archive_slot(int slot, bool force) {
         if (a.sk == q.sk && (force ? a.n == n && a.split == q.split && a.ram : a.n >= n) &&
             std::equal(q.seq.begin(), q.seq.begin() + n, a.toks.begin())) {
             a.used = ++tick_;  // already archived
+            a.last_s = std::max(a.last_s, q.last_s);
             return;
         }
     const int ng = workers_.size();
-    // checkpoint states inside [0, n): live snapshots, and those of the archives this one
-    // supersedes (e.g. the system-prompt state of a conversation restored after a restart)
-    struct Sub { int pos; std::vector<const char*> src; std::shared_ptr<Bufs> hold; };
-    std::vector<Sub> subs;
-    auto have = [&](int p) {
-        for (auto& x : subs) if (x.pos == p) return true;
-        return false;
-    };
-    for (auto& sn : snaps_)
-        if (sn.sk == q.sk && sn.pos >= 512 && sn.pos < n && !have(sn.pos) &&
-            std::equal(sn.toks.begin(), sn.toks.begin() + sn.pos, q.seq.begin())) {
-            Sub x{sn.pos, {}, nullptr};
-            for (int r = 0; r < ng; r++) x.src.push_back((const char*)sn.bufs[r]);
-            subs.push_back(std::move(x));
-        }
-    std::vector<std::list<KvArchive>::iterator> superseded;
-    for (auto it = archives_.begin(); it != archives_.end(); ++it)
-        if (it->sk == q.sk && it->n <= n && !it->pinned && !it->hold &&
-            std::equal(it->toks.begin(), it->toks.begin() + it->n, q.seq.begin()))
-            superseded.push_back(it);
-    for (auto it : superseded)
-        for (size_t si = 0; si < it->subs.size(); si++) {
-            if (have(it->subs[si])) continue;
-            Sub x{it->subs[si], {}, it->ram};
-            if (!x.hold) {  // on disk only: read just this state
-                bool ok = false;
-                {
-                    std::unique_lock<std::mutex> l(it->disk->mu);
-                    it->disk->cv.wait(l, [&] { return it->disk->done; });
-                    ok = it->disk->ok;
-                }
-                const int fd = ok ? open(it->path.c_str(), O_RDONLY) : -1;
-                if (fd < 0) break;
-                x.hold = std::make_shared<Bufs>(&hpool_);
-                size_t o = it->data_off;
-                for (int r = 0; r < ng && ok; r++) {
-                    const size_t sb = workers_[r]->snapshot_bytes();
-                    x.hold->add(sb);
-                    ok = read_all(fd, x.hold->back().get(), sb,
-                                  o + workers_[r]->archive_bytes(0, it->n) + si * sb);
-                    o += it->sizes[r];
-                }
-                close(fd);
-                if (!ok) break;
-                for (int r = 0; r < ng; r++) x.src.push_back(x.hold->at(r).get());
-            } else {
-                for (int r = 0; r < ng; r++)
-                    x.src.push_back(it->ram->at(r).get() + workers_[r]->archive_bytes(it->split, it->n) +
-                                    si * workers_[r]->snapshot_bytes());
-            }
-            subs.push_back(std::move(x));
-        }
-    std::sort(subs.begin(), subs.end(), [](const Sub& a, const Sub& b) { return a.pos > b.pos; });
-    if ((int)subs.size() > kMaxSubs) subs.resize(kMaxSubs);
-
+    std::vector<ArchSub> subs = archive_subs(q, n);
     KvArchive a;
     a.sk = q.sk;
     a.split = q.split;  // rows [0, split) stay with the shared prefix (named by the tokens)
@@ -1541,7 +1950,8 @@ void Engine::archive_slot(int slot, bool force) {
         a.sizes.push_back(workers_[r]->archive_bytes(a.split, n) + subs.size() * workers_[r]->snapshot_bytes());
         a.total += a.sizes.back();
     }
-    if (a.total > archive_budget_ || !ram_make_room(a.total, q.prio)) {
+    if (archive_used_ + a.total > ram_budget()) stage_subs(subs);
+    if (a.total > archive_budget_ || !ram_fits(a.total) || !ram_make_room(a.total, q.prio)) {
         if (pool_log_) printf("archive: no room for %d tokens prio %d (%.2f GB)\n", n, q.prio, a.total / 1e9), fflush(stdout);
         return;
     }
@@ -1549,6 +1959,7 @@ void Engine::archive_slot(int slot, bool force) {
         printf("archive: slot %d %d tokens prio %d, %zu checkpoints, %.2f GB (used %.2f of %.2f GB)\n", slot, n, q.prio,
                subs.size(), a.total / 1e9, (archive_used_ + a.total) / 1e9, archive_budget_ / 1e9), fflush(stdout);
     a.prio = q.prio;
+    a.last_s = q.last_s;
     a.ram = std::make_shared<Bufs>(&hpool_);
     for (size_t sz : a.sizes) a.ram->add(sz);
     for (auto& x : subs) a.subs.push_back(x.pos);
@@ -1557,10 +1968,11 @@ void Engine::archive_slot(int slot, bool force) {
             memcpy(a.ram->at(r).get() + workers_[r]->archive_bytes(a.split, n) + si * workers_[r]->snapshot_bytes(),
                    subs[si].src[r], workers_[r]->snapshot_bytes());
     subs.clear();
-    for (auto it : superseded) drop_archive(it);  // this archive covers them
+    // this archive covers them (found again: ram_make_room may have dropped some of them)
+    drop_covered(q.sk, q.seq.data(), n, ~0ull);
     a.toks.assign(q.seq.begin(), q.seq.begin() + n);
     a.n = n;
-    a.used = ++tick_;
+    a.born = a.used = ++tick_;
     pool_->run([&](int r) {
         void* b = a.ram->at(r).get();
         workers_[r]->archive_xfer(slot, a.split, n, n, &b, kArchiveChunk, true, true);
@@ -1569,6 +1981,7 @@ void Engine::archive_slot(int slot, bool force) {
     archives_.push_back(std::move(a));
     // (steered conversations stay in host memory: the disk cache has no steering key)
     if (!disk_dir_.empty() && !archives_.back().split && archives_.back().sk < 0) disk_enqueue(archives_.back());
+    disk_flush_covered();
 }
 
 // Prepare the archive of an idle slot for incremental copying (pieces copied by archive_more).
@@ -1579,14 +1992,9 @@ bool Engine::bg_prepare(int slot) {
     BgArchive b;
     b.slot = slot;
     b.n = n;
-    // checkpoint states inside [0, n) from the live snapshots (the archive's subs)
-    std::vector<std::pair<int, const Snapshot*>> subs;
-    for (auto& sn : snaps_)
-        if (sn.sk == q.sk && sn.pos >= 512 && sn.pos < n && std::equal(sn.toks.begin(), sn.toks.begin() + sn.pos, q.seq.begin()) &&
-            std::none_of(subs.begin(), subs.end(), [&](auto& x) { return x.first == sn.pos; }))
-            subs.push_back({sn.pos, &sn});
-    std::sort(subs.begin(), subs.end(), [](auto& x, auto& y) { return x.first > y.first; });
-    if ((int)subs.size() > kMaxSubs) subs.resize(kMaxSubs);
+    // the checkpoints of what bg_finish will drop, too (as in archive_slot)
+    std::vector<ArchSub> subs = archive_subs(q, n);
+    b.born = tick_;
     KvArchive& a = b.a;
     a.sk = q.sk;
     a.split = q.split;
@@ -1594,14 +2002,18 @@ bool Engine::bg_prepare(int slot) {
         a.sizes.push_back(workers_[r]->archive_bytes(a.split, n) + subs.size() * workers_[r]->snapshot_bytes());
         a.total += a.sizes.back();
     }
-    if (a.total > archive_budget_ || !ram_make_room(a.total, q.prio)) return false;
+    if (archive_used_ + a.total > ram_budget()) stage_subs(subs);
+    // optional (the conversation stays in its slot): evicts only what goes before it, so never a newer conversation and,
+    // for an ordinary one, no active main
+    const qe_arch::Rank me{qe_arch::active_main(q.prio, q.last_s, mono_s(), main_stale_s_), q.last_s, tick_ + 1};
+    if (a.total > archive_budget_ || !ram_fits(a.total, &me) || !ram_make_room(a.total, q.prio)) return false;
     a.ram = std::make_shared<Bufs>(&hpool_);
     for (size_t sz : a.sizes) a.ram->add(sz);
-    for (auto& x : subs) a.subs.push_back(x.first);
+    for (auto& x : subs) a.subs.push_back(x.pos);
     for (int r = 0; r < ng; r++)
         for (size_t si = 0; si < subs.size(); si++)
             memcpy(a.ram->at(r).get() + workers_[r]->archive_bytes(a.split, n) + si * workers_[r]->snapshot_bytes(),
-                   subs[si].second->bufs[r], workers_[r]->snapshot_bytes());
+                   subs[si].src[r], workers_[r]->snapshot_bytes());
     a.toks.assign(q.seq.begin(), q.seq.begin() + n);
     a.n = n;
     a.prio = q.prio;
@@ -1629,20 +2041,16 @@ void Engine::bg_finish(bool all) {
     });
     if (keep != cur_) use_slot(keep);
     if (std::all_of(bg_.piece.begin(), bg_.piece.end(), [](int p) { return p < 0; })) {
-        // archives this one covers go (as in archive_slot)
-        for (auto it = archives_.begin(); it != archives_.end();) {
-            auto nx = std::next(it);
-            if (it->sk == a.sk && it->n <= a.n && !it->pinned && !it->hold &&
-                std::equal(it->toks.begin(), it->toks.begin() + it->n, a.toks.begin()))
-                drop_archive(it);
-            it = nx;
-        }
-        a.used = ++tick_;
+        // archives this one covers go (as in archive_slot), but not one made since bg_prepare
+        drop_covered(a.sk, a.toks.data(), a.n, bg_.born);
+        a.born = a.used = ++tick_;
+        a.last_s = seqs_[bg_.slot].last_s;
         if (pool_log_)
             printf("archive: slot %d %d tokens prio %d in the background, %zu checkpoints, %.2f GB (used %.2f of %.2f GB)\n",
                    bg_.slot, a.n, a.prio, a.subs.size(), a.total / 1e9, archive_used_ / 1e9, archive_budget_ / 1e9), fflush(stdout);
         archives_.push_back(std::move(a));
         if (!disk_dir_.empty() && !archives_.back().split && archives_.back().sk < 0) disk_enqueue(archives_.back());
+        disk_flush_covered();
         bg_ = BgArchive{};
     }
 }
@@ -1795,6 +2203,12 @@ int Engine::probe_cached(const int* ids, int n) const {
 }
 
 // Write an archive to the disk cache in the background.
+// No new file took them over (not written to disk, or too big): the covered files go now.
+void Engine::disk_flush_covered() {
+    for (auto& p : covered_files_) unlink(p.c_str());
+    covered_files_.clear();
+}
+
 void Engine::disk_enqueue(KvArchive& a) {
     if (a.total > disk_budget_) return;
     disk_make_room(a.total);
@@ -1808,6 +2222,8 @@ void Engine::disk_enqueue(KvArchive& a) {
     j.sizes = a.sizes;
     j.path = a.path;
     j.st = a.disk;
+    j.covered = std::move(covered_files_);
+    covered_files_.clear();
     std::vector<char>& h = j.header;
     h.insert(h.end(), kArchMagic, kArchMagic + 8);
     put(h, (uint32_t)fingerprint_.size());
@@ -1828,6 +2244,7 @@ void Engine::disk_enqueue(KvArchive& a) {
 }
 
 void Engine::disk_writer() {
+    std::vector<std::string> covered;  // superseded files: deleted once a newer archive's file exists
     while (true) {
         DiskJob j;
         {
@@ -1860,6 +2277,12 @@ void Engine::disk_writer() {
             j.st->ok = ok;
             j.st->done = true;
             if (!ok && !j.st->cancel) fprintf(stderr, "disk cache: write failed: %s\n", j.path.c_str());
+        }
+        covered.insert(covered.end(), j.covered.begin(), j.covered.end());
+        if (j.st->ok) {  // (a cancelled or failed write passes them on; files left at exit are found at the next start)
+            for (auto& p : covered)
+                if (p != j.path) unlink(p.c_str());
+            covered.clear();
         }
         j.st->cv.notify_all();
         {
@@ -1926,6 +2349,16 @@ void Engine::disk_init() {
     }
     fp << "|g" << workers_.size() << "|" << (env_str("QE_SPLIT") ? env_str("QE_SPLIT") : "");
     if (kvs_.on()) fp << "|kvsplit" << kvs_.period << "," << kvs_.a01 << "," << kvs_.a12;
+    {   // RoPE scaling: keys rotated with YaRN (and the states computed under it) never meet native RoPE or another factor
+        // (native: no token, so the archives written before keep matching)
+        float t[33];
+        rope_table_host(cfg_.yarn, cfg_.rope_theta, cfg_.rot_dim, cfg_.native_ctx, t);
+        if (cfg_.yarn > 0) {
+            char b[96];
+            snprintf(b, sizeof b, "|yarn%.17g,%d,%.9g", cfg_.yarn, cfg_.native_ctx, (double)t[32]);
+            fp << b;
+        }
+    }
     for (auto& w : workers_) fp << "|" << w->archive_bytes(0, 1) << "," << w->archive_bytes(0, 2) << "," << w->snapshot_bytes();
     fingerprint_ = fp.str();
 
@@ -2016,6 +2449,7 @@ void Engine::step(const int* ids, int m, bool want_logits) {
         CUDA_CHECK(cudaMemcpyAsync(w.tokens_, ids, m * 4, cudaMemcpyHostToDevice, w.stream));
         CUDA_CHECK(cudaMemcpyAsync(w.pos_, &pos, 4, cudaMemcpyHostToDevice, w.stream));
         w.set_pf_p0(pos);
+        w.lsa_step(cur_, pos);  // (no stale LSA bit from another slot's request)
         if (m <= kMaxGemvTokens) w.run(m, want_logits);
         else w.forward(m, want_logits);
         CUDA_CHECK(cudaStreamSynchronize(w.stream));
@@ -2025,10 +2459,12 @@ void Engine::step(const int* ids, int m, bool want_logits) {
 }
 
 int Engine::prefill(const int* ids, int n) {
+    pool_->run([&](int r) { workers_[r]->set_in_pf(true); });  // (the exchange: the device set, as prefill_chunk)
     for (int i = 0; i < n; i += kChunk) {
         const int m = std::min(kChunk, n - i);
         step(ids + i, m, i + m == n);
     }
+    pool_->run([&](int r) { workers_[r]->set_in_pf(false); });
     const int m = (n - 1) % kChunk + 1;
     int tok;
     CUDA_CHECK(cudaSetDevice(workers_[0]->device));
@@ -2368,13 +2804,20 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     Seq& q = seqs_[slot];
     q.pen = q.no_lookup = false;  // per reply (set_penalty / set_no_lookup after this start)
     if (q.sk != sk) {  // another key: the old content is archived (above) and not reused
+        if (workers_[0]->lsa_on() && workers_[0]->lsa_owner() == slot) {  // LSA: the index waits for its key's tokens
+            lsa_toks_ = q.seq;
+            lsa_sk_ = q.sk;
+            for (auto& w : workers_) w->lsa_detach();
+        }
         q.pos = 0;
         q.seq.clear();
         q.sk = sk;
     }
     steer_slot(slot);  // the slot's device steering = its conversation's key (stream-ordered, no graph change)
     const unsigned long long prev_aff = q.affinity;
+    q.hint = hint;
     q.used = ++tick_;
+    q.last_s = mono_s();
     q.affinity = affinity;
     q.active = true;
     q.admit = ++tick_;
@@ -2465,6 +2908,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         if (best_arch) {
             from = best_pos;
             best_arch->used = ++tick_;
+            if (2 * best_pos >= best_arch->n) best_arch->last_s = mono_s();  // (not a short shared prefix of another conversation)
             held.add(best_arch);
             if (best_arch->pinned && share_prefix_ && !best && best_sub < 0) {
                 // the whole prefix: attach to its shared region (materialized if needed)
@@ -2494,6 +2938,28 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     // are rewritten (archive_slot above only runs when the prompt does not extend the slot,
     // e.g. not for a retry of the identical prompt, whose restore may change the layout)
     if (mode != LIVE && bg_.slot == slot) bg_finish(true);
+    // LSA: the index belongs to a conversation (its tokens and steering key), not to a slot. The owner's slot getting
+    // other content detaches it (the tokens kept); a request of the same key that repeats at least half of the
+    // detached tokens and one complete block (the conversation coming back, in any slot) takes it again, valid up to
+    // the common prefix. lsa_keep: how far the index stays valid for this request
+    // Decided here, while q.seq still holds the slot's tokens; applied after the layout step and the room check (a
+    // shared prefix attached or dropped by the layout would wipe an attached index; a prompt without room keeps the
+    // index waiting with its tokens and counts untouched). The owner's own index waits too in between (host only).
+    int lsa_keep = 0, lsa_re = -1;  // lsa_re: the reattach's keep (-1: none)
+    bool lsa_own = false;           // the owner's slot itself (a new turn): no "returning conversation" line
+    if (workers_[0]->lsa_on()) {
+        if (workers_[0]->lsa_owner() == slot) {  // the owner's slot: its index waits with the slot's tokens and key
+            lsa_toks_ = q.seq;
+            lsa_sk_ = q.sk;
+            for (auto& w : workers_) w->lsa_detach();
+            lsa_own = true;
+        }
+        if (!workers_[0]->lsa_detached()) lsa_toks_.clear();  // (a bind dropped the waiting index: nothing to match)
+        if (workers_[0]->lsa_owner() < 0 && !lsa_toks_.empty()) {
+            const int k = lcpk(lsa_toks_, lsa_sk_, sk, ids, n);
+            if (2 * (size_t)k >= lsa_toks_.size() && k >= kLsaBlk) lsa_re = k;
+        }
+    }
     if (mode == SNAP) {
         q.pos = from;
         q.seq.resize(from);
@@ -2547,6 +3013,15 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         }
         return -1;
     }
+    // LSA: the decided reattach, now that the layout is final (not onto a shared prefix: LSA runs dense there, and the
+    // index keeps waiting for a slot of its own); the keep covers every restore / copy below (reset after them)
+    if (lsa_re >= 0 && q.split == 0) {
+        pool_->run([&](int r) { workers_[r]->lsa_reattach(slot, lsa_re, !lsa_own); });  // each card's counts (R4-M1)
+        lsa_toks_.clear();
+        lsa_keep = lsa_re;
+    }
+    if (workers_[0]->lsa_on())
+        for (auto& w : workers_) w->lsa_set_keep(lsa_keep);
     // ---- bring the cached part in
     if (mode == SNAP || mode == OTHER) {
         best->used = ++tick_;
@@ -2584,6 +3059,8 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         reset_slot();
         src = "none";
     }
+    if (workers_[0]->lsa_on())
+        for (auto& w : workers_) w->lsa_set_keep(0);
     if (mode == OTHER || mode == ATTACH || mode == ARCH) {  // rows [0, from) now hold the prompt's prefix
         q.pos = from;
         q.seq.assign(ids, ids + from);
@@ -2671,6 +3148,7 @@ bool Engine::prefill_more(int budget) {
 }
 
 bool Engine::prefill_more_slot(int slot, int budget) {
+    vram_tick();
     PrefillState* pp = pf_of(slot);
     if (!pp || pp->i >= pp->n) return true;
     epoch_++;  // the chunks overwrite the step buffers (trim)
@@ -2691,7 +3169,11 @@ bool Engine::prefill_more_slot(int slot, int budget) {
         static const int tail = env_int("QE_PREFILL_TAIL", 32);
         if (m > 256 && m % 256 > 0 && m % 256 <= tail) m -= m % 256;
         pf.last_m = m;
+        static const int prof_at = env_int("QE_PROF_AT", -1);  // debug: nsys --capture-range=cudaProfilerApi on one chunk
+        const bool prof = prof_at >= i && prof_at < i + m;
+        if (prof) CUDA_CHECK(cudaProfilerStart());
         pool_->run([&](int r) { workers_[r]->prefill_chunk(pids, i, m, n, pf.kstart, r3); });
+        if (prof) CUDA_CHECK(cudaProfilerStop());
         pf.i += m;
         done += m;
         const bool mark = std::find(pf.marks.begin(), pf.marks.end(), pf.i) != pf.marks.end();
@@ -2768,7 +3250,8 @@ void Engine::launch_step(int buf, int base, int lk) {
     seqs_[cur_].launches++;
     const bool wd = seqs_[cur_].want_drafts && kd > 0;
     seqs_[cur_].k_avail = kd;
-    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look);
+    if (workers_[0]->lsa_on())  // LSA: the graph's mode bit from host state (the catch-up runs in the step's job)
+        for (auto& w : workers_) w->lsa_mode(cur_, seqs_[cur_].pos);
     const unsigned* mh = con ? mask_buffer(cur_) : nullptr;
     int* io = con ? spec_io(cur_) : nullptr;
     if (io) io[0] = kd;
@@ -2784,6 +3267,7 @@ void Engine::launch_step(int buf, int base, int lk) {
             w.upload_drafts(cur_, io + 17, kv);
         }
         if (r == 0) CUDA_CHECK(cudaEventRecord(tstart_[buf], w.stream));
+        w.lsa_step(cur_, seqs_[cur_].pos);  // LSA: blocks before the committed position (eager, before the graph)
         w.run_spec(kv, kd, true, look);
         if (r == 0) {
             CUDA_CHECK(cudaMemcpyAsync(emit_host_ + buf * 64, w.spec_.emit, (w.lk_on() ? 32 : kv + 2) * 4,
@@ -2853,7 +3337,7 @@ void Engine::release(int slot) {
         bdrop_.push_back(slot);
     }
     lkb_inval(slot);
-    if (seqs_.at(slot).active) n_release_++;  // room may have freed: paused slots try to resume
+    if (seqs_.at(slot).active) n_release_++, seqs_[slot].last_s = mono_s();  // room may have freed: paused slots try to resume
     if (seqs_[slot].paused) {  // released while paused: its archive stays (the next turn resumes from it)
         auto it = paused_.find(slot);
         it->second.arch->hold--;
@@ -2874,6 +3358,8 @@ void Engine::release(int slot) {
         }
     seqs_.at(slot).active = false;
     seqs_[slot].full = false;
+    seqs_[slot].vwait = false;  // (review R4-L3: an idle slot / the next request does not report a VRAM wait)
+    seqs_[slot].vtry = 0;
     seqs_[slot].end = 0;
     seqs_[slot].want_drafts = seqs_[slot].no_ahead = false;
     seqs_[slot].drafts.clear();
@@ -2974,9 +3460,9 @@ void Engine::launch_batch(int buf, bool ahead) {
                 continue;
             }
             if ((int)lkb_pin_.size() <= s) lkb_pin_.resize(seqs_.size(), nullptr);
-            if (!lkb_pin_[s]) CUDA_CHECK(cudaHostAlloc((void**)&lkb_pin_[s], (size_t)(kMaxPos + 64) * 4, cudaHostAllocPortable));
+            if (!lkb_pin_[s]) CUDA_CHECK(cudaHostAlloc((void**)&lkb_pin_[s], (size_t)(cfg_.max_pos + 64) * 4, cudaHostAllocPortable));
             int nt = 0;
-            for (int j = fr; j < hn && j < kMaxPos + 64; j++) lkb_pin_[s][nt++] = j + 1 < hn ? q.seq[j] : q.pending;
+            for (int j = fr; j < hn && j < cfg_.max_pos + 64; j++) lkb_pin_[s][nt++] = j + 1 < hn ? q.seq[j] : q.pending;
             sync.emplace_back(s, nt);
             from.push_back(fr);
             lkb_len_[s] = hn;
@@ -3098,6 +3584,7 @@ void Engine::launch_batch(int buf, bool ahead) {
 }
 
 void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
+    vram_tick();
     CHECK(n >= 1 && n <= kMaxBatch && k_ > 0, "step_batch n=%d k=%d", n, k_);
     finish_single();  // the single-sequence step queued ahead, if any
     if (!batch_host_) {
@@ -3135,7 +3622,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         for (int i = 0; i < n && keep; i++) {
             const Seq& q = seqs_.at(sl[i]);
             if (from[i] < 0 && !q.full && !q.paused && q.pos + 2 * (cap + 1) + 1 > q.max_t) keep = false;  // needs to grow
-            if (q.paused && paused_.at(sl[i]).seen != n_release_) keep = false;  // room may have freed: try to resume
+            if (q.paused && paused_.at(sl[i]).seen != n_release_ + n_room_) keep = false;  // room may have freed: try to resume
         }
         if (!keep) {
             finish_batch();
@@ -3177,28 +3664,50 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
             return x.prio != y.prio ? x.prio > y.prio : paused_.at(sl[a]).at < paused_.at(sl[b]).at;
         });
         bool blocked = false;
+        int block_prio = -1;  // while the pool is shrunk: a head that did not fit blocks only those worth less (R4-L4)
         for (int i : order) {
             Seq& q = seqs_.at(sl[i]);
             CHECK(q.active, "slot %d not active", sl[i]);
             if (q.paused) {
                 Paused& p = paused_.at(sl[i]);
-                if (!blocked && (lone || p.seen != n_release_)) blocked = !unpause_slot(sl[i]);
-                if (q.paused) p.seen = n_release_;  // (tried again after the next release)
+                // (retried after the next release or pool regrow, review N-M5; while the pool is shrunk a head that does
+                // not fit does not block the ones behind it)
+                if (!blocked && q.prio >= block_prio && (lone || p.seen != n_release_ + n_room_) && !unpause_slot(sl[i])) {
+                    if (pool_tokens_ >= pool_tokens0_) blocked = true;
+                    else block_prio = std::max(block_prio, q.prio);
+                }
+                if (q.paused) p.seen = n_release_ + n_room_;
             }
             if (!q.full && !q.paused) {
                 resync(q, sl[i]);
-                if (q.pos + 2 * (cap + 1) + 1 > q.max_t &&
-                    !room_or_pause(sl[i], std::min(q.pos + 2 * (cap + 1) + 1, max_ctx_)) && !q.paused)
-                    q.full = true;  // no room left even alone: this sequence ends, the others step without it
+                const int need = std::min(q.pos + 2 * (cap + 1) + 1, max_ctx_);
+                if (q.pos + 2 * (cap + 1) + 1 > q.max_t && !room_or_pause(sl[i], need) && !q.paused) {
+                    // a pool shrunk under VRAM pressure: never an early end (review H2): back as far as memory is free
+                    // (a pool total, N-H1), else the sequence pauses (held archive) or, without archive room, waits
+                    if (pool_tokens_ < pool_tokens0_ && pool_regrow_now(total_for(sl[i], need)) && room_or_pause(sl[i], need))
+                        continue;
+                    if (pool_tokens_ < pool_tokens0_) {
+                        q.vwait = true;
+                        const double tn = vnow_s();
+                        // (one pause try per second, N-L1; the time is that of the last try, review R4-M2)
+                        if (tn - q.vtry < 1.0) q.waiting = true;
+                        else if (q.vtry = tn, !pause_slot(sl[i])) q.waiting = true;
+                    } else {
+                        q.full = true;  // no room left even alone at the full pool: this sequence ends, the others step without it
+                    }
+                } else if (!q.paused) {
+                    q.vwait = false;
+                }
             }
         }
         // (a sequence may pause another one of the set that was checked before it)
         for (int i = 0; i < n; i++) {
             Seq& q = seqs_[sl[i]];
-            if (q.full || q.paused) {
+            if (q.full || q.paused || q.waiting) {
                 full[i] = 1;
-                cnt[i] = q.paused ? 0 : 1;  // paused: no tokens (the stream stalls), ended: its end token
-                if (!q.paused) out[i * 64] = cfg_.eos;
+                cnt[i] = q.paused || q.waiting ? 0 : 1;  // paused / waiting for room: no tokens (the stream stalls), ended: its end token
+                if (!q.paused && !q.waiting) out[i * 64] = cfg_.eos;
+                q.waiting = false;  // (tried again next step)
                 continue;
             }
             CHECK(q.pos + cap + 1 <= q.max_t, "context full");
@@ -3294,6 +3803,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
 }
 
 int Engine::spec_step(int* out) {
+    vram_tick();
     // the current slot must belong to a running reply: not released, its prompt not still being prefilled (a step there
     // would continue another conversation and hand its tokens to the caller's request)
     if (pf_of(cur_) || !seqs_[cur_].active) {
@@ -3331,9 +3841,23 @@ int Engine::spec_step(int* out) {
     if (!inflight_ && q.pos + 2 * (k_ + 1) + 1 > q.max_t &&  // room for this step and the next
         !room_or_pause(cur_, std::min(q.pos + 2 * (k_ + 1) + 1, max_ctx_))) {
         if (q.paused) return 0;  // paused for a sequence worth more: no tokens until it resumes
-        out[0] = cfg_.eos;  // no room left even alone: the sequence ends here (like reaching max tokens)
-        return 1;
+        const int need = std::min(q.pos + 2 * (k_ + 1) + 1, max_ctx_);
+        if (pool_tokens_ < pool_tokens0_) {  // shrunk under VRAM pressure: never an early end (review H2)
+            if (!(pool_regrow_now(total_for(cur_, need)) && room_or_pause(cur_, need))) {
+                q.vwait = true;
+                const double tn = vnow_s();
+                if (!q.paused && tn - q.vtry >= 1.0) {  // (held archive; else no tokens, retried after a second, R4-M2)
+                    q.vtry = tn;
+                    pause_slot(cur_);
+                }
+                return 0;
+            }
+        } else {
+            out[0] = cfg_.eos;  // no room left even alone at the full pool: the sequence ends here (like reaching max tokens)
+            return 1;
+        }
     }
+    q.vwait = false;
     CHECK(q.pos + k_ + 1 <= q.max_t, "context full");
     // lookup drafts (QE_LOOKUP): the device history must be this sequence's; a lookup step is launched once the
     // previous step's result is known (no step queued ahead while the text is being copied)
@@ -3422,4 +3946,458 @@ void Engine::logits(float* out, int m) {
                                 (size_t)p.vocab.size() * 4, (size_t)p.vocab.size() * 4, m,
                                 cudaMemcpyDeviceToHost));
     }
+}
+
+// ---------------------------------------------------------------- VRAM pressure (other processes take memory)
+
+void Engine::vram_marks(size_t* low, size_t* target) const {
+    // (marks for the default 1.5 GB reserve, scaled down with a smaller one: the steady free memory sits below it)
+    const double sc = std::min(1.0, (double)reserve_min_ / 1.5e9);
+    static const size_t low0 = (size_t)env_int("QE_VRAM_LOW_MB", 384) << 20, target0 = (size_t)env_int("QE_VRAM_TARGET_MB", 1024) << 20;
+    *low = env_set("QE_VRAM_LOW_MB") ? low0 : std::max<size_t>((size_t)32 << 20, (size_t)(low0 * sc));
+    *target = env_set("QE_VRAM_TARGET_MB") ? target0 : std::max<size_t>(*low + ((size_t)64 << 20), (size_t)(target0 * sc));
+}
+
+// the pool total that gives slot s room for need positions (its region at its floor next to everything else)
+size_t Engine::total_for(int s, int need) const {
+    const Seq& q = seqs_[s];
+    const size_t want = units(min_cap(need) - q.split), have = units_of(q);
+    return pool_tokens_ + (want > have ? want - have : 0) + 1024;
+}
+
+void Engine::vram_tick() {
+    if (!vram_adapt_ || workers_.empty() || !workers_[0]->pool_vmm() || pool_tokens0_ == 0) return;
+    static const double every = env_int("QE_VRAM_CHECK_MS", 200) / 1e3;
+    const double now = vnow_s();
+    if (now - vlast_ < every) return;
+    vlast_ = now;
+    // what other processes took on each card (their growth since the start, gpu_others.h): only that is given back,
+    // and all of it comes back once they give it up
+    size_t low = 0, target = 0;
+    vram_marks(&low, &target);
+    if (vwatch_.size() != workers_.size()) vwatch_.assign(workers_.size(), qe_gpu_others::Watch{});
+    if (vfree0_.size() != workers_.size()) {
+        vfree0_.assign(workers_.size(), 0);
+        vfree0p_.assign(workers_.size(), 0);
+        vfree0t_.assign(workers_.size(), now);
+    }
+    size_t need_tok = 0, back_bytes = SIZE_MAX;
+    long long og_max = 0;
+    bool back = pool_tokens_ < pool_tokens0_;
+    for (size_t r = 0; r < workers_.size(); r++) {
+        auto& w = workers_[r];
+        const size_t f = w->free_mem(), stb = w->slot_token_bytes();
+        const long long own = (long long)(w->weight_bytes + w->cache_bytes);
+        // (NVML on demand below the low mark; while the pool is shrunk every 2 s for the way back, else every 10 s)
+        const long long og = vwatch_[r].growth_lazy(f < low, pool_tokens_ < pool_tokens0_ ? 2.0 : 10.0, vnow_s, w->device, f, own,
+                                                     384LL << 20, "[qengine]");
+        og_max = std::max(og_max, og);
+        // (the minimum free at the full pool over a 300 s window: one transient dip of our own does not lower the way
+        // back's floor for good, review R5-L6)
+        if (pool_tokens_ >= pool_tokens0_ && og <= (64LL << 20)) {  // (per card, review R6-L6)
+            if (now - vfree0t_[r] > 300.0) { vfree0p_[r] = vfree0_[r]; vfree0_[r] = 0; vfree0t_[r] = now; }
+            vfree0_[r] = vfree0_[r] ? std::min(vfree0_[r], f) : f;
+        }
+        const long long given = (long long)((pool_tokens0_ - pool_tokens_) * stb);  // what this card gave up so far
+        // give back what the others took at most (review N-M3), so that the target is free again
+        if (f < low && og > (128LL << 20) && given < og + (64LL << 20)) {
+            const long long want = std::min<long long>((long long)(target - f), og + (64LL << 20) - given);
+            if (want > 0) need_tok = std::max(need_tok, ((size_t)want + stb - 1) / stb);
+        }
+        // back: what was given up beyond what the others still hold plus the 64 MB a shrink gives on top (no regrow
+        // right after a capped shrink, review R4-L5); all of it once they are down to 64 MB, while this card keeps the
+        // low mark + 16 MB free, or what it had free at the full pool less 32 MB when that is lower (a lowered reserve,
+        // the desktop card: the way back reaches the start size, review N-M4)
+        const long long keep_given = og > (64LL << 20) ? og + (64LL << 20) : 0;
+        long long floor_f = (long long)low + (16LL << 20);
+        // (the steady minimum: this window's, and the previous window's until this one is 60 s old)
+        size_t f0 = vfree0_[r];
+        if (vfree0p_[r] && (now - vfree0t_[r] < 60.0 || !f0)) f0 = f0 ? std::min(f0, vfree0p_[r]) : vfree0p_[r];
+        if (f0 > (32u << 20))
+            floor_f = std::max((long long)low / 2, std::min(floor_f, (long long)f0 - (32LL << 20)));
+        const long long b2 = std::min<long long>(given - keep_given, (long long)f - floor_f);
+        if (b2 <= 0) back = false;
+        else back_bytes = std::min(back_bytes, (size_t)b2);
+    }
+    if (need_tok) {
+        if (now < vback_) return;  // (a shrink that freed nothing: backoff, review M3)
+        // hysteresis: right after a regrow, a shrink needs the others to have grown since (review N-M6)
+        if (now - vregrow_t_ < 5.0 && og_max <= vregrow_og_ + (64LL << 20)) return;
+        const size_t floor_tok = std::min(pool_tokens_, (size_t)16384 + slack_);
+        const size_t c = pool_tokens_ > need_tok + 1024 ? (pool_tokens_ - need_tok - 1024) / 1024 * 1024 : 0;
+        if (pool_shrink(std::max(c, floor_tok))) vback_step_ = 0.2;
+        else {
+            vback_ = now + vback_step_;
+            vback_step_ = std::min(10.0, vback_step_ * 2);
+        }
+        return;
+    }
+    vog_last_ = og_max;
+    if (back && back_bytes != SIZE_MAX && pool_regrow(std::min(back_bytes, (size_t)512 << 20))) {
+        vregrow_t_ = now;
+        vregrow_og_ = og_max;
+    }
+}
+
+// The pool cannot go below `keep` (computed first, with no side effects: review H3 / M3): the active regions, each
+// decoding one with its growth floor (min_cap: no running out of room right after a shrink, H2), plus the referenced
+// prefixes (relocatable). Then idle regions are trimmed, compacted, prefixes moved down, idle conversations archived.
+bool Engine::pool_shrink(size_t ceil_tokens) {
+    if (ceil_tokens >= pool_tokens_) return false;
+    size_t keep = 0;  // what stays whatever is evicted
+    for (size_t j = 0; j < seqs_.size(); j++) {
+        const Seq& x = seqs_[j];
+        if (!x.active || x.max_t <= 0) continue;
+        const bool decoding = !x.paused && !pf_of(j);
+        keep += decoding ? std::max(units_of(x), units(min_cap(std::min(x.pos + 2 * kMaxSpecK + 4, max_ctx_)) - x.split)) : units_of(x);
+    }
+    for (auto& p : pres_)
+        if (p.refs > 0) keep += units(p.n);
+    ceil_tokens = std::max(ceil_tokens, (keep + 1023) / 1024 * 1024);
+    if (ceil_tokens + 1024 > pool_tokens_) return false;  // (nothing to free: no side effects, the caller backs off)
+    QeWdSlow slow;  // (region moves and releases: the peers' waits are not a dead GPU)
+    const double t0 = vnow_s();
+    finish();
+    const size_t p0 = pool_tokens_;
+    for (size_t j = 0; j < seqs_.size(); j++) {  // idle conversations: trimmed to their contents
+        Seq& x = seqs_[j];
+        const int keepr = x.pos ? std::min(x.max_t, (x.pos + 2 * kMaxSpecK + 4 + 1023) / 1024 * 1024) : 0;
+        if (!x.active && x.max_t > keepr) place(j, x.off, keepr);
+    }
+    auto top = [&] {
+        size_t t = 0;
+        for (const Seq& x : seqs_)
+            if (x.max_t > 0) t = std::max(t, x.off + units_of(x));
+        for (auto& p : pres_) t = std::max(t, p.off + units(p.n));
+        return t;
+    };
+    // referenced prefixes past the ceiling move down into a gap (the slots reading them are re-pointed), so a pinned
+    // system prompt at the pool top no longer blocks the shrink (review H3)
+    auto relocate = [&] {
+        for (size_t i = 0; i < pres_.size(); i++) {
+            GpuPrefix& p = pres_[i];
+            if (p.refs == 0 || p.off + units(p.n) <= ceil_tokens) continue;  // (unreferenced ones are dropped, N-L6)
+            std::vector<std::pair<size_t, size_t>> used;
+            used_intervals(used);
+            used.erase(std::remove_if(used.begin(), used.end(), [&](const std::pair<size_t, size_t>& u) { return u.first == p.off; }), used.end());
+            used.push_back({ceil_tokens, ceil_tokens});
+            std::sort(used.begin(), used.end());
+            size_t cur = 0;
+            for (auto& u : used) {
+                if (u.first >= cur + units(p.n) && cur + units(p.n) <= ceil_tokens && cur < p.off) { move_prefix(i, cur); break; }
+                cur = std::max(cur, u.second);
+            }
+        }
+    };
+    compact();
+    relocate();
+    int evicted = 0;
+    while (top() > ceil_tokens) {  // unused prefix regions, then idle conversations to the archive (active ones stay)
+        if (drop_lru_prefix() || (evict_one(-1, {}) && ++evicted)) { compact(); relocate(); continue; }
+        break;
+    }
+    const size_t nc = std::min(p0, (std::max(top(), ceil_tokens) + 1023) / 1024 * 1024);
+    if (nc >= p0) return false;
+    size_t freed = 0;
+    for (auto& w : workers_) freed = std::max(freed, w->pool_release_above(nc * w->slot_token_bytes()));
+    pool_tokens_ = nc;
+    fprintf(stderr, "[qengine] VRAM pressure: KV pool %zu -> %zu tokens (%.0f MB per card freed, %d idle conversation%s archived, "
+            "%.0f ms); grows back once the memory is free\n", p0, nc, freed / 1048576.0, evicted, evicted == 1 ? "" : "s",
+            (vnow_s() - t0) * 1e3);
+    return true;
+}
+
+bool Engine::move_prefix(size_t i, size_t noff) {
+    GpuPrefix& p = pres_.at(i);
+    if (noff >= p.off) return false;
+    const size_t n = units(p.n), from = p.off;
+    pool_->run([&](int r) { workers_[r]->move_pool_bytes(noff, from, n); });
+    p.off = noff;
+    for (size_t j = 0; j < seqs_.size(); j++)
+        if (seqs_[j].pre == (int)i)
+            pool_->run([&](int r) {
+                workers_[r]->set_prefix((int)j, p.off, p.n);
+                workers_[r]->clear_graphs((int)j);
+            });
+    if (pool_log_) printf("pool: prefix of %d tokens moved %zu -> %zu (VRAM pressure)\n", p.n, from, noff), fflush(stdout);
+    return true;
+}
+
+bool Engine::pool_regrow(size_t max_add_bytes) {
+    size_t stb = 0;
+    for (auto& w : workers_) stb = std::max(stb, w->slot_token_bytes());
+    const size_t add = std::max<size_t>(1024, max_add_bytes / std::max<size_t>(stb, 1) / 1024 * 1024);
+    const size_t nc = std::min(pool_tokens0_, pool_tokens_ + add);
+    if (nc <= pool_tokens_) return false;
+    QeWdSlow slow;
+    for (auto& w : workers_)
+        if (!w->pool_map_upto(nc * w->slot_token_bytes())) {  // out of memory again: back to the old ceiling
+            for (auto& x : workers_) x->pool_release_above(pool_tokens_ * x->slot_token_bytes());
+            return false;
+        }
+    fprintf(stderr, "[qengine] VRAM free again: KV pool %zu -> %zu tokens (start size %zu)\n", pool_tokens_, nc, pool_tokens0_);
+    pool_tokens_ = nc;
+    n_room_++;  // (paused slots try again, review N-M5)
+    return true;
+}
+
+// up to need_tokens of pool (a request or a decoding sequence waits for it): as far as every card keeps the low mark
+// free now, without the hold of vram_tick (H1 / H2)
+bool Engine::pool_regrow_now(size_t need_tokens) {
+    if (!vram_adapt_ || pool_tokens_ >= pool_tokens0_ || need_tokens <= pool_tokens_) return false;
+    size_t low = 0, target = 0;
+    vram_marks(&low, &target);
+    size_t tok = std::min(pool_tokens0_, (need_tokens + 1023) / 1024 * 1024) - pool_tokens_;
+    for (auto& w : workers_) {  // (down to the target, not the low mark that shrinks: no back and forth, review N-M6)
+        const size_t f = w->free_mem(), stb = w->slot_token_bytes();
+        tok = std::min(tok, f > target ? (f - target) / stb / 1024 * 1024 : 0);
+    }
+    if (tok < 1024 || !pool_regrow(tok * workers_[0]->slot_token_bytes())) return false;
+    vregrow_t_ = vnow_s();
+    vregrow_og_ = vog_last_;  // (review R4-L5: the hysteresis compares against the growth at this regrow)
+    return true;
+}
+
+// a worker's out-of-memory while the engine thread waits for the step (no region moves now): the chunks past every
+// region and prefix on that card go back; the pool's ceiling drops to that top on every card's view (the other cards
+// keep their chunks mapped; vram_tick releases or regrows them later). Review M4
+size_t Engine::emergency_release(int r, size_t need) {
+    std::lock_guard<std::mutex> lk(vemerg_mu_);
+    size_t t = 0;
+    for (const Seq& x : seqs_)
+        if (x.max_t > 0) t = std::max(t, x.off + units_of(x));
+    for (auto& p : pres_) t = std::max(t, p.off + units(p.n));
+    Worker& w = *workers_[r];
+    // (only what the allocation needs, + 25 %, review N-L3; never into a region)
+    const size_t need_tok = (need + need / 4) / std::max<size_t>(w.slot_token_bytes(), 1) + 1024;
+    const size_t want = pool_tokens_ > need_tok ? (pool_tokens_ - need_tok) / 1024 * 1024 : 0;
+    const size_t nc = std::max({(t + 1023) / 1024 * 1024, std::min(pool_tokens_, (size_t)16384 + slack_), want});
+    if (nc >= pool_tokens_) return 0;
+    const size_t freed = w.pool_release_above(nc * w.slot_token_bytes());
+    if (freed) {
+        pool_tokens_ = nc;
+        fprintf(stderr, "[qengine] GPU%d out of memory while serving: KV pool tail released (%.0f MB, pool %zu tokens) for a %.0f MB "
+                "allocation\n", w.device, freed / 1048576.0, nc, need / 1048576.0);
+    }
+    return freed;
+}
+
+// QE_DECODE_COMM=auto (club-3090 #1926), as Flash-Next's (flash_capi.cpp decode_calibrate): real decode steps of this
+// model, P2P SM stores into the peers vs pinned host memory, single sequence and 4 batched sequences separately; the
+// faster path per mode (host only when faster by QE_DECODE_CAL_MARGIN), both timings logged. Dummy prompt, greedy,
+// lookup off; both paths give bit-identical tokens. reset() afterwards; P2P everywhere frees the host candidates.
+void Engine::decode_calibrate() {
+    // its reset()s must not forget the disk cache found at start (only files then: nothing in host memory or pinned)
+    struct KeepDisk {
+        Engine& e;
+        std::list<KvArchive> a;
+        size_t used;
+        explicit KeepDisk(Engine& x) : e(x), a(std::move(x.archives_)), used(x.disk_used_) { e.archives_.clear(); }
+        ~KeepDisk() { e.archives_ = std::move(a); e.disk_used_ = used; }
+    } keep_disk(*this);
+    if (!comm_.dcal) {  // (comm_free_p2p clears it: no peer access, nothing to time, review L3)
+        if (comm_.p2p && comm_.hpll[0])  // forced QE_DECODE_COMM=host: the same set_dpath rules
+            pool_->run([&](int r) { workers_[r]->set_dpath(comm_.dxfer, comm_.dxfer); });
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    // the background pinning (archive pool slabs, snapshot buffers) held while the steps run: their memset + register
+    // made the 27B c=1 legs swing ~30 % (host faster in 2 of 4 rounds by chance); resumed on every exit
+    struct Hold {
+        Engine* e;
+        bool timed_out = false;  // (review round 3 R8: then the result is not cached)
+        explicit Hold(Engine* x) : e(x) {
+            timed_out = !e->hpool_.pause(true);
+            e->snap_pause_ = true;
+            const int n = std::max(0, env_int("QE_DECODE_CAL_PAUSE_MS", 3000)) / 10;
+            for (int i = 0; i < n && e->snap_busy_; i++) usleep(10000);
+            if (e->snap_busy_) {
+                timed_out = true;
+                fprintf(stderr, "[comm] decode calibration: snapshot pinning still busy after %d ms (timings may be noisy)\n",
+                        n * 10);
+            }
+        }
+        ~Hold() { e->hpool_.pause(false); e->snap_pause_ = false; }
+    };
+    std::unique_ptr<Hold> hold;
+    const int steps = std::max(4, env_int("QE_DECODE_CAL_STEPS", 12)), warm = std::max(2, env_int("QE_DECODE_CAL_WARM", 3));
+    const double margin = env_double("QE_DECODE_CAL_MARGIN", 0.05);
+    // QE_DECODE_CAL_ROUNDS (4) interleaved rounds of a P2P leg and a host leg, the median per path; host only when its
+    // median is faster by the margin AND it won at least 3 of 4 rounds: 27B c=1 on our box runs in phases (whole
+    // runs at ~9.3 or ~12 ms/step on either path), so a single or best-of-two leg could flip the pick; a board where
+    // one path is far faster wins every round
+    const int rounds = std::max(1, env_int("QE_DECODE_CAL_ROUNDS", 4));
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const size_t n = v.size();
+        return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    };
+    int hwins[2] = {0, 0};
+    const int k = std::max(0, env_int("QE_DECODE_CAL_K", 3));
+    const int nb = num_slots() >= 4 ? 4 : 0;
+    const std::string dkey = comm_decode_key(devs_.data(), (int)workers_.size(), comm_.p2p, "27B", model_dir_, k, nb, steps, warm, margin,
+                                             "slots " + std::to_string(num_slots()) + " ctx " + std::to_string(req_ctx_));
+    {  // the start-up cache (comm_cache.h): the same cards, links, driver, build and model measured before
+        DecodeCal dc;
+        if (!comm_.dcal_fresh && comm_decode_cache_get(dkey, dc)) {
+            pool_->run([&](int r) { workers_[r]->set_dpath(dc.x[0], dc.x[1]); });
+            if (dc.x[0] == kXferP2P && dc.x[1] == kXferP2P) {
+                pool_->run([&](int r) { workers_[r]->free_dhost(); });
+                comm_free_decode_host(comm_);
+            }
+            comm_.dxfer = dc.x[0];
+            auto nm = [](int x) { return x == kXferHost ? "pinned host memory" : "P2P SM stores"; };
+            fprintf(stderr, "[comm] decode collectives (QE_DECODE_COMM=auto, from the start-up cache, measured %s): single "
+                            "sequence: %s (P2P %.2f, host memory %.2f ms/step); batched: %s (P2P %.2f, host memory %.2f ms/step); "
+                            "QE_DECODE_COMM=remeasure measures again\n",
+                    dc.when.c_str(), nm(dc.x[0]), dc.tp[0], dc.th[0], nm(dc.x[1]), dc.tp[1], dc.th[1]);
+            return;
+        }
+    }
+    hold.reset(new Hold(this));  // (measuring: the background pinning waits)
+    // nothing of the calibration stays (review M1): the legs run with a fixed draft count (adapt_ 0: no spec graph is
+    // captured inside a timed window, the dummy prompt's acceptance never reaches the adaptive draft count), and the
+    // adaptive-k statistics, the step-time model and the counters go back to their values from before
+    struct Keep {
+        Engine* e;
+        double an[kMaxSpecK + 2], ad[kMaxSpecK + 2], rs[5], c0, c1;
+        int adapt, kh;
+        long long lks, lkr, lkt, sa, n[6], lb[5];
+        std::vector<std::array<long long, 5>> ds;
+        explicit Keep(Engine* x) : e(x) {
+            memcpy(an, e->acc_num_, sizeof an), memcpy(ad, e->acc_den_, sizeof ad), memcpy(rs, e->rs_, sizeof rs);
+            c0 = e->cost0_, c1 = e->cost1_, adapt = e->adapt_, kh = e->k_heur_;
+            lks = e->lk_steps_, lkr = e->lk_rows_, lkt = e->lk_tok_, sa = e->steps_all_;
+            const long long* m[6] = {&e->n_grow_, &e->n_move_, &e->n_evict_, &e->n_pause_, &e->n_unpause_, &e->n_release_};
+            for (int i = 0; i < 6; i++) n[i] = *m[i];
+            for (auto& q : e->seqs_) ds.push_back({q.ds[0], q.ds[1], q.ds[2], q.ds[3], q.ds[4]});
+            const long long* l[5] = {&e->lkb_steps_, &e->lkb_rows_sum_, &e->lkb_tok_, &e->lkb_bsteps_, &e->lkb_slotsteps_};
+            for (int i = 0; i < 5; i++) lb[i] = *l[i];
+            e->adapt_ = 0;
+        }
+        ~Keep() {
+            memcpy(e->acc_num_, an, sizeof an), memcpy(e->acc_den_, ad, sizeof ad), memcpy(e->rs_, rs, sizeof rs);
+            e->cost0_ = c0, e->cost1_ = c1, e->adapt_ = adapt, e->k_heur_ = kh;
+            e->lk_steps_ = lks, e->lk_rows_ = lkr, e->lk_tok_ = lkt, e->steps_all_ = sa;
+            long long* m[6] = {&e->n_grow_, &e->n_move_, &e->n_evict_, &e->n_pause_, &e->n_unpause_, &e->n_release_};
+            for (int i = 0; i < 6; i++) *m[i] = n[i];
+            for (size_t i = 0; i < ds.size() && i < e->seqs_.size(); i++)
+                for (int j = 0; j < 5; j++) e->seqs_[i].ds[j] = ds[i][j];
+            long long* l[5] = {&e->lkb_steps_, &e->lkb_rows_sum_, &e->lkb_tok_, &e->lkb_bsteps_, &e->lkb_slotsteps_};
+            for (int i = 0; i < 5; i++) *l[i] = lb[i];
+        }
+    };
+    std::unique_ptr<Keep> keep(new Keep(this));
+    const bool conc0 = concurrent_;
+    std::vector<int> ids(96);
+    for (int i = 0; i < (int)ids.size(); i++) ids[i] = 1000 + (int)((i * 7919u + 13u) % 60000u);
+    std::vector<int> out(64 * 4), cnt(4);
+    CommBusyWatch bwatch(devs_.data(), (int)workers_.size());  // (other processes' GPU use, polled after every leg: comm_cache.h)
+    bwatch.start(comm_now_us());
+    auto leg = [&](int x, bool batched, int xh = -1) -> double {  // xh: attention exchanges (-1: with x)
+        const unsigned long long ls = comm_now_us();
+        struct Poll { CommBusyWatch& w; unsigned long long t; ~Poll() { w.poll(t); } } poll{bwatch, ls};
+        pool_->run([&](int r) { workers_[r]->set_dpath(x, x, xh); });
+        set_concurrent(batched);
+        std::vector<int> slots;
+        for (int i = 0; i < (batched ? nb : 1); i++) {
+            std::vector<int> q = ids;
+            q[0] += i;
+            if (start(q.data(), (int)q.size(), k) < 0) return -1.0;
+            slots.push_back(last_slot());
+            set_no_lookup(slots.back(), true);
+        }
+        auto one = [&] {
+            if (batched) step_batch(slots.data(), (int)slots.size(), out.data(), cnt.data());
+            else spec_step(out.data());
+        };
+        for (int i = 0; i < warm; i++) one();
+        const auto a = std::chrono::steady_clock::now();
+        for (int i = 0; i < steps; i++) one();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count() / steps;
+        for (int sl : slots) set_no_lookup(sl, false);  // (lookup back on for the slots: nothing of the calibration stays)
+        reset();
+        return ms;
+    };
+    double tp[2] = {-1, -1}, th[2] = {-1, -1};
+    int pick[2] = {kXferP2P, kXferP2P};
+    const unsigned long long t0us = comm_now_us();  // (the busy check: GPU use by other processes since here)
+    bool noisy = false;  // not cached: the pinning wait timed out (27B) or an extra leg failed
+    noisy = hold && hold->timed_out;
+    bool ok = true;
+    for (int b = 0; b < (nb ? 2 : 1) && ok; b++) {
+        std::vector<double> vp, vh;
+        for (int r = 0; r < rounds && ok; r++) {
+            const double p2 = leg(kXferP2P, b), h2 = leg(kXferHost, b);
+            if (p2 < 0 || h2 < 0) ok = false;
+            vp.push_back(p2), vh.push_back(h2);
+            hwins[b] += h2 < p2;
+        }
+        if (!ok) break;
+        tp[b] = median(vp), th[b] = median(vh);
+        pick[b] = th[b] < (1.0 - margin) * tp[b] && hwins[b] >= rounds - rounds / 4 ? kXferHost : kXferP2P;
+    }
+    if (!ok) pick[0] = pick[1] = kXferP2P;
+    if (!nb) pick[1] = pick[0];
+    // a mixed pick runs the host mode's collectives with the attention exchanges on P2P (one flag set per run): a
+    // combination the legs did not time; two more rounds time it, and the mode goes back to P2P unless it still wins
+    // by the margin (review round 2 N5)
+    char mixed[200] = "";
+    if (ok && nb && pick[0] != pick[1]) {
+        const int b = pick[0] == kXferHost ? 0 : 1;
+        // two interleaved pairs (P2P leg, mixed leg); the mixed pick stays only when it wins both by the margin
+        // (review round 3 R6: a single fast-phase pair against an older median could keep it)
+        std::vector<double> vm, vq;
+        int mw = 0;
+        for (int r = 0; r < 2 && ok; r++) {
+            const double q2 = leg(kXferP2P, b), m2 = leg(kXferHost, b, 0);
+            if (q2 < 0 || m2 < 0) ok = false;
+            vq.push_back(q2), vm.push_back(m2);
+            mw += m2 < (1.0 - margin) * q2;
+        }
+        const double mm = ok ? median(vm) : -1.0, mq = ok ? median(vq) : -1.0;
+        const bool keep = ok && mw == 2;
+        snprintf(mixed, sizeof mixed, "; mixed pick: %s host memory with P2P attention exchanges %.2f ms/step vs P2P %.2f "
+                 "(won %d/2): %s", b ? "batched" : "single sequence", mm, mq, mw, keep ? "kept" : "back to P2P");
+        if (!keep) pick[b] = kXferP2P;
+        if (!ok) pick[0] = pick[1] = kXferP2P, ok = true, noisy = true;  // (a failed extra leg: P2P, not cached)
+    }
+    pool_->run([&](int r) { workers_[r]->set_dpath(pick[0], pick[1]); });
+    if (pick[0] == kXferP2P && pick[1] == kXferP2P) {
+        pool_->run([&](int r) { workers_[r]->free_dhost(); });
+        comm_free_decode_host(comm_);
+    }
+    comm_.dxfer = pick[0];
+    set_concurrent(conc0);
+    reset();
+    if (ok) {
+        // not cached (measured again at the next start): rounds that disagree, or another compute process on the cards
+        // (review M2)
+        // review round 2 (N3): only a host pick that was not unanimous is refused (the risky direction); a P2P pick
+        // (host median not faster by the margin) is cached whatever the round count
+        bool split = false;
+        for (int b = 0; b < (nb ? 2 : 1); b++) split |= pick[b] == kXferHost && hwins[b] != rounds;
+        std::string why;
+        if (split || noisy || comm_cache_busy(devs_.data(), (int)workers_.size(), why, t0us, &bwatch)) {
+            fprintf(stderr, "[comm] decode collectives: calibration not cached (%s)\n",
+                    split ? "host pick not unanimous" : noisy ? "noisy: background pinning or a failed extra leg" : why.c_str());
+        } else {
+            DecodeCal dc;
+            dc.x[0] = pick[0], dc.x[1] = pick[1];
+            for (int b = 0; b < 2; b++) dc.tp[b] = tp[b], dc.th[b] = th[b];
+            comm_decode_cache_put(dkey, dc);
+        }
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    auto nm = [](int x) { return x == kXferHost ? "pinned host memory" : "P2P SM stores"; };
+    char bl[420] = "";
+    if (nb) snprintf(bl, sizeof bl, "; batched (%d sequences): %s (P2P %.2f, host memory %.2f ms/step, host faster in %d/%d)", nb,
+                     nm(pick[1]), tp[1], th[1], hwins[1], rounds);
+    if (*mixed) strncat(bl, mixed, sizeof bl - strlen(bl) - 1);
+    if (ok)
+        fprintf(stderr, "[comm] decode collectives (QE_DECODE_COMM=auto, real decode steps, median of %d interleaved rounds of %d): single "
+                        "sequence: %s (P2P %.2f, host memory %.2f ms/step, host faster in %d/%d)%s; calibration %.0f ms\n", rounds, steps, nm(pick[0]), tp[0], th[0], hwins[0], rounds, bl, ms);
+    else
+        fprintf(stderr, "[comm] decode collectives (QE_DECODE_COMM=auto): calibration could not run a decode step, P2P SM stores "
+                        "(%.0f ms)\n", ms);
 }

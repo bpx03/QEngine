@@ -209,5 +209,23 @@ if os.path.exists(dump):
     m4 = app.anthropic_to_messages(dict(body3, messages=body3["messages"] + [tool_use("Bash", 99), tool_result(99, "ok")]))
     check("dump reworded: next turn", tr.observe(m4, app.anthropic_tools(body3["tools"]), body3["metadata"]).main, True)
 
+print("more than 64 sessions: a new one is tracked, reaches its 2nd turn, its side task is not main (review 9 H2)")
+tr = Tracker(override="")
+for i in range(70):
+    Client(tr, session=f"old-{i}").ask(NEW_MAIN, [{"role": "user", "content": f"task {i}"}], TOOLS, "", True)
+c = Client(tr, session="new-one")
+h = [{"role": "user", "content": "Long task."}]
+c.ask(NEW_MAIN, h, TOOLS, "", True)
+check("new session kept past the cap", "s:new-one" in tr.sessions, True)
+h2 = h + [tool_use("Agent", 1), tool_result(1, "ok")]
+check("its 2nd turn is main", c.ask(NEW_MAIN, h2, TOOLS, "", True).main, True)
+side = h2 + [{"role": "user", "content": "Summarize the conversation."}]
+check("its side task is not main", c.ask(NEW_MAIN, side, TOOLS, "short summary", True).main, False)
+print("no session id: groups of forgotten conversations are pruned (review 9 L1)")
+tr = Tracker(override="", max_convs=8)
+for i in range(200):
+    tr.observe([{"role": "system", "content": "rag"}, {"role": "user", "content": f"question {i}"}], [], None, affinity=5)
+check("groups bounded", len(tr.sessions["a:5"].groups) <= 9, True)
+
 print("FAIL: " + ", ".join(FAILS) if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

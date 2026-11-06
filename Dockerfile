@@ -14,7 +14,7 @@ ARG UBUNTU=ubuntu24.04
 # ---------------------------------------------------------------- build: libqengine.so
 FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS build
 # 86 = RTX 3090 (supported, tuned), 89 = RTX 4090 (not tested by us, not tuned), 120 = RTX 5090 (community-tested,
-# not tuned). A source build without -DCMAKE_CUDA_ARCHITECTURES is sm_86 only.
+# not tuned). A source build without -DCMAKE_CUDA_ARCHITECTURES builds for the GPUs of its machine, plus sm_86.
 ARG CUDA_ARCHS="86;89;120"
 # the build's git hash for the start-up log (the build context has no .git): --build-arg REVISION=$(git rev-parse HEAD)
 ARG REVISION=unknown
@@ -52,6 +52,9 @@ COPY server ./server
 COPY --from=build /src/build/libqengine.so ./build/libqengine.so
 # Qwen3.8-Flash-Next engine (preview): picked by the server when QE_MODEL points to a Flash-Next directory
 COPY --from=build /src/build/libqflash.so ./build/libqflash.so
+# next-token KL against the BF16 reference set (`docker run ... qengine kl --ref /ref --work /work`, README "Quality")
+COPY --from=build /src/build/flash_run ./build/flash_run
+COPY tools/flash_kl_ref.py ./tools/flash_kl_ref.py
 COPY LICENSE ./
 # the release version and the engine's build hash, shown in /api/stats (qetop, web dashboard) and the start-up log
 COPY VERSION ./
@@ -60,17 +63,23 @@ COPY --from=build /src/build/qe_build.txt ./build/qe_build.txt
 COPY vectors ./vectors
 
 # Entry point: server/run.sh with the container defaults (listen on 0.0.0.0).
-# QE_GPUS = GPU ids as seen in the container (with --gpus all: the host ids), default 0,1,2;
+# GPU ids as seen in the container (with --gpus all: the host ids): QE_DEVICES if set, else QE_GPUS, else 0,1,2;
 # run.sh sets CUDA_VISIBLE_DEVICES from it and passes --devices 0..n-1 (n != 3: warning, less tested).
 COPY <<'EOF' /usr/local/bin/qengine-entrypoint
 #!/usr/bin/env bash
 set -euo pipefail
 cd /app
-export QE_DEVICES="${QE_GPUS:-0,1,2}"
+export QE_DEVICES="${QE_DEVICES:-${QE_GPUS:-0,1,2}}"  # a user-set QE_DEVICES wins (it was overwritten before)
 MODEL="${QE_MODEL:-/app/models/Qwen3.8-27B-INT4}"
 if [ ! -f "$MODEL/config.json" ]; then
   echo "model not found at $MODEL: mount it (-v /path/to/models:/app/models:ro)" >&2
   exit 1
+fi
+# `kl`: the next-token KL of $MODEL (Flash-Next) against jyohukuchan's BF16 reference set, mounted at --ref, with
+# scratch space at --work (tools/flash_kl_ref.py; the cards of QE_GPUS); the other arguments go to the tool
+if [ "${1:-}" = kl ]; then
+  shift
+  exec python3 tools/flash_kl_ref.py --model "$MODEL" --devices "$QE_DEVICES" "$@"
 fi
 # Activation steering (off by default). QE_STEERING=0: no vectors, the server runs as without them. QE_STEERING=1:
 # the included refusal_projection (Flash-Next only) is the default of every request; QE_STEERING=<name>: that vector

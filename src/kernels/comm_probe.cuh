@@ -6,6 +6,7 @@
 // collectives switch to the fastest one when SM stores are markedly slower (comm_select_path).
 #include "../env.h"
 #include "comm_rule.h"
+#include "comm_cache.h"
 #include <dirent.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -180,6 +181,209 @@ const char* comm_path_name(int xfer) {
     return xfer == kXferCE ? "copy engine" : xfer == kXferHost ? "host-staged" : "P2P SM loads / stores";
 }
 
+// ---------------------------------------------------------------- decode collectives' path (QE_DECODE_COMM)
+// receive words of the decode collectives in pinned host memory (one set per receiving rank, on its NUMA node), mapped
+// on every card: the LL16 all-reduce and the small all-gather keep the P2P kernels (the reader clears what it read, so
+// the 16-bit tags never alias; the older host path, QE_P2P=0, shares one word between its readers and cannot clear)
+static void* comm_host_words(size_t bytes, int node) {
+    const size_t pg = 4096, cap = (bytes + pg - 1) / pg * pg;
+    void* p = nullptr;
+    CHECK(posix_memalign(&p, pg, cap) == 0 && p, "comm: decode host words");
+    if (node >= 0) numa_place(p, cap, {node});
+    memset(p, 0, cap);
+    CUDA_CHECK(cudaHostRegister(p, cap, cudaHostRegisterPortable | cudaHostRegisterMapped));
+    void* d = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&d, p, 0));
+    CHECK(d == p, "comm: decode host words need unified addressing");
+    return p;
+}
+static void comm_free_host_words(void* p) {
+    if (!p) return;
+    cudaHostUnregister(p);
+    free(p);
+}
+void* comm_host_alloc(size_t bytes, int node) { return comm_host_words(bytes, node); }
+void comm_host_free(void* p) { comm_free_host_words(p); }
+void comm_alloc_dhost(Comm& c, const int* devices) {
+    const size_t lb = (size_t)4 * c.ngpu * kMaxBatchRows * pll_row_words(c.ll_hidden) * sizeof(uint4);
+    const size_t ab = (size_t)2 * c.ngpu * kAgWords * sizeof(uint2);
+    for (int i = 0; i < c.ngpu; i++) {
+        const int node = gpu_numa_node(devices[i]);  // the reader's node: its polls stay local
+        if (!c.hpll[i]) c.hpll[i] = (uint4*)comm_host_words(lb, node);
+        if (!c.hpag[i]) c.hpag[i] = (uint2*)comm_host_words(ab, node);
+    }
+}
+void comm_free_decode_host(Comm& c);
+static void comm_free_dhost(Comm& c) {
+    for (int i = 0; i < 4; i++) {
+        comm_free_host_words(c.hpll[i]);
+        comm_free_host_words(c.hpag[i]);
+        c.hpll[i] = nullptr;
+        c.hpag[i] = nullptr;
+    }
+    c.dxfer = kXferP2P;
+}
+void comm_free_decode_host(Comm& c) { comm_free_dhost(c); }
+
+// decode microbench: us per LL all-reduce of m rows (h = the engine's hidden size; norm: the 27B fused norm, else the
+// QFN add into y), 64 dependent collectives per graph on every card, max over the cards; host: receive words in host
+// memory. Its own buffers (never the engine's: the LL16 tags must not see words from another counter set). 0: failed.
+static float comm_decode_bench(const int* devices, int ng, int h, bool host, int m, bool norm, int reps) {
+    Comm t = comm_create(ng, kMaxBatchRows * h, h);
+    float worst = 0.f;
+    if (comm_enable_p2p(t, devices)) {
+        if (host) comm_alloc_dhost(t, devices), t.dxfer = kXferHost;
+        constexpr int K = 64;
+        struct R {
+            cudaStream_t st = nullptr;
+            CommCounters ctr;
+            float *resid = nullptr, *part = nullptr;
+            bf16 *nw = nullptr, *xn = nullptr;
+            cudaGraphExec_t ge = nullptr;
+            cudaEvent_t e0 = nullptr, e1 = nullptr;
+        };
+        std::vector<R> r(ng);
+        for (int g = 0; g < ng; g++) {
+            R& q = r[g];
+            CUDA_CHECK(cudaSetDevice(devices[g]));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&q.st, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreate(&q.e0));
+            CUDA_CHECK(cudaEventCreate(&q.e1));
+            for (unsigned** u : {&q.ctr.seq, &q.ctr.go, &q.ctr.epoch}) { CUDA_CHECK(cudaMalloc(u, 4)); CUDA_CHECK(cudaMemset(*u, 0, 4)); }
+            for (unsigned** u : {&q.ctr.done, &q.ctr.bar}) { CUDA_CHECK(cudaMalloc(u, 8)); CUDA_CHECK(cudaMemset(*u, 0, 8)); }
+            CUDA_CHECK(cudaMalloc(&q.ctr.ss, kCommBlocks * kMaxBatchRows * 4));
+            CUDA_CHECK(cudaMalloc(&q.resid, (size_t)m * h * 4));
+            CUDA_CHECK(cudaMalloc(&q.part, (size_t)m * h * 4));
+            CUDA_CHECK(cudaMemset(q.resid, 0, (size_t)m * h * 4));
+            CUDA_CHECK(cudaMemset(q.part, 0, (size_t)m * h * 4));
+            CUDA_CHECK(cudaMalloc(&q.nw, (size_t)h * 2));
+            CUDA_CHECK(cudaMemset(q.nw, 0, (size_t)h * 2));
+            CUDA_CHECK(cudaMalloc(&q.xn, (size_t)m * h * 2));
+            cudaGraph_t gr;
+            CUDA_CHECK(cudaStreamBeginCapture(q.st, cudaStreamCaptureModeThreadLocal));
+            comm_begin_unit(q.ctr, q.st);
+            for (int i = 0; i < K; i++)
+                allreduce_add(q.resid, q.part, m, h, t, g, q.ctr, q.st, norm ? q.nw : nullptr, 1e-6f, norm ? q.xn : nullptr, i);
+            CUDA_CHECK(cudaStreamEndCapture(q.st, &gr));
+            CUDA_CHECK(cudaGraphInstantiate(&q.ge, gr, 0));
+            CUDA_CHECK(cudaGraphDestroy(gr));
+        }
+        for (int g = 0; g < ng; g++) { CUDA_CHECK(cudaSetDevice(devices[g])); CUDA_CHECK(cudaGraphLaunch(r[g].ge, r[g].st)); }  // warm-up
+        for (int g = 0; g < ng; g++) { CUDA_CHECK(cudaSetDevice(devices[g])); CUDA_CHECK(cudaStreamSynchronize(r[g].st)); }
+        for (int g = 0; g < ng; g++) {
+            CUDA_CHECK(cudaSetDevice(devices[g]));
+            CUDA_CHECK(cudaEventRecord(r[g].e0, r[g].st));
+            for (int i = 0; i < reps; i++) CUDA_CHECK(cudaGraphLaunch(r[g].ge, r[g].st));
+            CUDA_CHECK(cudaEventRecord(r[g].e1, r[g].st));
+        }
+        for (int g = 0; g < ng; g++) {
+            R& q = r[g];
+            CUDA_CHECK(cudaSetDevice(devices[g]));
+            CUDA_CHECK(cudaEventSynchronize(q.e1));
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, q.e0, q.e1));
+            worst = std::max(worst, ms * 1000.f / (reps * K));
+            CUDA_CHECK(cudaGraphExecDestroy(q.ge));
+            CUDA_CHECK(cudaEventDestroy(q.e0));
+            CUDA_CHECK(cudaEventDestroy(q.e1));
+            CUDA_CHECK(cudaStreamDestroy(q.st));
+            for (void* v : {(void*)q.ctr.seq, (void*)q.ctr.go, (void*)q.ctr.epoch, (void*)q.ctr.done, (void*)q.ctr.bar,
+                            (void*)q.ctr.ss, (void*)q.resid, (void*)q.part, (void*)q.nw, (void*)q.xn})
+                CUDA_CHECK(cudaFree(v));
+        }
+        comm_free_dhost(t);
+        comm_free_p2p(t, devices);
+    }
+    CUDA_CHECK(cudaFreeHost(t.ll));
+    CUDA_CHECK(cudaFreeHost(t.data));
+    CUDA_CHECK(cudaFreeHost(t.flags));
+    return worst;
+}
+
+// The decode collectives' path (comm.cuh Comm::dxfer), after the prefill pick: QE_DECODE_COMM = auto | p2p | host.
+// auto: P2P stores unless the prefill tax rule (pf: its verdict on staged engines; else evaluated here the same way,
+// the receiver-load / sender-store choice per pair as Flash-Next makes it) leaves P2P, and the decode microbench does
+// not have host memory markedly slower (comm_decode_rule). Logs one [comm] decode line.
+static void comm_select_decode(Comm& c, const int* devices, bool staged, bool probe, const std::vector<ProbeBw>& bw,
+                               const ProbeBw& mn, const CommRule* pf, bool cross_numa, int min_lanes) {
+    const int ng = c.ngpu;
+    if (ng < 2) return;
+    const char* ev = env_str("QE_DECODE_COMM");
+    std::string want = ev ? ev : "auto";
+    if (want == "remeasure") want = "auto", c.dcal_fresh = true;  // auto, the start-up cache not read (rewritten)
+    if (want != "auto" && want != "p2p" && want != "host") {
+        fprintf(stderr, "[comm] QE_DECODE_COMM=%s: expected auto, remeasure, p2p or host; using auto\n", want.c_str());
+        want = "auto";
+    }
+    if (!c.p2p) {
+        fprintf(stderr, "[comm] decode collectives: pinned host memory (no peer access: every collective)%s\n",
+                want == "p2p" ? "; QE_DECODE_COMM=p2p ignored" : "");
+        return;
+    }
+    CommRule rule = pf ? *pf : CommRule{false, "probe off"};
+    float tax = 1.f;  // the rule's P2P tax (worst pair of the per-pair mode)
+    if (!pf && probe) {  // the 27B engine (its prefill all-reduce runs on the copy engine): the rule as Flash-Next applies it
+        const float pr = (float)env_double("QE_COMM_PULL_RATIO", 0.7f);
+        float mnp = 1e30f, tce = 1.f;
+        for (int i = 0; i < ng; i++)
+            for (int j = 0; j < ng; j++) {
+                if (i == j) continue;
+                const ProbeBw& b = bw[(size_t)i * ng + j];
+                const bool pl = b.ld >= pr * b.sm && b.tax_ld <= b.tax_st * 1.1f + 0.05f;
+                tax = std::max(tax, pl ? b.tax_ld : b.tax_st);
+                mnp = std::min(mnp, pl ? b.ld : b.sm);
+                tce = std::max(tce, b.tax_ce);
+            }
+        const bool narrow = comm_narrow_link(min_lanes, mnp, env_int("QE_COMM_NARROW_X", 8),
+                                             (float)env_double("QE_COMM_NARROW_GBPS", 10.0));
+        rule = comm_auto_rule(tax, tce, (float)env_double("QE_COMM_TAX", 1.30f), (float)env_double("QE_COMM_TAX_1NODE", 1.90),
+                              (float)env_double("QE_COMM_TAX_SEVERE", 3.0), cross_numa, env_int("QE_COMM_XNUMA", 1), narrow,
+                              mnp < (float)env_double("QE_COMM_RATIO", 0.5f) * std::max(mn.ce, mn.host));
+    }
+    // the microbench (diagnostic, QE_DECODE_BENCH=1; off by default): QFN decode shape (add into y, no norm) or the 27B
+    // one (fused norm); m = 4 (one sequence, 3 MTP drafts) and 16 (4 sequences). Idle collectives do not show the
+    // co-run stall of a taxed board (our 3x3090: host 2.1-2.8x P2P here, but only 9-30 % slower end to end), so it only
+    // vetoes a pathological host path in the rule pick (engines without the calibration)
+    const bool bench = probe && env_int("QE_DECODE_BENCH", 0);
+    float tp[2] = {0.f, 0.f}, th[2] = {0.f, 0.f};
+    const int ms[2] = {4, 16};
+    double bms = 0.0;
+    if (bench) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int reps = std::max(1, env_int("QE_DECODE_BENCH_REPS", 8));
+        for (int k = 0; k < 2; k++) {
+            tp[k] = comm_decode_bench(devices, ng, c.ll_hidden, false, ms[k], !staged, reps);
+            th[k] = comm_decode_bench(devices, ng, c.ll_hidden, true, ms[k], !staged, reps);
+        }
+        bms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // the veto only catches a pathological host path: an idle microbench does not see the co-run stalls that make P2P
+    // decode slow on taxed boards (our 3x3090, where P2P wins: host 2.1x / 2.8x slower at m = 4 / 16)
+    const float host_max = (float)env_double("QE_DECODE_HOST_MAX", 4.0);
+    const DecodeRule d = comm_decode_rule(rule.leave_p2p, tp[0] + tp[1], th[0] + th[1], host_max);
+    const int x = want == "p2p" ? kXferP2P : want == "host" ? kXferHost : d.x;
+    // auto in an engine that calibrates (Flash-Next C API / server, QE_DECODE_CAL=1): both candidates allocated, the
+    // rule's pick is only the start; real decode steps on both paths decide at the end of the start-up
+    const bool cal = want == "auto" && c.dcal_want && env_int("QE_DECODE_CAL", 1);
+    if (x == kXferHost || cal) comm_alloc_dhost(c, devices);
+    c.dxfer = x;
+    c.dcal = cal;
+    if (cal) {
+        fprintf(stderr, "[comm] decode collectives: auto, timed on real decode steps at the end of the start-up (P2P SM stores "
+                        "vs pinned host memory); the rule alone would pick %s (%s: %s)\n",
+                x == kXferHost ? "host memory" : "P2P", d.why, rule.why);
+        return;
+    }
+    char mb[200] = "";
+    if (bench)
+        snprintf(mb, sizeof mb, "; decode microbench us per all-reduce m=%d/%d: P2P %.1f/%.1f, host memory %.1f/%.1f (%.0f ms)",
+                 ms[0], ms[1], tp[0], tp[1], th[0], th[1], bms);
+    fprintf(stderr, "[comm] decode collectives (all-reduce, all-gather%s): %s (QE_DECODE_COMM=%s, %s%s%s%s)\n",
+            staged ? ", attention exchanges" : "",
+            x == kXferHost ? "pinned host memory" : "P2P SM stores into the peers' memory", want.c_str(),
+            want == "auto" ? d.why : "forced", want == "auto" ? ": " : "", want == "auto" ? rule.why : "", mb);
+}
+
 int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) {
     const char* ev = env_str(env);
     std::string want = ev ? ev : "auto";
@@ -225,6 +429,38 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
     // not used there (comm_check_pull / comm_check_pick below). Runs with QE_COMM_PROBE=0 too.
     const int chk = ng > 1 && c.p2p ? std::max(0, env_int("QE_COMM_CHECK", 4)) : 0;
     int tax_runs = 0;  // co-run tax runs done (the medians' sample count)
+    // the probe's numbers from the start-up cache (comm_cache.h): same build, cards, links, driver -> the bandwidth and
+    // co-run tax runs are skipped (the P2P data check still runs every start)
+    comm_boot_snap() = comm_proc_snap(devices, ng);  // the busy-card baseline (comm_cache.h)
+    const unsigned long long probe_t0 = comm_now_us();  // (the busy check's window: GPU use by others since here)
+    CommBusyWatch pwatch(devices, ng);  // (polled on a thread and after the bandwidth / co-run tax runs; started below,
+                                        // on a probe-cache miss only)
+    const std::string pkey = probe ? comm_cache_hw_key(devices, ng, c.p2p) + "|probe staged " + std::to_string(staged) : "";
+    bool pc = false;
+    if (probe) {
+        std::map<std::string, std::string> kv;
+        std::string when;
+        if (comm_cache_read("probe", pkey, kv, &when)) {
+            pc = true;
+            for (int i = 0; i < ng && pc; i++)
+                for (int j = 0; j < ng && pc; j++) {
+                    if (i == j) continue;
+                    ProbeBw& b = bw[(size_t)i * ng + j];
+                    const auto it = kv.find("bw" + std::to_string(i) + "_" + std::to_string(j));
+                    pc = it != kv.end() && sscanf(it->second.c_str(), "%f %f %f %f %f %f %f %f %f %f %f %f %f", &b.sm, &b.ld, &b.ce,
+                                                  &b.host, &b.tax_st, &b.tax_ld, &b.tax_ce, &b.st_lo, &b.st_hi, &b.ld_lo,
+                                                  &b.ld_hi, &b.ce_lo, &b.ce_hi) == 13;
+                    mn.sm = std::min(mn.sm, b.sm), mn.ce = std::min(mn.ce, b.ce), mn.host = std::min(mn.host, b.host);
+                }
+            tax_runs = kv.count("tax_runs") ? atoi(kv["tax_runs"].c_str()) : 0;
+            if (pc)
+                fprintf(stderr, "[comm] probe: bandwidth and co-run tax from the start-up cache (measured %s, same cards, links, "
+                                "driver and build; QE_COMM_CACHE=refresh measures again)\n", when.c_str());
+            else
+                bw.assign((size_t)ng * ng, ProbeBw{}), mn = ProbeBw{1e30f, 1e30f, 1e30f};
+        }
+    }
+    if (probe && !pc) pwatch.start(probe_t0);
     if (probe || chk > 0) {
         const size_t bytes = (size_t)std::max(1, env_int("QE_COMM_PROBE_MB", 16)) << 20;
         std::vector<void*> src(ng), dst(ng);
@@ -238,7 +474,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
             CUDA_CHECK(cudaMemset(src[i], 1, bytes));
             CUDA_CHECK(cudaStreamCreateWithFlags(&st[i], cudaStreamNonBlocking));
         }
-        for (int i = 0; i < ng && probe; i++)
+        for (int i = 0; i < ng && probe && !pc; i++)
             for (int j = 0; j < ng; j++) {
                 if (i == j) continue;
                 ProbeBw& b = bw[(size_t)i * ng + j];
@@ -269,6 +505,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                 mn.ce = std::min(mn.ce, b.ce);
                 mn.host = std::min(mn.host, b.host);
             }
+        if (probe && !pc) pwatch.poll(probe_t0);
         if (chk > 0) {
             const auto t0 = std::chrono::steady_clock::now();
             // test hook: QE_COMM_CHECK_TEST=ld|st|ce[:i-j] writes 64 all-ones bytes (a failed PCIe read) into the received
@@ -394,7 +631,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
         // (not with CUDA_LAUNCH_BLOCKING=1: the spinning side-stream kernel would block the host launch forever).
         // Repeated QE_COMM_CORUN_RUNS times (default 5; at least 3 within QE_COMM_CORUN_MS, default 1500 ms): the
         // medians decide (one run on our box read 3.69 against 1.33-1.54 and flipped auto to CE, issue #2).
-        if (probe && env_int("QE_COMM_CORUN", 1) && !env_int("CUDA_LAUNCH_BLOCKING", 0)) {
+        if (probe && !pc && env_int("QE_COMM_CORUN", 1) && !env_int("CUDA_LAUNCH_BLOCKING", 0)) {
             const auto t0 = std::chrono::steady_clock::now();
             const size_t n16 = bytes / 16;
             const int reps = std::max(1, env_int("QE_COMM_CORUN_REPS", 8));
@@ -460,6 +697,19 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                     b.tax_ld = l.med, b.ld_lo = l.lo, b.ld_hi = l.hi;
                     b.tax_ce = e.med, b.ce_lo = e.lo, b.ce_hi = e.hi;
                 }
+            // test only: QE_COMM_TEST_TAX=store,load,ce replaces the measured medians of every pair (a board with a high
+            // co-run tax, e.g. club-3090 #1926: 29,3.1,1.03), so auto's prefill and decode picks run as they would there
+            if (const char* e = env_str("QE_COMM_TEST_TAX")) {
+                float ts = 0.f, tl = 0.f, tc = 0.f;
+                if (sscanf(e, "%f,%f,%f", &ts, &tl, &tc) == 3) {
+                    for (ProbeBw& b : bw)
+                        b.tax_st = b.st_lo = b.st_hi = ts, b.tax_ld = b.ld_lo = b.ld_hi = tl, b.tax_ce = b.ce_lo = b.ce_hi = tc;
+                    fprintf(stderr, "[comm] TEST: QE_COMM_TEST_TAX=%s replaces the measured co-run tax (store/load/ce) of "
+                                    "every pair\n", e);
+                } else {
+                    fprintf(stderr, "[comm] QE_COMM_TEST_TAX=%s: expected store,load,ce; ignored\n", e);
+                }
+            }
             for (int i = 0; i < ng; i++) {
                 CUDA_CHECK(cudaSetDevice(devices[i]));
                 CUDA_CHECK(cudaStreamDestroy(stB[i]));
@@ -500,6 +750,25 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                     }
             fprintf(stderr, "[comm] probe GB/s (SM store / SM load by receiver / copy engine / host-staged; tax = local compute slowdown store/load/ce, median): %s\n", line.c_str());
         }
+    }
+    if (probe && !pc) pwatch.poll(probe_t0);
+    if (probe && !pc && tax_runs > 0) {  // store the fresh numbers (a run without the tax probe is not cached)
+        std::map<std::string, std::string> kv;
+        for (int i = 0; i < ng; i++)
+            for (int j = 0; j < ng; j++) {
+                if (i == j) continue;
+                const ProbeBw& b = bw[(size_t)i * ng + j];
+                char v[512];
+                snprintf(v, sizeof v, "%.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g", b.sm, b.ld, b.ce, b.host,
+                         b.tax_st, b.tax_ld, b.tax_ce, b.st_lo, b.st_hi, b.ld_lo, b.ld_hi, b.ce_lo, b.ce_hi);
+                kv["bw" + std::to_string(i) + "_" + std::to_string(j)] = v;
+            }
+        kv["tax_runs"] = std::to_string(tax_runs);
+        std::string why;
+        if (comm_cache_busy(devices, ng, why, probe_t0, &pwatch))  // a busy card (or no NVML to tell): these numbers are not cached
+            fprintf(stderr, "[comm] probe: not cached (%s)\n", why.c_str());
+        else
+            comm_cache_write("probe", pkey, kv);
     }
     bool bad_st = false, bad_ld = false, bad_ce = false;  // the data check failed on some pair
     for (const ProbeBw& b : bw) bad_st |= b.bad_st != 0, bad_ld |= b.bad_ld != 0, bad_ce |= b.bad_ce != 0;
@@ -547,6 +816,8 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
     // the choice: SM stores unless they are markedly slower than the best alternative on some pair (the slowest pair
     // bounds every collective); QE_COMM_RATIO: the factor that counts as markedly (default 0.5)
     int x = kXferP2P;
+    CommRule pf_rule{false, ""};  // the prefill tax rule's verdict (auto, staged engines), the decode pick's signal
+    bool pf_rule_set = false;
     const char* why = "";
     if (ng < 2) {
         why = "one GPU";
@@ -581,6 +852,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
             const bool narrow = comm_narrow_link(min_lanes, mn.sm, narrow_x, narrow_gbps);
             const CommRule rule = comm_auto_rule(tax_p2p, tax_ce, taxcap, cap1, severe, cross_numa, xnuma, narrow,
                                                  mn.sm < ratio * alt);
+            pf_rule = rule, pf_rule_set = true;
             if (rule.leave_p2p) x = mn.ce >= 0.8f * mn.host ? kXferCE : kXferHost;
             const char* dest = !rule.leave_p2p ? "" : x == kXferCE ? "-> copy engine (" : "-> host-staged (";
             char w[512];
@@ -634,6 +906,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                         env, want.c_str(), what.c_str(), env);
         }
     }
+    comm_select_decode(c, devices, staged, probe, bw, mn, pf_rule_set ? &pf_rule : nullptr, cross_numa, min_lanes);
     // no peer access: the host-staged collectives (copies through pinned host memory by the copy engines, local work on
     // the SMs) need each card's own receive / sum rows in device memory, which comm_enable_p2p did not allocate. Before
     // this, a box without P2P kept xfer = P2P semantics over host-mapped memory: every prefill all-reduce read and wrote

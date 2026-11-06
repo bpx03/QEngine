@@ -1,3 +1,7 @@
+#include <functional>
+#include <cuda.h>
+#include <atomic>
+#include <unistd.h>
 #include "env.h"
 #include <unistd.h>
 #include <chrono>
@@ -27,15 +31,42 @@ struct Scratch {
         }
         return p;
     }
+    void release() {
+        if (p) CUDA_CHECK(cudaFree(p));
+        p = nullptr;
+        n = 0;
+    }
     ~Scratch() { if (p) cudaFree(p); }
 };
 thread_local Scratch g_scratch_q, g_scratch_s;
 
 }  // namespace
 
+// the load's staging buffers of this thread (the largest: lm_head in bf16, 0.8 GB per card on 3 cards, 1.2 GB on 2)
+// given back once the weights are loaded: before the KV pool is sized, so the pool gets the room (and smaller cards
+// load); a later use allocates again
+size_t qe_release_load_scratch() {
+    const size_t b = g_scratch_q.n + g_scratch_s.n;
+    g_scratch_q.release();
+    g_scratch_s.release();
+    return b;
+}
+
+// (pool_shrink, a prefix region moved down below a new ceiling: ascending pieces no longer than the gap, so a piece
+// never overwrites rows still to be copied)
+void Worker::move_pool_bytes(size_t dst_tok, size_t src_tok, size_t tokens) {
+    CUDA_CHECK(cudaSetDevice(device));
+    const size_t stb = slot_token_bytes(), gap = (src_tok - dst_tok) * stb, tot = tokens * stb;
+    for (size_t o = 0; o < tot; o += gap)
+        CUDA_CHECK(cudaMemcpyAsync(pool_ + dst_tok * stb + o, pool_ + src_tok * stb + o, std::min(gap, tot - o), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 Worker::Worker(const Config& cfg, const std::vector<CardPlan>& plan, int rank_, int device_,
                const Comm& comm)
-    : rank(rank_), device(device_), c_(cfg), p_(plan[rank_]), ngpu_(plan.size()), comm_(comm) {}
+    : rank(rank_), device(device_), c_(cfg), p_(plan[rank_]), ngpu_(plan.size()), comm_(comm) {
+    dpath_[0] = dpath_[1] = comm.dxfer;  // (QE_DECODE_COMM=host forced, or the rule pick before the calibration)
+}
 
 size_t Worker::slot_token_bytes() const { return tok_bytes_; }
 
@@ -148,7 +179,101 @@ void Worker::add_slot() {
 // layer's k and v. The layout depends on cap, so resizing a region moves its rows (move_region).
 void Worker::alloc_pool(size_t tokens) {
     CUDA_CHECK(cudaSetDevice(device));
-    pool_ = (char*)dalloc(tokens * slot_token_bytes(), false);
+    const size_t bytes = tokens * slot_token_bytes();
+    CUdevice cd;
+    int vmm = 0;
+    if (env_int("QE_VRAM_ADAPT", 1) && cuDeviceGet(&cd, device) == CUDA_SUCCESS)
+        cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cd);
+    if (vmm) {
+        CUmemAllocationProp pr = {};
+        pr.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        pr.location.id = cd;
+        size_t g = 0;
+        cuMemGetAllocationGranularity(&g, &pr, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        const size_t ch = g ? ((size_t)env_int("QE_VRAM_CHUNK_MB", 64) << 20) / g * g : 0;
+        CUdeviceptr va = 0;
+        const size_t total = ch ? (bytes + ch - 1) / ch * ch : 0;
+        if (ch && cuMemAddressReserve(&va, total, g, 0, 0) == CUDA_SUCCESS) {
+            pool_ = (char*)(uintptr_t)va;
+            pool_chunk_ = ch;
+            pool_ch_.assign(total / ch, 0);
+            if (pool_map_upto(bytes)) return;  // (pool_map_upto zeroes and counts the mapped chunks; review N-L8)
+            pool_release_above(0);
+            cuMemAddressFree(va, total);
+            pool_ch_.clear();
+            pool_ = nullptr;
+        }
+        (void)cudaGetLastError();
+    }
+    pool_ = (char*)dalloc(bytes, false);
+}
+
+size_t Worker::free_mem() const {
+    size_t f = 0, t = 0;
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaMemGetInfo(&f, &t));
+    return f;
+}
+
+size_t Worker::pool_release_above(size_t bytes) {
+    if (pool_ch_.empty()) return 0;
+    CUDA_CHECK(cudaSetDevice(device));
+    size_t freed = 0;
+    for (size_t i = (bytes + pool_chunk_ - 1) / pool_chunk_; i < pool_ch_.size(); i++) {
+        if (!pool_ch_[i]) continue;
+        CUdeviceptr va = (CUdeviceptr)(uintptr_t)pool_ + i * pool_chunk_;
+        CHECK(cuMemUnmap(va, pool_chunk_) == CUDA_SUCCESS, "KV pool: unmap failed");
+        cuMemRelease((CUmemGenericAllocationHandle)pool_ch_[i]);
+        pool_ch_[i] = 0;
+        freed += pool_chunk_;
+    }
+    cache_bytes -= std::min(cache_bytes, freed);
+    return freed;
+}
+
+bool Worker::pool_map_upto(size_t bytes) {
+    if (pool_ch_.empty()) return true;
+    CUDA_CHECK(cudaSetDevice(device));
+    CUdevice cd;
+    cuDeviceGet(&cd, device);
+    CUmemAllocationProp pr = {};
+    pr.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    pr.location.id = cd;
+    std::vector<CUmemAccessDesc> ad;  // this card and the cards with peer access to it
+    int nd = 0;
+    cudaGetDeviceCount(&nd);
+    for (int d = 0; d < nd; d++) {
+        int can = d == device;
+        if (!can) cudaDeviceCanAccessPeer(&can, d, device);
+        if (!can) continue;
+        CUmemAccessDesc x = {};
+        x.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        x.location.id = d;
+        x.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        ad.push_back(x);
+    }
+    const size_t n = std::min(pool_ch_.size(), (bytes + pool_chunk_ - 1) / pool_chunk_);
+    for (size_t i = 0; i < n; i++) {
+        if (pool_ch_[i]) continue;
+        CUmemGenericAllocationHandle h;
+        CUdeviceptr va = (CUdeviceptr)(uintptr_t)pool_ + i * pool_chunk_;
+        if (cuMemCreate(&h, pool_chunk_, &pr, 0) != CUDA_SUCCESS) { (void)cudaGetLastError(); CUDA_CHECK(cudaStreamSynchronize(stream)); return false; }
+        if (cuMemMap(va, pool_chunk_, 0, h, 0) != CUDA_SUCCESS || cuMemSetAccess(va, pool_chunk_, ad.data(), ad.size()) != CUDA_SUCCESS) {
+            cuMemUnmap(va, pool_chunk_);
+            cuMemRelease(h);
+            (void)cudaGetLastError();
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            return false;
+        }
+        pool_ch_[i] = (unsigned long long)h;
+        cache_bytes += pool_chunk_;
+        // (fresh memory: zeroed on this worker's stream, ordered before every region write there; waited for below)
+        CUDA_CHECK(cudaMemsetAsync((void*)(uintptr_t)va, 0, pool_chunk_, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));  // (review N-M1: the legacy-stream memset was not ordered with it)
+    return true;
 }
 
 void Worker::region_arrays(size_t off, int cap, std::vector<std::pair<char*, size_t>>& out) const {
@@ -170,6 +295,7 @@ void Worker::region_arrays(size_t off, int cap, std::vector<std::pair<char*, siz
 }
 
 void Worker::set_prefix(int slot, size_t off, int n) {
+    lsa_invalidate(slot, 0);
     SeqSlot& sl = slots_.at(slot);
     sl.split = n;
     sl.kc2.assign(c_.n_full(), nullptr);
@@ -378,6 +504,9 @@ int Worker::region_xfer(size_t off, int cap, int split, int lo, int hi, int copy
     CUDA_CHECK(cudaSetDevice(device));
     CHECK(lo >= split && lo <= copy_hi && copy_hi <= hi && copy_hi - split <= cap, "region_xfer keys [%d, %d) of [%d, %d) into cap %d from %d",
           lo, copy_hi, lo, hi, cap, split);
+    // keys restored into the owner's region: LSA rebuilds from lo, or from where they differ from what it clustered
+    // (lsa_set_keep: the Engine knows how far the restored tokens equal the slot's previous ones)
+    if (!save) lsa_invalidate_region(off, std::max(lo, lsa_keep_));
     std::vector<std::pair<char*, size_t>> arr;
     region_arrays(off, cap, arr);
     const size_t esz = kv_fp8_ ? 1 : 2, mesz = mtp_fp8() ? 1 : 2;
@@ -415,6 +544,7 @@ int Worker::region_xfer(size_t off, int cap, int split, int lo, int hi, int copy
 void Worker::copy_keys(size_t src_off, int src_cap, int src_split, size_t dst_off, int dst_cap, int dst_split, int lo,
                        int hi) {
     if (hi <= lo) return;
+    lsa_invalidate_region(dst_off, std::max(lo, lsa_keep_));  // (copies from another slot: the same keep)
     CUDA_CHECK(cudaSetDevice(device));
     CHECK(lo >= src_split && lo >= dst_split && hi - src_split <= src_cap && hi - dst_split <= dst_cap, "copy_keys [%d, %d)",
           lo, hi);
@@ -447,6 +577,24 @@ void Worker::alloc_xchg() {
     xbuf_ = (float*)dalloc((size_t)2 * 2 * kChunk * gh * kXchgFloats * 4, false);
     xflags_ = (unsigned*)dalloc(4 * sizeof(unsigned), false);
     CUDA_CHECK(cudaMemset(xflags_, 0, 4 * sizeof(unsigned)));
+    if (comm_.p2p && comm_.hpll[0]) {  // the host-memory candidates of the decode path (QE_DECODE_COMM)
+        xbufH_ = (float*)comm_host_alloc((size_t)2 * 2 * kChunk * gh * kXchgFloats * 4, gpu_numa_node(device));
+        xflagsH_ = (unsigned*)comm_host_alloc(4 * sizeof(unsigned), gpu_numa_node(device));
+        xh_ = comm_.dxfer == kXferHost;  // (forced host)
+        for (unsigned*& e : xep_) {  // (0 like the zeroed flags; each set counts its own units from here)
+            e = (unsigned*)dalloc(sizeof(unsigned), false);
+            CUDA_CHECK(cudaMemset(e, 0, sizeof(unsigned)));
+        }
+    }
+}
+
+void Worker::begin_unit(cudaStream_t st) {
+    // per-set exchange epochs whenever the two sets exist (review round 5 T1 / T2): the unit bumps the counter of the
+    // set its exchanges use (xchg_set), in the same kernel as the LL epoch; no copy between counters at a path switch
+    if (xep_[0]) comm_begin_unit2(ctr_, xep_[xchg_set(xh_, in_pf_)], st);
+    else comm_begin_unit(ctr_, st);
+    ll_idx_ = 0;
+    xidx_ = 0;
 }
 
 void Worker::set_xchg_peer(int j, float* buf, unsigned* flags) {
@@ -458,7 +606,8 @@ void Worker::set_xchg_peer(int j, float* buf, unsigned* flags) {
 // slots per peer; the all-reduce between layers already orders writer and reader)
 void Worker::xchg_fill(AttnShape& a) {
     a.rtab = p_.pos_split ? rtab_ : nullptr;  // (the old layout keeps the in-kernel RoPE)
-    a.xepoch = ctr_.epoch;
+    const int xs = xchg_set(xh_, in_pf_);  // the unit's flag set: the same call as begin_unit (its counter)
+    a.xepoch = xep_[0] ? xep_[xs] : ctr_.epoch;
     a.xdone = xdone_;
     a.xidx = xidx_;
     const int gh = c_.n_q / c_.n_kv, slot = xidx_ & 1;
@@ -467,12 +616,16 @@ void Worker::xchg_fill(AttnShape& a) {
         if (ash_.kv_x[j] != 3) continue;
         any = true;
         CHECK(xbuf_ && xpeer_buf_[j] && xpeer_flags_[j], "exchange buffers of kv head %d not set", j);
-        a.xo[j] = xbuf_ + ((size_t)(slot * 2 + xridx_[j]) * kChunk) * gh * kXchgFloats;
-        a.xflag[j] = xflags_ + xridx_[j] * 2 + slot;
-        a.xpo[j] = xpeer_buf_[j] + ((size_t)(slot * 2 + xsidx_[j]) * kChunk) * gh * kXchgFloats;
-        a.xpflag[j] = xpeer_flags_[j] + xsidx_[j] * 2 + slot;
+        // decode rows only (prefill keeps its probe's path, review round 2 N5)
+        const bool h = xs == 1;
+        CHECK(!h || (xbufH_ && xpeer_bufH_[j] && xpeer_flagsH_[j]), "host exchange buffers of kv head %d not set", j);
+        a.xo[j] = (h ? xbufH_ : xbuf_) + ((size_t)(slot * 2 + xridx_[j]) * kChunk) * gh * kXchgFloats;
+        a.xflag[j] = (h ? xflagsH_ : xflags_) + xridx_[j] * 2 + slot;
+        a.xpo[j] = (h ? xpeer_bufH_[j] : xpeer_buf_[j]) + ((size_t)(slot * 2 + xsidx_[j]) * kChunk) * gh * kXchgFloats;
+        a.xpflag[j] = (h ? xpeer_flagsH_[j] : xpeer_flags_[j]) + xsidx_[j] * 2 + slot;
     }
     if (any) xidx_++;
+    if (any && xs == 0 && comm_.p2p && !in_pf_) comm_test_spin(stream);  // test (QE_DECODE_TEST_STORE_US)
 }
 
 void Worker::tune_gemm() {
@@ -522,6 +675,7 @@ void Worker::undo_slot(int i) {
 void Worker::trim_slot(int i, int r, bool stash) {
     CUDA_CHECK(cudaSetDevice(device));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    lsa_invalidate(i, r);
     SeqSlot& sl = slots_.at(i);
     if (stash) {
         dn_trim(sl.dn_cur, sl.dn_save, sl.dn_pn, r, stream);
@@ -557,9 +711,44 @@ void Worker::spec_resync(int i, int pos, int tok) {
     CUDA_CHECK(cudaMemcpy(ss.pos, &pos, 4, cudaMemcpyHostToDevice));
 }
 
+std::atomic<bool> g_qe_loaded{false};
+// the engine's emergency release (engine.cpp): the KV pool's chunks past every region on this worker's card, for an
+// out-of-memory on a worker thread while the engine thread waits for the step; true: memory was freed
+std::function<bool(Worker*, size_t)> g_pool_emergency;  // set when the Engine's constructor is done (engine.cpp)
+
 void* Worker::dalloc(size_t bytes, bool weight) {
     void* p;
-    CUDA_CHECK(cudaMalloc(&p, bytes));
+    const cudaError_t r = cudaMalloc(&p, bytes);
+    if (r == cudaErrorMemoryAllocation && !g_qe_loaded.load()) {
+        // at load the card is too small for the weights + buffers: a clear stop (no abort, no core dump)
+        size_t f = 0, t = 0;
+        (void)cudaGetLastError();
+        cudaMemGetInfo(&f, &t);
+        int nd = 0;
+        cudaGetDeviceCount(&nd);
+        fprintf(stderr, "qengine: not enough GPU memory to load Qwen3.8-27B: GPU%d: %.1f MB requested, %.1f MB free of %.1f GB, "
+                "%.2f GB weights + %.2f GB cache / buffers loaded so far. The weights take about %.1f GB per card on %d card%s, "
+                "plus about 3 GB of buffers and the KV cache: use more cards or cards with more memory\n", device,
+                bytes / 1048576.0, f / 1048576.0, t / 1e9, weight_bytes / 1e9, cache_bytes / 1e9, 15.0 / std::max(1, nd) + 0.8,
+                std::max(1, nd), nd > 1 ? "s" : "");
+        fflush(stderr);
+        _exit(3);
+    }
+    if (r == cudaErrorMemoryAllocation) {  // serving (a lazily sized buffer): the cached graphs go, then the pool's unused tail
+        (void)cudaGetLastError();
+        drop_graphs();
+        fprintf(stderr, "GPU%d: out of memory for a %.1f MB buffer while serving; graph caches cleared, retrying\n", device, bytes / 1048576.0);
+        cudaError_t r2 = cudaMalloc(&p, bytes);
+        if (r2 == cudaErrorMemoryAllocation && g_pool_emergency) {
+            (void)cudaGetLastError();
+            if (g_pool_emergency(this, bytes)) r2 = cudaMalloc(&p, bytes);
+        }
+        CUDA_CHECK(r2);
+        (weight ? weight_bytes : cache_bytes) += bytes;
+        allocs_.push_back(p);
+        return p;
+    }
+    CUDA_CHECK(r);
     (weight ? weight_bytes : cache_bytes) += bytes;
     allocs_.push_back(p);
     return p;
@@ -692,6 +881,7 @@ Worker::~Worker() {
     spec_graphs_.clear();
     batch_graphs_.clear();
     for (void* p : allocs_) cudaFree(p);
+    for (void* p : graph_reserve_) cudaFree(p);
     for (auto e : evs_) cudaEventDestroy(e);
     for (cudaStream_t s : {stream, comm_stream_, pf_stream_})
         if (s) cudaStreamDestroy(s);
@@ -1073,11 +1263,8 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     }
 
     {
-        std::vector<float> f(32);
-        for (int i = 0; i < 32; i++)
-            f[i] = (float)(1.0 / std::pow(c_.rope_theta, (double)(2 * i) / c_.rot_dim));
-        inv_freq_ = (float*)dalloc(32 * 4, true);
-        CUDA_CHECK(cudaMemcpy(inv_freq_, f.data(), 32 * 4, cudaMemcpyHostToDevice));
+        inv_freq_ = (float*)dalloc(33 * 4, true);  // [32] inverse frequencies + [32] the q factor (rope_table_host)
+        set_rope();
         rope3_ = (int*)dalloc((2 + 3 * (size_t)kChunk) * 4, true);
         CUDA_CHECK(cudaMemset(rope3_, 0, 8));
         ash_.rpos3 = rope3_;
@@ -1105,6 +1292,8 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     CHECK((int)spec_cv_.size() <= kMaxLinLayers, "too many delta-net layers");
     pattn_work_floats_ = attention_prefill_work_floats(5 * 1024, ash_.nq);  // splits * rows <= 5120
     pattn_work_ = (float*)dalloc(pattn_work_floats_ * 4, false);
+    if (const char* lp = env_str("QE_LSA")) lsa_load(lp);
+    // local key rows: the native context plus the chunk (a YaRN context: size_ctx, once the pool is planned)
     pattn_ksc_ = (uint2*)dalloc((size_t)ash_.nkv * kPattnKscRows * sizeof(uint2), false);
     ash_.ksc = pattn_ksc_;
     ash_.ksc_ld = kPattnKscRows;
@@ -1199,6 +1388,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     ctr_.ss = (float*)dalloc(kCommBlocks * kMaxBatchRows * 4, false);
     ctr_.epoch = (unsigned*)dalloc(4, false);
     CUDA_CHECK(cudaMemset(ctr_.epoch, 0, 4));
+    comm_bind_ll_scrub(ctr_, comm_, rank);
     {  // copy-engine AR: device ring of flag values v[i] = i (16-bit sequence numbers, copied by DMA)
         std::vector<unsigned> v(kCeVals);
         for (unsigned i = 0; i < kCeVals; i++) v[i] = i;
@@ -1324,18 +1514,63 @@ void Worker::apply_head_masks() {
 }
 
 // Instantiate a captured graph; when the GPU is out of memory, drop every cached graph (they
-// are rebuilt on demand) and retry instead of failing the request.
-void Worker::instantiate(cudaGraphExec_t* ge, cudaGraph_t g) {
+// are rebuilt on demand) and retry instead of failing the request; then the pool's unused tail (VRAM taken by others), then
+// the graph reserve a piece at a time: what a graph takes from it comes back through the driver when graphs are dropped.
+// False: still no memory (the caller runs the step without a graph where it can).
+// (an OOM clear stays per rank: a graph's content is a function of its key, the exchange set included, so a rank that
+// re-captures builds the same graph; review rounds 3 R1 / 4 S5)
+bool Worker::instantiate(cudaGraphExec_t* ge, cudaGraph_t g) {
+    QeWdSlow slow;  // (the peers wait for this rank's launch: a slow rank, not a dead one)
     cudaError_t err = cudaGraphInstantiate(ge, g, 0);
     if (err == cudaErrorMemoryAllocation) {
         cudaGetLastError();
-        graphs_.clear();
-        spec_graphs_.clear();
-        batch_graphs_.clear();
+        drop_graphs();
         fprintf(stderr, "GPU%d: out of memory instantiating a CUDA graph; graph caches cleared\n", device);
         err = cudaGraphInstantiate(ge, g, 0);
+        if (err == cudaErrorMemoryAllocation && g_pool_emergency) {  // then the pool's unused tail (VRAM taken by others)
+            cudaGetLastError();
+            if (g_pool_emergency(this, (size_t)256 << 20)) err = cudaGraphInstantiate(ge, g, 0);
+        }
+        while (err == cudaErrorMemoryAllocation && !graph_reserve_.empty()) {
+            cudaGetLastError();
+            cudaFree(graph_reserve_.back());
+            graph_reserve_.pop_back();
+            err = cudaGraphInstantiate(ge, g, 0);
+            if (err == cudaSuccess || graph_reserve_.empty())
+                fprintf(stderr, "GPU%d: graph reserve used, %zu MB left\n", device, graph_reserve_.size() * kGraphReservePiece >> 20);
+        }
+        if (err == cudaErrorMemoryAllocation) {
+            cudaGetLastError();
+            return false;
+        }
     }
     CUDA_CHECK(err);
+    return true;
+}
+
+// the cached graphs go. A step queued ahead may be running one: synchronized first (destroying an exec in flight is undefined),
+// unless a capture is open on the stream (it cannot be synchronized then). Only under memory pressure
+void Worker::drop_graphs() {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) cudaStreamSynchronize(stream);
+    cudaGetLastError();
+    graphs_.clear();
+    spec_graphs_.clear();
+    batch_graphs_.clear();
+}
+
+// a little VRAM kept for graphs: with nothing else left a graph can still be built (the conditional lookup chain and the batched
+// step cannot run without one). Off with QE_GRAPH_RESERVE_MB=0
+void Worker::reserve_graphs(size_t bytes) {
+    for (size_t n = 0; n < bytes; n += kGraphReservePiece) {
+        void* p = nullptr;
+        if (cudaMalloc(&p, kGraphReservePiece) != cudaSuccess) {
+            cudaGetLastError();
+            fprintf(stderr, "GPU%d: graph reserve %zu of %zu MB (no more VRAM free)\n", device, n >> 20, bytes >> 20);
+            return;
+        }
+        graph_reserve_.push_back(p);
+    }
 }
 
 // debug (QE_DN_DUMP=1): delta-net state slots of the current slot before /
@@ -1368,16 +1603,31 @@ void Worker::run(int m, bool logits) {
 }
 
 void Worker::run_(int m, bool logits) {
+    dpath_use(0);  // (single-sequence decode path; no-op inside a batched step)
     if (debug_hidden) return forward(m, logits);
-    auto key = std::make_tuple(m, logits, mode(), cur_slot_);
+    // in_pf_ in the key (review round 3 R1): a prefill tail and a k = 0 decode step of the same row count capture
+    // different exchange sets, so a graph's content is a function of its key alone
+    auto key = std::make_tuple(m | (in_pf_ ? 1 << 30 : 0), logits, mode(), cur_slot_);
     cudaGraphExec_t ge = graphs_.get(key);
+    if (!ge && graph_cool_ > 0) {  // (after a graph found no memory: no capture for a while)
+        graph_cool_--;
+        return forward(m, logits);
+    }
     if (!ge) {
         cudaGraph_t g;
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
         forward(m, logits);
         CUDA_CHECK(cudaStreamEndCapture(stream, &g));
-        instantiate(&ge, g);
+        static const bool test_oom = env_int("QE_TEST_GRAPH_OOM", 0);  // test: this path on rank 0 as if no graph could be built
+        const bool ok = !(test_oom && rank == 0) && instantiate(&ge, g);
         CUDA_CHECK(cudaGraphDestroy(g));
+        if (!ok) {  // no memory for a graph, even with everything else dropped: this step without one (same kernels, slower)
+            static std::atomic<int> nlog{0};
+            if (nlog++ == 0) fprintf(stderr, "GPU%d: no VRAM for a CUDA graph: steps run without one for now\n", device);
+            graph_cool_ = kGraphCoolSteps;
+            forward(m, logits);
+            return;
+        }
         graphs_.put(key, ge);
     }
     CUDA_CHECK(cudaGraphLaunch(ge, stream));
@@ -1387,9 +1637,7 @@ void Worker::forward(int m, bool logits, bool spec) {
     const int H = c_.hidden, I = p_.inter.size();
     const float eps = c_.eps;
     cudaStream_t st = stream;
-    comm_begin_unit(ctr_, st);
-    ll_idx_ = 0;
-    xidx_ = 0;
+    begin_unit(st);  // (LL epoch, ll_idx_, xidx_, the exchange set's epoch)
     if (!spec) dn_flush_cur(st);  // deferred commit of the last verification step
     embed_gather(embed_, tokens_, m, H, resid_, st);
     const int qw = ow_, vw = dsh_.nv * 128;
@@ -1410,10 +1658,14 @@ void Worker::forward(int m, bool logits, bool spec) {
             attn_prep(proj_, proj_ld_, a, L.fa.q_norm, L.fa.k_norm, eps, inv_freq_, pos_, m,
                       qbuf_, L.fa.kc, L.fa.vc, st);
             verify_ = spec;
-            attend(a, qbuf_, L.fa.kc, L.fa.vc, pos_, m, nullptr, nullptr, xha);
+            const bool lsa = lsa_use_ && !a.split && a.fp8 && m <= kChunk;
+            if (lsa)  // LSA: sizes from the device positions, one graph for every context
+                lsa_rows(i / 4, L, a, qbuf_, pos_, m, c_.max_pos / kLsaBlk * LSA_BPB, proj_, act_);
+            else
+                attend(a, qbuf_, L.fa.kc, L.fa.vc, pos_, m, nullptr, nullptr, xha);
             verify_ = false;
-            // prefill attention (m > 8) does not write XH: fallback packing
-            mm4(L.fa.o, act_, qw, partial_, H, m, st, (m <= kMaxGemvTokens || (spec && m <= kPendRows)) ? xha : nullptr, qw);
+            // prefill attention (m > 8) and LSA do not write XH: fallback packing
+            mm4(L.fa.o, act_, qw, partial_, H, m, st, !lsa && (m <= kMaxGemvTokens || (spec && m <= kPendRows)) ? xha : nullptr, qw);
         } else {
             const size_t abs = (size_t)kChunk * 2 * dsh_.ab_pad;
             static const bool ab_par = env_int("QE_AB_PAR", 1);
@@ -1537,7 +1789,7 @@ bool Worker::allreduce_early(int m, const bf16* norm, const W4& w, float* y, int
         fa.rank = rank;
         fa.idx = ll;
         fa.m = m;
-        fa.c = comm_;
+        fa.c = comm_decode_view(comm_);  // (QE_DECODE_COMM=host: the receive words in host memory)
         fa.epoch = ctr_.epoch;
         fa.norm_w = norm;
         fa.eps = c_.eps;
@@ -1603,9 +1855,7 @@ void Worker::forward_batch(const std::vector<int>& slots, const std::vector<int>
     RowsCap cap_guard(rows_cap_, kMaxBatchRows);  // batched step: up to 64 rows on the decode kernels
     int M = 0;
     for (int m : ms) M += m;
-    comm_begin_unit(ctr_, st);
-    ll_idx_ = 0;
-    xidx_ = 0;
+    begin_unit(st);  // (LL epoch, ll_idx_, xidx_, the exchange set's epoch)
     for (size_t i = 0; i < slots.size(); i++)
         embed_gather(embed_, slots_[slots[i]].spec.tokens, ms[i], H, resid_ + (size_t)r0[i] * H, st);
     rmsnorm(resid_, layers_[0].in_norm, M, H, eps, xn_, st, xh_xn_);
@@ -1726,9 +1976,7 @@ void Worker::mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0
     RowsCap cap_guard(rows_cap_, kMaxBatchRows);  // batched step: up to 64 rows on the decode kernels
     int M = 0;
     for (int m : ms) M += m;
-    comm_begin_unit(ctr_, st);
-    ll_idx_ = 0;
-    xidx_ = 0;
+    begin_unit(st);  // (LL epoch, ll_idx_, xidx_, the exchange set's epoch)
     for (size_t i = 0; i < slots.size(); i++) {
         const SpecState& ss = slots_[slots[i]].spec;
         mtp_prep(embed_, ss.mtp_tok, hsrc[i], ss.hrow, mtp_.pre_e, mtp_.pre_h, eps, ms[i], H,
@@ -1808,6 +2056,8 @@ void Worker::dec_gemm_warm(int) {
 
 void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd,
                             const std::vector<int>* lkr, const std::vector<int>* kav) {
+    dpath_use(1);  // the batched steps' decode path (calibration), kept by the inner calls
+    struct InBatch { bool& f; explicit InBatch(bool& x) : f(x) { f = true; } ~InBatch() { f = false; } } in_batch(in_batch_);
     attn_rs_ = false;  // row split only for the single-sequence step (launch_step)
     std::string key = std::to_string(kd);
     for (size_t i = 0; i < slots.size(); i++) {
@@ -1962,7 +2212,8 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         if (lkb_on()) lookup_step_batch(lb, st);  // drafts for the next step (count at emit[31])
         CUDA_CHECK(cudaStreamEndCapture(st, &g));
         const auto tcap1 = std::chrono::steady_clock::now();
-        if (!batch_update(key, g, &bge)) instantiate(&bge, g);
+        // (the batched step and the conditional lookup chain of run_spec need their graph: the reserve is what keeps them going)
+        if (!batch_update(key, g, &bge)) CHECK(instantiate(&bge, g), "out of VRAM for a batched-step graph");
         static double tcap_tot = 0;
         tcap_tot += std::chrono::duration<double, std::milli>(tcap1 - tcap0).count();
         CUDA_CHECK(cudaGraphDestroy(g));
@@ -2102,6 +2353,321 @@ void Worker::matmul_part(const W4& w, const bf16* x, int ldx, int m, size_t row0
 // 64 = the prefill all-reduce kernels themselves
 static int dbg_skip() { return env_int("QE_DBG_SKIP", 0); }
 
+// QE_LSA_DUMP=<dir> (debug): for the prefill micro-batch holding position QE_LSA_DUMP_POS,
+// write each full-attention layer's q rows (this card's heads, bf16) and this card's K / V arrays (fp8 bytes, owned
+// keys before the batch's end) with their position maps, for the Python reference. QE_LSA_DUMP_LAYERS: comma list of
+// full-attention ordinals (default all). Synchronous, eager prefill only.
+static void lsa_dump(const Worker& w, int rank, int li, int ord, const AttnShape& a, const CardPlan& p, int p0, int mb,
+                     const bf16* q, const void* kc, const void* vc, float ks, float vs, cudaStream_t st) {
+    static const char* dir = env_str("QE_LSA_DUMP");
+    static const int at = env_int("QE_LSA_DUMP_POS", -1);
+    if (!dir || at < p0 || at >= p0 + mb || a.split) return;
+    if (const char* ls = env_str("QE_LSA_DUMP_LAYERS")) {
+        bool hit = false;
+        for (const char* c = ls; *c;) {
+            if (atoi(c) == ord) hit = true;
+            while (*c && *c != ',') c++;
+            if (*c) c++;
+        }
+        if (!hit) return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    const int end = p0 + mb;
+    char fn[512];
+    snprintf(fn, sizeof fn, "%s/L%02d_r%d.json", dir, ord, rank);
+    FILE* f = fopen(fn, "w");
+    CHECK(f, "open %s", fn);
+    fprintf(f, "{\"layer\": %d, \"ord\": %d, \"rank\": %d, \"p0\": %d, \"mb\": %d, \"nq\": %d, \"q0\": %d, "
+               "\"ks\": %.9g, \"vs\": %.9g, \"fp8\": %d, \"kv\": [", li, ord, rank, p0, mb, a.nq, p.q_heads.b, ks, vs, a.fp8);
+    std::vector<char> buf;
+    for (int j = 0; j < a.nkv; j++) {
+        const PosMap& m = a.kv_pm[j];
+        const size_t es = a.fp8 ? 1 : 2, rows = pm_rank(m, end), o = head_rows(a, j, a.max_t) * 256 * es;
+        fprintf(f, "%s{\"g\": %d, \"P\": %d, \"A\": %d, \"O\": %d, \"rows\": %zu}", j ? ", " : "", p.kv_heads.b + j, m.P,
+                m.A, m.O, rows);
+        for (int kv = 0; kv < 2; kv++) {
+            buf.resize(rows * 256 * es);
+            CUDA_CHECK(cudaMemcpy(buf.data(), (const char*)(kv ? vc : kc) + o, buf.size(), cudaMemcpyDeviceToHost));
+            snprintf(fn, sizeof fn, "%s/L%02d_r%d_%c%d.bin", dir, ord, rank, kv ? 'v' : 'k', p.kv_heads.b + j);
+            FILE* g = fopen(fn, "wb");
+            CHECK(g, "open %s", fn);
+            fwrite(buf.data(), 1, buf.size(), g);
+            fclose(g);
+        }
+    }
+    fprintf(f, "]}\n");
+    fclose(f);
+    buf.resize((size_t)mb * a.nq * 256 * 2);
+    CUDA_CHECK(cudaMemcpy(buf.data(), q, buf.size(), cudaMemcpyDeviceToHost));
+    snprintf(fn, sizeof fn, "%s/L%02d_r%d_q.bin", dir, ord, rank);
+    FILE* g = fopen(fn, "wb");
+    CHECK(g, "open %s", fn);
+    fwrite(buf.data(), 1, buf.size(), g);
+    fclose(g);
+    (void)w;
+}
+
+// ---------------------------------------------------------------- LSA
+// QE_LSA=<map.safetensors> (tools/lsa/convert_map.py): D-LSA flat in the 16 full-attention layers (prefill and single-sequence decode).
+// QE_LSA_PF_MIN / QE_LSA_DEC_MIN: prefill chunks / decode steps starting below these positions keep the dense kernels.
+void Worker::lsa_load(const std::string& path) {
+    // refusals: one behaviour (LSA off, the reason on stdout with the start-up lines, the server runs dense)
+    const char* why = !lsa_allowed_ ? lsa_refusal_.c_str() : !kv_fp8_ ? "it needs the FP8 KV cache (QE_KV_FP8=1)" : nullptr;
+    if (why) {
+        if (rank == 0) printf("LSA off: %s; full attention\n", why);
+        return;
+    }
+    const int nfull = (int)std::count(c_.is_full.begin(), c_.is_full.end(), true);
+    lsa_.assign(nfull, LsaLayer{});
+    lsa_closed_.assign(nfull, 0);
+    try {  // (the Engine validated the map already; a failure here is refused the same way, never std::terminate)
+        SafeTensors mp;
+        mp.open(path);
+        for (int i = 0; i < c_.layers; i++) {
+            if (!c_.is_full[i]) continue;
+            if (i % 4 != 3) throw std::runtime_error("full-attention layer " + std::to_string(i) + " is not every 4th");
+            LsaLayer& L = lsa_[i / 4];
+            for (int w = 0; w < 2; w++) {
+                const TensorInfo& t = mp.get(std::to_string(i) + (w ? ".W_K_idx" : ".W_Q_idx"));
+                if (!(t.dtype == "F32" && t.shape.size() == 2 && t.shape[0] == kLsaIn && t.shape[1] == kLsaDim &&
+                      t.nbytes == (size_t)kLsaIn * kLsaDim * 4))
+                    throw std::runtime_error("layer " + std::to_string(i) + " needs fp32 [768, 64]");
+                std::vector<bf16> h(kLsaIn * kLsaDim);
+                const float* f = (const float*)t.data;
+                for (size_t e = 0; e < h.size(); e++) h[e] = __float2bfloat16(f[e]);
+                bf16* d = (bf16*)dalloc(h.size() * 2, true);
+                CUDA_CHECK(cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+                (w ? L.wk : L.wq) = d;
+            }
+        }
+    } catch (const std::exception& e) {
+        if (rank == 0) printf("LSA off: map %s: %s; full attention\n", path.c_str(), e.what());
+        return;
+    }
+    lsa_path_ = path;
+    lsa_part_ = (float*)dalloc((size_t)kLsaXRows * kLsaDim * 4, false);
+    lsa_iq_ = (bf16*)dalloc((size_t)kChunk * kLsaDim * 2, false);
+    lsa_ik_ = (bf16*)dalloc((size_t)kLsaXRows * kLsaDim * 2, false);
+    lsa_list_ = (unsigned*)dalloc((size_t)kChunk * kLsaListMax * 4, false);
+    lsa_n_ = (int*)dalloc((size_t)kChunk * 4, false);
+    lsa_uscr_ = dalloc(lsa_union_bytes(kChunk, ash_.nkv), false);
+    lsa_x_.rank = rank;
+    lsa_x_.ngpu = ngpu_;
+    lsa_x_.rx = (float*)dalloc((size_t)2 * ngpu_ * kLsaXRows * kLsaDim * 4, false);
+    lsa_x_.rf = (unsigned*)dalloc((size_t)2 * ngpu_ * 4, false);
+    lsa_x_.seq = (unsigned*)dalloc(16, false);
+    lsa_x_.done = lsa_x_.seq + 1;
+    lsa_x_.stats = lsa_x_.seq + 2;
+    CUDA_CHECK(cudaMemset(lsa_x_.rf, 0, (size_t)2 * ngpu_ * 4));
+    CUDA_CHECK(cudaMemset(lsa_x_.seq, 0, 16));
+    // per-length switches: below these positions the dense kernels are faster (and exact)
+    lsa_pf_min_ = env_int("QE_LSA_PF_MIN", 65536);
+    lsa_dec_min_ = env_int("QE_LSA_DEC_MIN", 196608);
+    lsa_closed_dev_ = (int*)dalloc((size_t)nfull * 4, false);
+    CUDA_CHECK(cudaMemset(lsa_closed_dev_, 0, (size_t)nfull * 4));
+    lsa_ready_ = true;
+    // the context-sized part (bucket cache, score rows): now for the native context, else once the pool planner knows
+    // what one conversation reaches (size_ctx; counted per position in ctx_bytes_per_pos)
+    if (c_.max_pos <= c_.native_ctx) lsa_size(c_.max_pos);
+}
+
+// QE_LSA_MODE: block (training-free block-sparse: every 4-key pool its own bucket, scored by its pooled index key;
+// k 2,048, p 512 as the paper's block baseline) or dlsa (Ward buckets of ~8 keys, k 4,096, p 1,024). Default by the
+// context one conversation reaches: block below 1M (512K prompt: 9.5 % faster prefill, the same gate answers as dlsa),
+// dlsa from 1M on (the one measured there; the paper has D-LSA ahead of block selection past ~1M). Chosen once: the
+// bucket structures differ.
+static bool lsa_block_mode(int max_pos) {
+    const char* mode = env_str("QE_LSA_MODE");
+    return mode ? !strcmp(mode, "block") : max_pos < 1048576;
+}
+static int lsa_sel_rows() { return env_int("QE_LSA_SEL_ROWS", 64); }  // v1 path rows, fallback score rows
+
+// bytes per position of the context-sized LSA buffers of the mode a context max_pos runs (bucket cache: centroids +
+// membership per full layer; the selection's score rows)
+static size_t lsa_bytes_per_pos(int nfull, int max_pos) {
+    const int bpb = lsa_block_mode(max_pos) ? kLsaPools : kLsaBpb;
+    return (size_t)nfull * bpb * (kLsaDim * 2 + 4) / kLsaBlk +
+           (lsa_select_scratch_bytes(kLsaBlk * 64, lsa_sel_rows(), bpb) - lsa_select_scratch_bytes(0, lsa_sel_rows(), bpb)) / (kLsaBlk * 64);
+}
+
+void Worker::lsa_size(int max_pos) {
+    if (!lsa_ready_ || lsa_on_) return;
+    if (max_pos > kLsaMaxPos) {
+        if (rank == 0) printf("LSA off: contexts above %d tokens are not supported; full attention\n", kLsaMaxPos);
+        return;
+    }
+    const bool block = lsa_block_mode(max_pos);
+    lsa_config(block ? LsaCfg{kLsaPools, 2048, 512} : LsaCfg{kLsaBpb, kLsaK, kLsaP});
+    const size_t nb = (size_t)max_pos / kLsaBlk * LSA_BPB;
+    for (auto& L : lsa_) {
+        L.cent = (bf16*)dalloc(nb * kLsaDim * 2, false);
+        L.mem = (unsigned*)dalloc(nb * 4, false);
+    }
+    lsa_scr_bytes_ = lsa_select_scratch_bytes(max_pos, lsa_sel_rows(), LSA_BPB);
+    lsa_scr_ = dalloc(lsa_scr_bytes_, false);
+    lsa_on_ = true;
+    if (rank == 0)
+        printf("LSA (%s): %s, %zu layers, k %d p %d sink %d window %d, bucket cache %.0f MB per GPU (context %d), "
+               "prefill from %d, decode from %d\n", LSA_BPB == kLsaBpb ? "D-LSA" : "block", lsa_path_.c_str(),
+               lsa_.size(), LSA_K, LSA_P, kLsaSink, kLsaBlk, lsa_.size() * nb * (kLsaDim * 2 + 4) / 1e6, max_pos,
+               lsa_pf_min_, lsa_dec_min_);
+}
+
+void Worker::lsa_disable(const std::string& why) {
+    if (lsa_on_ && rank == 0) printf("LSA off: %s; full attention\n", why.c_str());
+    lsa_on_ = false;
+    lsa_use_ = false;
+}
+
+void Worker::lsa_detach() {  // the owner's slot gets other content / is evicted: the index waits for its tokens
+    if (!lsa_on_ || lsa_slot_ < 0) return;
+    lsa_slot_ = -1;
+    lsa_detached_ = true;
+}
+
+void Worker::lsa_reattach(int slot, int keep, bool log) {  // its tokens came back (up to keep): the index follows, still valid
+    if (!lsa_on_ || !lsa_detached_ || lsa_slot_ >= 0) return;
+    lsa_slot_ = slot;
+    lsa_detached_ = false;
+    CUDA_CHECK(cudaSetDevice(device));  // (called inside pool_->run: each card writes its own device counts)
+    for (size_t o = 0; o < lsa_closed_.size(); o++) {
+        lsa_closed_[o] = std::min(lsa_closed_[o], std::max(0, keep) / kLsaBlk);
+        lsa_set_int(lsa_closed_dev_ + o, lsa_closed_[o], stream);
+    }
+    if (rank == 0 && log) printf("LSA: index of a returning conversation kept up to %d tokens (slot %d)\n", keep, slot);
+    static const bool check = env_int("QE_LSA_CHECK", 0) != 0;  // debug: every card's device counts = the host ones
+    if (check) {
+        std::vector<int> d(lsa_closed_.size());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpy(d.data(), lsa_closed_dev_, d.size() * 4, cudaMemcpyDeviceToHost));
+        printf("LSA check: card %d device closed %s the host counts (layer 0: %d / %d blocks)\n", rank,
+               d == lsa_closed_ ? "equal to" : "DIFFER from", d[0], lsa_closed_[0]);
+    }
+}
+
+void Worker::lsa_mode(int slot, int pos) {  // the decode graph's LSA bit, from host state only (no worker round trip)
+    lsa_use_ = lsa_on_ && slot == lsa_slot_ && !slots_.at(slot).split && pos >= lsa_dec_min_;
+}
+
+void Worker::lsa_invalidate(int slot, int from) {
+    if (!lsa_on_ || (slot >= 0 && slot != lsa_slot_)) return;
+    if (slot < 0) {
+        lsa_slot_ = -1;
+        lsa_detached_ = false;
+        return;
+    }
+    for (int& c : lsa_closed_) c = std::min(c, std::max(0, from) / kLsaBlk);
+    for (size_t o = 0; o < lsa_closed_.size(); o++) lsa_set_int(lsa_closed_dev_ + o, lsa_closed_[o], stream);
+}
+
+void Worker::lsa_invalidate_region(size_t off, int from) {  // keys from `from` on written into the region at off
+    // (a paused owner's region is released: cap 0; another slot restored at that offset does not touch its index)
+    if (lsa_on_ && lsa_slot_ >= 0 && slots_.at(lsa_slot_).max_t > 0 && slots_.at(lsa_slot_).off == off)
+        lsa_invalidate(lsa_slot_, from);
+}
+
+void Worker::lsa_bind(int slot, int from) {
+    const std::vector<int> was = lsa_closed_;
+    const bool moved = slot != lsa_slot_;  // a new slot: every count written (not only the changed ones)
+    if (moved) {
+        lsa_slot_ = slot;
+        lsa_detached_ = false;
+        std::fill(lsa_closed_.begin(), lsa_closed_.end(), 0);
+    }
+    for (int& c : lsa_closed_) c = std::min(c, std::max(0, from) / kLsaBlk);  // keys from `from` on (re)written
+    for (size_t o = 0; o < lsa_closed_.size(); o++)
+        if (lsa_closed_[o] != was[o] || moved) lsa_set_int(lsa_closed_dev_ + o, lsa_closed_[o], stream);
+}
+
+void Worker::lsa_catch_up(int ord, const Layer& L, const AttnShape& a, int keys) {
+    int& c = lsa_closed_[ord];
+    const int target = keys / kLsaBlk;
+    if (c >= target) return;
+    while (c < target) {
+        const int nb = std::min(target - c, kLsaXRows / kLsaBlk);
+        const int k0 = c * kLsaBlk, k1 = (c + nb) * kLsaBlk;
+        lsa_ik_partial(L.fa.kc, a, L.fa.ks, k0, k1, lsa_roles_, lsa_[ord].wk, lsa_part_, stream);
+        lsa_exchange(lsa_x_, lsa_part_, k1 - k0, lsa_ik_, stream);
+        lsa_cluster(lsa_ik_, c, c + nb, lsa_[ord], stream);
+        c += nb;
+    }
+    lsa_set_int(lsa_closed_dev_ + ord, c, stream);
+}
+
+void Worker::lsa_rows(int ord, const Layer& L, const AttnShape& a, const bf16* q, const int* pos, int m, int vmax,
+                      const float* proj, bf16* out) {
+    lsa_iq_partial(q, ash_.nq, m, lsa_roles_, lsa_[ord].wq, lsa_part_, stream);
+    lsa_exchange(lsa_x_, lsa_part_, m, lsa_iq_, stream);
+    lsa_select(lsa_iq_, m, vmax, pos, lsa_closed_dev_ + ord, lsa_[ord], lsa_scr_, lsa_scr_bytes_, lsa_list_, lsa_n_,
+               stream, lsa_x_.stats);
+    lsa_attend(q, L.fa.kc, L.fa.vc, a, proj, proj_ld_, pos, lsa_closed_dev_ + ord, m, c_.max_pos, lsa_list_, lsa_n_,
+               lsa_uscr_, out, pattn_work_, pattn_work_floats_, stream);
+}
+
+void Worker::lsa_step(int slot, int pos, bool bind) {
+    lsa_use_ = false;
+    if (!lsa_on_) return;
+    // one bucket cache: a decode step of another slot runs dense and leaves it to its owner (only a long prefill
+    // takes it over, prefill_chunk), so alternating conversations never rebuild it
+    if (slot != lsa_slot_ && !bind) return;
+    if (slots_.at(slot).split) {  // on a shared prefix: dense, and the owner (another slot) keeps its cache
+        if (rank == 0 && pos >= std::min(lsa_pf_min_, lsa_dec_min_) && lsa_split_logged_.insert(slot).second)
+            printf("LSA: slot %d is attached to a shared prefix: full attention for it (the sparse index stays with "
+                   "slot %d)\n", slot, lsa_slot_);
+        if (slot == lsa_slot_) lsa_slot_ = -1;
+        return;
+    }
+    CUDA_CHECK(cudaSetDevice(device));
+    if (bind && slot != lsa_slot_ && lsa_slot_ >= 0 && rank == 0) {  // M5: the index moves (rebuilt from the cache)
+        int c = 0;
+        for (int x : lsa_closed_) c = std::max(c, x);
+        if (c > 0)
+            printf("LSA: index moves from slot %d (%d blocks) to slot %d: rebuilt from its KV cache\n", lsa_slot_, c,
+                   slot);
+    }
+    lsa_bind(slot, pos);  // (positions >= pos are the step's rows: nothing clustered there)
+    for (int i = 0; i < c_.layers; i++)
+        if (layers_[i].full) lsa_catch_up(i / 4, layers_[i], layer_shape(&layers_[i]), pos);
+    lsa_use_ = pos >= lsa_dec_min_;
+}
+
+bool Worker::lsa_prefill(int ord, const Layer& L, const AttnShape& a, int r0, int mb, const int* pos, const float* proj) {
+    if (cur_slot_ != lsa_slot_) return false;  // another slot's prompt: dense, the cache stays with its owner
+    if (a.split) {  // (the owner attached to a shared prefix: set_prefix invalidated it already)
+        lsa_slot_ = -1;
+        return false;
+    }
+    const int p0 = pf_p0_ + r0;
+    lsa_catch_up(ord, L, a, p0 + mb);
+    if (!lsa_use_ || mb > kChunk) return false;
+    const int qbw = ash_.nq * 256;
+    lsa_rows(ord, L, a, qbuf_ + (size_t)r0 * qbw, pos, mb, (p0 + mb - 1) / kLsaBlk * LSA_BPB, proj,
+             act_ + (size_t)r0 * ow_);
+    static const char* dir = env_str("QE_LSA_DUMP");
+    static const int at = env_int("QE_LSA_DUMP_POS", -1);
+    if (dir && at >= p0 && at < p0 + mb) {  // debug (lsa_ref.py --engine): lists, gated outputs, gates of this batch
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto put = [&](const char* tag, const void* src, size_t bytes, size_t pitch = 0, size_t width = 0, int rows = 0) {
+            std::vector<char> b(bytes);
+            if (pitch)
+                CUDA_CHECK(cudaMemcpy2D(b.data(), width, src, pitch, width, rows, cudaMemcpyDeviceToHost));
+            else
+                CUDA_CHECK(cudaMemcpy(b.data(), src, bytes, cudaMemcpyDeviceToHost));
+            char fn[512];
+            snprintf(fn, sizeof fn, "%s/L%02d_r%d_%s.bin", dir, ord, rank, tag);
+            FILE* f = fopen(fn, "wb");
+            CHECK(f, "open %s", fn);
+            fwrite(b.data(), 1, b.size(), f);
+            fclose(f);
+        };
+        put("list", lsa_list_, (size_t)mb * kLsaListMax * 4);
+        put("nlist", lsa_n_, (size_t)mb * 4);
+        put("out", act_ + (size_t)r0 * ow_, (size_t)mb * ow_ * 2);
+        put("proj", proj, (size_t)mb * ash_.nq * 512 * 4, (size_t)proj_ld_ * 4, (size_t)ash_.nq * 512 * 4, mb);
+    }
+    return true;
+}
+
 void Worker::mixer_rows(int i, int r0, int mb, const int* pos, int slot_off, bool pb) {
     Layer& L = layers_[i];
     const int H = c_.hidden;
@@ -2118,7 +2684,10 @@ void Worker::mixer_rows(int i, int r0, int mb, const int* pos, int slot_off, boo
         xchg_fill(a);
         attn_prep(proj, proj_ld_, a, L.fa.q_norm, L.fa.k_norm, eps, inv_freq_, pos, mb,
                   qbuf_ + (size_t)r0 * qbw, L.fa.kc, L.fa.vc, st);
-        if (!(dbg_skip() & 8)) attend(a, qbuf_ + (size_t)r0 * qbw, L.fa.kc, L.fa.vc, pos, mb, proj, act_ + (size_t)r0 * qw);
+        if (pf_p0_ >= 0) lsa_dump(*this, rank, i, i / 4, a, p_, pf_p0_ + r0, mb, qbuf_ + (size_t)r0 * qbw, L.fa.kc, L.fa.vc,
+                                  L.fa.ks, L.fa.vs, st);
+        if (!(dbg_skip() & 8) && !(lsa_on_ && pf_p0_ >= 0 && lsa_prefill(i / 4, L, a, r0, mb, pos, proj)))
+            attend(a, qbuf_ + (size_t)r0 * qbw, L.fa.kc, L.fa.vc, pos, mb, proj, act_ + (size_t)r0 * qw);
         matmul_part(L.fa.o, act_ + (size_t)r0 * qw, qw, mb, r0, pb);
     } else {
         const int ldab = 2 * dsh_.ab_pad, vw = dsh_.nv * 128;
@@ -2157,6 +2726,7 @@ void Worker::mixer_rows(int i, int r0, int mb, const int* pos, int slot_off, boo
 }
 
 void Worker::forward_prefill(int m, bool logits) {
+    struct InPf { bool& f; bool o; explicit InPf(bool& x) : f(x), o(x) { f = true; } ~InPf() { f = o; } } in_pf(in_pf_);  // (nested: restores)
     const int H = c_.hidden, I = p_.inter.size();
     const float eps = c_.eps;
     cudaStream_t st = stream, cs = comm_stream_;
@@ -2166,9 +2736,7 @@ void Worker::forward_prefill(int m, bool logits) {
     add_int(pos_mb_, pos_, m0, st);
     const int* poss[2] = {pos_, pos_mb_};
     if (p_.pos_split) {  // the stats flags need a fresh epoch per prefill chunk (old layout: as before)
-        comm_begin_unit(ctr_, st);
-        ll_idx_ = 0;
-        xidx_ = 0;
+        begin_unit(st);  // (LL epoch, ll_idx_, xidx_, the exchange set's epoch)
     }
     embed_gather(embed_, tokens_, m, H, resid_, st);
     rmsnorm(resid_, layers_[0].in_norm, m, H, eps, xn_, st);
@@ -2443,9 +3011,7 @@ void Worker::mtp_forward(int m, const int* pos, const int* tok, const bf16* hsrc
     const int H = c_.hidden, I = p_.inter.size();
     const float eps = c_.eps;
     cudaStream_t st = stream;
-    comm_begin_unit(ctr_, st);
-    ll_idx_ = 0;
-    xidx_ = 0;
+    begin_unit(st);  // (LL epoch, ll_idx_, xidx_, the exchange set's epoch)
     mtp_prep(embed_, tok, hsrc, hrow, mtp_.pre_e, mtp_.pre_h, eps, m, H, mtp_in_, st);
     mm4(mtp_.fc, mtp_in_ + p_.fc_k.b, 2 * H, partial_, H, m, st);
     CUDA_CHECK(cudaMemsetAsync(mtp_resid_, 0, (size_t)m * H * 4, st));
@@ -2489,9 +3055,7 @@ void Worker::mtp_forward_prefill(int m, bool logits) {
     const int r0s[2] = {0, m0}, mbs[2] = {m0, m - m0};
     add_int(pos_mb_, pos_, m0, st);
     const int* poss[2] = {pos_, pos_mb_};
-    comm_begin_unit(ctr_, st);
-    ll_idx_ = 0;
-    xidx_ = 0;
+    begin_unit(st);  // (LL epoch, ll_idx_, xidx_, the exchange set's epoch)
     mtp_prep(embed_, spec_.mtp_tok, xn_, nullptr, mtp_.pre_e, mtp_.pre_h, eps, m, H, mtp_in_, st);
     CUDA_CHECK(cudaMemsetAsync(mtp_resid_, 0, (size_t)m * H * 4, st));
     AttnShape a0 = layer_shape(nullptr);
@@ -2680,8 +3244,17 @@ void Worker::set_rope_delta(int delta) {
 }
 
 void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const int* rope3) {
+    struct InPf { bool& f; bool o; explicit InPf(bool& x) : f(x), o(x) { f = true; } ~InPf() { f = o; } } in_pf(in_pf_);  // (nested: restores)
     const bool last = i0 + m == n;
     pf_p0_ = i0;
+    if (lsa_on_) {  // LSA: this slot's bucket cache up to the chunk (its own blocks: per micro-batch / next chunk);
+        // a prompt that stays below QE_LSA_PF_MIN in another slot runs dense and leaves the cache to its owner
+        lsa_use_ = false;
+        if (cur_slot_ == lsa_slot_ || i0 + m > lsa_pf_min_) {
+            lsa_step(cur_slot_, i0, true);
+            lsa_use_ = lsa_slot_ == cur_slot_ && i0 >= lsa_pf_min_;
+        }
+    }
     CUDA_CHECK(cudaMemcpyAsync(tokens_, ids + i0, m * 4, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(pos_, &i0, 4, cudaMemcpyHostToDevice, stream));
     // multimodal prompt: (t, h, w) RoPE positions of this chunk's rows (header: rows, first index)
@@ -2699,7 +3272,7 @@ void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const in
     // prompt-end token of a long prompt: the graphs go whenever the slot's region moves, so nearly
     // every new prompt captured and instantiated a whole-model graph for a single launch): launch
     // it directly; a repeated key is captured as before (QE_PF_EAGER=0: always a graph)
-    const auto gkey = std::make_tuple(m, last, mode(), cur_slot_);
+    const auto gkey = std::make_tuple(m | (in_pf_ ? 1 << 30 : 0), last, mode(), cur_slot_);  // (run_'s key: S4)
     if (cap_) forward(m, last);  // activation capture: eager, every layer output seen (capture_rows)
     else if (m <= kMaxGemvTokens && env_int("QE_PF_EAGER", 1) && !debug_hidden && !graphs_.m.count(gkey) &&
         eager_seen_.insert(gkey).second)
@@ -2735,6 +3308,54 @@ void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const in
     }
     if (rope3) CUDA_CHECK(cudaMemsetAsync(rope3_, 0, 4, stream));  // later passes: text positions
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    static const bool lsa_stats = env_int("QE_LSA_STATS", 0) != 0;
+    if (lsa_on_ && lsa_stats && last) {  // since the last report (decode steps and this prompt), reset on every card
+        unsigned st2[2];
+        CUDA_CHECK(cudaMemcpy(st2, lsa_x_.stats, 8, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemset(lsa_x_.stats, 0, 8));
+        if (rank == 0)
+            printf("LSA stats since the last report: rows x layers that took the exact fallback: %u in prompt chunks, "
+                   "%u in decode-sized steps (<= 16 rows)\n", st2[0], st2[1]);
+    }
+}
+
+// RoPE table (c_.yarn, c_.native_ctx) to the device: at load and again when the Engine lowers the YaRN factor to the
+// context the pool holds (before any request)
+void Worker::set_rope() {
+    CUDA_CHECK(cudaSetDevice(device));
+    std::vector<float> f(33);
+    double lo = 0, hi = 0;
+    rope_table_host(c_.yarn, c_.rope_theta, c_.rot_dim, c_.native_ctx, f.data(), &lo, &hi);
+    CUDA_CHECK(cudaMemcpy(inv_freq_, f.data(), 33 * 4, cudaMemcpyHostToDevice));
+    if (c_.yarn > 1 && rank == 0)
+        printf("YaRN RoPE: factor %.3f (original %d), correction dims %.0f..%.0f, attention factor %.4f (squared on q)\n",
+               c_.yarn, c_.native_ctx, lo, hi, std::sqrt((double)f[32]));
+}
+
+// buffers sized by the context above the native one (YaRN): the prefill per-key K-scale scratch
+void Worker::size_ctx(int max_pos) {
+    lsa_size(max_pos);  // (QE_LSA: its context-sized buffers for the reachable context)
+    if (max_pos + 4096 <= ash_.ksc_ld) return;
+    CUDA_CHECK(cudaSetDevice(device));
+    pattn_ksc_ = (uint2*)dalloc((size_t)ash_.nkv * (max_pos + 4096) * sizeof(uint2), false);
+    ash_.ksc = pattn_ksc_;
+    ash_.ksc_ld = max_pos + 4096;
+}
+
+size_t Worker::ctx_bytes_per_pos(int max_pos) const {
+    // (LSA: none above kLsaMaxPos, where lsa_size refuses and the run is dense)
+    const bool lsa = lsa_ready_ && !lsa_on_ && max_pos <= kLsaMaxPos;
+    return (size_t)ash_.nkv * sizeof(uint2) + (lsa ? lsa_bytes_per_pos((int)lsa_.size(), max_pos) : 0);
+}
+
+size_t Worker::ctx_fixed_bytes(int max_pos) const {  // the selection scratch's part that does not grow with the context
+    return lsa_ready_ && !lsa_on_ && max_pos <= kLsaMaxPos ? lsa_select_scratch_bytes(0, lsa_sel_rows(), kLsaBpbMax) : 0;
+}
+
+void Worker::lsa_unsized(size_t reach) {
+    if (lsa_ready_ && !lsa_on_ && rank == 0)
+        printf("LSA off: one conversation reaches only %zu tokens with its buffers in the KV pool (below the native "
+               "context %d); full attention\n", reach, c_.native_ctx);
 }
 
 void Worker::lk_init(int cap, int mmin, int lmax) {
@@ -2792,6 +3413,7 @@ void Worker::lk_set_history(const int* ids, int n) {
 }
 
 void Worker::run_spec(int kv, int kd, bool launch, bool lookup) {
+    dpath_use(0);
     auto key = std::make_tuple(kv, kd | (lookup ? 256 : 0), mode(), cur_slot_);
     cudaGraphExec_t sge = spec_graphs_.get(key);
     if (!sge) {
@@ -2890,9 +3512,33 @@ void Worker::run_spec(int kv, int kd, bool launch, bool lookup) {
             }
         }
         CUDA_CHECK(cudaStreamEndCapture(stream, &g));
-        instantiate(&sge, g);
+        CHECK(instantiate(&sge, g), "out of VRAM for a speculative-step graph");
         CUDA_CHECK(cudaGraphDestroy(g));
         spec_graphs_.put(key, sge);
     }
     if (launch) CUDA_CHECK(cudaGraphLaunch(sge, stream));
+}
+
+void Worker::set_dpath(int single, int batched, int xh) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    graphs_.clear();
+    spec_graphs_.clear();
+    batch_graphs_.clear();
+    dpath_[0] = single, dpath_[1] = batched;
+    comm_.dxfer = single;
+    // the KV-split exchange of decode units on host memory only when both modes are (xh: forced by the calibration's
+    // mixed-pick legs); each set has its own epoch counter (xep_, begin_unit), so switching sets needs no copy
+    xh_ = xbufH_ && (xh < 0 ? single == kXferHost && batched == kXferHost : xh != 0);
+}
+void Worker::free_dhost() {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    comm_host_free(xbufH_);
+    comm_host_free(xflagsH_);
+    xbufH_ = nullptr, xflagsH_ = nullptr, xh_ = false;  // (xep_ stays: the device set keeps its own counter, no jump)
+    for (int j = 0; j < kMaxLocalKv; j++) xpeer_bufH_[j] = nullptr, xpeer_flagsH_[j] = nullptr;
+    dpath_[0] = dpath_[1] = kXferP2P;
+    comm_.dxfer = kXferP2P;
+    for (int i = 0; i < 4; i++) comm_.hpll[i] = nullptr, comm_.hpag[i] = nullptr;  // (freed by the engine's Comm)
 }

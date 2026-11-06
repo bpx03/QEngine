@@ -231,6 +231,9 @@ def effort_units():
         assert rules is {"qwen": Q, "glm": G, "raw": tb.RAW_RULES}[kind], (label, rules.describe())
         if kind == "raw":
             assert tb.budget_source({}, {}, BM.parse("low:40,xhigh:60"), rules) == (60, "effort:xhigh")
+            # review L3: thinking off gets no server budget (the request's own budget still wins)
+            assert tb.budget_source({}, {"enable_thinking": False}, BM.parse("low:40,xhigh:60"), rules) == (None, "none")
+            assert tb.budget_source({"thinking_budget": 30}, {"enable_thinking": False}, BM.parse("xhigh:60"), rules) == (30, "request")
             print(f"  template {label}: {rules.describe()}")
             continue
         seen = []
@@ -531,6 +534,22 @@ def main():
     assert got == {"effort:low": 3, "effort:xhigh": 4, "effort:medium": 1, "request": 1, "off": 1, "default": 1}, got
     assert th["budget_default"] == 45 and th["effort_rules"].startswith("qwen3.8"), th
     print("  thinking off: no forced close; plain 45: default; /api/stats budget_from", got)
+    # 26b. enable_thinking null / 0: the template opens <think> (its test is `is false`), so the reply starts in reasoning on both APIs
+    for v in (None, 0):
+        kwa = {"chat_template_kwargs": {"enable_thinking": v}}
+        r = c.post("/v1/chat/completions", json={"model": name, "messages": msgs, "max_tokens": 200, **kwa}).json()
+        p = [l for l in open(log) if l.startswith("P ")][-1].split()
+        assert tok.decode([int(x) for x in p[3:]], skip_special_tokens=False).endswith("<think>\n"), v
+        m = r["choices"][0]["message"]
+        assert m.get("reasoning_content") and "</think>" not in (m["content"] or ""), (v, m)
+        r = c.post("/v1/messages", json={"model": name, "messages": msgs, "max_tokens": 200, **kwa}).json()
+        kinds = [b["type"] for b in r["content"]]
+        assert "thinking" in kinds and not any("</think>" in b.get("text", "") for b in r["content"]), (v, r["content"])
+        t = c.post("/v1/chat/completions", json={"model": name, "messages": msgs, "max_tokens": 200, "stream": True, **kwa}).text
+        assert "reasoning_content" in t and "</think>" not in t.replace("\\u003c", "<"), (v, t[:300])
+        t = c.post("/v1/messages", json={"model": name, "messages": msgs, "max_tokens": 200, "stream": True, **kwa}).text
+        assert "thinking_delta" in t and "</think>" not in t, (v, t[:300])
+    print("  enable_thinking null / 0: reasoning on chat and messages, stream and not")
     # the prompt really carries the aliased effort: max renders the xhigh instruction on /v1/messages
     r = c.post("/v1/messages/count_tokens", json={"model": name, "messages": msgs, "output_config": {"effort": "max"}})
     r2 = c.post("/v1/messages/count_tokens", json={"model": name, "messages": msgs, "reasoning_effort": "xhigh"})

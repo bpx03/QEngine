@@ -668,6 +668,8 @@ void Worker::set_bhist(int slot, const int* ids, int n) {
 }
 
 void Worker::batch_launch(const int* slots, const int* bases, const int* lims, int nseg, int k) {
+    dpath_use(1);  // the batched steps' decode path (calibration), kept by the inner forwards
+    struct InBatch { bool& f; explicit InBatch(bool& x) : f(x) { f = true; } ~InBatch() { f = false; } } in_batch(in_batch_);
     qe_wd_crumb(wdid_, dev_, "batch step (sequences, drafts)", nseg, k);
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(nseg >= 1 && nseg * (k + 1) <= MAXM && !qsa_a_ && dec_k_ && dec_split_ <= 8, "flash batch: %d x %d rows", nseg, k + 1);

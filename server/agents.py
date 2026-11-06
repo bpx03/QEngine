@@ -181,8 +181,9 @@ class Tracker:
             s = self.sessions.get(sk)
             if s is None:
                 s = self.sessions[sk] = Session(sk, client)
+                s.t_last = now  # (before the cap: a new session must never be its own LRU victim, review 9 H2)
                 while len(self.sessions) > self.max_sessions:
-                    old = min(self.sessions.values(), key=lambda x: x.t_last)
+                    old = min((x for x in self.sessions.values() if x is not s), key=lambda x: x.t_last)
                     del self.sessions[old.key]
             s.n += 1
             s.t_last = now
@@ -254,6 +255,8 @@ class Tracker:
             s.convs.sort(key=lambda x: x.t_last)
             for x in s.convs[:len(s.convs) - self.max_convs]:
                 x.group.convs.remove(x)
+                if not x.group.convs and x.group is not s.main and x.group is not g:  # (review 9 L1)
+                    s.groups.pop(x.group.key, None)
             del s.convs[:len(s.convs) - self.max_convs]
         return c, (bl if branch else 0)
 
@@ -329,14 +332,18 @@ class Tracker:
         return best is c
 
     # ------------------------------------------------------------ results
-    def finished(self, info, reply_text, tool_call):
-        """The request's reply: a final one (no tool call) is remembered to recognise it in a parent's history."""
+    def finished(self, info, reply_text, tool_call, split=True):
+        """The request's reply: a final one (no tool call) is remembered to recognise it in a parent's history.
+        split=False: reply_text is already the answer (the server cuts it at the real tag tokens, so a quoted
+        `</think>` / `<tool_call>` stays part of it)."""
         if info is None or info.conv is None:
             return
         txt = reply_text or ""
-        if "</think>" in txt:
-            txt = txt.split("</think>", 1)[1]
-        txt = norm(txt.split("<tool_call>", 1)[0])
+        if split:
+            if "</think>" in txt:
+                txt = txt.split("</think>", 1)[1]
+            txt = txt.split("<tool_call>", 1)[0]
+        txt = norm(txt)
         with self.lock:
             if tool_call or len(txt) < SNIP_MIN:
                 info.conv.final = None

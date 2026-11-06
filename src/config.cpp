@@ -32,6 +32,13 @@ Config Config::load(const std::string& model_dir) {
     c.head_dim = t["head_dim"].i();
     const Json& rp = t["rope_parameters"];
     c.rope_theta = rp["rope_theta"].f();
+    if (t.has("max_position_embeddings")) c.native_ctx = c.max_pos = (int)t["max_position_embeddings"].i();
+    // a config edited as the model card says (rope_type yarn, factor, original_max_position_embeddings): YaRN with that
+    // factor on the original context (Engine; QE_YARN overrides)
+    if (rp.has("rope_type") && rp["rope_type"].str == "yarn") {
+        c.yarn_cfg = rp.has("factor") ? rp["factor"].f() : 0;
+        if (rp.has("original_max_position_embeddings")) c.native_ctx = c.max_pos = (int)rp["original_max_position_embeddings"].i();
+    }
     c.rot_dim = (int)std::lround(c.head_dim * rp["partial_rotary_factor"].f());
     c.lin_nk = t["linear_num_key_heads"].i();
     c.lin_nv = t["linear_num_value_heads"].i();
@@ -177,4 +184,24 @@ void print_plan(const Config& c, const std::vector<CardPlan>& plan) {
                            m.O, p.kv_peer[j]);
             }
     }
+}
+
+void rope_table_host(double factor, double theta, int rot_dim, int native_ctx, float* out, double* lo_, double* hi_) {
+    for (int i = 0; i < 32; i++) out[i] = (float)(1.0 / std::pow(theta, (double)(2 * i) / rot_dim));
+    out[32] = 1.f;
+    if (factor <= 1) return;
+    const double dim = rot_dim, base = theta, orig = native_ctx;
+    auto corr = [&](double nrot) { return dim * std::log(orig / (nrot * 2 * M_PI)) / (2 * std::log(base)); };
+    double lo = std::max(0.0, std::floor(corr(32))), hi = std::min(dim - 1, std::ceil(corr(1)));
+    if (lo == hi) hi += 0.001;
+    for (int i = 0; i < 32; i++) {
+        const float pf = std::pow((float)base, (float)(2 * i) / (float)dim);
+        const float ext = 1.f / pf, itp = 1.f / ((float)factor * pf);
+        const float ef = 1.f - (float)std::min(1.0, std::max(0.0, (i - lo) / (hi - lo)));
+        out[i] = itp * (1.f - ef) + ext * ef;
+    }
+    const double ms = 0.1 * std::log(factor) + 1.0;
+    out[32] = (float)(ms * ms);
+    if (lo_) *lo_ = lo;
+    if (hi_) *hi_ = hi;
 }

@@ -111,6 +111,8 @@ void gemm_set_sk_maxparts(int n);  // (bench) cap of the stream-K split count, 0
 // (QE_TUNE_FILE=path / off). defer on: this thread's new choices are saved once, when it is turned off.
 void gemm_tune_set_model(const std::string& model);
 void gemm_tune_defer(bool on);
+// the autotuner when QE_GEMM_TUNE is unset (default on); call before the first GEMM
+void gemm_tune_default(bool on);
 void gemm_w16(const W16& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st,
               int ksplit = 1, size_t cstride = 0);
 // W4A8 prefill GEMM with an explicit configuration (experiments; gemm_w4 selects it by

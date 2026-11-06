@@ -3160,7 +3160,7 @@ __global__ void prefill_combine_kernel(const float* __restrict__ work, int split
     if (xch) {  // the peer's flag, raised on every exchange (data or not)
         if (d == 0) {
             unsigned ws = 0;
-            while ((int)(qe_ld_acquire_sys(s.xflag[kv]) - xchg_seq(s)) < 0) {
+            while (!xchg_arrived(qe_ld_acquire_sys(s.xflag[kv]), xchg_seq(s))) {  // (xchg_seq.h, tested)
                 __nanosleep(64);
                 // a stuck wait (peer gone / flag-sequence mismatch) is reported by the watchdog, not silent
                 QE_WD_POLL(ws, kWdKvPrefill, -1, xchg_seq(s), qe_ld_acquire_sys(s.xflag[kv]));

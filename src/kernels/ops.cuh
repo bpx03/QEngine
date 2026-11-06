@@ -1,4 +1,5 @@
 #pragma once
+#include "xchg_seq.h"
 #include "../common.h"
 #include <cfloat>
 
@@ -361,11 +362,12 @@ QE_HD size_t head_rows(const AttnShape& s, int kv, int cap) {
 // local rows of a kv head in the window [k0w, L) of a sequence / the local split rule, shared by
 // the attention kernels, the combine and the sender so all agree bit for bit
 #ifdef __CUDACC__
-// Flag value of exchange xidx of the launch unit with epoch *xepoch (bumped by comm_begin_unit),
-// compared by the receiver as (int)(flag - expected) < 0. The sender raises the flag on EVERY
-// exchange (also when it has no keys to send), so flag and expected never drift apart by more
-// than one exchange and the wrap-around of the unsigned sequence is harmless.
-__device__ __forceinline__ unsigned xchg_seq(const AttnShape& s) { return *s.xepoch * 4096u + (unsigned)s.xidx + 1u; }
+// Flag value of exchange xidx of the launch unit with epoch *xepoch, compared by the receiver as (int)(flag - expected)
+// < 0 (xchg_seq.h). The sender raises the flag on EVERY exchange (also when it has no keys to send). xepoch is the
+// counter of the flag set the unit uses: CommCounters::epoch with one set; with the 27B decode host set
+// (QE_DECODE_COMM) one counter per set, bumped only by the units that use it (Worker::begin_unit), so flag and expected
+// never drift apart by more than one exchange and the wrap-around of the unsigned sequence is harmless.
+__device__ __forceinline__ unsigned xchg_seq(const AttnShape& s) { return xchg_seq_of(*s.xepoch, s.xidx); }
 // keys per flash-decoding split of kv head kv over `len` local keys (len_abs absolute keys) before
 // the query block. A position-split head takes the chunk a full head of the same absolute length
 // would use (xdiv = 0, default): its blocks stream as many keys as the full heads' blocks, so the

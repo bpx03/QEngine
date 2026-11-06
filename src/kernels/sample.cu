@@ -1,7 +1,11 @@
 #include <algorithm>
 #include <cfloat>
 
+#include "../common.h"
 #include "sample.cuh"
+#include "sample_rng.h"
+
+static_assert(kMaxBatchRows <= kSampleMaxRows, "sample_rng.h: a row must fit below the step counter's bits");
 
 namespace {
 
@@ -62,16 +66,8 @@ __global__ void __launch_bounds__(kSelThreads) topk_kernel(const float* __restri
     }
 }
 
-__device__ __forceinline__ unsigned long long splitmix(unsigned long long x) {
-    x += 0x9E3779B97F4A7C15ull;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-    return x ^ (x >> 31);
-}
 __device__ __forceinline__ float uniform(const SampleParams& p, int row, int salt) {
-    const unsigned long long h =
-        splitmix(p.seed ^ splitmix(p.counter * 64 + row * 4 + salt + 1));
-    return (h >> 40) * (1.0f / 16777216.0f);  // 24-bit uniform in [0, 1)
+    return sample_uniform(p.seed, p.counter, row, salt);
 }
 
 // Merge the per-GPU sorted lists of one row into the global top-K and turn them into

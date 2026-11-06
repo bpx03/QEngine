@@ -72,6 +72,7 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x, const bf16* __restri
 }
 
 // grid (m, nq + 2*nkv), block 256 (one thread per head dim)
+// inv_freq: [32] inverse frequencies (YaRN-blended when on) + [32] the factor on the rotary dims of q (YaRN mscale^2).
 // RoPE angle of cache index p for rotary frequency fi: p + rdelta (text after images) unless p
 // falls in the multimodal rows of the prompt chunk (rpos3), interleaved M-RoPE sections 11/11/10:
 // frequency fi uses the h position if fi % 3 == 1 (fi < 33), w if fi % 3 == 2 (fi < 30), else t
@@ -151,7 +152,10 @@ __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, in
             c = cos((double)ang);
             sn = sin((double)ang);
         }
-        y = d < 32 ? (float)(xn * c - xs[d + 32] * sn) : (float)(xn * c + xs[d - 32] * sn);
+        // YaRN: the rotary dims of q carry the squared attention factor (inv_freq[32], 1 native: exact); K stays at
+        // the range its fp8 scale was calibrated for
+        const double qf = is_q ? (double)inv_freq[32] : 1.0;
+        y = d < 32 ? (float)((xn * c - xs[d + 32] * sn) * qf) : (float)((xn * c + xs[d - 32] * sn) * qf);
     }
     if (is_q) {
         q_out[((size_t)mi * s.nq + j) * 256 + d] = __float2bfloat16(y);
@@ -452,7 +456,7 @@ __device__ __forceinline__ void attn_combine_dev(const float* __restrict__ work,
     if (xch) {  // wait for the peer's flag (raised after all rows)
         if (d == 0) {
             unsigned ws = 0;
-            while ((int)(qe_ld_acquire_sys(s.xflag[kv]) - xchg_seq(s)) < 0) {
+            while (!xchg_arrived(qe_ld_acquire_sys(s.xflag[kv]), xchg_seq(s))) {  // (xchg_seq.h, tested)
                 __nanosleep(64);
                 // a stuck wait (peer gone / flag-sequence mismatch) is reported by the watchdog, not silent
                 QE_WD_POLL(ws, kWdKvDecode, -1, xchg_seq(s), qe_ld_acquire_sys(s.xflag[kv]));

@@ -2,6 +2,7 @@
 // Qwen3.8-Flash-Next (qwen4_exp) decode engine for 2 or 3 GPUs: EP experts, TP GDN / QSA heads, QSA KV split by
 // token position across the cards (each card owns `own` of every `period` positions), hyper-connection
 // residual 4 x 2560 replicated in fp32.
+#include "../gpu_others.h"
 #include <string>
 #include <vector>
 #include <array>
@@ -26,6 +27,9 @@
 #include "graph_oom.h"
 
 namespace flash {
+// a thread that drives the workers (the API caller in run() / each(), the rank threads): the only ones that may take
+// over a worker's expert-group moves after an out-of-memory (Worker::vram_owner_here, review R5-L7)
+inline thread_local bool tl_serving = false;
 struct Xchg;  // flash_kernels.cuh: a QSA exchange (receive buffers, flags, counters)
 // block unions of the QSA prefill attention's row groups (flash_pfq.cuh k_qpf_union): U[g], ublk[g][QP_UMAX], um[g][QP_UMAX]
 struct QpUnion {
@@ -51,6 +55,10 @@ constexpr int PFM = 512;               // rows per prefill chunk
 // mixer chunks (FLASH_ARU, default 2 chunks), the MoE half runs per collective unit (prefill-r2)
 constexpr int ARU_MAX = 2 * PFM;
 constexpr int MAXM = 32;
+constexpr int kSlotCutMax = 64;
+// lone prompt batches from this many rows take the sequence-parallel trunk with P2P exchanges (FLASH_PF_SP_MIN,
+// Worker::pf_sp_min; [qfn-boot-det]: 3 cards 64 tokens 36.3 vs 34.7 ms plain, 96 39.8 vs 40.9, 200 56.9 vs 64.3)
+constexpr int kPfSpMin = 80;
 constexpr int MAXP = 17;                // rows of a deferred-commit forward (verify: 1 + drafts); prompts use prefill()                // rows per forward (decode / verify / prefill chunks): 8-token mma tiles x 4
 constexpr float EPS = 1e-6f;
 constexpr double THETA = 1e7;
@@ -117,6 +125,9 @@ double yarn_factor();        // 0: off
 // QSA / row exchanges hold 4
 constexpr int kMaxTp = 4;
 static_assert(sizeof(((Comm*)nullptr)->dev) / sizeof(int) >= kMaxTp, "Comm holds kMaxTp ranks");
+// the C API's FLASH_PAR=pp start-up: device lookup drafts off in this process (not on the stages)
+extern std::atomic<bool> g_lookup_off;
+
 struct Plan {
     int rank = 0, ngpu = 3;
     // pipeline stage (ngpu == 1): trunk layers [l0, l1), stage `stage` of `nstage`. The first stage (l0 == 0) embeds
@@ -124,6 +135,7 @@ struct Plan {
     // rows of the previous stage and hand theirs to the next (Worker::pp_io). TP plans: [0, LAYERS), 1 stage.
     int l0 = 0, l1 = LAYERS, stage = 0, nstage = 1;
     int wid = -1;  // pipeline worker index (every rank of every stage, in order; watchdog identity), -1: TP rank
+    int max_seqs = 0;  // sequence slots of this worker, 0: FLASH_MAX_SEQS (default 16)
     bool first() const { return l0 == 0; }
     bool last() const { return l1 == LAYERS; }
     bool pp() const { return nstage > 1; }
@@ -393,7 +405,8 @@ public:
     // for the segments with end set, in segment order. The workspace keeps the bound slot's state.
     struct PfSeg { int slot, base, pos, n, commit; bool end; };
     static constexpr int PFSEG_MAX = 16;
-    bool pf_multi_ok(const int* segn, int nseg) const;  // the layout fits (units, collectives, buffers)
+    bool pf_multi_ok(const int* segn, int nseg) const;
+    int pf_sp_min() const;  // lone batches from this many rows on the sequence-parallel trunk (FLASH_PF_SP_MIN)  // the layout fits (units, collectives, buffers)
     // host-backed (cold) expert bytes of this card: every prefill pass reads / stages them over PCIe
     long long cold_bytes() const {
         long long n = 0;
@@ -490,6 +503,11 @@ public:
     unsigned* xflags() const { return xflags_; }
     void set_peer(int g, float* recv, unsigned* flags) { xpr_[g] = recv; xpf_[g] = flags; }
     void set_agpeer(int g, const Worker* w);  // sequence-parallel HC prefill: the peer's x / xh / R batch rows and flags
+    // decode collectives' path per mode (0: single-sequence steps, 1: batched steps), comm_.dxfer values; set_dpath
+    // drops every cached graph (they hold the Comm of their capture). free_dhost: the host-memory candidates go
+    bool decode_host_ready() const { return dhs_; }
+    void set_dpath(int single, int batched, int xh = -1);  // xh: QSA exchanges on host (-1: both modes host)
+    void free_dhost();
     float* xqrecv() const { return xqrecv_; }
     unsigned* xqflags() const { return xqflags_; }
     void set_qpeer(int g, float* recv, unsigned* flags) { xqpr_[g] = recv; xqpf_[g] = flags; }
@@ -509,6 +527,13 @@ public:
     void state_pieces(bool pend, std::vector<Piece>& out);
     void kv_claim(int ntok) { CUDA_CHECK(cudaSetDevice(dev_)); ec_tick(ntok, 1); }  // expert-cache slots over rows < ntok -> KV
     cudaStream_t stream() const { return st_; }
+    // mode A (a TP rank and a pipeline stage per card; the stages read the TP ranks' groups): a chunk moves only while
+    // no prompt is in the pipeline. vmove_begin / _end around a move (false: the pipeline runs, the move is skipped);
+    // pp_hold_begin (waits for a move in progress) / _end around a pipelined prompt
+    static bool vmove_begin();
+    static void vmove_end();
+    static void pp_hold_begin();
+    static void pp_hold_end();
     int prev_m() const { return prev_m_; }
     // sequence slots (FLASH_MAX_SEQS): recurrent state per slot, KV of slot s in a region of the one pool starting at
     // period `base` (rows base * own on every card). use_slot points the layers (and the graph caches) at slot s;
@@ -640,6 +665,9 @@ public:
     void kvs_report();  // KV streaming: block cache hits / misses / host fallbacks (stderr)
     bool kv_stream() const { return kvs_; }
     bool ec_enabled() const { return ec_on_; }  // dynamic expert cache on (cold groups exist, FLASH_EC != 0)
+    // the expert cache learns nothing while frozen (decode calibration: its dummy steps must not change which groups are
+    // resident, the later steps' outputs depend on it): touches dropped, no scores, no admissions; unfreeze clears them
+    void ec_freeze(bool on);
     // KV streaming: the host rows of the region at period `base`, positions [t0, t1) changed (archive restore, moves):
     // drop their cached blocks in every layer (stream order)
     void kv_inval(int base, int t0, int t1);
@@ -723,6 +751,41 @@ private:
     void mtp_core_b(int m, bool chain, const int* toks, int* out, const int* rp, const int* rb, const int* rs, int rps);
     void batch_body(int nseg, int k);
     void* dalloc(size_t bytes);
+    void* dalloc_try(size_t bytes);  // as dalloc, but nullptr when the card is out of memory (an optional buffer)
+    // VRAM taken by other processes while serving (vram_*, flash.cu; club-3090 #1918): the resident expert groups
+    // (L.groups) live in VMM chunks that move to host-pinned VMM memory at the same address when the card's free memory
+    // falls below FLASH_VRAM_LOW_MB (kernels, gmap tables and captured graphs keep their addresses and read those
+    // groups zero-copy, as cold groups) and come back when it stays above the target. FLASH_VRAM_ADAPT=0: off
+    struct VChunk { char* va; size_t bytes; unsigned long long hdev, hhost; double hot; bool host; };
+    std::vector<VChunk> vch_;            // every layer's chunks; coldest first once the load is done
+    bool vadapt_ = false;                // chunks exist and the moves are allowed (one worker per card)
+    bool vready_ = false;                // serving: the check runs, a failed serving-time dalloc reclaims and retries
+    unsigned long long vtmp_ = 0;        // a VA range for staging the moves (vtmp_bytes_)
+    size_t vtmp_bytes_ = 0, vhost_bytes_ = 0;
+    double vlast_ = 0, vhigh_since_ = 0, vlog_ = 0;
+    size_t vlog_moved_ = 0;
+    qe_gpu_others::Watch vwatch_;        // what other processes took on this card (gpu_others.h)
+    std::atomic<std::thread::id> vtid_{};  // the serving thread of this worker (the only one that moves its chunks)
+    double vback_ = 0;                   // no staging before this time (mode A: the pipeline held the moves)
+    bool vhost_short_logged_ = false;
+public:
+    bool vram_owner_here() const { return vtid_.load() == std::this_thread::get_id(); }
+    // the expert cache's live / total slots, published by this worker's own thread (ec_tick, every 64 launches): read
+    // from other threads (the pressure-driven idle reclaim) without touching the cache's state
+    std::atomic<int> ec_live_pub_{0}, ec_cap_pub_{0};
+    unsigned long long ec_pub_n_ = 0;
+    // the load is done (qe_create's end): the VRAM-pressure check runs, a serving-time dalloc reclaims instead of the
+    // load-time stop; logs once when the resident groups cannot move (no VMM chunks)
+    void set_serving();
+private:
+    cudaStream_t vst_ = nullptr;         // the moves' copies
+    char* vmm_groups(size_t bytes, const std::vector<double>& hot);  // nullptr: not available (dalloc instead)
+    void vram_tick();                    // before every launch (ec_tick): the free-memory check, every FLASH_VRAM_CHECK_MS
+    size_t vram_reclaim(size_t need, const char* why);  // chunks to host until `need` more bytes are free (bounded); bytes freed
+    size_t vram_regrow(size_t max_bytes);                // host chunks back to the device; bytes moved
+    size_t vram_move(bool to_host, size_t want);  // up to FLASH_VRAM_STEP_MB of chunks to host / back; bytes moved
+    void vram_quiesce();                 // every stream of this worker idle (no kernel reads a chunk being moved)
+    size_t vram_host_bytes() const { return vhost_bytes_; }
     void body(int m);
     void body_mtp(int m, bool chain);
     void head(int m, int* dst, bool draft = false);
@@ -749,6 +812,14 @@ private:
     // expert cache
     void load_groups(const SafeTensors& st, Layer& L, const std::string& pre, const std::vector<char>& isc);
     void load_deferred_groups();
+    // the VRAM a card keeps free after its load-time buffers (FLASH_EC_MARGIN_MB of the card + the host-registration
+    // page tables + the graph room on top of the margin, or the emergency reserve without host registrations)
+    struct LoadMargin { double user_mb = 256, hostreg_mb = 0, graph_add_mb = 0, total_mb = 256; long long graph_mb = 0; };
+    LoadMargin load_margin() const;
+    // a load-time staging ring (2 halves of cap groups, the first cap0 of each in pfs_ring_, the rest in the extension
+    // pfs_ext_) fitted to the free memory minus keep_b: the extension shrinks first, then the ring; 0 groups: no ring
+    // (the cold groups read zero-copy). Never aborts: the ring is an optimization with a fallback
+    void pfs_alloc_fit(int cap, int cap0, long long keep_b);
     struct DeferL { const SafeTensors* st; std::string pre; int li; };
     std::vector<DeferL> ec_defer_l_;
     bool ec_defer_ = false;
@@ -831,7 +902,7 @@ private:
     ColdTab stab(const Layer& L) const { return ColdTab((pfs_full_ ? pfs_tab_d_ : pfs_tab0_d_) + L.coff, pfs_touch_d_ + L.coff); }
     void pfs_init();
     void pfs_copy(int li);
-    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool bt = false; int prev = -1; bool ik = false; bool al = false; };  // al: a KV-array tail that is also mapped as big-batch rows (al_*)  // ik: in the tail of an indexer-key array (KV streaming)  // bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
+    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool bt = false; int prev = -1; bool ik = false; bool fz = false; bool al = false; };  // al: a KV-array tail that is also mapped as big-batch rows (al_*)  // ik: in the tail of an indexer-key array (KV streaming)  // bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
     std::vector<float> ec_prior_;
     std::vector<EcSlot> ec_slots_;
     std::vector<int> ec_slot_of_;      // cold group -> slot or -1
@@ -847,7 +918,7 @@ private:
     unsigned char *ec_touch_h_ = nullptr, *ec_touch_d_ = nullptr;
     cudaStream_t ec_cs_ = nullptr;
     cudaEvent_t ec_evt_ = nullptr;
-    bool ec_on_ = false, ec_dirty_ = false;
+    bool ec_on_ = false, ec_dirty_ = false, ec_frozen_ = false;
     int ec_n_ = 0, ec_kind_ = -1, ec_maxcopy_ = 16;
     long long ec_now_ = 0;
     size_t ec_bound_ = (size_t)-1;
@@ -893,6 +964,7 @@ private:
     char* vmm_map(size_t own_bytes, size_t al_chunks, bool to_pool);  // own head + al chunks (from / into al_pool_)
     void bt_clear_y(int n);  // big batch: its borrowed rows of the y accumulator zeroed (rows [pfbn_base_, n))
     int* pfinv_ = nullptr;         // slot of every (row, k) of the batch's routing
+    int* slcut_ = nullptr;         // slot window cuts (k_slot_cuts, [qfn-boot-det]): [kSlotCutMax]
     bool mtpb_ = false, mtpb_last_ = false;  // prefill_batch with the MTP layer
     float* dnqk_ = nullptr;  // chunked DeltaNet inputs: normalized q / k [PFM][2][nk][128], decay / beta [PFM][2][nv]
     float* dngb_ = nullptr;
@@ -939,6 +1011,8 @@ private:
     __half* pfact_ = nullptr;
     size_t pfact_bytes_ = 0;
     bool rq_attr_ = false;
+    int rq_sms_ = 82;  // SMs of this card (rows8 block-width pick)
+    int gprio_rows_ = 0;  // rows of the prompt batch being captured (inst_graph: node priorities for big batches)
     size_t qpf_attr_ = 0;
     QpUnion qpu_;
     int nsm_ = 0;
@@ -1113,6 +1187,7 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     float* rfpart_ = nullptr;  // router v5: K-split partials
     unsigned* rfcnt_ = nullptr;  // router v5: arrival counter
     int* njobs_ = nullptr;    // device
+    int dn_fx_ = 0;           // decode MoE down in exact fixed point (full batch invariance)
     int maxjob_ = MAXJOB, maxjob_pf_ = MAXJOB_PF;  // job list capacities of this card (decode, prefill)
     MoeJob* jobs_ = nullptr;  // [maxjob_]
     float* jw_ = nullptr;     // job weights [MAXJOB][MAXM]
@@ -1153,6 +1228,24 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     float* xqpr_[4] = {};
     unsigned* xqpf_[4] = {};
     unsigned* xpf_[4] = {};
+    // decode collectives through host memory (comm_.dxfer == kXferHost, QE_DECODE_COMM): the decode / verify rows' QSA
+    // q, partial and indexer exchanges (direct sends) land in pinned host-mapped slots + flags instead of the peers'
+    // device memory, so no SM store crosses a peer link; prefill keeps the device slots (its own transfer path)
+    bool dhx_ = false;        // the current step's exchanges use the host slots
+    bool dhs_ = false;        // the host slots exist (QE_DECODE_COMM=host, or auto before the calibration)
+    int dpath_[2] = {0, 0};   // decode path of single-sequence / batched steps (kXfer*)
+    bool in_batch_ = false;   // inside batch_launch (its inner forwards keep the batched path)
+    // the all-reduces / all-gathers follow the mode's pick; the flag-based QSA exchanges (dhx_) use host memory only
+    // when both modes picked it, so one flag set serves the whole run (two sets behind one sequence counter could go
+    // stale across 2^31 exchanges, review L2)
+    void dpath_use(int mode) {
+        if (!dhs_ || (in_batch_ && mode == 0)) return;
+        comm_.dxfer = dpath_[mode];
+    }
+    float *xrecvH_ = nullptr, *xqrecvH_ = nullptr, *xirecvH_ = nullptr;
+    unsigned *xflagsH_ = nullptr, *xqflagsH_ = nullptr, *xiflagsH_ = nullptr;
+    float *xprH_[4] = {}, *xqprH_[4] = {}, *xiprH_[4] = {};
+    unsigned *xpfH_[4] = {}, *xqpfH_[4] = {}, *xipfH_[4] = {};
     int *tok_h_ = nullptr, *pos_h_ = nullptr, *out_h_ = nullptr;  // pinned staging (graph inputs / outputs)
     bf16* ple_h_ = nullptr;
     cudaGraphExec_t graph_[2][2][MAXM + 1] = {};  // [sampling][selection][m]

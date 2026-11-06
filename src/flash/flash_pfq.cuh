@@ -418,15 +418,21 @@ __global__ void __launch_bounds__(128) k_moe_dn_q(const PfJob* __restrict__ jobs
     if (job >= *njobs) return;
     const int ngj = jobs[job].ng;
     if (ngj == 0) return;
+    SlotBuf sb = slots;
+    if (sb.cut) {  // slot window: only the jobs whose slots lie in [cut[p], cut[p + 1]) (a job never straddles a cut)
+        const int lo = sb.cut[sb.p], o = jobs[job].off;
+        if (o < lo || o >= sb.cut[sb.p + 1]) return;
+        sb.lo = lo;
+    }
     switch ((jobs[job].n + 7) >> 3) {
-        case 1: dn_q_job<1, TT>(jobs, job, ngj, act, slots); break;
-        case 2: dn_q_job<2, TT>(jobs, job, ngj, act, slots); break;
-        case 3: dn_q_job<3, TT>(jobs, job, ngj, act, slots); break;
-        case 4: dn_q_job<4, TT>(jobs, job, ngj, act, slots); break;
-        case 5: dn_q_job<5, TT>(jobs, job, ngj, act, slots); break;
-        case 6: dn_q_job<6, TT>(jobs, job, ngj, act, slots); break;
-        case 7: dn_q_job<7, TT>(jobs, job, ngj, act, slots); break;
-        default: dn_q_job<8, TT>(jobs, job, ngj, act, slots); break;
+        case 1: dn_q_job<1, TT>(jobs, job, ngj, act, sb); break;
+        case 2: dn_q_job<2, TT>(jobs, job, ngj, act, sb); break;
+        case 3: dn_q_job<3, TT>(jobs, job, ngj, act, sb); break;
+        case 4: dn_q_job<4, TT>(jobs, job, ngj, act, sb); break;
+        case 5: dn_q_job<5, TT>(jobs, job, ngj, act, sb); break;
+        case 6: dn_q_job<6, TT>(jobs, job, ngj, act, sb); break;
+        case 7: dn_q_job<7, TT>(jobs, job, ngj, act, sb); break;
+        default: dn_q_job<8, TT>(jobs, job, ngj, act, sb); break;
     }
 }
 
@@ -486,25 +492,33 @@ __global__ void __launch_bounds__(RQ_KMAX / 16) k_x_to_r8(const bf16* __restrict
 // the weights (8 tiles x 2 KB, contiguous in the W8 layout) and the tokens' R8 slices (128 x 128 B, 16-byte pieces
 // swizzled by row parity) are staged by cp.async (RQ_NST stages). grid (token blocks, row blocks): the token blocks of
 // one weight block run next to each other (L2 reuse). Rows past N (N % 128 != 0) read tile N / 16 - 1, not stored.
+// TA (template): weight tiles per warp, block = 2 x TA tiles (NB = 32 TA weight rows); TA = 4 is the 128 x 128 block.
+// A narrower block fills the last wave better (3 cards GDN in-projection, N 5504: 172 blocks of 128 rows = 2.1 waves on
+// 82 SMs, 232 of 96 rows = 2.8); each output's arithmetic (k order, MMA, rescale) is the same for every TA ([fp-rq]).
 constexpr int RQ_TB = 128, RQ_NB = 128, RQ_NST = 3;
-constexpr size_t RQ_STAGE = (size_t)RQ_NB * 128 + (size_t)RQ_TB * 128 + (size_t)RQ_TB * 8;  // weights, x, scales
-constexpr size_t RQ_SMEM = RQ_NST * RQ_STAGE;
-__global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq, const bf16* __restrict__ ws, int K, int N,
+template <int TA> __host__ __device__ constexpr size_t rq_stage() { return (size_t)32 * TA * 128 + (size_t)RQ_TB * 128 + (size_t)RQ_TB * 8; }  // weights, x, scales
+template <int TA> __host__ __device__ constexpr size_t rq_smem() { return RQ_NST * rq_stage<TA>(); }
+constexpr size_t RQ_STAGE = rq_stage<4>();
+constexpr size_t RQ_SMEM = rq_smem<4>();
+template <int TA>
+__global__ void __launch_bounds__(256, 1) k_rows_qt(const uint4* __restrict__ wq, const bf16* __restrict__ ws, int K, int N,
                                                    const int8_t* __restrict__ xq, const float2* __restrict__ xsc,
                                                    float* __restrict__ y, int ldy, int m) {
     extern __shared__ __align__(16) unsigned char rq_smem[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     const int wn = warp & 1, wt = warp >> 1;
-    const int t0 = blockIdx.x * RQ_TB, nb0 = blockIdx.y * (RQ_NB / 16);  // first token, first tile
+    constexpr int NB = 32 * TA;
+    constexpr size_t STG = rq_stage<TA>();
+    const int t0 = blockIdx.x * RQ_TB, nb0 = blockIdx.y * (NB / 16);  // first token, first tile
     const int ntile = N >> 4, nks = K >> 7, gl = K >> 5;                 // tiles, stages, k32 blocks per tile
-    auto sw_ = [&](int b) { return rq_smem + b * RQ_STAGE; };
-    auto sx_ = [&](int b) { return rq_smem + b * RQ_STAGE + RQ_NB * 128; };
-    auto ss_ = [&](int b) { return reinterpret_cast<float2*>(rq_smem + b * RQ_STAGE + RQ_NB * 128 + RQ_TB * 128); };
+    auto sw_ = [&](int b) { return rq_smem + b * STG; };
+    auto sx_ = [&](int b) { return rq_smem + b * STG + NB * 128; };
+    auto ss_ = [&](int b) { return reinterpret_cast<float2*>(rq_smem + b * STG + NB * 128 + RQ_TB * 128); };
     auto stage = [&](int ks) {
         const int b = ks % RQ_NST;
-        // weights: 8 tiles x 128 pieces of 16 B (tile-major, as in global); 1024 pieces, 4 per thread
+        // weights: 2 TA tiles x 128 pieces of 16 B (tile-major, as in global); 256 TA pieces, TA per thread
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < TA; i++) {
             const int pc = threadIdx.x + 256 * i, tl_ = pc >> 7, w = pc & 127;
             const int T = min(nb0 + tl_, ntile - 1);
             const uint4* src = wq + ((size_t)T * gl + ks * 4) * 32 + w;
@@ -526,9 +540,9 @@ __global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq,
         }
         asm volatile("cp.async.commit_group;");
     };
-    float acc[4][4][4];
+    float acc[TA][4][4];
 #pragma unroll
-    for (int a = 0; a < 4; a++)
+    for (int a = 0; a < TA; a++)
 #pragma unroll
         for (int j = 0; j < 4; j++) acc[a][j][0] = acc[a][j][1] = acc[a][j][2] = acc[a][j][3] = 0.f;
 #pragma unroll
@@ -542,14 +556,14 @@ __global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq,
         if (ks + RQ_NST - 1 < nks) stage(ks + RQ_NST - 1);
         else asm volatile("cp.async.commit_group;");
         // weight scales of this stage (rows g, g + 8 of the warp's 4 tiles)
-        float sw0[4], sw8[4];
+        float sw0[TA], sw8[TA];
 #pragma unroll
-        for (int a = 0; a < 4; a++) {
-            const int T = min(nb0 + 4 * wn + a, ntile - 1);
+        for (int a = 0; a < TA; a++) {
+            const int T = min(nb0 + TA * wn + a, ntile - 1);
             sw0[a] = __bfloat162float(ws[((size_t)T * nks + ks) * 16 + g]);
             sw8[a] = __bfloat162float(ws[((size_t)T * nks + ks) * 16 + g + 8]);
         }
-        uint32_t ci[4][4][4];
+        uint32_t ci[TA][4][4];
         const unsigned char* wsm = sw_(b);
         const unsigned char* xsm = sx_(b);
 #pragma unroll
@@ -563,10 +577,10 @@ __global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq,
             }
 #pragma unroll
             for (int kb = 0; kb < 2; kb++) {  // k32 block 2 cp + kb of the stage
-                uint32_t A[4][4];
+                uint32_t A[TA][4];
 #pragma unroll
-                for (int a = 0; a < 4; a++) {
-                    const uint4 u = *reinterpret_cast<const uint4*>(wsm + ((size_t)(4 * wn + a) * 128 + (2 * cp + kb) * 32 + lane) * 16);
+                for (int a = 0; a < TA; a++) {
+                    const uint4 u = *reinterpret_cast<const uint4*>(wsm + ((size_t)(TA * wn + a) * 128 + (2 * cp + kb) * 32 + lane) * 16);
                     A[a][0] = __byte_perm(u.x, u.y, 0x5410);
                     A[a][1] = __byte_perm(u.x, u.y, 0x7632);
                     A[a][2] = __byte_perm(u.z, u.w, 0x5410);
@@ -575,7 +589,7 @@ __global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq,
 #pragma unroll
                 for (int j = 0; j < 4; j++)
 #pragma unroll
-                    for (int a = 0; a < 4; a++) {
+                    for (int a = 0; a < TA; a++) {
                         if (cp == 0 && kb == 0) q_mma_init(ci[a][j], A[a], bx[j][0], bx[j][1]);
                         else q_mma(ci[a][j], A[a], bx[j][2 * kb], bx[j][2 * kb + 1]);
                     }
@@ -586,7 +600,7 @@ __global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq,
         for (int j = 0; j < 4; j++) {
             const float2 x0 = ssm[32 * wt + 8 * j + 2 * t4], x1 = ssm[32 * wt + 8 * j + 2 * t4 + 1];
 #pragma unroll
-            for (int a = 0; a < 4; a++) {
+            for (int a = 0; a < TA; a++) {
                 acc[a][j][0] = __fmaf_rn(__fmaf_rn(__uint_as_float(ci[a][j][0]), x0.x, x0.y), sw0[a], acc[a][j][0]);
                 acc[a][j][1] = __fmaf_rn(__fmaf_rn(__uint_as_float(ci[a][j][1]), x1.x, x1.y), sw0[a], acc[a][j][1]);
                 acc[a][j][2] = __fmaf_rn(__fmaf_rn(__uint_as_float(ci[a][j][2]), x0.x, x0.y), sw8[a], acc[a][j][2]);
@@ -596,8 +610,8 @@ __global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq,
     }
     asm volatile("cp.async.wait_group 0;");
 #pragma unroll
-    for (int a = 0; a < 4; a++) {
-        const int T = nb0 + 4 * wn + a;
+    for (int a = 0; a < TA; a++) {
+        const int T = nb0 + TA * wn + a;
         if (T >= ntile) continue;
         const int row0 = T * 16;
 #pragma unroll
@@ -608,6 +622,7 @@ __global__ void __launch_bounds__(256, 1) k_rows_q(const uint4* __restrict__ wq,
         }
     }
 }
+#define k_rows_q k_rows_qt<4>
 
 // ------------------------------------------------------------------ QSA prefill attention with block selection
 // (prefill-r3). k_qsa_dec runs one (row, kv head) per block: every row loads its own ~700 keys (fp8 K / V) and the

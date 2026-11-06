@@ -12,6 +12,7 @@
 #include <cstring>
 #include "../env.h"
 #include "flash.h"
+#include "../kernels/watchdog.cuh"
 #include <map>
 #include <cmath>
 #include <algorithm>
@@ -92,9 +93,10 @@ void Worker::pieces_of(const SlotState& q, bool pend, std::vector<Piece>& out) c
     if (pend) out.push_back({(char*)q.stepc, 4});
 }
 
-// FLASH_MAX_SEQS slots (default 16), each with its own state storage; the workspace (alloc_state) holds the bound one
+// FLASH_MAX_SEQS slots (default 16; a pipeline stage: Plan::max_seqs when set), each with its own state storage; the
+// workspace (alloc_state) holds the bound one
 void Worker::alloc_slots() {
-    int ns = env_int("FLASH_MAX_SEQS", 16);
+    int ns = p_.max_seqs > 0 ? p_.max_seqs : env_int("FLASH_MAX_SEQS", 16);
     ns = std::max(1, std::min(16, ns));
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV;
@@ -499,7 +501,21 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind) {
     }();
     const int call = ++ginst_calls_;
     *e = nullptr;
-    cudaError_t r = inj.first(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+    // FLASH_GRAPH_PRIO ([fp-gprio]): cudaGraphInstantiateFlagUseNodePriority, i.e. replays keep the stream priorities
+    // captured into the kernel nodes (the high-priority prefill collectives on cst_, FLASH_CST_PRIO); without it every
+    // node runs at the launching stream's priority. 0 (default): no graph gets it (= master). 1: only pf-batch graphs
+    // (prefill_batch, single-prompt batches) of >= FLASH_GRAPH_PRIO_MIN rows (default 4096); prefill() (pgraphs_),
+    // prefill_mtp and prefill_multi never get it. 2: every graph, decode included. Off by default: flash_run 3 cards 90K
+    // -7.5 % with mode 1, but in the server the decode stayed ~20 % slower for the rest of the process after long-prompt
+    // batches ran with it (3 cards agent c=8 TPOT 8.6 -> 10.4 ms; mode 2 likewise), cause unknown (queued after 1.3.5)
+    static const int gprio = env_int("FLASH_GRAPH_PRIO", 0);
+    const bool pf_big = !strcmp(kind, "pf-batch") && gprio_rows_ >= env_int("FLASH_GRAPH_PRIO_MIN", 4096);
+    const unsigned long long gfl = gprio == 2 || (gprio == 1 && pf_big) ? cudaGraphInstantiateFlagUseNodePriority : 0;
+    cudaError_t r;
+    {
+        QeWdSlow slow;  // (an instantiate can take a while: the peers wait for this rank's launch)
+        r = inj.first(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, gfl);
+    }
     if (r == cudaErrorMemoryAllocation) {
         (void)cudaGetLastError();
         *e = nullptr;
@@ -511,7 +527,7 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind) {
             const int n = graph_drop_pf(e);
             fprintf(stderr, "[flash] GPU%d: %s graph instantiate out of memory (%.0f MB free): dropped %d prefill-side graphs, "
                     "retrying\n", dev_, kind, f0, n);
-            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, gfl);
             if (r != cudaErrorMemoryAllocation) goto done;
             (void)cudaGetLastError();
             *e = nullptr;
@@ -525,7 +541,7 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind) {
         if (oom_reserve_free()) {
             fprintf(stderr, "[flash] GPU%d: graph instantiate out of memory (%.0f MB free): freed the %.0f MB emergency "
                     "reserve, retrying\n", dev_, f0, oom_res_bytes_ / 1048576.0);
-            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, gfl);
             if (r != cudaErrorMemoryAllocation) goto done;
             (void)cudaGetLastError();
             *e = nullptr;
@@ -537,14 +553,24 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind) {
         fprintf(stderr, "[flash] GPU%d: graph instantiate out of memory (%.0f MB free): dropped %d of %zu cached graphs%s, "
                 "retrying%s\n", dev_, f0, n, held, n < (int)held ? " (least recently used)" : "",
                 inj.first(call, p_.rank) ? " (FLASH_TEST_GRAPH_OOM)" : "");
-        r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+        r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, gfl);
         if (r == cudaErrorMemoryAllocation && n < (int)held) {
             (void)cudaGetLastError();
             *e = nullptr;
             const int n2 = drop_all_graphs(e);
             fprintf(stderr, "[flash] GPU%d: still out of memory: dropped the other %d cached graphs, retrying\n", dev_, n2);
-            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+            r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, gfl);
         }
+        }
+        // after the graphs (cheap, recoverable): resident expert groups to host memory (VRAM taken by another process),
+        // before this step runs without a graph
+        if (r == cudaErrorMemoryAllocation) {
+            (void)cudaGetLastError();
+            *e = nullptr;
+            if (vram_reclaim((size_t)128 << 20, "graph instantiate out of memory")) {
+                r = inj.retry(call, p_.rank) ? cudaErrorMemoryAllocation : cudaGraphInstantiate(e, g, 0);
+                if (r != cudaErrorMemoryAllocation) goto done;
+            }
         }
         if (r == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();

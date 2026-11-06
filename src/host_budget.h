@@ -14,9 +14,10 @@
 //   3. the KV archive + pinned prefixes get what is left, up to their defaults.
 // room = MemTotal - reserve - base - fixed: reserve for the OS and the desktop (max(8 GB, 8 % of MemTotal),
 // QE_HOST_RESERVE_GB), base for the server process (Python, torch, the vision encoder, CUDA; QE_HOST_BASE_GB, 6),
-// fixed = the engine's other pinned buffers it knows (embeddings, snapshot buffers). Pinning the n-gram table must also
-// fit what the host has free now (MemAvailable at boot), the archive is a static budget (the runtime guard of
-// host_mem.h keeps it below MemAvailable - margin as it fills).
+// fixed = the engine's other pinned buffers it knows (embeddings, snapshot buffers). The machine's size decides the plan: a
+// short MemAvailable at boot only warns. The archive is a static budget (the runtime guard of host_mem.h keeps it below
+// MemAvailable - margin as it fills and lets it grow when the memory comes back); the n-gram table goes to the page cache
+// instead only when it really does not fit at the moment it is pinned (flash_capi.cpp).
 // Explicit env values win (FLASH_NGRAM_PIN, FLASH_KV_ARCHIVE_GB / QE_KV_ARCHIVE_GB, FLASH_PREFIX_GB / QE_PREFIX_GB),
 // with a warning when they do not fit. On a host where everything fits (our 251 GB host) the plan is the old
 // defaults, exactly.
@@ -25,6 +26,8 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 namespace qe_hostbudget {
@@ -61,6 +64,8 @@ struct Out {
     bool reduced = false;        // a default was lowered to fit
     std::vector<std::string> why;   // what was reduced and why
     std::vector<std::string> warn;  // explicit values that do not fit
+    bool experts_short = false;     // the host-backed experts do not fit what is free above the margin (warned; the pins' guard decides)
+    bool avail_short = false;       // what is pinned at load does not fit what is free now: a previous server may still be exiting (plan_wait)
 };
 
 inline double default_reserve(double total) { return std::max(8 * GB, 0.08 * total); }
@@ -103,10 +108,20 @@ inline Out plan(const In& in) {
     double mnow = in.margin_now >= 0 ? in.margin_now : std::max(8 * GB, 0.05 * in.total);
     if (in.cg_limit > 0) mnow = std::min(mnow, std::max(8 * GB, 0.05 * total));
     o.room_now = avail - mnow;
+    // the machine's size decides; what is free right now only warns (review M1: a process alive at boot must not fix the
+    // budgets low until a restart, the runtime guard holds the archive back while memory is short)
     const double r = o.room - in.experts, rn = o.room_now - in.experts;
-    if (in.experts > 0 && std::min(r, rn) < 0)
+    // pinned at load and never reduced. The size is an estimate: no refusal here, a warning. If the model can load it runs;
+    // the guard of the pins (host_mem.h pin_fits, real sizes) stops the load only when the memory is really not there
+    o.experts_short = in.experts > 0 && rn < 0;
+    if (o.experts_short)
+        o.warn.push_back(fmt("the host-backed expert groups need about %.1f GB of pinned host RAM, the host has %.1f GB free above "
+                             "its margin (MemAvailable %.1f GB at start)", in.experts / GB, std::max(0.0, o.room_now) / GB, avail / GB) +
+                         fmt(": the host may swap and the archive stays small; free host RAM, add RAM or cards (more cards keep "
+                             "more experts in VRAM)"));
+    else if (in.experts > 0 && o.room - in.experts < 0)
         o.warn.push_back(fmt("the host-backed experts (%.1f GB) alone take more than the room (%.1f GB): add host RAM or "
-                             "cards; the host may swap", in.experts / GB, std::min(o.room, o.room_now) / GB));
+                             "cards; the host may swap", in.experts / GB, o.room / GB));
     const bool arch_on = in.arch_user != 0 && (in.arch_user > 0 || in.arch_def > 0);
     // 2. the n-gram table
     if (in.ngram > 0) {
@@ -121,13 +136,11 @@ inline Out plan(const In& in) {
         } else {
             // room for a minimal archive next to the pinned table (8 GB), else the page cache serves the table
             const double floor_ = arch_on ? std::min(8 * GB, in.arch_def + in.pref_def) : 0.0;
-            // the machine's size decides (MemTotal); MemAvailable short at this moment (another server still exiting, a
-            // model switch) only warns: the archive's runtime guard then holds back instead
             o.ngram_pinned = in.ngram + floor_ <= r;
             if (o.ngram_pinned && in.ngram > rn)
                 o.warn.push_back(fmt("MemAvailable is short right now (%.1f GB free above the margin after the experts) for "
-                                     "the pinned n-gram table (%.1f GB): pinned anyway (the machine has the room); the archive "
-                                     "waits until memory is free", rn / GB, in.ngram / GB));
+                                     "the pinned n-gram table (%.1f GB): pinned if it fits when it is read, else read from the "
+                                     "page cache; the archive waits until memory is free", rn / GB, in.ngram / GB));
             if (!o.ngram_pinned && !in.ngram_can_map) {
                 o.ngram_pinned = true;
                 o.warn.push_back(fmt("the n-gram table (%.1f GB) does not fit the room after the experts (%.1f GB), and "
@@ -141,6 +154,7 @@ inline Out plan(const In& in) {
             }
         }
     }
+    o.avail_short = o.experts_short || (o.ngram_pinned && in.ngram > rn);
     double left = r - (o.ngram_pinned ? in.ngram : 0.0);
     if (in.ngram > 0 && !o.ngram_pinned) {  // the mapped table's hot rows: half of what is left, at most 12 GB
         o.ngram_cache = floor01(std::min(12 * GB, std::max(0.0, left) / 2));
@@ -185,7 +199,35 @@ inline Out plan(const In& in) {
         }
     }
     o.archive = a;
+    // (a warning only: the defaults stay, a start is never refused for this; an explicit value is the user's choice)
+    if (!au && in.arch_def > 0 && a < 2 * GB)
+        o.warn.push_back(fmt("the KV archive is only %.1f GB: conversations that leave VRAM mostly cannot be restored and get "
+                             "recomputed (slow re-prefills). QE_MEM_MARGIN_GB and QE_HOST_RESERVE_GB change what it gets", a / GB));
     o.prefix = a > 0 || !in.prefix_needs_archive ? p : 0;
+    return o;
+}
+
+// the plan, after waiting up to wait_s for MemAvailable to come back when what is pinned at load does not fit it yet (a model
+// switch: the previous server is still exiting); read_avail() reads MemAvailable again. *waited: the seconds waited
+// busy(): a previous holder is still alive (gpu_others.h big_holder): flat seconds do not end the wait (review N-L2)
+template <class F>
+inline Out plan_wait(In& in, F read_avail, double wait_s, double* waited, bool (*busy)() = nullptr) {
+    Out o = plan(in);
+    // waits only while MemAvailable rises (a process exiting gives memory back): a host that is just short starts at once
+    // (reviews: 27B L4, Flash-Next M4)
+    double t = 0;
+    int flat = 0;
+    while (o.avail_short && t < wait_s) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        t += 1;
+        const double a = read_avail();
+        const bool rising = a > in.avail + 0.5 * GB;
+        in.avail = a;
+        o = plan(in);
+        flat = rising || (busy && busy()) ? 0 : flat + 1;
+        if (flat >= 3) break;  // (three flat seconds with no previous holder alive: nothing is exiting, review N-L2)
+    }
+    if (waited) *waited = t;
     return o;
 }
 

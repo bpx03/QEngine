@@ -41,7 +41,11 @@ struct QeWdRec {             // one per rank, written by the first thread of tha
 };
 struct QeWdHost {            // host-mapped, shared by all GPUs
     volatile unsigned abort; // 0, else 1 + rank of the GPU that timed out (0xFF: host error)
-    unsigned pad[7];
+    // host threads inside a slow driver call (QeWdSlow: host-memory registration, VRAM moves, graph instantiation): it
+    // can hold the driver lock, so a peer's host thread waits to launch its part. While non-zero a waiting GPU restarts
+    // its clock instead of trapping: a slow peer, not a dead one (the host's run() monitor still ends a real hang)
+    volatile unsigned slow;
+    unsigned pad[6];
     QeWdRec rec[8];
 };
 struct QeWdDev {             // per device and translation unit (__device__ qe_wd_dev)
@@ -60,6 +64,13 @@ void qe_wd_init(int rank, int device);              // current device: install t
 int qe_wd_budget_ms();                              // 0 = off
 bool qe_fault_skip(int rank, const char* kind);      // fault injection (QE_FAULT_SKIP_AR_RANK), off by default
 [[noreturn]] void qe_wd_host_timeout(const char* what);  // a host-side wait ran past the budget
+void qe_wd_slow(int delta);                          // QeWdHost::slow += delta (no-op before qe_wd_init)
+struct QeWdSlow {                                    // scope of a slow driver call (see QeWdHost::slow)
+    QeWdSlow() { qe_wd_slow(1); }
+    ~QeWdSlow() { qe_wd_slow(-1); }
+    QeWdSlow(const QeWdSlow&) = delete;
+    QeWdSlow& operator=(const QeWdSlow&) = delete;
+};
 // breadcrumbs for hang reports (remote diagnosis): per worker id (the qe_wd_init rank), what its host thread launched
 // last (op, two numbers, a launch count) and its streams; printed with the watchdog's timeout report: the host side
 // and each stream's state (idle / busy / error) next to the device-side waits
@@ -118,6 +129,8 @@ __device__ __forceinline__ unsigned qe_wd_check(unsigned ws, unsigned site, int 
     const unsigned waited = (now - t0) & kWdTickMask;
     QeWdHost* h = *reinterpret_cast<QeWdHost* volatile*>(&qe_wd_dev.wd);
     const bool ab = h && h->abort != 0u;
+    if (!ab && h && h->slow != 0u && waited > (budget ? budget : kWdDefaultTicks) / 4u)
+        return (ws & kWdMask) | ((now ? now : 1u) << 14);  // a host thread is in a slow driver call: the clock restarts
     if (ab || (budget != 0xFFFFFFFFu && waited > (budget ? budget : kWdDefaultTicks))) {
         qe_wd_trip(ab, site, peer, want, seen, waited);
         __trap();

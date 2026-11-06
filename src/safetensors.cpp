@@ -25,17 +25,22 @@ void SafeTensors::open(const std::string& path) {
     maps_.push_back({base, size});
     paths_.push_back(path);
 
-    uint64_t hlen;
-    memcpy(&hlen, base, 8);
+    uint64_t hlen = 0;
+    if (size >= 8) memcpy(&hlen, base, 8);
+    // bounds (a truncated file, or not a safetensors file at all, e.g. a PyTorch .pt zip): a clear error, no wild read
+    if (size < 10 || hlen > size - 8 || ((const char*)base)[8] != '{')
+        throw std::runtime_error("not a safetensors file (bad header): " + path);
     std::string header((const char*)base + 8, hlen);
     Json j = Json::parse(header);
     const char* data = (const char*)base + 8 + hlen;
+    const size_t dsize = size - 8 - hlen;
     for (auto& [name, v] : j.obj) {
         if (name == "__metadata__") continue;
         TensorInfo t;
         t.dtype = v["dtype"].str;
         for (auto& d : v["shape"].arr) t.shape.push_back(d.i());
         size_t b = v["data_offsets"][0].i(), e = v["data_offsets"][1].i();
+        if (b > e || e > dsize) throw std::runtime_error("tensor " + name + ": data offsets outside the file " + path);
         t.data = data + b;
         t.nbytes = e - b;
         // a name in two files is allowed only with identical content (MTP: mtp.safetensors and mtp-int4 both carry the

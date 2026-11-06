@@ -6,6 +6,13 @@ usage:
 One engine, one request at a time (requests queue up); prompt caching is automatic: every
 request is a full prompt and the engine reuses the longest cached prefix.
 """
+import os
+
+# First, before anything imports numpy: its OpenBLAS pool (one thread per CPU, the server does no BLAS work) would be alive
+# at every later environment write: parse_args below and libqflash's constructor (issue #11). A value set by the user stays.
+if not os.environ.get("OPENBLAS_NUM_THREADS", "").strip():
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import argparse
 import array
 import hashlib
@@ -14,7 +21,6 @@ import collections
 import faulthandler
 import functools
 import json
-import os
 import re
 import shutil
 import signal
@@ -33,7 +39,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from agents import Tracker
 from qe_env import env_float, env_int, env_str
 import loop_guard
-from engine import Engine, SequenceFault, StartRefused
+from content_markers import OUT_MARK, SENT, Markers, escape_out, mark, out_marks, unmark
+from engine import Engine, EngineRefused, SequenceFault, StartRefused
 import engine_stats
 from steering import DEFAULT as STEER_DEFAULT, resolve_steering
 from grammar import GrammarError, Grammars, TokenLookup, schema_of
@@ -108,11 +115,15 @@ STEP_PROF = env_str("QE_STEP_PROF", "0") != "0"
 # never returns) -> Python + native stacks, the requests end with an error, exit 75 (docker / systemd restart it).
 # A start refused after admission for lack of room (KV pool full, prompts in flight) is requeued while sequences run,
 # for up to QE_START_RETRY_S seconds, before it fails; bad input and too-long refusals fail at once.
+# A queued request that fits nowhere while nothing runs (a KV pool shrunk under VRAM pressure: nothing here will free
+# room) ends with an error after QE_NO_ROOM_S seconds, 0 = no deadline; the server goes on.
 # A sequence that gets no token for QE_NO_PROGRESS_STEPS steps and QE_NO_PROGRESS_S seconds while not paused fails.
 HANG_S = env_float("QE_HANG_S", 180.0)
 START_RETRY_S = env_float("QE_START_RETRY_S", 60.0)
+NO_ROOM_S = env_float("QE_NO_ROOM_S", 10.0)
 NOPROG_STEPS = env_int("QE_NO_PROGRESS_STEPS", 64)
 NOPROG_S = env_float("QE_NO_PROGRESS_S", 10.0)
+PAUSE_TIMEOUT_S = env_float("QE_PAUSE_TIMEOUT_S", 900.0)  # deadline of a reply waiting for VRAM another process holds (preemption pauses: none)
 # the hang deadline while the slots are persisted to the disk cache (27B --disk-cache: idle and at shutdown)
 HANG_PERSIST_S = env_float("QE_HANG_PERSIST_S", 3600.0)
 
@@ -234,35 +245,109 @@ class Template:
 
 
 class Detok:
-    """Incremental detokenization that never emits half of a multi-byte character."""
+    """Incremental detokenization that never emits half of a multi-byte character. marks: {token id:
+    text} for the reply parser's tags (server/content_markers.py): those tokens come out with their `<`
+    replaced by OUT_MARK (same length), so a tag written as plain text is never taken for the token
+    (default: the tokenizer's tag tokens; {} = plain decode)."""
 
-    def __init__(self, tok):
+    def __init__(self, tok, marks=None):
         self.tok, self.ids, self.prefix, self.read = tok, [], 0, 0
+        self.marks = out_marks(tok) if marks is None else marks
+
+    def _dec(self, ids):
+        mk = self.marks
+        if not mk:  # (marks off: still escaped, parse_tool_calls keys on OUT_MARK, review L10)
+            return escape_out(self.tok.decode(ids, skip_special_tokens=False))
+        if not any(t in mk for t in ids):  # (a U+FDD1 the model wrote: escaped, only the tag tokens are marked, L5)
+            return escape_out(self.tok.decode(ids, skip_special_tokens=False))
+        out, run = [], []
+        for t in ids:
+            if t in mk:
+                if run:
+                    out.append(escape_out(self.tok.decode(run, skip_special_tokens=False)))
+                    run = []
+                out.append(mk[t])
+            else:
+                run.append(t)
+        if run:
+            out.append(escape_out(self.tok.decode(run, skip_special_tokens=False)))
+        return "".join(out)
 
     def push(self, ids):
         self.ids += ids
-        prev = self.tok.decode(self.ids[self.prefix:self.read], skip_special_tokens=False)
-        cur = self.tok.decode(self.ids[self.prefix:], skip_special_tokens=False)
+        prev = self._dec(self.ids[self.prefix:self.read])
+        cur = self._dec(self.ids[self.prefix:])
         if cur.endswith("�"):
             return ""
         out = cur[len(prev):]
         self.prefix, self.read = max(0, len(self.ids) - 6), len(self.ids)
         return out
 
+    def flush(self):
+        """The end of the reply: what push still holds back for a character that will not complete now, without that
+        partial character (a step can end anywhere, so complete text may sit in front of it)."""
+        prev = self._dec(self.ids[self.prefix:self.read])
+        cur = self._dec(self.ids[self.prefix:]).rstrip("�")
+        self.prefix, self.read = max(0, len(self.ids) - 6), len(self.ids)
+        return cur[len(prev):]
+
 
 # ----------------------------------------------------------------------------- output parser
 
 
-class Parser:
-    """Splits generated text into reasoning / content / tool calls, holding back partial tags."""
+def bad_param(body, stop_key, keys):
+    """(field, message) of a request field that would fail on the scheduler thread, where an error can end other clients'
+    replies too (Job.feed: all active jobs) or leave a started prefill behind (Job.begin_start). None: all fine. The
+    conversions are the ones the engine call makes, so what worked before still does."""
+    stop = body.get(stop_key)
+    if stop is not None and not isinstance(stop, str) and not (isinstance(stop, list) and all(isinstance(s, str) for s in stop)):
+        return stop_key, f"{stop_key} must be a string or a list of strings"
+    conv = {"temperature": None, "max_tokens": None, "max_completion_tokens": None,
+            "top_p": float, "min_p": float, "presence_penalty": float, "frequency_penalty": float, "top_k": int, "seed": int}
+    for k in keys:
+        v = body.get(k)
+        if v is None:
+            continue
+        if k == "temperature" or k.startswith("max_"):
+            if isinstance(v, int) or (k == "temperature" and isinstance(v, float)):
+                continue
+            return k, f"{k} must be {'a number' if k == 'temperature' else 'an integer'}"
+        try:
+            conv[k](v)
+        except (TypeError, ValueError, OverflowError):
+            return k, f"{k} must be a number"
+    return None
 
-    TAGS = ("<think>", "</think>", "<tool_call>")
+
+def reply_thinking(gen, ids, kw):
+    """The reply starts in reasoning: what the template really rendered (`enable_thinking` null or 0 still opens <think>,
+    the template's test is `is false`), as ThinkControl decides it. Without the tag tokens: the request's setting."""
+    ti = getattr(gen, "think_ids", None)
+    if ti is not None and ti.ok:
+        return ti.open_at_end(ids, gen.im_start)
+    return kw.get("enable_thinking", True)
+
+
+class Parser:
+    """Splits generated text into reasoning / content / tool calls, holding back partial tags. The tags
+    are the real tokens (marked by Detok, see server/content_markers.py); the same strings written as
+    plain text are text. tool_text keeps the marks (parse_tool_calls reads them)."""
+
+    THINK, END_THINK, CALL = mark("<think>"), mark("</think>"), mark("<tool_call>")
+    TAGS = (THINK, END_THINK, CALL)
+    END_CALL = mark("</tool_call>")
+    CALL_BODY = "\n<function="  # what follows the tag in a call (the template's form, what parse_tool_calls needs)
 
     def __init__(self, thinking):
         self.mode = "reasoning" if thinking else "content"
         self.buf = ""
         self.tool_text = ""
         self.lead = False  # right after </think>: newlines before the answer are dropped, also in later chunks
+        # no content text yet (the reply's start or right after a </think>): only here a real <think> opens reasoning.
+        # Once the answer has begun it is text, as a stray </think> is. Kept as state, because a step can end anywhere
+        # in the tokens (draft counts follow measured step times): whitespace waits here until the next thing is known.
+        self.fresh = True
+        self.promoted = False  # the reply's last calls, inside an open block, went to tool_text
 
     def _hold(self, s):
         # length of the longest suffix of s that is a prefix of a tag we may still see
@@ -271,8 +356,8 @@ class Parser:
                 return n
         return 0
 
-    def feed(self, text, final=False):
-        """Returns list of (kind, text) with kind in reasoning/content."""
+    def feed(self, text, final=False, promote=False):
+        """Returns list of (kind, text) with kind in reasoning/content. promote (with final): Job.call_in_block said yes."""
         out = []
         self.buf += text
         while True:
@@ -285,13 +370,59 @@ class Parser:
                 if not self.buf:
                     break
                 self.lead = False
-            tag = "</think>" if self.mode == "reasoning" else "<tool_call>"
+            if self.mode == "content" and self.fresh:
+                b = self.buf.lstrip()
+                if b.startswith(self.THINK):  # model re-opened a think block
+                    self.buf = b[len(self.THINK):]
+                    self.mode = "reasoning"
+                    continue
+                if not final and self.THINK.startswith(b):  # whitespace or part of the tag so far: undecided
+                    break
+                self.fresh = False
+            tag = self.END_THINK if self.mode == "reasoning" else self.CALL
             i = self.buf.find(tag)
-            if self.mode == "content" and self.buf.lstrip().startswith("<think>") and not out:
-                j = self.buf.find("<think>")  # model re-opened a think block
-                self.buf = self.buf[j + 7:]
-                self.mode = "reasoning"
-                continue
+            if self.mode == "reasoning" and i < 0 and self.CALL in self.buf:
+                # a real <tool_call> inside an open block. Not followed by the call's form it is reasoning text at once.
+                # A call waits for what follows: calls that end a reply the model ended itself are its calls (`promote`:
+                # Job.call_in_block; the template writes them after the block, but an agent harness would see a stop and no
+                # call). More reasoning, a later </think> or any other end means quoted: reasoning text, as before.
+                j = self.buf.find(self.CALL)
+                if j:
+                    out.append((self.mode, self.buf[:j]))
+                    self.buf = self.buf[j:]
+                p = 0  # end of the complete calls so far
+                tag_text = False
+                while True:
+                    b = self.buf[p:].lstrip()
+                    q = len(self.buf) - len(b)
+                    if not b.startswith(self.CALL):
+                        break
+                    r = b[len(self.CALL):]
+                    if not r.startswith(self.CALL_BODY):
+                        if self.CALL_BODY.startswith(r):
+                            b = None  # the form can still come
+                        else:
+                            tag_text = True
+                        break
+                    e = self.buf.find(self.END_CALL, q)
+                    if e < 0:
+                        b = None  # a call in progress
+                        break
+                    p = e + len(self.END_CALL)
+                if tag_text:
+                    out.append((self.mode, self.buf[:q + len(self.CALL)]))
+                    self.buf = self.buf[q + len(self.CALL):]
+                    continue
+                if not final:
+                    if b is None or self.CALL.startswith(b) or self.END_THINK.startswith(b):
+                        break  # undecided (whitespace or part of a tag counts as "startswith")
+                    out.append((self.mode, self.buf[:q]))  # other text follows: those calls were quoted
+                    self.buf = self.buf[q:]
+                    continue
+                if promote and p and b == "":
+                    self.promoted = True
+                    self.mode, self.tool_text, self.buf = "tool", self.buf, ""
+                    continue
             if i >= 0:
                 if i:
                     out.append((self.mode, self.buf[:i]))
@@ -310,7 +441,7 @@ class Parser:
                 out.append((self.mode, emit))
             self.buf = self.buf[len(self.buf) - keep:]
             break
-        return [(k, t) for k, t in out if t]
+        return [(k, unmark(t)) for k, t in out if t]
 
 
 GENERIC = re.compile(r"^(you are claude code, anthropic's official cli|you are a claude agent, built on|"
@@ -426,14 +557,24 @@ def parse_tool_calls(text, tools):
         props = (f.get("parameters") or {}).get("properties")
         schemas[f.get("name")] = props if isinstance(props, dict) and props else None
     calls = []
-    for block in re.findall(r"<tool_call>(.*?)(?:</tool_call>|$)", text, re.S):
-        m = re.search(r"<function=([^>\n]+)>(.*?)(?:</function>|$)", block, re.S)
+    if OUT_MARK in text:  # from Parser: only the real <tool_call> / </tool_call> tokens delimit a call
+        blocks = [unmark(b) for b in re.findall(re.escape(mark("<tool_call>")) + "(.*?)(?:" +
+                                                re.escape(mark("</tool_call>")) + "|$)", text, re.S)]
+    else:
+        blocks = [unmark(b) for b in re.findall(r"<tool_call>(.*?)(?:</tool_call>|$)", text, re.S)]  # (L5 escapes)
+    for block in blocks:
+        m = re.search(r"<function=([^>\n]+)>(.*)", block, re.S)
         if not m:
             continue
+        # the body ends at the LAST </function> and a value at a </parameter> followed by the next parameter or the
+        # end of the body: a value that quotes </parameter> / </function> (a file with a chat template or this
+        # server's source) is not cut there (review L6)
         name, body = m.group(1).strip(), m.group(2)
+        k = body.rfind("</function>")
+        body = body[:k] if k >= 0 else body
         props = schemas.get(name)
         args = {}
-        ms = list(re.finditer(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", body, re.S))
+        ms = list(re.finditer(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>(?=\s*(?:<parameter=|$))", body, re.S))
         found = [(pm.group(1).strip(), pm.group(2)) for pm in ms]
         end = ms[-1].end() if ms else 0
         # the last parameter left open (the model went straight to </function>): its value runs
@@ -469,7 +610,7 @@ def parse_tool_calls(text, tools):
             miss = [r for r in params.get("required", []) if r not in args]
             if miss:
                 diag("TOOL_ARGS_MISSING", f"{name} missing {miss}: {block[:300]!r}"
-                     f" (raw: {diag_dump('tool', text)})")
+                     f" (raw: {diag_dump('tool', unmark(text))})")
     return calls
 
 
@@ -477,6 +618,10 @@ def parse_tool_calls(text, tools):
 
 
 WS = re.compile(r"\s+")
+
+
+# generated ids of recent assistant turns (Generator.remember_turn): 8M tokens = 32 MB
+GEN_TURNS_TOKENS = int(os.environ.get("QE_GEN_TURNS_TOKENS", 8_000_000))
 
 
 def turn_key(text):
@@ -628,11 +773,14 @@ class Generator:
         self.tok, tok_json, tok_note = prof.tokenizer(getattr(args, "tokenizer", None))
         print(f"model {prof.family} ({prof.model_type or 'no model_type'}), tokenizer {tok_note}", flush=True)
         self.tmpl = Template(args.template)
+        self.marks = Markers(self.tok, tok_json)  # markers in content stay plain text (issue #7)
+        self.marks.plain_tok()  # at start, not on the event loop of the first request that needs it (review M2)
         self.im_start_user = self.tok.encode("<|im_start|>user", add_special_tokens=False).ids
         self.seg_cache = collections.OrderedDict()
         self.seg_tokens = 0
         self.turns = collections.OrderedDict()  # affinity -> recent (prompt, generated) (see check_reuse)
         self.gen_turns = collections.OrderedDict()  # see remember_turn
+        self.gen_turn_tokens = 0
         self.im_start = self.tok.token_to_id("<|im_start|>")
         self.im_end_nl = self.tok.encode("<|im_end|>\n", add_special_tokens=False).ids
         # loop guard (server/loop_guard.py): the repeated reply's tokens seed the penalty, without special tokens
@@ -817,11 +965,13 @@ class Generator:
             time.sleep(max(0.0, min(3.0 - (time.monotonic() - t_hang), left())))
             os._exit(75)
 
-    def prompt(self, messages, tools, kw, meta=None, track=False, guard_on=True):
+    def prompt(self, messages, tools, kw, meta=None, track=False, guard_on=True, guard_think=True):
         """Returns (ids, affinity): affinity = hash of the system prompt, so the main agent and
         each kind of subagent keep returning to their own sequence slot. ids.hint = position of
         the first user turn (end of the system part). track: a generation request (not a token
-        count): the main-thread tracker sees it (meta: the request's metadata, its session id)."""
+        count): the main-thread tracker sees it (meta: the request's metadata, its session id). guard_think: a guarded
+        turn may be generated with reasoning on (kw["enable_thinking"] is then set True: the caller's parser follows
+        it; False for structured output, constrained from the first token)."""
         info = None
         if track:
             sys0 = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
@@ -830,6 +980,8 @@ class Generator:
                 info = self.agents.observe(messages, tools, meta, aff0)
             except Exception as ex:  # monitoring / priority only: never fail a request for it
                 print(f"agents: {ex!r}", flush=True)
+        # (before the images are rewritten: without vision they become one fixed text, not a repeated result)
+        guard = self.loop_check(messages, info) if track and guard_on else None
         images = []
         for m in messages:  # image parts in prompt order -> placeholders (+ their sources)
             c = m.get("content")
@@ -845,13 +997,24 @@ class Generator:
                 else:
                     parts.append({"type": "text", "text": "[image omitted: this server runs without vision]"})
             m["content"] = parts
-        guard = self.loop_check(messages, info) if track and guard_on else None
-        if guard and self.args.loop_guard_note:  # the repeated call's result tells the model it is looping
-            messages, guard["note"] = loop_guard.add_note(messages, guard["turns"])
+        if guard and self.args.loop_guard_note and not guard["human"]:  # the repeated results tell it it is looping
+            messages, guard["note"] = loop_guard.add_note(messages, guard["turns"], guard["distinct"])
         messages = self.clean_history(messages, info, track)
         if getattr(self.args, "sort_tools", 1):
             tools = canonical_tools(tools)
-        text = self.tmpl.render(messages, tools, **kw)
+        mk = getattr(self, "marks", None)
+        if mk is not None:  # added-token strings in the request's text -> sentinels (server/content_markers.py)
+            text = self.tmpl.render(mk.protect_messages(messages), mk.protect(tools), **kw)
+        else:
+            text = self.tmpl.render(messages, tools, **kw)
+        if guard and guard_think and getattr(self.args, "loop_guard_think", 0) > 0 and kw.get("enable_thinking") is False \
+                and text.endswith(EMPTY_THINK):
+            # a looping agent on a no-think server: this turn reasons first (session 92997599: 10/10 replays broke the
+            # loop, presence / note alone did not). The prompt is rendered without thinking (same system header and
+            # history, so the cached prefix holds) and only the generation prompt's empty think block is opened.
+            text = text[:len(text) - len(EMPTY_THINK)] + "<think>\n"
+            kw["enable_thinking"] = True
+            guard["think"] = self.args.loop_guard_think
         sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
         label = "main agent" if info is not None and info.main else agent_label(sys_txt, messages)
         affinity = int.from_bytes(hashlib.blake2b(sys_txt.encode(), digest_size=8).digest(), "little")
@@ -859,7 +1022,7 @@ class Generator:
             d = env_str("QE_DUMP_PROMPTS")
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
-                f.write(text)
+                f.write(mk.restore(text) if mk is not None else text)
         ids = self.encode(text)
         ids.label, ids.agent, ids.guard = label, info, guard
         if images:
@@ -886,17 +1049,19 @@ class Generator:
         if getattr(a, "loop_guard_turns", 0) <= 0:
             return None
         try:
-            k = loop_guard.streak(messages)
+            st = loop_guard.state(messages)
         except Exception as ex:  # a guard must never fail a request
             print(f"loop guard: {ex!r}", flush=True)
             return None
-        if k < a.loop_guard_turns:
+        k = st["turns"]
+        if k < a.loop_guard_turns or not (st["human"] or loop_guard.due(st, a.loop_guard_turns)):
             return None
-        pres = a.loop_guard_penalty if k < 2 * a.loop_guard_turns else max(a.loop_guard_penalty, 2.0)
+        # the human just spoke (maybe "run it again"): only think first, no penalty, no note
+        pres = 0.0 if st["human"] else a.loop_guard_penalty if k < 2 * a.loop_guard_turns else max(a.loop_guard_penalty, 2.0)
         conv = getattr(getattr(info, "conv", None), "id", None)
         sess = getattr(getattr(info, "session", None), "key", "") or ""
-        return {"turns": k, "presence": pres, "conv": conv, "session": sess[2:10],
-                "main": bool(getattr(info, "main", False))}
+        return {"turns": k, "distinct": st["distinct"], "human": st["human"], "presence": pres, "conv": conv,
+                "session": sess[2:10], "main": bool(getattr(info, "main", False))}
 
     def guard_note(self, guard):
         """A guarded turn starts: warning line, diag log, /api/stats (qetop)."""
@@ -906,11 +1071,14 @@ class Generator:
             self.guards["triggers"] += 1
             self.guards["recent"] = (self.guards["recent"] + [ev])[-8:]
         print(f"WARNING loop guard: conversation {guard['conv']} (session {guard['session'] or '-'}) repeated the "
-              f"same turn {guard['turns']} times: next turn with presence penalty {guard['presence']:.2f} on the "
-              f"repeated reply ({guard.get('seed', 0)} tokens), lookup drafts off"
-              f"{', note appended to the tool result' if guard.get('note') else ''}", flush=True)
+              f"same turns {guard['turns']} times ({guard['distinct']} different): next turn with presence penalty "
+              f"{guard['presence']:.2f} on the repeated reply ({guard.get('seed', 0)} tokens), lookup drafts off"
+              f"{', note appended to the tool result' if guard.get('note') else ''}"
+              f"{', reasoning on (budget %d)' % guard['think'] if guard.get('think') else ''}"
+              f"{', after a human message' if guard.get('human') else ''}", flush=True)
         diag("LOOP_GUARD", f"conversation {guard['conv']} session {guard['session']} turns {guard['turns']} "
-             f"presence {guard['presence']:.2f} note {int(bool(guard.get('note')))}")
+             f"distinct {guard['distinct']} presence {guard['presence']:.2f} note {int(bool(guard.get('note')))} "
+             f"think {guard.get('think', 0)} human {int(bool(guard.get('human')))}")
 
     def steer_stats(self):
         """/api/stats steering: loaded vector names, the default, and the vectors dropped at start (with the reason)"""
@@ -950,23 +1118,26 @@ class Generator:
     def encode(self, text):
         """Tokenize chat text segment by segment (each starts with <|im_start|>, an atomic special
         token, so the result equals tokenizing the whole text) with a cache: every turn of a long
-        conversation only tokenizes its new messages (84K tokens: ~85 ms -> <1 ms)."""
+        conversation only tokenizes its new messages (84K tokens: ~85 ms -> <1 ms). A segment with
+        content markers (sentinels, see prompt()) is tokenized with those markers as plain text."""
         ids = Ids()
+        mk = getattr(self, "marks", None)
         with self.seg_lock:
             for i, part in enumerate(text.split("<|im_start|>")):
                 seg = part if i == 0 else "<|im_start|>" + part
                 if not seg:
                     continue
                 t = self.seg_cache.get(seg)
+                prot = mk is not None and SENT in seg
                 if t is None and seg.startswith("<|im_start|>assistant"):
-                    t = self.gen_turns.get(turn_key(seg))
+                    t = self.gen_turns.get(turn_key(mk.restore(seg) if prot else seg))
                     if t is not None:
-                        t = t + self.im_end_nl if seg.endswith("<|im_end|>\n") else None
+                        t = list(t) + self.im_end_nl if seg.endswith("<|im_end|>\n") else None
                     if t is not None:
                         self.seg_cache[seg] = t
                         self.seg_tokens += len(t)
                 if t is None:
-                    t = self.tok.encode(seg, add_special_tokens=False).ids
+                    t = mk.encode_segment(seg) if prot else self.tok.encode(seg, add_special_tokens=False).ids
                     self.seg_cache[seg] = t
                     self.seg_tokens += len(t)
                     while self.seg_tokens > 2_000_000 and self.seg_cache:
@@ -1024,17 +1195,25 @@ class Generator:
         re-serialized tool arguments), so the next request would roll back to the end of the
         previous prompt and prefill the whole reply again. Keep the generated ids (with the
         assistant header from the prompt) keyed by the turn's text without whitespace; encode()
-        uses them for a matching assistant segment."""
+        uses them for a matching assistant segment.
+        Bounded by tokens (GEN_TURNS_TOKENS), not by turns: a turn whose ids differ from its re-tokenized text (a
+        real tag token the Parser passed through as text comes back as plain text, review L2; merged whitespace)
+        must keep its ids as long as its KV can still be reused (the live pool and the RAM archive hold far fewer
+        reply tokens than the bound), or the same history would tokenize differently once the turn was evicted
+        (up to 1.3.4.3: 1024 turns, which agent sessions pass while the main thread's KV is still archived)."""
         if self.im_start not in prompt[-16:]:
             return
         head = prompt[len(prompt) - prompt[::-1].index(self.im_start) - 1:]
-        t = list(head) + list(out)
-        k = turn_key(self.tok.decode(t, skip_special_tokens=False) + "<|im_end|>")
+        t = array.array("i", list(head) + list(out))
+        k = turn_key(self.tok.decode(list(t), skip_special_tokens=False) + "<|im_end|>")
         with self.seg_lock:
+            old = self.gen_turns.pop(k, None)
+            n = getattr(self, "gen_turn_tokens", 0) - (len(old) if old is not None else 0) + len(t)
             self.gen_turns[k] = t
-            self.gen_turns.move_to_end(k)
-            while len(self.gen_turns) > 1024:
-                self.gen_turns.popitem(last=False)
+            while n > GEN_TURNS_TOKENS and len(self.gen_turns) > 1:
+                _, x = self.gen_turns.popitem(last=False)
+                n -= len(x)
+            self.gen_turn_tokens = n
 
     def system_end(self, ids):
         """Position of the first user turn: a snapshot there lets new sessions / subagents with
@@ -1071,6 +1250,20 @@ class Generator:
     def think_add(self, key, n=1):
         with self.think_mu:
             self.think[key] = self.think.get(key, 0) + int(n)
+
+    def no_room_msg(self, n, k, waited):
+        """Why a request that fits nowhere while nothing runs ends. Another process is named only when the pool is smaller
+        than at start and the request would have fit at that size (the pool shrinks only under VRAM pressure)."""
+        e = self.engine
+        cur, start = e.pool_now(), e.pool_tokens
+        facts = f"requested {n} tokens, KV pool now {cur} tokens (at start {start}), nothing else running, waited {waited:.0f} s"
+        gpus = ", ".join(f"GPU{x['i']} {(x['mem_total'] - x['mem']) / 2**30:.1f} GB" for x in self.metrics.gpus)
+        if gpus:
+            facts += f", free VRAM {gpus}"
+        if cur < start and n + k + 2 <= min(start, e.max_t):
+            return (f"no room in the KV pool: another process took the GPU memory and this request can't be finished ({facts}). "
+                    "Free the GPU memory and send it again.")
+        return f"no room in the KV pool: this request doesn't fit ({facts}). No sign of another process taking memory."
 
     def stop_requests(self):
         """Shutdown (SIGTERM / SIGINT, before uvicorn waits for the open streams): queued requests fail now, prompts
@@ -1129,7 +1322,7 @@ class Generator:
         """A sequence that gets no token for NOPROG_STEPS steps and NOPROG_S seconds while it is not paused fails
         with an error (and the pool state is logged) instead of looping silently (issue #3 D2)."""
         if n or j.finished or NOPROG_STEPS <= 0 or NOPROG_S <= 0:  # QE_NO_PROGRESS_STEPS / _S = 0: off
-            j.empty_n, j.t_tok = 0, time.time()
+            j.empty_n, j.t_tok, j.t_vwait = 0, time.time(), None
             return
         j.empty_n = getattr(j, "empty_n", 0) + 1
         t_tok = getattr(j, "t_tok", None) or time.time()
@@ -1138,8 +1331,21 @@ class Generator:
             return
         try:
             pi = self.engine.pool_info()
-            if pi["slots"][j.slot]["paused"]:
-                j.empty_n = 0
+            pz = pi["slots"][j.slot]["paused"]
+            if pz:  # paused: preempted by a reply worth more (waits for it, no deadline, as before), or waiting for
+                # GPU memory another process holds (vram): a long, explicit deadline (QE_PAUSE_TIMEOUT_S), counted from
+                # when the VRAM wait began, not from the last token (a preemption before it does not count, R6-L1)
+                if not pi["slots"][j.slot].get("vram"):
+                    j.t_vwait = None
+                    return
+                if getattr(j, "t_vwait", None) is None:
+                    j.t_vwait = time.time()
+                if time.time() - j.t_vwait < PAUSE_TIMEOUT_S:
+                    return
+                why = "no GPU memory for this reply's context: another process holds VRAM the KV cache gave up"
+                print(f"engine: slot {j.slot} waited {time.time() - j.t_vwait:.0f} s for VRAM ({why}): the request ends with an error",
+                      flush=True)
+                j.fail(SequenceFault(f"the reply waited {time.time() - j.t_vwait:.0f} s for GPU memory: {why}; try again later"))
                 return
         except Exception:
             pi = None
@@ -1167,7 +1373,7 @@ class Generator:
         # completion between its chunks (see pick_next)
         prefills = []
         decode_until = 0.0  # while another prompt is prefilled, decode steps run until this time
-        bg_done = True  # idle archiving has nothing left (reset whenever a request finishes)
+        bg_done = True  # idle archiving has nothing left (reset only when a request ends without a decode step; else the idle persist)
         pre_min, pre_max = self.args.preempt_min, self.args.preempt_max
         burst_wait = max(0.0, getattr(self.args, "burst_wait", 5.0)) / 1000.0
 
@@ -1180,9 +1386,12 @@ class Generator:
             if trace:
                 trace.write(json.dumps([kind, round(t0, 6), round(time.time() - t0, 6), n, toks]) + "\n")
         last_mg = 0.0
+        stuck_since = None  # since when requests have been queued with nothing running and nothing admitted
         while True:
             self.beat("scheduler loop")
             self.jobs_ref = (active, prefills)
+            if active or prefills:
+                stuck_since = None
             if self.retry_q:  # refused starts back to the queue (in order): a sequence or prefill ended since the
                 # refusal (retry_gen), the backoff ran out, or nothing runs any more (the last try decides)
                 tn = time.monotonic()
@@ -1388,6 +1597,7 @@ class Generator:
                             order = adm.batch_order(tc, prefills)
                             ready = e.prefill_multi([j.slot for j in order], budget)
                             if ready is not None:
+                                self.cur_slot = -1  # a piece prefilled alone binds its own slot: the next step resumes
                                 tr("prefill_multi", tc, len(order))
                                 finished = [j for j in order if j.slot in ready]
                                 self.sched["multi_batches"] = self.sched.get("multi_batches", 0) + 1
@@ -1429,7 +1639,18 @@ class Generator:
             if not active:
                 prof_last = 0.0
                 if self.queue and not prefills:  # nothing running and nothing admitted
+                    # nothing will free room: the pool is smaller than the request (shrunk under VRAM pressure; it grows back
+                    # if the memory returns, every can_admit tries). A bounded wait, then a clear error (review M4)
+                    now = time.time()
+                    stuck_since = stuck_since or now
                     with self.cv:
+                        # (the last can_admit: a request that fits was only not tried yet, e.g. behind a refused start)
+                        for j in [j for j in self.queue if NO_ROOM_S > 0 and now - max(stuck_since, j.t_enq) >= NO_ROOM_S
+                                  and not e.can_admit(len(j.ids) + adm.k + 2)]:
+                            self.queue.remove(j)
+                            msg = self.no_room_msg(len(j.ids), adm.k, now - max(stuck_since, j.t_enq))
+                            print(f"[sched] ERROR, the request ends, the server goes on: {msg}", flush=True)
+                            j.fail(SequenceFault(msg))
                         self.cv.wait(0.05)
                 continue
             try:
@@ -1462,6 +1683,8 @@ class Generator:
                         continue
                     j.feed(toks)
                     self.no_progress(j, len(toks))
+                    if not toks and not prefills:  # paused / waiting for room: no hot spin (N-L7; never while a prompt prefills, R4-L2)
+                        time.sleep(0.02)
                     if STEP_PROF:
                         p3 = _pc()
                         gap = p0 - prof_last if prof_last else 0.0  # previous step's return -> this call
@@ -1482,11 +1705,16 @@ class Generator:
                             j.feed(toks)
                             self.no_progress(j, len(toks))
                     tr("feed", tf, len(active))
+                    if not any(res) and not prefills:  # every slot paused / waiting: no hot spin (N-L7; not while a prompt prefills, R4-L2)
+                        time.sleep(0.02)
             except Exception as ex:
                 for j in active:
                     j.fail(ex)
                 active = []
+            n_active = len(active)
             active = [j for j in active if not j.check_done()]
+            if len(active) < n_active:
+                self.retry_gen += 1  # room may have freed: refused starts try again
 
 
 def repetition_period(ids, max_period=200, min_span=600, min_reps=5):
@@ -1509,6 +1737,12 @@ MULTI_MAX = 8  # prompts in flight that share prefill batches (the engine's FLAS
 
 class Job:
     """One generation request driven by the scheduler thread."""
+
+    text_mk = ""  # the reply with the real tag tokens marked (server/content_markers.py); text_all: the text itself
+    eos_end = False  # the model ended the reply itself
+    stop_sent = 0  # stop sequences: the length of text_all that went to the client (stop_scan)
+    answer_at = 0  # stop sequences match from here; None: a guard-opened thinking turn whose answer has not begun (stop_from)
+    answer_max = None  # a guard-opened thinking turn: the client's max_tokens, for the answer alone
 
     def __init__(self, gen, ids, p, on_text, cancelled, affinity):
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
@@ -1586,6 +1820,15 @@ class Job:
         # max_tokens in the engine: an MTP step accepting drafts past it would leave tokens in the
         # slot that the reply does not have, and the next turn would miss the live end (resume
         # from the prompt-end checkpoint and recompute the whole reply)
+        guard = getattr(self.ids, "guard", None)
+        if guard and guard.get("think") and self.p.get("max_tokens") and g.think_ids.ok:
+            # the client sized max_tokens for an answer and never asked for reasoning: those tokens come on top (as far
+            # as the context has room: ThinkControl plans its close from max_new, not from the slot, so the limit must
+            # not pass the slot end, or the reply ends there inside <think>)
+            self.answer_max = self.max_new
+            room = e.slots[self.slot] - len(self.ids) - 8
+            top = self.max_new + self.p["think_budget"] + g.think_ids.wrap_max
+            self.max_new = min(top, room) if room > 0 else self.max_new
         e.set_limit(self.slot, self.max_new - 1)
         # stop sequences: the reply is cut where its stop starts; the engine undoes the accepted
         # tokens past it (trim) when no step ran since, so the next turn resumes from the cut reply's
@@ -1614,13 +1857,16 @@ class Job:
                 except Exception as ex:
                     print(f"check_reuse: {ex!r}", flush=True)
             threading.Thread(target=check, daemon=True).start()
-        self.det = Detok(g.tok)
+        self.det = Detok(g.tok, g.marks.out if getattr(g, "marks", None) is not None else None)  # (tags marked)
         self.n, self.finish, self.text_all, self.cut = 0, "length", "", False
+        self.text_mk = ""
         self.loop_checked = 0
         self.tc = None  # thinking state / forced close (server/think_budget.py)
         if g.think_ids.ok and g.think_ids.open_at_end(self.ids, g.im_start):
             self.tc = ThinkControl(self, self.p.get("think_budget"), g.think_ids, g.can_force,
                                    self.p.get("think_budget_src"))
+        if guard and guard.get("think") and self.tc is not None:  # (also without a client max_tokens)
+            self.answer_at = None
         self.feed([first])
 
     def feed(self, pending):
@@ -1658,46 +1904,61 @@ class Job:
         for i, t in enumerate(pending):
             if t in g.eos and not self.p.get("ignore_eos"):
                 self.finish, stop_now = "stop", True
+                self.eos_end = True
                 pending = pending[:i]
                 break
             if t == g.im_start and not self.p.get("ignore_eos"):
                 # <|im_start|> is never valid inside a reply: the model skipped <|im_end|> and began a
                 # turn of its own (seen at 130K+ contexts). End the turn here: the client gets the reply
-                # so far, cleanly closed, instead of a hallucinated user / tool turn.
-                print(f"stopping at a generated <|im_start|> after {self.n + i} tokens", flush=True)
+                # so far, cleanly closed, instead of a hallucinated user / tool turn. (Markers quoted in
+                # the prompt's content are plain text since issue #7, so the model does not copy this
+                # token from there.) The log line shows the turn's first and last 16 tokens.
+                turn = list(self.det.ids) + list(pending[:i])
+                dec = lambda x: g.tok.decode(x, skip_special_tokens=False)  # noqa: E731
+                print(f"stopping at a generated <|im_start|> after {self.n + i} tokens (prompt {len(self.ids)}): "
+                      f"turn starts {dec(turn[:16])!r}, ends {dec(turn[-16:]) if len(turn) > 16 else ''!r}",
+                      flush=True)
+                diag("IM_START_STOP", f"slot {self.slot} prompt {len(self.ids)} after {self.n + i} tokens: "
+                     f"head {dec(turn[:16])!r} tail {dec(turn[-16:])!r}")
                 self.finish, stop_now = "stop", True
                 pending = pending[:i]
                 break
         self.n += len(pending)
         if self.tc is not None:
             self.tc.track(pending)
+            if self.answer_max is not None and not self.tc.open:  # thinking done: max_tokens for the answer from here
+                self.max_new = min(self.max_new, self.tc.n + 1 + self.answer_max)
+                self.answer_max = None  # (the engine's limit stays the larger one: only verifies a few drafts more)
         if STEP_PROF:
             q0 = _pc()
-        s = self.det.push(pending) if pending else ""
-        if STEP_PROF:
-            self.prof_detok += _pc() - q0
-        if s:
-            self.text_all += s
-            hit = next((x for x in self.stops if x in self.text_all[-len(s) - 64:]), None)
-            if hit:
-                cut = self.text_all.rfind(hit)
-                if STOP_ROLLBACK:
-                    self.keep = self.kept_tokens(self.text_all[:cut])
-                s = s[: max(0, len(s) - (len(self.text_all) - cut))]
-                self.finish, stop_now = "stop", True
-                self.cut = True
-            if s:
-                if STEP_PROF:
-                    q0 = _pc()
-                self.on_text(s)
-                if STEP_PROF:
-                    self.prof_emit += _pc() - q0
+        s = self.det.push(pending) if pending else ""  # (parser tags marked: server/content_markers.py)
         if not stop_now and g.args.loop_guard_tokens and not self.p.get("ignore_eos") and self.n - self.loop_checked >= 64:
             self.loop_checked = self.n
             p = repetition_period(self.det.ids, min_span=g.args.loop_guard_tokens)
             if p:  # degenerate loop: end the turn instead of streaming up to max_tokens of it
                 print(f"stopping a repetition loop (period {p} tokens) after {self.n} tokens", flush=True)
                 self.finish, stop_now = "stop", True
+        if stop_now or gdone or self.n >= self.max_new or len(self.ids) + self.n + 8 >= g.engine.slots[self.slot]:
+            s += self.det.flush()  # the last text of the reply, whichever step it arrived in
+        if STEP_PROF:
+            self.prof_detok += _pc() - q0
+        if self.stops:
+            s, cut = self.stop_scan(s, stop_now or gdone or self.n >= self.max_new or
+                                    len(self.ids) + self.n + 8 >= g.engine.slots[self.slot])
+            if cut >= 0:
+                if STOP_ROLLBACK:
+                    self.keep = self.kept_tokens(self.text_all[:cut])
+                self.finish, stop_now = "stop", True
+                self.cut = True
+        elif s:
+            self.text_all += unmark(s)  # the text itself (stops); on_text gets the marked text
+            self.text_mk += s
+        if s:
+            if STEP_PROF:
+                q0 = _pc()
+            self.on_text(s)
+            if STEP_PROF:
+                self.prof_emit += _pc() - q0
         if gdone and not stop_now:
             self.finish, stop_now = "stop", True
         c = self.grammar
@@ -1714,6 +1975,68 @@ class Job:
             self.finished = True
         elif self.tc is not None:
             self.tc.after(pending)  # a forced close of <think> in flight, or one due now (budget / answer tail)
+
+    def call_in_block(self):
+        """The model ended the reply itself with complete tool calls inside an open <think>: they are its calls. Not after a
+        stop string, max_tokens, the context limit or the loop guard: such a cut can land right after a quoted call. The
+        call's tokens are then not thinking tokens."""
+        g = self.gen
+        if not self.eos_end or self.cut or mark("<tool_call>") not in self.text_mk or not g.think_ids.ok:
+            return False
+        p = Parser(g.think_ids.open_at_end(self.ids, g.im_start))
+        p.feed(self.text_mk)
+        p.feed("", final=True, promote=True)
+        if not p.promoted or not re.search(r"<function=[^>\n]+>", p.tool_text):  # (as parse_tool_calls needs)
+            return False
+        print("WARNING: the reply ended inside <think> with a complete tool call: running the call", flush=True)
+        if self.tc is not None:
+            tid, left, k = g.tok.token_to_id("<tool_call>"), p.tool_text.count(mark("<tool_call>")), len(self.det.ids)
+            while left and k > 0:
+                k -= 1
+                left -= self.det.ids[k] == tid
+            self.tc.n -= min(self.tc.n, len(self.det.ids) - k)
+        return True
+
+    def stop_from(self):
+        """Where client stop sequences may match in text_all, None: not yet. On a guard-opened thinking turn they start at
+        the answer's first character: the client asked for no reasoning, and its stops (ReAct "Observation:", "\\n\\n") must
+        not end the reply mid-thought or in the blank line after </think>. The real </think> (marked): a block can reopen,
+        and the same string in the text is text."""
+        if self.answer_at is None and not self.tc.open:
+            tag = mark("</think>")
+            i = self.text_mk.rfind(tag)
+            rest = self.text_all[i + len(tag):]
+            if i >= 0 and rest.strip():
+                self.answer_at = len(self.text_all) - len(rest.lstrip())
+        return self.answer_at
+
+    def stop_scan(self, s, ending):
+        """A request with stop sequences: takes new text, returns what may go to the client now and where the reply is cut
+        (-1: not cut). Text that could still become a stop waits, so what the client gets does not depend on where steps
+        end. The cut is the leftmost stop of the reply: a stop found while an earlier-starting one can still complete waits
+        too. `ending`: nothing more comes, the waiting text goes out."""
+        self.text_all += unmark(s)  # the text itself (stops); on_text gets the marked text
+        self.text_mk += s
+        t, sent = self.text_all, self.stop_sent
+        a = self.stop_from()
+        if a is None:  # nothing to scan yet: all of it goes out (the parser holds its own tags)
+            self.stop_sent = len(t)
+            return self.text_mk[sent:], -1
+        a = max(sent, a)  # (the text in front of the answer goes out with what follows)
+        found = [p for p in (t.find(x, a) for x in self.stops) if p >= 0]
+        pos = min(found) if found else -1
+        hold = len(t)  # start of the longest end of the text that begins a stop
+        for x in self.stops:
+            for n in range(min(len(x) - 1, len(t) - a), 0, -1):
+                if x.startswith(t[-n:]):
+                    hold = min(hold, len(t) - n)
+                    break
+        if pos >= 0 and (ending or hold >= pos):
+            self.stop_sent = pos
+            return self.text_mk[sent:pos], pos
+        end = len(t) if ending else hold
+        self.stop_sent = end
+        return self.text_mk[sent:end], -1
 
     def kept_tokens(self, text):
         """Reply tokens wholly inside the text before the stop (trailing whitespace dropped: the
@@ -1751,11 +2074,16 @@ class Job:
         if not self.finished:
             return False
         if not self.done.is_set():
-            if self.prio == 1 and self.finish == "stop" and "<tool_call>" not in self.text_all:
+            promoted = self.call_in_block()
+            call = mark("<tool_call>") in self.text_mk  # a real tool-call token, not the text (review L3)
+            if self.prio == 1 and self.finish == "stop" and not call:
                 self.gen.engine.set_prio(self.slot, 0)  # a subagent that is done (no tool to run)
             if getattr(self, "det", None) is not None:  # its final reply is recognised in a parent's history
-                self.gen.agents.finished(getattr(self.ids, "agent", None), self.text_all,
-                                         "<tool_call>" in self.text_all)
+                ans = self.text_mk  # the answer: after the real </think>, before a real <tool_call>
+                if mark("</think>") in ans:
+                    ans = ans.split(mark("</think>"), 1)[1]
+                self.gen.agents.finished(getattr(self.ids, "agent", None), unmark(ans.split(mark("<tool_call>"), 1)[0]),
+                                         call, split=False)
             ds = engine_stats.delta(getattr(self, "ds0", None), self.gen.dstats.read(self.slot))
             trimmed = None
             if getattr(self, "keep", None) is not None:
@@ -1764,7 +2092,8 @@ class Job:
             if getattr(self, "det", None) and not getattr(self.ids, "mm", None) and (
                     not self.cut or getattr(self, "keep", None) is not None):
                 out = self.det.ids if not self.cut else self.det.ids[:self.keep]
-                self.gen.remember(self.affinity, self.ids, out)
+                if not promoted:  # (the next turn renders a </think> the tokens don't have: not a changed reply)
+                    self.gen.remember(self.affinity, self.ids, out)
                 self.gen.remember_turn(self.ids, out)
                 self.gen.engine.add_corpus(out)
             t2 = time.time()
@@ -1776,6 +2105,8 @@ class Job:
                 self.stats["drafts"] = ds  # [steps, MTP drafted, accepted, lookup drafted, accepted]
             if trimmed is not None:
                 self.stats["stop_trim"] = trimmed
+            if promoted:
+                self.stats["promote_call"] = True
             if self.penalty:
                 self.stats["penalty"] = self.penalty
             if self.guarded:
@@ -1919,7 +2250,7 @@ async def complete(gen, ids, params, aff, thinking, tools):
                 return item
             if isinstance(item, dict):
                 st = item
-                for kind, t in parser.feed("", final=True):
+                for kind, t in parser.feed("", final=True, promote=st.get("promote_call", False)):
                     parts[kind] += t
             else:
                 for kind, t in parser.feed(item):
@@ -1945,7 +2276,7 @@ async def complete(gen, ids, params, aff, thinking, tools):
         spent_s += st.get("decode_s", 0.0)
         gen.think_add("empty_retried")
         if parser.tool_text:  # the empty-reply WARNING skips replies with <tool_call>: this is the line for it
-            raw = diag_dump("tool", parser.tool_text)
+            raw = diag_dump("tool", unmark(parser.tool_text))
             print(f"WARNING empty reply: a tool call that does not parse ({st['completion_tokens']} tokens"
                   f"{', raw: ' + raw if raw else ''}); retry {attempt + 1}/{tries} follows", flush=True)
     if spent:
@@ -1990,6 +2321,18 @@ def log_stats(kind, st):
 # 'max' to 'xhigh' and 'minimal' to 'low' before rendering (think_budget.QWEN_RULES.client)
 KNOWN_EFFORTS = ("xhigh", "high", "medium", "low")
 CLIENT_EFFORTS = ("max", "minimal")
+
+
+EMPTY_THINK = "<think>\n\n</think>\n\n"  # the template's generation prompt with enable_thinking=false
+
+
+def guard_budget(ids, budget, src):
+    """(think budget, source) of a request whose turn the loop guard generates with reasoning on (prompt():
+    guard["think"]): at most --loop-guard-think tokens; otherwise the request's own."""
+    g = getattr(ids, "guard", None)
+    if not g or not g.get("think"):
+        return budget, src
+    return (g["think"] if budget is None else min(budget, g["think"])), "loop_guard"
 
 
 def template_kwargs(body, default_think, default_effort=None, anthropic=False):
@@ -2259,6 +2602,10 @@ def build_app(gen: Generator, args):
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
         body = await req.json()
+        bad = bad_param(body, "stop", ("max_completion_tokens", "max_tokens", "temperature", "top_p", "top_k", "min_p", "seed",
+                                       "presence_penalty", "frequency_penalty"))
+        if bad:
+            return JSONResponse({"error": {"message": bad[1], "type": "invalid_request_error", "param": bad[0]}}, status_code=400)
         tools = body.get("tools")
         kw = gen.effort_rules.client_effort(template_kwargs(body, args.think, args.reasoning_effort))
         try:
@@ -2278,7 +2625,7 @@ def build_app(gen: Generator, args):
                                            "param": "steering"}}, status_code=400)
         try:
             ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True,
-                                  guard_on=body.get("loop_guard") is not False)
+                                  guard_on=body.get("loop_guard") is not False, guard_think=grammar is None)
         except InputError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error", "param": "messages"}},
                                 status_code=400)
@@ -2292,6 +2639,7 @@ def build_app(gen: Generator, args):
                                            "code": "context_length_exceeded"}}, status_code=400)
         if body.get("loop_guard") is False:  # per request off-switch of the cross-turn loop guard
             ids.guard = None
+        budget, budget_src = guard_budget(ids, budget, budget_src)
         stop = body.get("stop")
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "min_p": body.get("min_p"), "seed": body.get("seed"),
@@ -2302,7 +2650,7 @@ def build_app(gen: Generator, args):
                   "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
-        parser = Parser(kw.get("enable_thinking", True))
+        parser = Parser(reply_thinking(gen, ids, kw))
 
         def tool_calls_out(calls):
             return [{"index": i, "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
@@ -2342,7 +2690,7 @@ def build_app(gen: Generator, args):
                         yield chunk({"role": "assistant", "content": ""})
                     if isinstance(item, dict):
                         st = item
-                        for kind, t in parser.feed("", final=True):
+                        for kind, t in parser.feed("", final=True, promote=st.get("promote_call", False)):
                             yield chunk({"reasoning_content" if kind == "reasoning" else "content": t})
                         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
                         if calls:
@@ -2370,7 +2718,7 @@ def build_app(gen: Generator, args):
                             a0 = _pc()
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, kw.get("enable_thinking", True), tools)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools)
         if isinstance(r, SequenceFault):
             if bad_input(r):
                 return JSONResponse({"error": {"message": str(r), "type": "invalid_request_error"}}, status_code=400)
@@ -2405,7 +2753,11 @@ def build_app(gen: Generator, args):
     @app.post("/v1/messages")
     async def messages(req: Request):
         body = await req.json()
-        if env_str("QE_DUMP_PROMPTS"):
+        bad = bad_param(body, "stop_sequences", ("max_tokens", "temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"))
+        if bad:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": bad[1]}}, status_code=400)
+        if env_str("QE_DUMP_PROMPTS"):  # the request as received (prompt() writes the rendered text next to it)
+            os.makedirs(env_str("QE_DUMP_PROMPTS"), exist_ok=True)
             with open(os.path.join(env_str("QE_DUMP_PROMPTS"), f"{time.time():.3f}.json"), "w") as f:
                 json.dump(body, f, ensure_ascii=False, indent=1)
         tools = anthropic_tools(body.get("tools"))
@@ -2429,7 +2781,7 @@ def build_app(gen: Generator, args):
             msgs = anthropic_to_messages(body)
             prev = dict(msgs[-1]) if msgs else None  # before prompt() rewrites image parts
             ids, aff = gen.prompt(msgs, tools, kw, body.get("metadata"), track=True,
-                                  guard_on=body.get("loop_guard") is not False)
+                                  guard_on=body.get("loop_guard") is not False, guard_think=grammar is None)
         except InputError as ex:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
                                 status_code=400)
@@ -2438,13 +2790,15 @@ def build_app(gen: Generator, args):
                                 status_code=400)
         if body.get("loop_guard") is False:  # per request off-switch of the cross-turn loop guard
             ids.guard = None
+        budget, budget_src = guard_budget(ids, budget, budget_src)
+        stop = body.get("stop_sequences")
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
-                  "stop": body.get("stop_sequences"), "grammar": grammar, "steering_sel": steer, "think_budget": budget,
+                  "stop": [stop] if isinstance(stop, str) else stop, "grammar": grammar, "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
         mid = "msg_" + uuid.uuid4().hex[:24]
-        parser = Parser(kw.get("enable_thinking", True))
+        parser = Parser(reply_thinking(gen, ids, kw))
         stop_map = {"stop": "end_turn", "length": "max_tokens"}
 
         def usage(st):
@@ -2492,7 +2846,7 @@ def build_app(gen: Generator, args):
                         return
                     if isinstance(item, dict):
                         st = item
-                        for kind, t in parser.feed("", final=True):
+                        for kind, t in parser.feed("", final=True, promote=st.get("promote_call", False)):
                             for x in emit(kind, t):
                                 yield x
                         if state["kind"] is not None:
@@ -2521,7 +2875,7 @@ def build_app(gen: Generator, args):
                             yield x
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, kw.get("enable_thinking", True), tools)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools)
         if isinstance(r, SequenceFault):
             if bad_input(r):
                 return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(r)}},
@@ -2590,8 +2944,8 @@ def parse_args(argv=None):
             raise argparse.ArgumentTypeError("a token count (262144, 512K, 1M)")
         return int(float(m.group(1)) * {"": 1, "k": 1024, "m": 1024 * 1024}[m.group(2).lower()])
     ap.add_argument("--max-ctx", type=ctx_arg, default=262144,
-                    help="context per conversation (default 262144); Flash-Next above 262144 (up to 1M) turns on "
-                         "YaRN RoPE scaling and needs FLASH_KV=ram")
+                    help="context per conversation (default 262144); above 262144 (up to 1M) turns on YaRN RoPE "
+                         "scaling, factor context / 262144 (27B: QE_YARN, Flash-Next: FLASH_YARN, and needs FLASH_KV=ram)")
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
     ap.add_argument("--temperature", type=float, default=None,
@@ -2603,6 +2957,11 @@ def parse_args(argv=None):
                     help="MTP head weights for the engine (sets $QE_MTP_FILE; default: the engine's own choice, "
                          "for 27B model_mtp_ft.safetensors when present, else downloaded once from the latest "
                          "release into ~/.cache/qengine/assets; QE_FETCH_ASSETS=0: no download)")
+    ap.add_argument("--lsa", default=None, metavar="MAP",
+                    help="27B: Latent Sparse Attention for long contexts (opt-in, lossy): the D-LSA index map as "
+                         "safetensors (tools/lsa/convert_map.py from the released .pt); sets $QE_LSA ($QE_LSA_MODE block / dlsa: "
+                         "default block below --max-ctx 1M, dlsa from 1M on). Rows at "
+                         "positions >= $QE_LSA_PF_MIN (prefill) / $QE_LSA_DEC_MIN (decode) attend sparsely")
     ap.add_argument("--think", type=int, default=1, help="default enable_thinking")
     ap.add_argument("--reasoning-effort", default=env_str("QE_REASONING_EFFORT"),
                     help="default reasoning effort for requests that send none (xhigh, high = xhigh, max = xhigh, "
@@ -2694,12 +3053,16 @@ def parse_args(argv=None):
     ap.add_argument("--frequency-penalty", type=float, default=env_float("QE_FREQUENCY_PENALTY", 0.0),
                     help="frequency penalty of sampled requests that send none; env QE_FREQUENCY_PENALTY")
     ap.add_argument("--loop-guard-turns", type=int, default=env_int("QE_LOOP_GUARD_TURNS", 3),
-                    help="cross-turn loop guard: after N consecutive identical (reply, result) turns of a "
+                    help="cross-turn loop guard: after N turns that repeat earlier (reply, tool result) turns of a "
                          "conversation the next turn runs with --loop-guard-penalty on the repeated reply's tokens "
-                         "and no lookup drafts (0 = off); env QE_LOOP_GUARD_TURNS")
+                         "and no lookup drafts, again at 2N and 4N turns, then every 24 turns (0 = off); env "
+                         "QE_LOOP_GUARD_TURNS")
     ap.add_argument("--loop-guard-penalty", type=float,
                     default=env_float("QE_LOOP_GUARD_PENALTY", 1.5),
                     help="presence penalty of a guarded turn (2.0 from 2N repeated turns); env QE_LOOP_GUARD_PENALTY")
+    ap.add_argument("--loop-guard-think", type=int, default=env_int("QE_LOOP_GUARD_THINK", 2048),
+                    help="a guarded turn of a request without reasoning is generated with reasoning on, at most this "
+                         "many reasoning tokens, on top of the client's max_tokens (0 = off); env QE_LOOP_GUARD_THINK")
     ap.add_argument("--loop-guard-note", type=int, default=env_int("QE_LOOP_GUARD_NOTE", 1),
                     help="guarded turn: append a server note to the latest tool result (the same call returned the "
                          "same result N times, change the approach); 0 = off; env QE_LOOP_GUARD_NOTE")
@@ -2709,8 +3072,9 @@ def parse_args(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--disk-cache", default="",
-                    help="directory of a persistent prompt cache surviving restarts (default off: "
-                         "conversations live in GPU slots and host memory only)")
+                    help="27B: directory of a persistent prompt cache surviving restarts (default off: "
+                         "conversations live in GPU slots and host memory only). Flash-Next has no disk cache: "
+                         "the flag is accepted, ignored with a warning at start")
     ap.add_argument("--stats-file", default="~/.cache/qengine/stats.json",
                     help="all-time monitoring totals (dashboard)")
     ap.add_argument("--disk-cache-gb", type=float, default=200)
@@ -2738,14 +3102,32 @@ def parse_args(argv=None):
               f"{', '.join(KNOWN_EFFORTS)}: the template renders it as medium", flush=True)
     # the MTP head fine-tuned on the engine's own answers: +8% accepted drafts
     ft = os.path.join(args.model, "model_mtp_ft.safetensors")
+    if getattr(args, "lsa", None):
+        if not os.path.isfile(args.lsa):
+            sys.exit(f"--lsa: no such file {args.lsa}")
+        with open(args.lsa, "rb") as f:
+            head = f.read(9)
+        n = int.from_bytes(head[:8], "little") if len(head) == 9 else 0
+        if head[:2] == b"PK" or len(head) < 9 or head[8:9] != b"{" or n > os.path.getsize(args.lsa) - 8:
+            sys.exit(f"--lsa: {args.lsa} is not a safetensors file (a released .pt map must be converted first: "
+                     f"python3 -I tools/lsa/convert_map.py <map.pt> <out.safetensors>)")
+        os.environ["QE_LSA"] = os.path.abspath(args.lsa)
     if args.mtp_file:
         os.environ["QE_MTP_FILE"] = args.mtp_file
     elif env_str("QE_MTP_FILE") is None and os.path.exists(ft):
         os.environ["QE_MTP_FILE"] = ft
-    if args.disk_cache:
+    if args.disk_cache:  # (also the directory of the start-up cache, comm_cache.h: on Flash-Next too)
         os.environ["QE_DISK_CACHE"] = args.disk_cache
         os.environ["QE_DISK_CACHE_GB"] = str(args.disk_cache_gb)
     return args
+
+
+def refuse_disk_cache_on_flash(args):
+    """Flash-Next has no disk tier (issue #15). A warning goes unread and the user believes conversations survive a
+    restart, so stop before the load. The start-up cache of the link probe has its own variable: QE_DISK_CACHE."""
+    if args.disk_cache and args.profile.is_flash:
+        sys.exit("error: --disk-cache is not supported on Flash-Next yet (only the 27B has it): remove the flag. "
+                 "Conversations do not survive a restart on Flash-Next. For the directory of the start-up cache, set QE_DISK_CACHE.")
 
 
 def start_log(args):
@@ -2771,6 +3153,7 @@ def main():
     args = parse_args()
     start_log(args)
     print("QEngine %s (build %s)" % version_info(args.engine_lib or env_str("QE_LIB")), flush=True)
+    refuse_disk_cache_on_flash(args)
     if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
         import assets
         assets.ensure(args.model)
@@ -2778,7 +3161,11 @@ def main():
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     except Exception:
         pass
-    gen = Generator(args)
+    try:
+        gen = Generator(args)
+    except EngineRefused as ex:  # (exit 3 = a refused start, as the engine's own load-time stops; review Flash-Next M7)
+        print(f"qengine: {ex}", file=sys.stderr, flush=True)
+        os._exit(3)
     class Server(uvicorn.Server):  # SIGTERM / SIGINT: end the requests first, then uvicorn's wait for the streams
         def handle_exit(self, sig, frame):
             if not gen.stopping:

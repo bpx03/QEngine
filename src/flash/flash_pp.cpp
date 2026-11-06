@@ -3,6 +3,7 @@
 #include "card_probe.h"
 #include "../env.h"
 
+#include <atomic>
 #include <cmath>
 #include <algorithm>
 #include <chrono>
@@ -24,6 +25,7 @@ StageThreads::StageThreads(int n) {
     for (int s = 0; s < n; s++) {
         Q* q = new Q;
         q->th = std::thread([q] {
+            flash::tl_serving = true;  // (a stage thread drives its workers: it may take over their moves, R6-L2)
             std::unique_lock<std::mutex> lk(q->mu);
             while (true) {
                 if (q->fns.empty() && !q->quit && spin_us > 0) {
@@ -97,6 +99,7 @@ RankPool::RankPool(int t) : t_(std::max(1, t)) {
     static const int spin_us = env_int("FLASH_PP_RANK_SPIN_US", 5000);
     for (int r = 1; r < t_; r++)
         th_.emplace_back([this, r] {
+            flash::tl_serving = true;  // (a rank thread drives its worker, R6-L2)
             long long seen = 0;
             while (true) {
                 // a short spin first (a stage task runs several fan-outs back to back), then the condition variable
@@ -1499,6 +1502,23 @@ std::string pp_calibrate(const std::vector<int>& devs) {
     return line;
 }
 
+static std::atomic<double> g_h2d_probe{-1.0};
+static std::atomic<bool> g_no_p2p{false};
+void pp_set_h2d_probe(double gbps) {
+    double none = -1.0;
+    g_h2d_probe.compare_exchange_strong(none, gbps);
+}
+double pp_h2d_gbps(double def) {
+    if (env_set("FLASH_PP_H2D_GBPS")) return env_double("FLASH_PP_H2D_GBPS", def);
+    const double p = g_h2d_probe.load();
+    return p >= 0 ? p : def;
+}
+void pp_set_no_p2p() { g_no_p2p.store(true); }
+bool pp_hop_p2p() {
+    if (env_set("FLASH_PP_P2P")) return env_int("FLASH_PP_P2P", 1) != 0;
+    return !g_no_p2p.load();
+}
+
 std::vector<int> pp_bounds(int n, long long np, bool decode, std::string* err) {
     std::vector<int> b = flash_pp::parse_layers(env_str("FLASH_PP_LAYERS"), n, err);
     if (!err->empty()) return {};
@@ -1506,7 +1526,7 @@ std::vector<int> pp_bounds(int n, long long np, bool decode, std::string* err) {
     const flash_pp::CostModel cm;
     const double w = decode ? std::clamp(env_double("FLASH_PP_DECODE_W", 0.5), 0.0, 1.0) : 0.0;
     if ((int)g_cards.size() == n && flash_pp::cards_uneven(g_cards) && env_int("FLASH_PP_CARD_SPLIT", 1)) {
-        const double h2d = env_double("FLASH_PP_H2D_GBPS", 22.0) * 1e9;
+        const double h2d = pp_h2d_gbps(22.0) * 1e9;
         return flash_pp::partition_cards(n, cm, np / 2.0, flash_pp::DecodeCost{}, w, g_cards, h2d);
     }
     return flash_pp::partition_mixed(n, cm, np / 2.0, flash_pp::DecodeCost{}, w);
@@ -1541,15 +1561,16 @@ bool pp_p2p_ok(int a, int b) {
 std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vector<int>& bounds, int ctx, const SafeTensors& st,
                                            const HostTables& ht, const SafeTensors* mst, const std::vector<std::vector<int>>& cold,
                                            const std::vector<float>& prior, const std::vector<int>& draft_ids, const NgramDev& ngd,
-                                           const std::vector<const Worker*>& views) {
+                                           const std::vector<const Worker*>& views, int max_seqs) {
     const int n = (int)devs.size();
     std::vector<Plan> plans = make_stage_plans(bounds);
+    for (Plan& p : plans) p.max_seqs = max_seqs;
     std::vector<Worker*> S(n);
     // the hop between neighbours goes peer-to-peer (one copy into the next stage's receive buffers) where the cards have
     // peer access, unless FLASH_PP_P2P=0; else through pinned host memory (D2H + H2D). Peer access is enabled here, before
     // the loads (the receive buffers are allocated ahead of the expert budget)
     std::vector<char> rx(n, 0);
-    for (int s = 1; s < n && env_int("FLASH_PP_P2P", 1); s++) {
+    for (int s = 1; s < n && pp_hop_p2p(); s++) {
         int a = 0, b = 0;
         if (cudaDeviceCanAccessPeer(&a, devs[s - 1], devs[s]) != cudaSuccess || cudaDeviceCanAccessPeer(&b, devs[s], devs[s - 1]) != cudaSuccess || !a || !b) continue;
         CUDA_CHECK(cudaSetDevice(devs[s - 1]));
@@ -1649,18 +1670,19 @@ std::vector<int> pptp_bounds(const std::vector<std::vector<int>>& groups, long l
     const std::vector<flash_pp::CardSpeed> gs = flash_pp::group_speeds(groups, gmin, p2p);
     const flash_pp::CostModel cm;
     const double w = std::clamp(env_double("FLASH_PP_DECODE_W", 0.5), 0.0, 1.0);
-    const double h2d = env_double("FLASH_PP_H2D_GBPS", 22.0) * 1e9;
+    const double h2d = pp_h2d_gbps(22.0) * 1e9;
     return flash_pp::partition_cards(n, cm, np / 2.0, flash_pp::DecodeCost{}, w, gs, h2d);
 }
 
 std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups, const std::vector<int>& bounds, int ctx,
                                     const SafeTensors& st, const HostTables& ht, const SafeTensors* mst,
                                     const std::vector<std::vector<int>>& cold, const std::vector<float>& prior,
-                                    const std::vector<int>& draft_ids, const NgramDev& ngd) {
+                                    const std::vector<int>& draft_ids, const NgramDev& ngd, int max_seqs) {
     const int n = (int)groups.size();
     std::vector<int> tps;
     for (auto& g : groups) tps.push_back((int)g.size());
-    const std::vector<Plan> plans = make_stage_plans(bounds, tps);
+    std::vector<Plan> plans = make_stage_plans(bounds, tps);
+    for (Plan& p : plans) p.max_seqs = max_seqs;
     std::vector<int> dev, stg, rk;  // per worker (flat)
     for (int s = 0; s < n; s++)
         for (size_t r = 0; r < groups[s].size(); r++) { dev.push_back(groups[s][r]); stg.push_back(s); rk.push_back((int)r); }
@@ -1686,7 +1708,7 @@ std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups,
     // have peer access (or are the same card), unless FLASH_PP_P2P=0. The engine uses P2P on a boundary only when every
     // receiver of it has a receive buffer.
     std::vector<char> rx(nw, 0);
-    for (int s = 1; s < n && env_int("FLASH_PP_P2P", 1); s++)
+    for (int s = 1; s < n && pp_hop_p2p(); s++)
         for (int j = 0; j < tps[s]; j++) {
             const int a = groups[s - 1][j % tps[s - 1]], b = groups[s][j];
             bool ok = a == b;
@@ -1759,7 +1781,7 @@ int pp_microbatch(const std::vector<Worker*>& Wall, const std::vector<int>& b, l
     // the host link: FLASH_PP_H2D_GBPS (the server sets it from its startup probe), else the slow-link emulation's rate
     // when it slows the staging too (FLASH_TEST_LINK_HOST), else 22 GB/s (PCIe 4.0 x16)
     const double emu = env_int("FLASH_TEST_LINK_HOST", 0) ? env_double("FLASH_TEST_LINK_GBPS", 0.0) : 0.0;
-    const double h2d = env_double("FLASH_PP_H2D_GBPS", emu > 0 ? emu : 22.0) * 1e9;
+    const double h2d = pp_h2d_gbps(emu > 0 ? emu : 22.0) * 1e9;
     for (size_t s = 0; s < S.size(); s++) {
         flash_pp::PfStage p;
         for (int li = b[s]; li < b[s + 1]; li++) p.u += cm.layer(li, ctx0 + np / 2.0);

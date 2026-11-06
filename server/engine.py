@@ -91,6 +91,10 @@ SIGS = {
 }
 
 
+class EngineRefused(RuntimeError):
+    """qe_create refused the start (it printed the reason): the server exits with code 3, no traceback."""
+
+
 class SequenceFault(RuntimeError):
     """The engine's NaN guard failed this request (non-finite values in its forward); the server goes on."""
 
@@ -163,8 +167,8 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         self._active = set()  # slots started and not released (can_admit emulation)
         self._masks, self._sio = {}, {}
         self.h = L.qe_create(model_dir.encode(), devices.encode(), max_t, (split or "").encode())
-        if not self.h:
-            raise RuntimeError(f"qe_create failed for {model_dir}")
+        if not self.h:  # the engine printed why (not enough VRAM / host RAM, a refused setting): a refusal, not a crash
+            raise EngineRefused(f"the engine did not start for {model_dir} (see the message above)")
         self.max_t = L.qe_max_context(self.h)
         self.pool_tokens = L.qe_pool_tokens(self.h) if "qe_pool_tokens" in self.fns else self.max_t
         self.kv_in_ram = bool(L.qe_kv_in_ram(self.h)) if "qe_kv_in_ram" in self.fns else False
@@ -426,6 +430,10 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             return bool(self.lib.qe_can_admit(self.h, int(n)))
         return len(self._active) < len(self.slots) and n <= self.max_t
 
+    def pool_now(self):
+        """The KV pool's size in tokens now (the pool_tokens attribute is its size at start)."""
+        return self.lib.qe_pool_tokens(self.h) if "qe_pool_tokens" in self.fns else self.pool_tokens
+
     def pause_for(self, n, prio):
         """Pause decoding sequences of lower prio (lowest first, never a prefill) until a new sequence of n
         tokens fits; True: it fits now (nothing is paused when it cannot be made to fit)."""
@@ -521,7 +529,7 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             if "qe_slot_info" in self.fns:
                 L.qe_slot_info(h, i, b)
                 slots.append({"off": b[0], "cap": b[1], "pos": b[2], "active": bool(b[3]), "used": b[4], "prio": b[5],
-                              "paused": bool(b[6])})
+                              "paused": bool(b[6]), "vram": b[6] == 2})  # (2: paused / waiting under VRAM pressure)
             else:
                 slots.append({"off": 0, "cap": self.max_t, "pos": 0, "active": i in self._active, "used": 0, "prio": 1,
                               "paused": False})

@@ -35,9 +35,10 @@ private:
     static void ws(const std::string& s, size_t& p) {
         while (p < s.size() && (s[p] == ' ' || s[p] == '\n' || s[p] == '\r' || s[p] == '\t')) p++;
     }
-    static Json parse_value(const std::string& s, size_t& p) {
+    static Json parse_value(const std::string& s, size_t& p, int depth = 0) {
         ws(s, p);
         if (p >= s.size()) throw std::runtime_error("json: eof");
+        if (depth > 64) throw std::runtime_error("json: nested too deep");
         Json j;
         char c = s[p];
         if (c == '{') {
@@ -51,7 +52,7 @@ private:
                 ws(s, p);
                 if (s[p] != ':') throw std::runtime_error("json: expected :");
                 p++;
-                j.obj.emplace(std::move(k), parse_value(s, p));
+                j.obj.emplace(std::move(k), parse_value(s, p, depth + 1));
                 ws(s, p);
                 if (s[p] == ',') { p++; continue; }
                 if (s[p] == '}') { p++; break; }
@@ -63,7 +64,7 @@ private:
             ws(s, p);
             if (s[p] == ']') { p++; return j; }
             while (true) {
-                j.arr.push_back(parse_value(s, p));
+                j.arr.push_back(parse_value(s, p, depth + 1));
                 ws(s, p);
                 if (s[p] == ',') { p++; continue; }
                 if (s[p] == ']') { p++; break; }
@@ -87,16 +88,22 @@ private:
         return j;
     }
     static std::string parse_string(const std::string& s, size_t& p) {
-        if (s[p] != '"') throw std::runtime_error("json: expected string");
+        if (p >= s.size() || s[p] != '"') throw std::runtime_error("json: expected string");
         p++;
         std::string out;
-        while (s[p] != '"') {
+        while (true) {  // every read bounded: an unterminated string is an error, not a read past the end
+            if (p >= s.size()) throw std::runtime_error("json: unterminated string");
+            if (s[p] == '"') break;
             if (s[p] == '\\') {
-                p++;
+                if (++p >= s.size()) throw std::runtime_error("json: unterminated string");
                 char e = s[p];
                 if (e == 'n') out += '\n';
                 else if (e == 't') out += '\t';
-                else if (e == 'u') { out += '?'; p += 4; }
+                else if (e == 'u') {
+                    if (p + 4 >= s.size()) throw std::runtime_error("json: unterminated string");
+                    out += '?';
+                    p += 4;
+                }
                 else out += e;
                 p++;
             } else {

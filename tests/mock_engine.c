@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct {
     int max_t, k, reused, nseq, cap;
@@ -125,6 +126,8 @@ static int con_step(Mock* m, int* out) {
 #endif
 int qe_spec_step(void* e, int* out) {
     Mock* m = e;
+    const char* step_ms = getenv("QE_MOCK_STEP_MS");  // (a reply that takes time, for tests of what waits behind it)
+    if (step_ms) usleep(atoi(step_ms) * 1000);
 #ifdef MOCK_GRAMMAR
     if (m->con) return con_step(m, out);
 #endif
@@ -157,9 +160,9 @@ void qe_release(void* e, int slot) {
 #ifndef MOCK_TIER0
 int qe_vocab(void* e) { (void)e; return 248320; }
 int qe_num_slots(void* e) { (void)e; return 1; }
-long long qe_pool_tokens(void* e) { return ((Mock*)e)->max_t; }
+long long qe_pool_tokens(void* e) { const char* v = getenv("QE_MOCK_POOL_NOW"); return v ? atoll(v) : ((Mock*)e)->max_t; }  // (QE_MOCK_POOL_NOW: the pool has shrunk to this)
 int qe_kv_in_ram(void* e) { (void)e; const char* v = getenv("QE_MOCK_KV_RAM"); return v && *v == '1'; }
-int qe_can_admit(void* e, int n) { return n <= ((Mock*)e)->max_t; }
+int qe_can_admit(void* e, int n) { return n <= ((Mock*)e)->max_t && !getenv("QE_MOCK_NO_ADMIT"); }  // (QE_MOCK_NO_ADMIT: a pool shrunk under VRAM pressure)
 void qe_set_limit(void* e, int slot, int tokens) { (void)slot; ((Mock*)e)->limit = tokens; }
 double qe_warmup(void* e, int modes) { (void)e, (void)modes; return 0.0; }
 void qe_reset(void* e) { ((Mock*)e)->nseq = 0; }

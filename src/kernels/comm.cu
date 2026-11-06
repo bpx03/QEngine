@@ -754,6 +754,16 @@ constexpr int kLLThreads = 1024, kLLMaxWords = 4;  // hidden <= 3 * 1024 * 4; 10
                                                     // enough PCIe reads in flight per row
 
 __global__ void bump_epoch_kernel(unsigned* epoch) { *epoch += 1; }
+__device__ __forceinline__ unsigned long long gtimer_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void test_spin_kernel(unsigned long long ns) {
+    const unsigned long long t0 = gtimer_ns();
+    while (gtimer_ns() - t0 < ns) {}
+}
+
 
 __device__ __forceinline__ uint32_t bf16_bits(float v) {
     const bf16 b = __float2bfloat16(v);
@@ -882,6 +892,12 @@ constexpr int kLL16Threads = 768;  // 7 * 768 = 5376 >= hidden
 __device__ __forceinline__ void ll16_consume(const uint4* p) {
     st_ll16(const_cast<uint4*>(p), make_uint4(0u, 0u, 0u, 0u));
 }
+// the host-memory view (comm_decode_view): the clear is a posted write to host memory and the sender's next word for
+// this slot arrives over another link; the kernels fence once per thread after the last consume (c.hfence, default on
+// in the view) so the clears are ordered before the thread's later stores at system scope; the P2P path is unchanged
+__device__ __forceinline__ void ll16_consume_v(const Comm&, const uint4* p) {
+    ll16_consume(p);  // (the host view's fence: once per thread after its last consume, see c.hfence in the kernels)
+}
 
 // MODE 0: all-to-all, the fp32 sum of the three bf16 partials is added to the residual.
 // MODE 1: all-to-all, the sum is rounded to bf16 before it is added (the arithmetic of MODE 2).
@@ -990,7 +1006,7 @@ __global__ void __launch_bounds__(NT) allreduce_ll16_kernel(
 #ifndef QE_LL16_NOWAIT
                 for (unsigned ws = 0; (u.w & 0xFFFF0000u) != tag;) { u = ld_ll16(src); QE_WD_POLL(ws, kWdLL16, g, tag, u.w); }
 #endif
-                if (c.p2p && c.clear) ll16_consume(src);
+                if (c.p2p && c.clear) ll16_consume_v(c, src);
             }
             acc[0] += bits_bf16(u.x & 0xFFFFu); acc[1] += bits_bf16(u.x >> 16);
             acc[2] += bits_bf16(u.y & 0xFFFFu); acc[3] += bits_bf16(u.y >> 16);
@@ -1014,13 +1030,14 @@ __global__ void __launch_bounds__(NT) allreduce_ll16_kernel(
             const uint4* src = pregion(rank, own) + w;
             uint4 u = ld_ll16(src);
             for (unsigned ws = 0; (u.w & 0xFFFF0000u) != tag;) { u = ld_ll16(src); QE_WD_POLL(ws, kWdLL16Sum, own, tag, u.w); }
-            if (c.clear) ll16_consume(src);
+            if (c.clear) ll16_consume_v(c, src);
             acc[0] = bits_bf16(u.x & 0xFFFFu); acc[1] = bits_bf16(u.x >> 16);
             acc[2] = bits_bf16(u.y & 0xFFFFu); acc[3] = bits_bf16(u.y >> 16);
             acc[4] = bits_bf16(u.z & 0xFFFFu); acc[5] = bits_bf16(u.z >> 16);
             acc[6] = bits_bf16(u.w & 0xFFFFu);
         }
     }
+    if (c.hfence) __threadfence_system();  // host view: this thread's clears before its later stores (one per thread)
     float q = 0.f;
     if (on)
 #pragma unroll
@@ -1132,7 +1149,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_llc_kernel(
     auto poll = [&](const uint4* p, int peer) {
         uint4 u = ld_ll16(p);
         for (unsigned ws = 0; (u.w & 0xFFFE0000u) != tagc;) { u = ld_ll16(p); QE_WD_POLL(ws, kWdLLC, peer, tagc, u.w); }
-        if (c.clear) ll16_consume(p);
+        if (c.clear) ll16_consume_v(c, p);
         return u;
     };
     const float* pr = partial + (size_t)row * h;
@@ -1207,6 +1224,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_llc_kernel(
         for (int e = 0; e < kCE; e++)
             if (i0 + e < h) s_sum[i0 + e] = bits_bf16(sb[e]);
     }
+    if (c.hfence) __threadfence_system();  // host view: this thread's clears before its later stores (one per thread)
     __syncthreads();
     // the tail of allreduce_ll16_kernel (7 values per thread, same order of the norm's sums)
     float acc[7];
@@ -1317,7 +1335,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_llq_kernel(
                 const uint4* src = pregion(rank, g) + w;
                 uint4 u = ld_ll16(src);
                 for (unsigned ws = 0; (u.w & 0xFFFF0000u) != tag;) { u = ld_ll16(src); QE_WD_POLL(ws, kWdLLQ, g, tag, u.w); }
-                if (c.clear) ll16_consume(src);
+                if (c.clear) ll16_consume_v(c, src);
                 dq_word(u, d);
             }
 #pragma unroll
@@ -1350,14 +1368,14 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_llq_kernel(
         const uint4* src = pregion(rank, own) + w;
         uint4 u = ld_ll16(src);
         for (unsigned ws = 0; (u.w & 0xFFFF0000u) != tag;) { u = ld_ll16(src); QE_WD_POLL(ws, kWdLLQ, own, tag, u.w); }
-        if (c.clear) ll16_consume(src);
+        if (c.clear) ll16_consume_v(c, src);
         if (AGQ) {
             dq_word(u, acc);
         } else {
             const uint4* src2 = pregion(rank, own) + hw + (w - own * per);
             uint4 u2 = ld_ll16(src2);
             for (unsigned ws = 0; (u2.w & 0xFFFF0000u) != tag;) { u2 = ld_ll16(src2); QE_WD_POLL(ws, kWdLLQ, own, tag, u2.w); }
-            if (c.clear) ll16_consume(src2);
+            if (c.clear) ll16_consume_v(c, src2);
             acc[0] = bits_bf16(u.x & 0xFFFFu); acc[1] = bits_bf16(u.x >> 16);
             acc[2] = bits_bf16(u.y & 0xFFFFu); acc[3] = bits_bf16(u.y >> 16);
             acc[4] = bits_bf16(u.z & 0xFFFFu); acc[5] = bits_bf16(u.z >> 16);
@@ -1367,6 +1385,7 @@ __global__ void __launch_bounds__(kLL16Threads) allreduce_llq_kernel(
             acc[11] = bits_bf16(u2.z & 0xFFFFu);
         }
     }
+    if (c.hfence) __threadfence_system();  // host view: this thread's clears before its later stores (one per thread)
     float q = 0.f;
     if (on)
 #pragma unroll
@@ -1457,6 +1476,17 @@ __global__ void allgather_ll_kernel(const float* __restrict__ src, int n, float*
 }
 
 }  // namespace
+float comm_test_store_us() {
+    static const float v = (float)env_double("QE_DECODE_TEST_STORE_US", 0.0);
+    return v;
+}
+bool comm_host_fence() {  // default on (fail closed: relaxed ordering cannot be ruled out from user space); 0: off
+    static const bool f = env_int("QE_DECODE_HOST_FENCE", 1) != 0;
+    return f;
+}
+void comm_test_spin(cudaStream_t st) {
+    if (comm_test_store_us() > 0.f) test_spin_kernel<<<1, 1, 0, st>>>((unsigned long long)(comm_test_store_us() * 1000.f));
+}
 
 Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
     Comm c;
@@ -1466,7 +1496,8 @@ Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
     c.clear = !(env_int("QE_LL_NOCLEAR", 0));
     c.coal = env_set("QE_AR_COAL") ? env_int("QE_AR_COAL", true) != 0 : true;
     const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
-    const size_t llb = (size_t)ngpu * 4 * kMaxBatchRows * ((ll_hidden + 2) / 3) * sizeof(uint2);
+    // (+ one barrier word per rank after the LL words, bump_epoch_scrub_kernel)
+    const size_t llb = (size_t)ngpu * 4 * kMaxBatchRows * ((ll_hidden + 2) / 3) * sizeof(uint2) + (size_t)ngpu * sizeof(unsigned);
     CUDA_CHECK(cudaHostAlloc(&c.ll, llb, fl));
     memset(c.ll, 0, llb);
     CUDA_CHECK(cudaHostAlloc(&c.data, (size_t)ngpu * kCommSlots * max_elems * sizeof(float), fl));
@@ -1546,10 +1577,48 @@ void comm_free_p2p(Comm& c, const int* devices) {
         c.pflags[i] = nullptr;
     }
     c.p2p = false;
+    // no peer access: there is no P2P path to time against host memory (every collective goes through it already)
+    comm_free_decode_host(c);
+    c.dcal = false;
+}
+
+__global__ void bump_epoch2_kernel(unsigned* a, unsigned* b) { *a += 1, *b += 1; }
+void comm_begin_unit2(const CommCounters& ctr, unsigned* xep, cudaStream_t st) { bump_epoch2_kernel<<<1, 1, 0, st>>>(ctr.epoch, xep); }
+// The epoch bump of a unit on the host path (comm_bind_ll_scrub). Every kLLScrubUnits units all ranks meet here, so every
+// collective of the earlier units has ended on every rank, and each rank clears its own words before it writes new ones.
+__global__ void __launch_bounds__(kLL16Threads) bump_epoch_scrub_kernel(unsigned* epoch, uint2* ll, int ngpu, int rank, int hidden) {
+    const unsigned e = *epoch + 1;
+    __syncthreads();  // (every thread has read the old value)
+    if (threadIdx.x == 0) *epoch = e;
+    if (e & (kLLScrubUnits - 1)) return;
+    const size_t slot_words = (size_t)kMaxBatchRows * ((hidden + 2) / 3);  // uint2 units, as the LL kernels
+    if (threadIdx.x == 0) {
+        unsigned* bar = reinterpret_cast<unsigned*>(ll + (size_t)ngpu * 4 * slot_words);
+        st_release_sys(bar + rank, e);
+        for (int g = 0; g < ngpu; g++) {
+            if (g == rank) continue;
+            unsigned v = ld_acquire_sys(bar + g);
+            for (unsigned ws = 0; (int)(v - e) < 0;) { v = ld_acquire_sys(bar + g); QE_WD_POLL(ws, kWdLL16, g, e, v); }
+        }
+    }
+    __syncthreads();
+    uint4* mine = reinterpret_cast<uint4*>(ll + (size_t)rank * 4 * slot_words);
+    const size_t n = 2 * slot_words;  // 16-byte words of this rank's 4 slots
+    for (size_t i = threadIdx.x; i < n; i += kLL16Threads) st_ll16(mine + i, make_uint4(0u, 0u, 0u, 0u));
+    __threadfence_system();  // before this rank's next words, which a peer may be polling for
+}
+
+void comm_bind_ll_scrub(CommCounters& ctr, const Comm& c, int rank) {
+    if (c.p2p || c.ngpu < 2 || !c.ll || !c.clear) return;
+    ctr.ll_host = c.ll;
+    ctr.ll_rank = rank;
+    ctr.ll_ngpu = c.ngpu;
+    ctr.ll_hidden = c.ll_hidden;
 }
 
 void comm_begin_unit(const CommCounters& ctr, cudaStream_t st) {
-    bump_epoch_kernel<<<1, 1, 0, st>>>(ctr.epoch);
+    if (ctr.ll_host) bump_epoch_scrub_kernel<<<1, kLL16Threads, 0, st>>>(ctr.epoch, ctr.ll_host, ctr.ll_ngpu, ctr.ll_rank, ctr.ll_hidden);
+    else bump_epoch_kernel<<<1, 1, 0, st>>>(ctr.epoch);
 }
 
 static bool rs_rows_p2p(const Comm& c, int m, int h) {
@@ -1601,6 +1670,13 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
                    bf16* xn, int ll_idx, bool overlapped, __half* xh, bool defer, int rs_off, bool part_bf16,
                    const OwnFin* of, const SteerArg* sa) {
     if (qe_fault_skip(rank, "ar")) return;  // test only (QE_FAULT_SKIP_AR_RANK): this rank skips the collective
+    if (ll_idx >= 0 && m <= kMaxBatchRows && c.dxfer == kXferHost && c.p2p && c.hpll[0]) {  // decode through host memory
+        allreduce_add(resid, partial, m, h, comm_decode_view(c), rank, ctr, st, norm_w, eps, xn, ll_idx, overlapped, xh,
+                      defer, rs_off, part_bf16, of, sa);
+        return;
+    }
+    if (ll_idx >= 0 && m <= kMaxBatchRows && c.p2p && !c.hview && ::comm_test_store_us() > 0.f)  // test: emulated store stall
+        test_spin_kernel<<<1, 1, 0, st>>>((unsigned long long)(::comm_test_store_us() * 1000.f));
     // layer-output steering (steer.cuh): fused into the LL16 / LLC kernels below; after the others, the separate
     // steer_fix (a deferred all-reduce gets it in allreduce_finish instead)
     CHECK(!sa || sa->li < 0 || (!defer && !of), "steering: a deferred all-reduce is steered by allreduce_finish");
@@ -2284,7 +2360,8 @@ void allgather_small(const float* src, int n, float* out, const Comm& c, int ran
     CHECK(n <= 8192 && n <= c.max_elems, "allgather too large");
     if (qe_fault_skip(rank, "ar")) return;  // test only (QE_FAULT_SKIP_AR_RANK)
     static const bool ll = env_int("QE_AG_LL", 1) != 0;  // P2P tagged words (0: the flag protocol through host memory)
-    if (ll && c.p2p && c.pag[0] && n <= kAgWords) allgather_ll_kernel<<<1, 256, 0, st>>>(src, n, out, c, rank, ctr);
+    if (ll && c.p2p && c.pag[0] && n <= kAgWords && c.dxfer != kXferHost) comm_test_spin(st);  // test: emulated store stall
+    if (ll && c.p2p && c.pag[0] && n <= kAgWords) allgather_ll_kernel<<<1, 256, 0, st>>>(src, n, out, comm_decode_view(c), rank, ctr);
     else allgather_kernel<<<1, 256, 0, st>>>(src, n, out, c, rank, ctr);
 }
 

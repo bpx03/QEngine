@@ -6,9 +6,17 @@
 #include "../env.h"
 
 #include <cuda_fp16.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <set>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -248,17 +256,46 @@ std::string box_report(const std::vector<int>& devs_in) {
     cudaDriverGetVersion(&drv);
     std::string o;
     char b[512];
-    snprintf(b, sizeof b, "[box] build %s, CUDA archs %s, runtime %d, driver API %d, kernel driver: %s\n", qe_internal_build_id(), QE_CUDA_ARCHS, rt,
-             drv, rd1("/proc/driver/nvidia/version").c_str());
+    // module loading as the driver runs it (read at the process's first CUDA call: a library that started CUDA before
+    // this one, e.g. torch for the vision encoder, decides it) and the collective watchdog's budget (QE_COLL_TIMEOUT_MS)
+    CUmoduleLoadingMode lm = CU_MODULE_EAGER_LOADING;
+    const char* lms = cuModuleGetLoadingMode(&lm) != CUDA_SUCCESS ? "unknown" : lm == CU_MODULE_LAZY_LOADING ? "LAZY" : "EAGER";
+    snprintf(b, sizeof b, "[box] build %s, CUDA archs %s, runtime %d, driver API %d, module loading %s, watchdog budget %d ms, "
+             "kernel driver: %s\n", qe_internal_build_id(), QE_CUDA_ARCHS, rt, drv, lms, env_int("QE_COLL_TIMEOUT_MS", 20000),
+             rd1("/proc/driver/nvidia/version").c_str());
     o += b;
+    // per card: native code of the build (an arch of the same major, minor <= the card's) or PTX JIT-compiled at start
+    std::vector<int> archs;
+    {
+        std::string a = QE_CUDA_ARCHS;
+        for (char& ch : a) if (ch < '0' || ch > '9') ch = ' ';
+        size_t i = 0;
+        while (i < a.size()) {
+            while (i < a.size() && a[i] == ' ') i++;
+            size_t j = i;
+            while (j < a.size() && a[j] != ' ') j++;
+            if (j > i) archs.push_back(atoi(a.substr(i, j - i).c_str()));
+            i = j;
+        }
+    }
     for (int d : devs) {
         cudaDeviceProp p;
         if (cudaGetDeviceProperties(&p, d) != cudaSuccess) { (void)cudaGetLastError(); continue; }
         const std::string sf = sysfs_of(d);
         char bus[32] = "";
         cudaDeviceGetPCIBusId(bus, sizeof bus, d);
-        snprintf(b, sizeof b, "[box] GPU%d %s sm_%d%d, %d SMs, %.1f GB, bus %s, NUMA %s, PCIe %s x%s (max %s x%s), host->card %.1f GB/s\n", d,
-                 p.name, p.major, p.minor, p.multiProcessorCount, p.totalGlobalMem / 1e9, bus, rd1(sf + "/numa_node").c_str(),
+        const int cc = p.major * 10 + p.minor;
+        int sass = 0, ptx = 0;
+        for (int a : archs) {
+            if (a / 10 == p.major && a <= cc) sass = std::max(sass, a);
+            if (a <= cc) ptx = std::max(ptx, a);
+        }
+        char code[64];
+        if (sass) snprintf(code, sizeof code, "native sm_%d", sass);
+        else if (ptx) snprintf(code, sizeof code, "PTX compute_%d JIT-compiled (no sm_%d in the build)", ptx, cc);
+        else snprintf(code, sizeof code, "no code for sm_%d in the build", cc);
+        snprintf(b, sizeof b, "[box] GPU%d %s sm_%d%d (%s), %d SMs, %.1f GB, bus %s, NUMA %s, PCIe %s x%s (max %s x%s), host->card %.1f GB/s\n", d,
+                 p.name, p.major, p.minor, code, p.multiProcessorCount, p.totalGlobalMem / 1e9, bus, rd1(sf + "/numa_node").c_str(),
                  rd1(sf + "/current_link_speed").c_str(), rd1(sf + "/current_link_width").c_str(), rd1(sf + "/max_link_speed").c_str(),
                  rd1(sf + "/max_link_width").c_str(), h2d_gbs(d, 64u << 20));
         o += b;
@@ -279,4 +316,101 @@ std::string box_report(const std::vector<int>& devs_in) {
     return o;
 }
 
+}  // namespace flash
+
+namespace flash {
+namespace {
+std::vector<int> build_archs() {
+    std::vector<int> archs;
+    std::string a = QE_CUDA_ARCHS;
+    for (char& ch : a) if (ch < '0' || ch > '9') ch = ' ';
+    size_t i = 0;
+    while (i < a.size()) {
+        while (i < a.size() && a[i] == ' ') i++;
+        size_t j = i;
+        while (j < a.size() && a[j] != ' ') j++;
+        if (j > i) archs.push_back(atoi(a.substr(i, j - i).c_str()));
+        i = j;
+    }
+    return archs;
+}
+const char* loading_mode() {
+    CUmoduleLoadingMode lm = CU_MODULE_EAGER_LOADING;
+    return cuModuleGetLoadingMode(&lm) != CUDA_SUCCESS ? "unknown" : lm == CU_MODULE_LAZY_LOADING ? "LAZY" : "EAGER";
+}
+}  // namespace
+
+std::string cuda_code_summary(const std::vector<int>& devs) {
+    const std::vector<int> archs = build_archs();
+    std::string cards;
+    for (int d : devs) {
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, d) != cudaSuccess) { (void)cudaGetLastError(); continue; }
+        const int cc = p.major * 10 + p.minor;
+        int sass = 0, ptx = 0;
+        for (int a : archs) {
+            if (a / 10 == p.major && a <= cc) sass = std::max(sass, a);
+            if (a <= cc) ptx = std::max(ptx, a);
+        }
+        char b[96];
+        if (sass) snprintf(b, sizeof b, "GPU%d sm_%d native", d, cc);
+        else if (ptx) snprintf(b, sizeof b, "GPU%d sm_%d PTX compute_%d JIT-compiled", d, cc, ptx);
+        else snprintf(b, sizeof b, "GPU%d sm_%d no code in the build", d, cc);
+        cards += (cards.empty() ? "" : ", ") + std::string(b);
+    }
+    char b[256];
+    snprintf(b, sizeof b, "[qflash] CUDA: build archs %s, module loading %s, %s; watchdog budget %d ms\n", QE_CUDA_ARCHS,
+             loading_mode(), cards.c_str(), env_int("QE_COLL_TIMEOUT_MS", 20000));
+    return b;
+}
+
+int preload_kernels(const std::vector<int>& devs, double* secs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (secs) *secs = 0;
+    if (strcmp(loading_mode(), "LAZY") != 0 || !env_int("FLASH_PRELOAD", 1)) return -1;
+    Dl_info di{};
+    if (!dladdr((const void*)&preload_kernels, &di) || !di.dli_fname) return -2;
+    const int fd = open(di.dli_fname, O_RDONLY);
+    if (fd < 0) return -2;
+    struct stat st{};
+    fstat(fd, &st);
+    void* m = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return -2;
+    const char* f = (const char*)m;
+    std::set<uintptr_t> fns;
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)f;
+    const size_t fsz = (size_t)st.st_size;
+    if (fsz > sizeof(Elf64_Ehdr) && memcmp(eh->e_ident, ELFMAG, SELFMAG) == 0 && eh->e_ident[EI_CLASS] == ELFCLASS64 &&
+        eh->e_shoff < fsz && (size_t)eh->e_shnum * sizeof(Elf64_Shdr) <= fsz - eh->e_shoff) {  // (bounds, L6)
+        const Elf64_Shdr* sh = (const Elf64_Shdr*)(f + eh->e_shoff);
+        for (int i = 0; i < eh->e_shnum; i++) {
+            if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) continue;
+            if (sh[i].sh_offset >= fsz || sh[i].sh_size > fsz - sh[i].sh_offset) continue;
+            const Elf64_Sym* sy = (const Elf64_Sym*)(f + sh[i].sh_offset);
+            const size_t n = sh[i].sh_size / sizeof(Elf64_Sym);
+            for (size_t k = 0; k < n; k++)
+                if (ELF64_ST_TYPE(sy[k].st_info) == STT_FUNC && sy[k].st_value && sy[k].st_shndx != SHN_UNDEF)
+                    fns.insert((uintptr_t)di.dli_fbase + sy[k].st_value);
+        }
+    }
+    munmap(m, (size_t)st.st_size);
+    if (fns.empty()) return -2;
+    int prev = 0, loaded = 0;
+    cudaGetDevice(&prev);
+    for (size_t j = 0; j < devs.size(); j++) {
+        if (std::find(devs.begin(), devs.begin() + j, devs[j]) != devs.begin() + j) continue;
+        cudaSetDevice(devs[j]);
+        int n = 0;
+        for (uintptr_t a : fns) {
+            cudaFuncAttributes fa;
+            if (cudaFuncGetAttributes(&fa, (const void*)a) == cudaSuccess) n++;
+            else (void)cudaGetLastError();
+        }
+        loaded = std::max(loaded, n);
+    }
+    cudaSetDevice(prev);
+    if (secs) *secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return loaded;
+}
 }  // namespace flash

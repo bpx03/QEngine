@@ -330,14 +330,20 @@ bool pp_p2p_ok(int a, int b);
 std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vector<int>& bounds, int ctx, const SafeTensors& st,
                                     const HostTables& ht, const SafeTensors* mst, const std::vector<std::vector<int>>& cold,
                                     const std::vector<float>& prior, const std::vector<int>& draft_ids, const NgramDev& ngd,
-                                    const std::vector<const Worker*>& views = {});
+                                    const std::vector<const Worker*>& views = {}, int max_seqs = 0);
 // PP x TP: the workers of every rank of every stage (groups[s] = the devices of stage s, its ranks in order), stage by
 // stage; each group of t > 1 gets its own comm (P2P where the cards allow, the TP exchange path probe) and its ranks
 // the peers' exchange buffers. comms: the groups' comms (kept by the caller for the run)
 std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups, const std::vector<int>& bounds, int ctx,
                                     const SafeTensors& st, const HostTables& ht, const SafeTensors* mst,
                                     const std::vector<std::vector<int>>& cold, const std::vector<float>& prior,
-                                    const std::vector<int>& draft_ids, const NgramDev& ngd);
+                                    const std::vector<int>& draft_ids, const NgramDev& ngd, int max_seqs = 0);
+// the C API's start-up decisions for the pipeline planner, each read through the environment variable when the user
+// set it (variables, not setenv: issue #11). The first probe of the process stays. The host link in GB/s:
+void pp_set_h2d_probe(double gbps);
+double pp_h2d_gbps(double def);  // FLASH_PP_H2D_GBPS, else the probe, else def
+void pp_set_no_p2p();            // QE_P2P=0: the stages' hop through pinned host memory too
+bool pp_hop_p2p();               // FLASH_PP_P2P, else not after pp_set_no_p2p
 // the layout of every worker (stage, rank, layers, expert groups per layer, KV period / ownership, VRAM, host-backed
 // experts) as log lines (remote diagnosis: 4+ card and PP x TP boots, FLASH_BOX_REPORT=1)
 std::string layout_report(const std::vector<Worker*>& W);

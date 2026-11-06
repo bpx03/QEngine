@@ -1,6 +1,10 @@
 #pragma once
+#include "archive_order.h"
+#include "gpu_others.h"
+#include <mutex>
 #include "host_mem.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -43,6 +47,8 @@ public:
 
     // Forget all cached prefixes (every slot's KV contents and all snapshots).
     void reset();
+    // QE_DECODE_COMM=auto: time real decode steps on P2P stores vs host memory, keep the faster path per mode (qe_create)
+    void decode_calibrate();
     // Build the speculative-step CUDA graphs of the first slot for every draft count / sampling
     // mode up front (each takes tens of ms to capture on first use otherwise). Returns seconds.
     // modes: bit 0 greedy, bit 1 sampling
@@ -168,9 +174,15 @@ public:
     int slot_capacity(int i) const { return seqs_.at(i).max_t; }
     int max_context() const { return max_ctx_; }
     size_t pool_tokens() const { return pool_tokens_; }
+    // VRAM taken by other processes while serving: every QE_VRAM_CHECK_MS at a step's start the cards' free memory;
+    // below QE_VRAM_LOW_MB the KV pool shrinks (idle conversations archived, regions compacted, the chunks past the new
+    // ceiling released) until QE_VRAM_TARGET_MB is free; it grows back to its start size once the memory is free again
+    void vram_tick();
+    bool pool_shrink(size_t ceil_tokens);
+    bool pool_regrow(size_t max_add_bytes);
     // a new sequence of n tokens can start now: a free slot, and the pool holds it next to the
     // running ones (each counted with 16K of room to grow; idle ones can be evicted)
-    bool can_admit(int n) const;
+    bool can_admit(int n);  // (a pool shrunk under VRAM pressure grows back first when the request needs it)
     // make room for a new n-token sequence of value `prio` (the main thread): pause decoding sequences
     // worth less (lowest prio, the most recently admitted first; never a prompt being prefilled, never
     // one of the same or a higher prio), only as many as needed and only when that makes it fit (paused
@@ -228,8 +240,26 @@ private:
     void reset_slot();  // the current slot starts from position 0
     void plan_slots(int main_cap);
     // KV pool (see plan_slots)
-    static constexpr size_t kMaxPos = 262144;
     size_t pool_tokens_ = 0;
+    size_t pool_tokens0_ = 0;  // the start size (vram_tick grows back to it)
+    size_t reserve_min_ = (size_t)1.5e9;  // the smallest card reserve (vram_tick's marks scale with it)
+    double vlast_ = 0, vhigh_since_ = 0;
+    std::vector<qe_gpu_others::Watch> vwatch_;  // other processes' VRAM per card (gpu_others.h)
+    unsigned long long n_room_ = 0;             // pool regrows (a paused slot retries after one, like after a release)
+    double vregrow_t_ = 0;                      // the last regrow, and the others' largest growth then (hysteresis)
+    long long vregrow_og_ = 0, vog_last_ = 0;    // (vog_last_: the others' largest growth at the last tick)
+    std::vector<size_t> vfree0_;                // per card: free memory at the full pool (the way back's floor, N-M4)
+    std::vector<size_t> vfree0p_;               // (the previous 300 s window's minimum, per card)
+    std::vector<double> vfree0t_;               // (start of each card's window)
+    size_t total_for(int s, int need) const;    // the pool total that gives slot s room for need positions
+    void vram_marks(size_t* low, size_t* target) const;
+    double vback_ = 0, vback_step_ = 0.2;       // shrink backoff after a try that freed nothing (review M3)
+    bool vram_adapt_ = true;                    // QE_VRAM_ADAPT (0: the plain pool and none of the VRAM-pressure paths)
+    std::vector<size_t> scratch_freed_;         // load scratch given back per card (the KV split choice ignores it)
+    bool pool_regrow_now(size_t need_tokens);   // up to need_tokens more pool, as far as the free memory allows now
+    bool move_prefix(size_t i, size_t noff);    // a shared prefix region moved down (pool_shrink)
+    size_t emergency_release(int r, size_t need);  // the pool chunks past every region on card r (worker OOM hooks)
+    std::mutex vemerg_mu_;
     // kv-pos-split: pool tokens every region takes beyond its rows (Worker::region_slack, max over
     // the cards; 0 without a split): a region of r rows occupies r + slack_ pool tokens
     size_t slack_ = 0;
@@ -238,6 +268,7 @@ private:
     bool kvs_auto_ = false;  // shares chosen in plan_slots from the free memory after the weights
     long long n_grow_ = 0, n_move_ = 0, n_evict_ = 0, n_pause_ = 0, n_unpause_ = 0, n_release_ = 0;
     int max_ctx_ = 0;
+    bool yarn_auto_ = false;  // the YaRN factor came from --max-ctx (plan_slots may lower it to the pool's reach)
     int round_cap(int need) const;
     int min_cap(int need) const;
     size_t free_after(int s) const;
@@ -285,6 +316,7 @@ private:
         bool active = false;        // in use by a generating request
         bool stale = false;         // device token/position invalid (queued step undone)
         int prio = 1;               // eviction value (set_prio): 0 finished, 1 normal, 2 main thread
+        int hint = 0;               // end of the system part in its last prompt (0: none), archive_subs keeps a state there
         bool constrained = false;   // grammar mask on (constrain)
         int end = 0;                // > 0: last position the reply may reach (set_limit)
         // stop sequences (watch_stops): the drafts of the next step for the caller, no step queued
@@ -300,6 +332,9 @@ private:
         bool rb_batched = false;
         bool full = false;          // no room to grow (step_batch): ends with its end token until released
         bool paused = false;        // preempted for room (paused_): its steps return no tokens until resumed
+        bool waiting = false;       // (step_batch) no room under VRAM pressure and no archive room: no tokens this step
+        bool vwait = false;         // paused / waiting because of VRAM pressure (slot_info: 2), until it steps again
+        double vtry = 0;            // the last pause attempt under VRAM pressure (one per second, review N-L1)
         long long admit = 0;        // admission order (start_begin): the most recent is paused first
         // shared prefix (stage 4): keys [0, split) are read from the prefix region pres_[pre];
         // the own region holds keys [split, max_t) (max_t stays the logical capacity)
@@ -307,6 +342,7 @@ private:
         long long sk = -1;          // steering key of its KV / state (set_steering): never served to another key
         // draft statistics (draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
         long long ds[5] = {0, 0, 0, 0, 0};
+        double last_s = 0;          // last start / release, mono_s() (archive order: an active main)
         void count_step(bool lookup, int drafted, int emitted) {
             const int acc = emitted > 1 ? emitted - 1 : 0;
             ds[0]++;
@@ -326,6 +362,8 @@ private:
         long long sk = -1;  // steering key of its rows
     };
     std::vector<GpuPrefix> pres_;
+    std::vector<int> lsa_toks_;  // LSA: tokens of the conversation a detached index belongs to
+    long long lsa_sk_ = -1;       // ... and their steering key
     bool share_prefix_ = true;  // QE_SHARE_PREFIX (0: prefixes are copied into every slot as before)
     int rows_of(const Seq& q) const { return q.max_t > 0 ? q.max_t - q.split : 0; }
     size_t units_of(const Seq& q) const { return units(rows_of(q)); }
@@ -362,6 +400,7 @@ private:
     int lkb_rows_ = 32, lkb_hold_ = 2, lkb_min_ = 4;
   public:
     long long lkb_steps_ = 0, lkb_rows_sum_ = 0, lkb_tok_ = 0, lkb_bsteps_ = 0, lkb_slotsteps_ = 0;
+    int req_ctx_ = 0;  // the requested context (max_t): the decode cache key (max_ctx_ moves with free VRAM)
   private:
     void lkb_inval(int slot) {
         if (slot < 0 || slot >= (int)lkb_len_.size()) return;
@@ -432,12 +471,15 @@ private:
         size_t used_bytes() const { return used_; }
         size_t pinned_free() const { std::lock_guard<std::mutex> l(mu_); return pinned_ - used_; }
         size_t release(size_t want);  // memory pressure: whole free slabs back to the host (host_mem.h)
+        // pinning held between slabs (decode calibration: a 4 GB memset + register next to its steps made 27B c=1
+        // timings swing ~30 %); on: returns once the slab in flight is done
+        bool pause(bool on);  // true: nothing in flight
     private:
         struct Slab { char* base; size_t size; std::map<size_t, size_t> free; };  // offset -> length
         std::vector<Slab> slabs_;
         mutable std::mutex mu_;
         std::thread th_;
-        std::atomic<bool> stop_{false};
+        std::atomic<bool> stop_{false}, pause_{false}, busy_{false};
         size_t pinned_ = 0, used_ = 0;
     };
     HostPool hpool_;
@@ -467,8 +509,9 @@ private:
         std::string path;                   // non-empty: on disk (or being written)
         std::shared_ptr<DiskState> disk;
         size_t data_off = 0;                // file offset of GPU 0's buffer
-        unsigned long long used = 0;
+        unsigned long long used = 0, born = 0;  // born: tick when made (0: found on disk at start)
         int prio = 1;                       // of the conversation when archived (Seq::prio)
+        double last_s = 0;                  // the conversation's last use (Seq::last_s; restored from it: then), mono_s()
         int split = 0;                      // rows [0, split) live in the prefix named by toks[0, split)
         // pinned prefix (end of a system prompt / shared tools block): outside the LRU and the
         // archive budget, never superseded; new agents of that kind and evicted conversations
@@ -494,13 +537,22 @@ private:
     // needed before it is done.
     struct BgArchive {
         int slot = -1, n = 0;
+        unsigned long long born = 0;  // tick at bg_prepare
         KvArchive a;
         std::vector<int> piece;
     } bg_;
+    struct ArchSub { int pos; std::vector<const char*> src; std::shared_ptr<Bufs> hold; bool whole; };  // whole: hold is its archive's buffer
+    void stage_subs(std::vector<ArchSub>& subs);
+    std::vector<ArchSub> archive_subs(const Seq& q, int n);
+    void drop_covered(long long sk, const int* toks, int n, unsigned long long born_after);
     bool bg_prepare(int slot);
     void bg_finish(bool all);
     void drop_archive(std::list<KvArchive>::iterator it);
     bool ram_make_room(size_t need, int prio, size_t limit = (size_t)-1);
+    bool ram_fits(size_t need, const qe_arch::Rank* older_than = nullptr);
+    qe_arch::Rank arch_rank(const KvArchive& a, double now) const;
+    double main_stale_s_ = 300;  // FLASH_MAIN_STALE_S: a main thread unused for this long is an ordinary conversation
+    static double mono_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     size_t ram_budget();  // archive_budget_ capped by the host's memory (host_mem.h)
     qe_hostmem::CapLog cap_log_;
 public:
@@ -522,14 +574,18 @@ private:
         std::vector<char> header;
         std::string path;
         std::shared_ptr<DiskState> st;
+        std::vector<std::string> covered;  // files this one supersedes
     };
     std::deque<DiskJob> disk_q_;
+    std::vector<std::string> covered_files_;  // of the archives drop_covered just dropped
+    void disk_flush_covered();
     std::mutex disk_mu_;
     std::condition_variable disk_cv_;
     bool disk_stop_ = false;
     int disk_busy_ = 0;
     std::thread disk_thread_;
     std::thread alloc_thread_;               // pre-pins snapshot buffers in the background
+    std::atomic<bool> snap_pause_{false}, snap_busy_{false};  // decode calibration: the snapshot pinning held
     std::mutex snap_mu_;
     std::vector<std::vector<void*>> free_bufs_;
     std::atomic<bool> stop_alloc_{false};

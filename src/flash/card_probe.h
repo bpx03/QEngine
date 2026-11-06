@@ -17,4 +17,13 @@ std::string card_line(const std::vector<CardCal>& c);
 // build, cards (links, NUMA, host rate), per-pair peer access and copy rates: printed on 4+ card and PP x TP boots and
 // with FLASH_BOX_REPORT=1 (remote diagnosis)
 std::string box_report(const std::vector<int>& devs);
+// one line, always printed at start: the module loading the driver runs, each card's code (native SASS of the build or
+// PTX JIT-compiled), the collective watchdog's budget
+std::string cuda_code_summary(const std::vector<int>& devs);
+// CUDA module loading is LAZY when another library started CUDA first (torch for the vision encoder): the engine's
+// kernels would load at their first launch, mid-serving (a module load next to a peer spinning on this card's flags:
+// the CE + pfsel deadlock, a JIT compile on a PTX-only build). Loads every kernel of this library on every card now
+// (cudaFuncGetAttributes per function symbol of its ELF symbol tables). Returns the kernels loaded per card, -1 when
+// loading is EAGER (nothing to do), -2 when the symbols could not be read. FLASH_PRELOAD=0: off.
+int preload_kernels(const std::vector<int>& devs, double* secs);
 }  // namespace flash
