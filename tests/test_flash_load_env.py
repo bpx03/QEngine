@@ -1,8 +1,8 @@
-"""CPU-only, < 10 s: libqflash sets its environment defaults when it is loaded, before any thread exists (issue #11: a
-setenv in flash::Worker::Worker, which runs on one thread per card, moved environ under another card's getenv).
+"""No device used, < 10 s: libqflash sets its environment defaults when it is loaded, before any thread exists (issue
+#11: a setenv in flash::Worker::Worker, which runs on one thread per card, moved environ under another card's getenv).
 - Worker::Worker has no setenv (source check, needs no build);
-- QE_GEMM_TUNE after loading build/libqflash.so: 0 when unset or empty, a value set by the user is kept (skipped
-  without the library). No device is used: the library is only loaded, with CUDA_VISIBLE_DEVICES empty.
+- QE_GEMM_TUNE after loading build/libqflash.so: 0 when unset or empty, a value set by the user is kept. The library is
+  only loaded, with CUDA_VISIBLE_DEVICES empty; skipped when it, or the CUDA libraries it links to, can't be loaded.
   python tests/test_flash_load_env.py
 """
 import os
@@ -36,6 +36,8 @@ def load(value):
     if value is not None:
         env["QE_GEMM_TUNE"] = value
     out = subprocess.run([sys.executable, "-c", PROBE, LIB], env=env, capture_output=True, text=True, timeout=60)
+    if out.returncode and "cannot open shared object" in out.stderr:
+        return None
     assert out.returncode == 0, out.stderr
     return out.stdout.strip().splitlines()[-1]
 
@@ -46,6 +48,9 @@ def test_defaults_at_load():
         return
     for value, want in ((None, "0"), ("", "0"), ("   ", "0"), ("0", "0"), ("1", "1")):
         got = load(value)
+        if got is None:
+            print("skip: the CUDA libraries are not on this host")
+            return
         assert got == want, f"QE_GEMM_TUNE={value!r}: {got!r}, wanted {want!r}"
 
 
