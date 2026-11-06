@@ -31,8 +31,13 @@
 // the first launch of a kernel loads its module, and in the eager first batch of a graph key that load can wait while
 // the device spins on a peer's flags whose card waits for this one: FLASH_COMM=ce + pfsel deadlocked 2 of 2 runs at the
 // base, 0 of 8 with EAGER (qfn_ce_eager_2026-10-27). A value set by the user is kept (CUDA_MODULE_LOADING=LAZY: off).
-__attribute__((constructor)) static void qe_eager_modules() {
+// QE_GEMM_TUNE 0, same place: the GEMM autotuner picks per process by timing (choices and so the rounding differ between
+// processes); the cost model's choice is as fast for the flash shapes (text 928 prefill 169.6 vs 169.7 ms) and the same
+// in every process: pinned unless QE_GEMM_TUNE is set explicitly. Here and not in Worker::Worker: the workers start on
+// one thread per card, and a setenv there can move environ under another card's getenv (issue #11, SIGSEGV in getenv).
+__attribute__((constructor)) static void qe_load_defaults() {
     if (!env_set("CUDA_MODULE_LOADING")) setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // empty = unset (env.h)
+    if (!env_set("QE_GEMM_TUNE")) setenv("QE_GEMM_TUNE", "0", 1);
 }
 
 namespace flash {
@@ -659,10 +664,6 @@ static YarnTab yarn_table(double factor) {
 }
 
 Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p), dev_(device), max_ctx_(max_ctx), comm_(comm) {
-    // the GEMM autotuner picks per process by timing (choices and so the rounding differ between processes); the cost
-    // model's choice is as fast for the flash shapes (text 928 prefill 169.6 vs 169.7 ms) and the same in every
-    // process: pinned unless QE_GEMM_TUNE is set explicitly
-    if (!env_set("QE_GEMM_TUNE")) setenv("QE_GEMM_TUNE", "0", 1);
     CUDA_CHECK(cudaSetDevice(dev_));
     gctx_ = green_ctx_for(dev_, &gsms_);  // (TP ranks sharing this card: its SM share; else null)
     mkstream(&st_, cudaStreamNonBlocking, 0);
