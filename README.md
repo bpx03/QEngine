@@ -1,6 +1,6 @@
 # QEngine
 
-![QEngine 1.3.4.2 vs 1.3.4.1: Qwen3.8-Flash-Next on 3x RTX 3090, club-3090 rebench-full](docs/img/qengine-1.3.4.2.jpg)
+![QEngine: fast local AI on RTX 3000, 4000 and 5000 series cards](docs/img/qengine.jpg)
 
 QEngine is a source-available inference engine for two models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
 nothing extra to install or set for any of them (tuned on the RTX 3090):
