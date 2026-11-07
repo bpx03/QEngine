@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # QEngine: Qwen3.8-27B INT4 inference server for 3x RTX 3090 (sm_86, tensor parallel 3).
-# GPU code (SASS) for sm_86 (RTX 3090, tuned), sm_89 (RTX 4090) and sm_120 (RTX 5090): see CUDA_ARCHS below.
+# GPU code (SASS) for sm_86 (RTX 3000 series, tuned on the 3090), sm_89 (RTX 4000) and sm_120 (RTX 5000): see CUDA_ARCHS below.
 # The model is NOT baked in: mount it at /app/models/Qwen3.8-27B-INT4 (see docker-compose.yml).
 # Qwen3.8-Flash-Next (preview): mount it too and set QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4.
 #
@@ -13,8 +13,8 @@ ARG UBUNTU=ubuntu24.04
 
 # ---------------------------------------------------------------- build: libqengine.so
 FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS build
-# 86 = RTX 3090 (supported, tuned), 89 = RTX 4090 (not tested by us, not tuned), 120 = RTX 5090 (community-tested,
-# not tuned). A source build without -DCMAKE_CUDA_ARCHITECTURES builds for the GPUs of its machine, plus sm_86.
+# 86 = RTX 3000 series (tuned on the 3090), 89 = RTX 4000 series (not tested by us, not tuned), 120 = RTX 5000 series
+# (community-tested, not tuned). A source build without -DCMAKE_CUDA_ARCHITECTURES builds for the GPUs of its machine, plus sm_86.
 ARG CUDA_ARCHS="86;89;120"
 # the build's git hash for the start-up log (the build context has no .git): --build-arg REVISION=$(git rev-parse HEAD)
 ARG REVISION=unknown

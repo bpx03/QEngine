@@ -2,7 +2,8 @@
 
 ![QEngine 1.3.4.2 vs 1.3.4.1: Qwen3.8-Flash-Next on 3x RTX 3090, club-3090 rebench-full](docs/img/qengine-1.3.4.2.jpg)
 
-QEngine is a source-available inference engine for two models on NVIDIA RTX 3090 cards:
+QEngine is a source-available inference engine for two models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
+nothing extra to install or set for any of them (tuned on the RTX 3090):
 
 - **Qwen3.8-Flash-Next** (routed experts INT4 from Intel's AutoRound checkpoint, the parts every token passes through
   in INT8 or calibrated INT4; converted for QEngine): a sparse mixture-of-experts model with 512 routed experts, 262K
@@ -56,7 +57,7 @@ the n-gram projections calibrated; KL against BF16 0.119 instead of 0.267), the 
 - **empty replies are sampled again** (non-streamed requests), clearer logs for empty turns and dropped history;
 - an overlong prompt gets **OpenAI's context-length error text** on the OpenAI path;
 - a stalled engine fails its requests at once and restarts; prompts that can never start fail at once with the reason;
-- the Docker images also carry code for the **RTX 5090 and RTX 4090** (not tuned).
+- the Docker images carry code for the **RTX 3000, 4000 and 5000 series** (tuned on the 3090).
 
 **Better on non-standard setups.** QEngine is tuned on 3× RTX 3090 with GPU P2P and plenty of host RAM; 1.3.4 is
 aimed at setups that differ from that, and should improve them:
@@ -70,7 +71,7 @@ aimed at setups that differ from that, and should improve them:
   ([Host memory](#host-memory-flash-next));
 - **mixed or uneven cards**: a per-card calibration and a layer split by speed;
 - **4 or more cards**: pipeline mode; `FLASH_PAR=pptp` is experimental;
-- **RTX 4090 / 5090**: built into the Docker images (5090 community-tested, 4090 untested, neither tuned).
+- **RTX 3000, 4000 and 5000 series**: built in, nothing to set (tuned on the 3090; [what has run where](#gpus)).
 
 If a setup like this is still slow or misbehaves, please open an issue with the start-up log, started with
 `FLASH_BOX_REPORT=1` (it adds `[box]` lines on each card and link; on 4 or more cards they are on by default): those,
@@ -96,7 +97,8 @@ More settings, measurements and the troubleshooting table: [docs/advanced.md](do
 
 ## Quick start
 
-You need Linux, two or three RTX 3090s (see [Hardware](#hardware-and-interconnect)), an NVIDIA driver with CUDA 13.1
+You need Linux, two or three RTX 3000, 4000 or 5000 series cards (see [Hardware](#hardware-and-interconnect)), an
+NVIDIA driver with CUDA 13.1
 support, and enough host RAM (Flash-Next: about 140 GB for the full defaults; with less, the start-up sizes its host
 memory to the machine, from 64 GB up; see [Host memory](#host-memory-flash-next)).
 
@@ -193,13 +195,17 @@ For **Claude Code**, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and `CLAUDE_
 
 ### GPUs
 
-- **RTX 3090 (24 GB, sm_86)** is the supported card; all tuning (82 SMs, tile shapes, split counts, memory
-  budgets) targets it. Everything published here was measured on 3090s.
-- **RTX 5090 (sm_120)**: the Docker images carry its code; community-tested on 2× RTX 5090
-  ([club-3090 #1826](https://github.com/noonghunna/club-3090/issues/1826)). Not tuned by us and not officially
-  supported.
-- **RTX 4090 (sm_89)**: the Docker images carry its code; not tested by us, not tuned.
-- Other GPU models are untested. A source build targets the GPUs it finds; `-DCMAKE_CUDA_ARCHITECTURES` sets others.
+QEngine runs on the RTX 3000, 4000 and 5000 series with no extra steps. The Docker images carry the code for all three,
+and a source build targets the GPUs it finds (`-DCMAKE_CUDA_ARCHITECTURES` sets others).
+
+| series | code | what has run on it |
+|---|---|---|
+| RTX 3000 | sm_86 | 3090: all tuning (82 SMs, tile shapes, split counts, memory budgets) targets it, and everything published here was measured on it. Community: 4× modded 3080 20 GB ([#9](https://github.com/bpx03/QEngine/issues/9)) |
+| RTX 4000 | sm_89 | built, but no run on record yet; reports are welcome |
+| RTX 5000 | sm_120 | community: 2× 5090 ([club-3090 #1826](https://github.com/noonghunna/club-3090/issues/1826)), 4× 5080 16 GB ([#13](https://github.com/bpx03/QEngine/issues/13)) |
+
+The 4000 and 5000 series use the settings tuned for the 3090, so they may have speed left unused. What limits a card
+is its memory; see below.
 
 **Smaller cards** (measured on our 3090s with all but 12 GB or 8 GB of each card taken by another process before the
 start, November 3, 2026; defaults otherwise, 16 conversation slots; c=1 / c=4: greedy decode of 400-token replies,
