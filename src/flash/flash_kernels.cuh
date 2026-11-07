@@ -4820,13 +4820,15 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
     Acc (*sa)[16] = sacc[warp];
     // software pipeline: the next job's weights, scales, row count, first-tile rows and activations are loaded while
     // this one computes (the activation slot g is read even past the count: those MMA columns are discarded)
-    constexpr int NW = Bits / 2;
+    constexpr int NW = Bits / 2;  // 2 INT4 / 4 W8 uint4 per 16-row tile
     struct Pre { uint4 w[NW], b[4]; float s0, s8; int cnt, r0, r1; };
     auto load = [&](int jj, Pre& p) {
         const MoeJob jb = jobs[jj];
         const uint4* qp = jb.dq + (size_t)r * NW * 32 + lane;
-        for (int q = 0; q < NW; q++) p.w[q] = __ldg(qp + q * 32);
-        p.s0 = moe_scale<Bits>(jb.ds, r * 16 + g) * kXhScale; p.s8 = moe_scale<Bits>(jb.ds, r * 16 + g + 8) * kXhScale;
+#pragma unroll
+        for (int q = 0; q < NW; q++) p.w[q] = __ldg(qp + (size_t)q * 32);
+        p.s0 = moe_scale<Bits>(jb.ds, (size_t)r * 16 + g) * kXhScale;
+        p.s8 = moe_scale<Bits>(jb.ds, (size_t)r * 16 + g + 8) * kXhScale;
         const int* rl = jrow + jj * (MAXM + 1);
         p.cnt = rl[0]; p.r0 = rl[1 + 2 * t4]; p.r1 = rl[2 + 2 * t4];
         const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + g) * GRP + t4 * 16);
@@ -4843,20 +4845,20 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
         acc[3] = row1 >= 0 ? sa[row1][g + 8] : 0;
         if constexpr (Bits == 4) {
 #pragma unroll
-        for (int c = 0; c < 2; c++) {
-            const uint4 wc = w[c];
-            uint32_t hacc[2] = {0u, 0u};
-            const uint4 b0 = bb4[c * 2], b1 = bb4[c * 2 + 1];
-            const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+            for (int c = 0; c < 2; c++) {
+                const uint4 wc = w[c];
+                uint32_t hacc[2] = {0u, 0u};
+                const uint4 b0 = bb4[c * 2], b1 = bb4[c * 2 + 1];
+                const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
 #pragma unroll
-            for (int q = 0; q < 4; q++) {
-                uint32_t a[4];
-                xh_dequant(words[q], a);
-                const uint4& bb = (q >> 1) ? b1 : b0;
-                xh_mma(hacc, a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                for (int q = 0; q < 4; q++) {
+                    uint32_t a[4];
+                    xh_dequant(words[q], a);
+                    const uint4& bb = (q >> 1) ? b1 : b0;
+                    xh_mma(hacc, a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                }
+                dn_flush<FX>(acc, hacc, sg, sg8, nf);
             }
-            dn_flush<FX>(acc, hacc, sg, sg8, nf);
-        }
         } else {
             float cw[4] = {};
 #pragma unroll
@@ -4868,9 +4870,9 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
                     const uint4 bb = bb4[c * 2 + s];
 #pragma unroll
                     for (int q = 0; q < 2; q++) {
-                        uint32_t aa[4];
-                        a_from_w8(words[2 * q], words[2 * q + 1], aa);
-                        mma16(cw, aa, q ? bb.z : bb.x, q ? bb.w : bb.y);
+                        uint32_t a[4];
+                        a_from_w8(words[2 * q], words[2 * q + 1], a);
+                        mma16(cw, a, q ? bb.z : bb.x, q ? bb.w : bb.y);
                     }
                 }
             }
@@ -5888,13 +5890,13 @@ __global__ void k_dbg_hash(const unsigned* __restrict__ p, size_t n, unsigned lo
     for (int o = 16; o > 0; o >>= 1) h += __shfl_xor_sync(0xffffffffu, h, o);
     if ((threadIdx.x & 31) == 0) atomicAdd(out, h);
 }
-template <int TT>
+template <int Bits, int TT>
 __global__ void __launch_bounds__(128) k_moe_dn_pf(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                    const int* __restrict__ tl, const __half* __restrict__ act,
                                                    float* __restrict__ part, unsigned long long* __restrict__ ipart = nullptr) {
     // jobs of one expert are consecutive and share the token list: the first one (ng > 0) runs all its local groups
     // and adds the sum once per output (atomics / ng)
-    constexpr int NT = 4;
+    constexpr int NT = 4, NW = Bits / 2;  // one job = one 128-k group: 2 INT4 / 4 W8 weight uint4
     const int job = blockIdx.y;
     if (job >= *njobs) return;
     const int ngj = jobs[job].ng;
@@ -5924,29 +5926,64 @@ __global__ void __launch_bounds__(128) k_moe_dn_pf(const PfJob* __restrict__ job
 #pragma unroll
             for (int tt = 0; tt < TT; tt++) {
                 const int r = rb + tt;
-                const uint4* qp = pj.w.dq + (size_t)r * 2 * 32 + lane;
-                const uint4 w0 = __ldg(qp), w1 = __ldg(qp + 32);
-                const float sg = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g]) * kXhScale, sg8 = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g + 8]) * kXhScale;
+                const uint4* qp = pj.w.dq + (size_t)r * NW * 32 + lane;
+                uint4 w[NW];
 #pragma unroll
-                for (int c = 0; c < 2; c++) {
-                    const uint4 wc = c ? w1 : w0;
-                    uint32_t hacc[NT][2];
+                for (int q = 0; q < NW; q++) w[q] = __ldg(qp + (size_t)q * 32);
+                const float sg = moe_scale<Bits>(pj.w.ds, (size_t)r * 16 + g) * kXhScale,
+                            sg8 = moe_scale<Bits>(pj.w.ds, (size_t)r * 16 + g + 8) * kXhScale;
+                if constexpr (Bits == 4) {
 #pragma unroll
-                    for (int j = 0; j < NT; j++) hacc[j][0] = hacc[j][1] = 0u;
-                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+                    for (int c = 0; c < 2; c++) {
+                        const uint4 wc = w[c];
+                        uint32_t hacc[NT][2];
 #pragma unroll
-                    for (int q = 0; q < 4; q++) {
-                        uint32_t a[4];
-                        xh_dequant(words[q], a);
+                        for (int j = 0; j < NT; j++) hacc[j][0] = hacc[j][1] = 0u;
+                        const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
 #pragma unroll
-                        for (int j = 0; j < NT; j++) {
-                            if (8 * j >= m) break;
-                            const uint4& bb = (q >> 1) ? b1[c][j] : b0[c][j];
-                            xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                        for (int q = 0; q < 4; q++) {
+                            uint32_t a[4];
+                            xh_dequant(words[q], a);
+#pragma unroll
+                            for (int j = 0; j < NT; j++) {
+                                if (8 * j >= m) break;
+                                const uint4& bb = (q >> 1) ? b1[c][j] : b0[c][j];
+                                xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                            }
                         }
-                    }
 #pragma unroll
-                    for (int j = 0; j < NT; j++) xh_flush(acc[tt][j], hacc[j], sg, sg8);
+                        for (int j = 0; j < NT; j++) xh_flush(acc[tt][j], hacc[j], sg, sg8);
+                    }
+                } else {
+                    // W8: two k32 sub-chunks per 64-k chunk, the group's eight steps in one fp32 MMA sum
+                    float cw[NT][4];
+#pragma unroll
+                    for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
+#pragma unroll
+                    for (int c = 0; c < 2; c++)
+#pragma unroll
+                        for (int s = 0; s < 2; s++) {
+                            const uint4 wc = w[2 * c + s];
+                            const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                            for (int q = 0; q < 2; q++) {
+                                uint32_t a[4];
+                                a_from_w8(words[2 * q], words[2 * q + 1], a);
+#pragma unroll
+                                for (int j = 0; j < NT; j++) {
+                                    if (8 * j >= m) break;
+                                    const uint4& bb = s ? b1[c][j] : b0[c][j];
+                                    mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
+                                }
+                            }
+                        }
+#pragma unroll
+                    for (int j = 0; j < NT; j++) {
+                        acc[tt][j][0] = __fmaf_rn(cw[j][0], sg, acc[tt][j][0]);
+                        acc[tt][j][1] = __fmaf_rn(cw[j][1], sg, acc[tt][j][1]);
+                        acc[tt][j][2] = __fmaf_rn(cw[j][2], sg8, acc[tt][j][2]);
+                        acc[tt][j][3] = __fmaf_rn(cw[j][3], sg8, acc[tt][j][3]);
+                    }
                 }
             }
         }
@@ -6069,7 +6106,8 @@ __global__ void __launch_bounds__(128) k_moe_dn_slot(const PfJob* __restrict__ j
                 const int r = rb + tt;
                 const uint4* qp = pj.w.dq + (size_t)r * 2 * 32 + lane;
                 const uint4 w0 = __ldg(qp), w1 = __ldg(qp + 32);
-                const float sg = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g]) * kXhScale, sg8 = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g + 8]) * kXhScale;
+                const __half* ds = static_cast<const __half*>(pj.w.ds);  // INT4 reference kernel: fp16 scales
+                const float sg = __half2float(ds[r * 16 + g]) * kXhScale, sg8 = __half2float(ds[r * 16 + g + 8]) * kXhScale;
 #pragma unroll
                 for (int c = 0; c < 2; c++) {
                     const uint4 wc = c ? w1 : w0;
