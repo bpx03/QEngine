@@ -765,7 +765,9 @@ static YarnTab yarn_table(double factor) {
     return t;
 }
 
-Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx) : p_(p), dev_(device), max_ctx_(max_ctx), comm_(comm) {
+Worker::Worker(const Plan& p, int device, const Comm& comm, int max_ctx, WeightFormat format)
+    : p_(p), format_(format), group_bytes_(format == WeightFormat::Int8 ? ExpertLayout<8>::bytes : ExpertLayout<4>::bytes),
+      dev_(device), max_ctx_(max_ctx), comm_(comm) {
     CUDA_CHECK(cudaSetDevice(dev_));
     gctx_ = green_ctx_for(dev_, &gsms_);  // (TP ranks sharing this card: its SM share; else null)
     mkstream(&st_, cudaStreamNonBlocking, 0);
@@ -960,6 +962,62 @@ W8 load_w8i(int n, int k, const std::vector<I8Block>& blocks, Worker* w, void* (
     CUDA_CHECK(cudaStreamSynchronize(s));
     return out;
 }
+struct Int8Block { std::string base; int r0, rows, c0, cols, dr, dc; };
+W8 load_w8_packed(const SafeTensors& tensors, int n, int k, const std::vector<Int8Block>& blocks,
+                  Worker* w, void* (Worker::*alloc)(size_t), cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || k % 128) throw std::runtime_error("packed W8: invalid destination shape");
+    const int padded = (n + 15) / 16 * 16;
+    struct Source { const TensorInfo *q, *s; int k; };
+    std::vector<Source> sources;
+    for (const auto& b : blocks) {
+        const auto& q = tensors.get(b.base + ".weight_packed");
+        if (q.shape.size() != 2) throw std::runtime_error(b.base + ": expected rank-2 packed projection");
+        std::vector<long long> logical = {q.shape[0], q.shape[1] * 4};
+        checkpoint_detail::validate_int8_tensor(tensors, b.base, logical);
+        if (b.r0 < 0 || b.rows <= 0 || b.r0 + b.rows > logical[0] || b.c0 < 0 || b.cols <= 0
+            || b.c0 % 128 || b.cols % 128 || b.dc % 128 || b.c0 + b.cols > logical[1]
+            || b.dr < 0 || b.dc < 0 || b.dr + b.rows > n || b.dc + b.cols > k)
+            throw std::runtime_error(b.base + ": packed W8 slice outside source/destination or not g128 aligned");
+        sources.push_back({&q, &tensors.get(b.base + ".weight_scale"), (int)logical[1]});
+    }
+    W8 out;
+    out.n = padded; out.k = k;
+    out.q = (uint4*)(w->*alloc)(w8_qbytes(padded, k));
+    out.s = (bf16*)(w->*alloc)((size_t)padded * (k / 128) * 2);
+    constexpr int BR = 256;
+    const size_t qb = (size_t)BR * k, sb = (size_t)BR * (k / 128) * 2, slot_bytes = qb + sb;
+    char* host = g_hs.get(2 * slot_bytes);
+    char* device = (char*)g_s1.get(2 * slot_bytes);
+    cudaEvent_t ev[2];
+    for (auto& x : ev) CUDA_CHECK(cudaEventCreateWithFlags(&x, cudaEventDisableTiming));
+    bool rec[2] = {false, false};
+    for (int tile = 0, bi = 0; tile < padded; tile += BR, bi ^= 1) {
+        const int rows = std::min(BR, padded - tile);
+        if (rec[bi]) CUDA_CHECK(cudaEventSynchronize(ev[bi]));
+        char* hb = host + (size_t)bi * slot_bytes;
+        char* db = device + (size_t)bi * slot_bytes;
+        const size_t qn = (size_t)rows * k, sn = (size_t)rows * (k / 128) * 2;
+        memset(hb, 128, qn);
+        auto* scales = (bf16*)(hb + qb);
+        std::fill(scales, scales + (size_t)rows * (k / 128), __float2bfloat16(1.f));
+        for (size_t si = 0; si < blocks.size(); ++si) {
+            const auto& b = blocks[si]; const auto& src = sources[si];
+            for (int row = std::max(tile, b.dr); row < std::min(tile + rows, b.dr + b.rows); ++row) {
+                const size_t sr = (size_t)(b.r0 + row - b.dr);
+                memcpy(hb + (size_t)(row - tile) * k + b.dc, src.q->data + sr * src.k + b.c0, b.cols);
+                memcpy(scales + (size_t)(row - tile) * (k / 128) + b.dc / 128,
+                       src.s->data + (sr * (src.k / 128) + b.c0 / 128) * 2, (size_t)(b.cols / 128) * 2);
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(db, hb, qn, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(db + qb, hb + qb, sn, cudaMemcpyHostToDevice, stream));
+        repack_w8((const int32_t*)db, (const bf16*)(db + qb), rows, k, const_cast<uint4*>(out.q) + (size_t)tile * k / 16,
+                  const_cast<bf16*>(out.s) + (size_t)tile * (k / 128), stream);
+}
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (auto& x : ev) CUDA_CHECK(cudaEventDestroy(x));
+    return out;
+}
 W16 load_w16(int n, int k, const std::vector<Bf16Block>& blocks, Worker* w, void* (Worker::*alloc)(size_t), cudaStream_t s) {
     std::vector<bf16> h((size_t)n * k, __float2bfloat16(0.f));
     for (auto& b : blocks)
@@ -1056,7 +1114,9 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0, ql = p_.q1 - p_.q0;
     // one decoder layer (trunk layer li, or the MTP block with li = -1) from tensors under `pre`
     auto load_layer = [&](const SafeTensors& st, Layer& L, const std::string& pre, int li) {
-        L.full = st.has(pre + "self_attn.q_proj.weight");
+        L.full = st.has(pre + "self_attn.q_proj.weight") || st.has(pre + "self_attn.q_proj.weight_packed");
+        const bool linear = st.has(pre + "linear_attn.in_proj_qkv.weight") || st.has(pre + "linear_attn.in_proj_qkv.weight_packed");
+        if (L.full == linear) throw std::runtime_error(pre + ": expected exactly one QSA/DeltaNet projection family");
         L.hca = hc_from(st, pre + "attn_hyper_connection.", true);
         L.hcm = hc_from(st, pre + "mlp_hyper_connection.", true);
         if (!L.full) {
@@ -1088,7 +1148,13 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
                 CHECK(chk(d + "in_proj_z", NZ, H) == in_i8, "flash: %s in_proj_qkv / in_proj_z: mixed BF16 / INT8", d.c_str());
             }
             if (out8) out_i8 = chk(d + "out_proj", H, NZ);
-            if (in8 && in_i8) {
+            if (format_ == WeightFormat::Int8) {
+                L.dn_in8 = load_w8_packed(st, 2*kl*DK+2*vl*DV, H, {
+                    {d+"in_proj_qkv", p_.k0*DK, kl*DK, 0, H, 0, 0},
+                    {d+"in_proj_qkv", LNK*DK+p_.k0*DK, kl*DK, 0, H, kl*DK, 0},
+                    {d+"in_proj_qkv", 2*LNK*DK+p_.v0*DV, vl*DV, 0, H, 2*kl*DK, 0},
+                    {d+"in_proj_z", p_.v0*DV, vl*DV, 0, H, 2*kl*DK+vl*DV, 0}}, this, A, st_);
+            } else if (in8 && in_i8) {
                 const int8_t* qkv = (const int8_t*)T(st, d + "in_proj_qkv.weight").data;
                 const int8_t* z = (const int8_t*)T(st, d + "in_proj_z.weight").data;
                 const bf16* sq = B(st, d + "in_proj_qkv.weight_scale");
@@ -1119,7 +1185,9 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
                               0, -1, false, this, A, st_);
             }
             static_assert(DV % 128 == 0, "out_proj column slices must start on a 128 group");
-            if (out8 && out_i8)  // columns v0*DV .. v1*DV of [H, LNV*DV]: the scale columns start at v0*DV/128
+            if (format_ == WeightFormat::Int8)
+                L.dn_out8 = load_w8_packed(st, H, vl*DV, {{d+"out_proj", 0, H, p_.v0*DV, vl*DV, 0, 0}}, this, A, st_);
+            else if (out8 && out_i8)  // columns v0*DV .. v1*DV of [H, LNV*DV]: the scale columns start at v0*DV/128
                 L.dn_out8 = load_w8i(H, vl * DV, {{(const int8_t*)T(st, d + "out_proj.weight").data + (size_t)p_.v0 * DV,
                                                    B(st, d + "out_proj.weight_scale") + (size_t)p_.v0 * DV / 128, LNV * DV, H, vl * DV, 0, 0}},
                                      this, A, st_);
@@ -1151,11 +1219,28 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             L.dn_norm = bf_dev(B(st, d + "norm.weight"), DV);
         } else {
             const std::string a = pre + "self_attn.";
-            const bf16* q = B(st, a + "q_proj.weight");
+            const bf16* q = format_ == WeightFormat::Int8 ? nullptr : B(st, a + "q_proj.weight");
             // rows [q of nqp heads][gate of the local heads][k 2][v 2]: variant B (default) q only of the local heads
             // (exchanged between the cards), FLASH_QSA_A=1 q of all 24 heads on every card
             const int nqp = qsa_a_ ? NQ : ql, qh0 = qsa_a_ ? 0 : p_.q0;
-            std::vector<Bf16Block> qb;
+            if (format_ == WeightFormat::Int8) {
+                std::vector<Int8Block> blocks;
+                for (int h = 0; h < nqp; h++) blocks.push_back({a+"q_proj", (qh0+h)*2*HD, HD, 0, H, h*HD, 0});
+                for (int h = p_.q0; h < p_.q1; h++) blocks.push_back({a+"q_proj", h*2*HD+HD, HD, 0, H, nqp*HD+(h-p_.q0)*HD, 0});
+                blocks.push_back({a+"k_proj", 0, NKV*HD, 0, H, (nqp+ql)*HD, 0});
+                blocks.push_back({a+"v_proj", 0, NKV*HD, 0, H, (nqp+ql+NKV)*HD, 0});
+                L.qkv = load_w8_packed(st, (nqp+ql+2*NKV)*HD, H, blocks, this, A, st_);
+                if (qx_on_) {
+                    std::vector<Int8Block> peers; int j = 0;
+                    for (int g = 0; g < p_.ngpu; g++) if (g != p_.rank)
+                        for (int h = g*QPC(p_); h < (g+1)*QPC(p_); h++, j++)
+                            peers.push_back({a+"q_proj", h*2*HD, HD, 0, H, j*HD, 0});
+                    L.qx = load_w8_packed(st, j*HD, H, peers, this, A, st_);
+                    if (!qxb_) qxb_ = (float*)dalloc((size_t)PFM*j*HD*4);
+                }
+                L.o = load_w8_packed(st, H, ql*HD, {{a+"o_proj", 0, H, p_.q0*HD, ql*HD, 0, 0}}, this, A, st_);
+            } else {
+                std::vector<Bf16Block> qb;
             for (int h = 0; h < nqp; h++) qb.push_back({q + (size_t)(qh0 + h) * 2 * HD * H, H, HD, H, h * HD, 0});
             for (int h = p_.q0; h < p_.q1; h++) qb.push_back({q + ((size_t)h * 2 * HD + HD) * H, H, HD, H, nqp * HD + (h - p_.q0) * HD, 0});
             qb.push_back({B(st, a + "k_proj.weight"), H, NKV * HD, H, nqp * HD + ql * HD, 0});
@@ -1172,6 +1257,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
                 if (!qxb_) qxb_ = (float*)dalloc((size_t)PFM * j * HD * 4);
             }
             L.o = load_w8(H, ql * HD, {{B(st, a + "o_proj.weight") + p_.q0 * HD, NQ * HD, H, ql * HD, 0, 0}}, this, A, st_);
+            }
             L.idx = load_w16((IDX_NH + 1) * IDX_HD, H, {{B(st, a + "indexer.index_qk_proj.weight"), H, (IDX_NH + 1) * IDX_HD, H, 0, 0}}, this, A, st_);
             L.q_norm = bf_dev(B(st, a + "q_norm.weight"), HD);
             L.k_norm = bf_dev(B(st, a + "k_norm.weight"), HD);
@@ -1204,8 +1290,13 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         }
         if (li == PLE_LAYER) {
             const std::string pl = pre + "ple.";
-            L.ple_key = load_w4(st, {{pl + "key_proj", 0, RW}}, 0, -1, false, this, A, st_);
-            L.ple_val = load_w4(st, {{pl + "value_proj", 0, H}}, 0, -1, false, this, A, st_);
+            if (format_ == WeightFormat::Int8) {
+                L.ple_key8 = load_w8_packed(st, RW, H, {{pl+"key_proj", 0, RW, 0, H, 0, 0}}, this, A, st_);
+                L.ple_val8 = load_w8_packed(st, H, H, {{pl+"value_proj", 0, H, 0, H, 0, 0}}, this, A, st_);
+            } else {
+                L.ple_key = load_w4(st, {{pl + "key_proj", 0, RW}}, 0, -1, false, this, A, st_);
+                L.ple_val = load_w4(st, {{pl + "value_proj", 0, H}}, 0, -1, false, this, A, st_);
+            }
             L.ple_nk = bf_dev(B(st, pl + "norm_key.weight"), RW);
             L.ple_nq = bf_dev(B(st, pl + "norm_query.weight"), RW);
             L.ple_nc = bf_dev(B(st, pl + "norm_conv.weight"), RW);
@@ -1222,14 +1313,19 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         const SafeTensors& ms = *mst;
         load_layer(ms, mtp_, "mtp.layers.0.", -1);
         mtp_mixer_ = hc_from(ms, "mtp.hyper_connection_mixer.", false);
-        mtp_fce_ = load_w8(H, H, {{B(ms, "mtp.fc_embedding.weight"), H, H, H, 0, 0}}, this, A, st_);
-        mtp_fch_ = load_w8(H, H, {{B(ms, "mtp.fc_hidden.weight"), H, H, H, 0, 0}}, this, A, st_);
+        if (format_ == WeightFormat::Int8) {
+            mtp_fce_ = load_w8_packed(ms, H, H, {{"mtp.fc_embedding", 0, H, 0, H, 0, 0}}, this, A, st_);
+            mtp_fch_ = load_w8_packed(ms, H, H, {{"mtp.fc_hidden", 0, H, 0, H, 0, 0}}, this, A, st_);
+        } else {
+            mtp_fce_ = load_w8(H, H, {{B(ms, "mtp.fc_embedding.weight"), H, H, H, 0, 0}}, this, A, st_);
+            mtp_fch_ = load_w8(H, H, {{B(ms, "mtp.fc_hidden.weight"), H, H, H, 0, 0}}, this, A, st_);
+        }
         mtp_pre_e_ = bf_dev(B(ms, "mtp.pre_fc_norm_embedding.weight"), H);
         mtp_pre_h_ = bf_dev(B(ms, "mtp.pre_fc_norm_hidden.weight"), RW);
         has_mtp_ = true;
     }
     if (p_.last()) {  // (pipeline: the head lives on the last stage only)
-        const bf16* lm = B(st, "lm_head.weight");
+        const bf16* lm = format_ == WeightFormat::Int8 ? nullptr : B(st, "lm_head.weight");
         const int nv = p_.voc1 - p_.voc0;
         // rows permuted: the draft vocabulary of this slice first (its first ndraft_ rows are the draft head), map_ =
         // local row -> token id
@@ -1239,9 +1335,15 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             if (t >= p_.voc0 && t < p_.voc1 && !in[t - p_.voc0]) { in[t - p_.voc0] = 1; rows.push_back(t); }
         ndraft_ = ((int)rows.size() + 15) / 16 * 16;
         for (int t = p_.voc0; t < p_.voc1; t++) if (!in[t - p_.voc0]) rows.push_back(t);
-        std::vector<Bf16Block> bl;
-        for (int i = 0; i < nv; i++) bl.push_back({lm + (size_t)rows[i] * H, H, 1, H, i, 0});
-        lm_ = load_w8(nv, H, bl, this, A, st_);
+        if (format_ == WeightFormat::Int8) {
+            std::vector<Int8Block> bl;
+            for (int i = 0; i < nv; i++) bl.push_back({"lm_head", rows[i], 1, 0, H, i, 0});
+            lm_ = load_w8_packed(st, nv, H, bl, this, A, st_);
+        } else {
+            std::vector<Bf16Block> bl;
+            for (int i = 0; i < nv; i++) bl.push_back({lm + (size_t)rows[i] * H, H, 1, H, i, 0});
+            lm_ = load_w8(nv, H, bl, this, A, st_);
+        }
         lmap_ = (int*)dalloc((size_t)nv * 4);
         CUDA_CHECK(cudaMemcpy(lmap_, rows.data(), (size_t)nv * 4, cudaMemcpyHostToDevice));
         if (ndraft_ == 0) ndraft_ = nv;
@@ -1254,9 +1356,15 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             for (size_t i = p_.rank; i < draft_ids_.size(); i += p_.ngpu) mine.push_back(draft_ids_[i]);
             const int nd = ((int)mine.size() + 15) / 16 * 16;
             while ((int)mine.size() < nd) mine.push_back(mine.back());  // padding rows repeat a token (ties: same id)
-            std::vector<Bf16Block> db;
-            for (int i = 0; i < nd; i++) db.push_back({lm + (size_t)mine[i] * H, H, 1, H, i, 0});
-            dlm_ = load_w8(nd, H, db, this, A, st_);
+            if (format_ == WeightFormat::Int8) {
+                std::vector<Int8Block> db;
+                for (int i = 0; i < nd; i++) db.push_back({"lm_head", mine[i], 1, 0, H, i, 0});
+                dlm_ = load_w8_packed(st, nd, H, db, this, A, st_);
+            } else {
+                std::vector<Bf16Block> db;
+                for (int i = 0; i < nd; i++) db.push_back({lm + (size_t)mine[i] * H, H, 1, H, i, 0});
+                dlm_ = load_w8(nd, H, db, this, A, st_);
+            }
             dmap_ = (int*)dalloc((size_t)nd * 4);
             CUDA_CHECK(cudaMemcpy(dmap_, mine.data(), (size_t)nd * 4, cudaMemcpyHostToDevice));
         }
@@ -1332,8 +1440,8 @@ void Worker::view_groups(Layer& L, int li) {
         for (auto& [x, k] : cold) {
             const int j = x - T.ndev;
             g[k] = O.ndev + nc++;
-            L.csrc.push_back(T.csrc.empty() ? T.hgroups + (size_t)j * GRP_BYTES : T.csrc[j]);
-            L.csrc_h.push_back(T.csrc_h.empty() ? T.hgroups_h + (size_t)j * GRP_BYTES : T.csrc_h[j]);
+            L.csrc.push_back(T.csrc.empty() ? T.hgroups + (size_t)j * T.group_bytes_ : T.csrc[j]);
+            L.csrc_h.push_back(T.csrc_h.empty() ? T.hgroups_h + (size_t)j * T.group_bytes_ : T.csrc_h[j]);
             L.cdev.push_back(0);
             L.cexp.push_back(k / NGRP);
         }
@@ -1351,7 +1459,7 @@ void Worker::view_groups(Layer& L, int li) {
             std::lock_guard<std::mutex> lk(hmu);
             char*& h = hcopy[T.groups];
             if (!h) {
-                const size_t b = (size_t)T.ndev * GRP_BYTES;
+                const size_t b = (size_t)T.ndev * T.group_bytes_;
                 // (no peer access: these copies are new pinned host memory, ~2/3 of the TP experts on 3 cards; never past
                 // the host's margin: the archive and the page cache need the rest)
                 if (qe_hostmem::headroom(true) < b + ((size_t)4 << 30)) {  // (a clear stop, no abort)
@@ -1370,7 +1478,7 @@ void Worker::view_groups(Layer& L, int li) {
         }
         for (auto& [x, k] : res) {
             g[k] = O.ndev + nc++;
-            const char* a = peer ? T.groups + (size_t)x * GRP_BYTES : hbase + (size_t)x * GRP_BYTES;
+            const char* a = peer ? T.groups + (size_t)x * T.group_bytes_ : hbase + (size_t)x * T.group_bytes_;
             L.csrc.push_back(a);
             L.csrc_h.push_back(a);
             L.cdev.push_back(peer);
@@ -1385,6 +1493,7 @@ void Worker::view_groups(Layer& L, int li) {
 }
 
 void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre, const std::vector<char>& isc) {
+    const bool int8 = format_ == WeightFormat::Int8;
     prefetch_experts(st, pre, true);
     // local expert groups: gate rows [128g, 128g + 128) + up rows [640 + 128g, ...) GLU-interleaved, down
     // columns [128g, 128g + 128); the shared expert (512) from its own tensors (same layout, 1 expert)
@@ -1392,10 +1501,10 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
     std::vector<int> gm((NE + 1) * NGRP, -1);
     int nl = 0, nh = 0;
     for (int k = 0; k < (NE + 1) * NGRP; k++)
-        if (p_.gcard[k] == p_.rank && !isc[k]) gm[k] = nl++;
+        if (p_.gcard[k] == p_.rank && (!isc[k] || (int8 && k / NGRP == NE))) gm[k] = nl++;
     L.cexp.clear();
     for (int k = 0; k < (NE + 1) * NGRP; k++)
-        if (p_.gcard[k] == p_.rank && isc[k]) { gm[k] = nl + nh++; L.cexp.push_back(k / NGRP); }
+        if (p_.gcard[k] == p_.rank && isc[k] && (!int8 || k / NGRP != NE)) { gm[k] = nl + nh++; L.cexp.push_back(k / NGRP); }
     L.ncold = nh;
     {  // the resident groups in VMM chunks (VRAM pressure while serving: vram_reclaim); hotness: the router prior
         const int li = &L == &mtp_ ? LAYERS : (int)(&L - L_.data());
@@ -1405,39 +1514,50 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
                 const int e = k / NGRP;
                 hot.push_back(e == NE ? 1e30 : li < LAYERS && (int)ec_prior_.size() == LAYERS * NE ? ec_prior_[(size_t)li * NE + e] : 1.0);
             }
-        L.groups = nl ? vmm_groups((size_t)nl * GRP_BYTES, hot) : nullptr;
-        if (!L.groups) L.groups = (char*)dalloc((size_t)nl * GRP_BYTES);
+        L.groups = nl ? vmm_groups((size_t)nl * group_bytes_, hot) : nullptr;
+        if (!L.groups) L.groups = (char*)dalloc((size_t)nl * group_bytes_);
     }
     L.ndev = nl;
     if (nh) {
         char* hp;
-        hp = pin_host(nullptr, (size_t)nh * GRP_BYTES, 4, false, {gpu_numa_node(dev_)});  // the card's NUMA node
+        hp = pin_host(nullptr, (size_t)nh * group_bytes_, 4, false, {gpu_numa_node(dev_)});  // the card's NUMA node
         CUDA_CHECK(cudaHostGetDevicePointer((void**)&L.hgroups, hp, 0));
         L.hgroups_h = hp;
-        host_bytes_ += (size_t)nh * GRP_BYTES;
+        host_bytes_ += (size_t)nh * group_bytes_;
     }
     L.gmap = (int*)dalloc(gm.size() * 4);
     CUDA_CHECK(cudaMemcpy(L.gmap, gm.data(), gm.size() * 4, cudaMemcpyHostToDevice));
     const std::string ep = pre + "mlp.experts.", sp = pre + "mlp.shared_expert.";
     const TensorInfo* q[2][4] = {{&T(st, ep + "gate_up_proj.weight_packed"), &T(st, ep + "gate_up_proj.weight_scale"),
                                   &T(st, ep + "down_proj.weight_packed"), &T(st, ep + "down_proj.weight_scale")},
-                                 {&T(st, sp + "gate_up_proj.weight_packed"), &T(st, sp + "gate_up_proj.weight_scale"),
+                                 {&T(st, sp + (int8 ? "gate_proj.weight_packed" : "gate_up_proj.weight_packed")),
+                                  &T(st, sp + (int8 ? "gate_proj.weight_scale" : "gate_up_proj.weight_scale")),
                                   &T(st, sp + "down_proj.weight_packed"), &T(st, sp + "down_proj.weight_scale")}};
+    const TensorInfo* upq = int8 ? &T(st, sp + "up_proj.weight_packed") : nullptr;
+    const TensorInfo* ups = int8 ? &T(st, sp + "up_proj.weight_scale") : nullptr;
+    if (int8) {
+        checkpoint_detail::validate_int8_tensor(st, ep + "gate_up_proj", {NE, 2*INTER, H});
+        checkpoint_detail::validate_int8_tensor(st, ep + "down_proj", {NE, H, INTER});
+        checkpoint_detail::validate_int8_tensor(st, sp + "gate_proj", {INTER, H});
+        checkpoint_detail::validate_int8_tensor(st, sp + "up_proj", {INTER, H});
+        checkpoint_detail::validate_int8_tensor(st, sp + "down_proj", {H, INTER});
     // staging of CH groups per batch, one record per group: gate_up rows [256][320] int32 + [256][20] f16, down
     // [2560][16] int32 + [2560][1] f16. Two pinned host + device buffers: the gather of batch j + 1 (FLASH_LOAD_THREADS
     // threads, the small row copies out of the mapped file are the cost) overlaps the copy and repack of batch j
     constexpr int CH = 64;
-    const size_t gqw = (size_t)2 * GRP * (H / 8), gsw = (size_t)2 * GRP * (H / 128);
-    const size_t dqw = (size_t)H * (GRP / 8), dsw = (size_t)H;
+    const int pack = int8 ? 4 : 8;
+    const size_t gqw = (size_t)2 * GRP * (H / pack), gsw = (size_t)2 * GRP * (H / 128);
+    const size_t dqw = (size_t)H * (GRP / pack), dsw = (size_t)H;
     const size_t SG = (gqw * 4 + gsw * 2 + dqw * 4 + dsw * 2 + 255) / 256 * 256;
     static const int nth = env_set("FLASH_LOAD_THREADS") ? std::max(1, env_int("FLASH_LOAD_THREADS", 8)) : 8;
     std::vector<int> ks;
     for (int k = 0; k < (NE + 1) * NGRP; k++)
         if (gm[k] >= 0) ks.push_back(k);
     if (ks.empty()) return;
+    char* cold = int8 && nh ? (char*)g_s3.get((size_t)CH * group_bytes_) : nullptr;
     char* hbuf = g_hs.get(2 * CH * SG);
     char* dbuf = (char*)g_s1.get(2 * CH * SG);
-    char* tmp = (char*)g_s2.get(gqw * 4 + gsw * 2);
+    char* tmp = int8 ? nullptr : (char*)g_s2.get(gqw * 4 + gsw * 2);
     cudaEvent_t ev[2];
     for (auto& x : ev) CUDA_CHECK(cudaEventCreateWithFlags(&x, cudaEventDisableTiming));
     bool rec[2] = {false, false};
@@ -1447,18 +1567,24 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
         int32_t* hdq = (int32_t*)(hgs + gsw);
         uint16_t* hds = (uint16_t*)(hdq + dqw);
         const int e = k / NGRP, g = k % NGRP, sh = e == NE, ee = sh ? 0 : e;
-        const char* gq = q[sh][0]->data + (size_t)ee * 2 * INTER * (H / 8) * 4;
+        const char* gq = q[sh][0]->data + (size_t)ee * 2 * INTER * (H / pack) * 4;
         const char* gs = q[sh][1]->data + (size_t)ee * 2 * INTER * (H / 128) * 2;
-        for (int half = 0; half < 2; half++)  // gate rows, then up rows
+        for (int half = 0; half < 2; half++) {
+            const bool separate = int8 && sh && half;
+            const char* gsrc = separate ? upq->data : gq;
+            const char* ssrc = separate ? ups->data : gs;
+            const int row0 = (int8 && sh ? 0 : half * INTER) + g * GRP;
             for (int i = 0; i < GRP; i++) {
-                const int row = half * INTER + g * GRP + i;
-                memcpy(&hgq[(size_t)(half * GRP + i) * (H / 8)], gq + (size_t)row * (H / 8) * 4, H / 2);
-                memcpy(&hgs[(size_t)(half * GRP + i) * (H / 128)], gs + (size_t)row * (H / 128) * 2, H / 128 * 2);
+                const int row = row0 + i;
+                const int dest = int8 ? (i / 8) * 16 + half * 8 + i % 8 : half * GRP + i;
+                memcpy(&hgq[(size_t)dest * (H / pack)], gsrc + (size_t)row * (H / pack) * 4, (size_t)(H / pack) * 4);
+                memcpy(&hgs[(size_t)dest * (H / 128)], ssrc + (size_t)row * (H / 128) * 2, (size_t)(H / 128) * 2);
             }
-        const char* dq = q[sh][2]->data + (size_t)ee * H * (INTER / 8) * 4;
+        }
+        const char* dq = q[sh][2]->data + (size_t)ee * H * (INTER / pack) * 4;
         const char* ds = q[sh][3]->data + (size_t)ee * H * (INTER / 128) * 2;
         for (int row = 0; row < H; row++) {
-            memcpy(&hdq[(size_t)row * (GRP / 8)], dq + ((size_t)row * (INTER / 8) + g * (GRP / 8)) * 4, GRP / 2);
+            memcpy(&hdq[(size_t)row * (GRP / pack)], dq + ((size_t)row * (INTER / pack) + g * (GRP / pack)) * 4, (size_t)(GRP / pack) * 4);
             hds[row] = *(const uint16_t*)(ds + ((size_t)row * (INTER / 128) + g) * 2);
         }
     };
@@ -1482,14 +1608,22 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
         CUDA_CHECK(cudaMemcpyAsync(db, hb, (size_t)n * SG, cudaMemcpyHostToDevice, st_));
         for (int b = 0; b < n; b++) {
             const int k = ks[j0 + b];
-            char* dst = gm[k] < L.ndev ? L.groups + (size_t)gm[k] * GRP_BYTES : L.hgroups + (size_t)(gm[k] - L.ndev) * GRP_BYTES;
+            const bool host_group = gm[k] >= L.ndev;
+            char* dst = host_group ? (int8 ? cold + (size_t)b * group_bytes_ : L.hgroups + (size_t)(gm[k] - L.ndev) * group_bytes_)
+                                   : L.groups + (size_t)gm[k] * group_bytes_;
             int32_t* dgq = (int32_t*)(db + (size_t)b * SG);
             uint16_t* dgs = (uint16_t*)(dgq + gqw);
             int32_t* ddq = (int32_t*)(dgs + gsw);
             uint16_t* dds = (uint16_t*)(ddq + dqw);
+            if (int8) {
+                repack_w8(dgq, (const bf16*)dgs, 2*GRP, H, (uint4*)dst, (bf16*)(dst+ExpertLayout<8>::gs), st_);
+                repack_w8(ddq, (const bf16*)dds, H, GRP, (uint4*)(dst+ExpertLayout<8>::dq), (bf16*)(dst+ExpertLayout<8>::ds), st_);
+                if (host_group) CUDA_CHECK(cudaMemcpyAsync(L.hgroups_h + (size_t)(gm[k] - L.ndev) * group_bytes_, dst, group_bytes_, cudaMemcpyDeviceToHost, st_));
+            } else {
             glu_interleave_rows(dgq, (const bf16*)dgs, 2 * GRP, H, (int32_t*)tmp, (bf16*)(tmp + gqw * 4), st_);
             repack_w4((const int32_t*)tmp, (const bf16*)(tmp + gqw * 4), 2 * GRP, H, (uint4*)dst, (bf16*)(dst + GG_Q), st_);
             repack_w4(ddq, (const bf16*)dds, H, GRP, (uint4*)(dst + GG_Q + GG_S), (bf16*)(dst + GG_Q + GG_S + GD_Q), st_);
+        }
         }
         CUDA_CHECK(cudaEventRecord(ev[bi], st_));
         rec[bi] = true;
@@ -1498,6 +1632,10 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
     CUDA_CHECK(cudaStreamSynchronize(st_));
     for (auto& x : ev) CUDA_CHECK(cudaEventDestroy(x));
     g_s1.release();
+    if (int8) {
+        g_s3.release();
+        fprintf(stderr, "[flash] GPU%d %s native W8 experts: %d device + %d host groups, stride %zu; BF16 scales preserved\n", dev_, pre.c_str(), nl, nh, group_bytes_);
+    }
     g_s2.release();
 }
 
@@ -2304,7 +2442,7 @@ char* Worker::vmm_groups(size_t bytes, const std::vector<double>& hot) {
         CUmemGenericAllocationHandle h;
         if (cuMemCreate(&h, sz, &pr, 0) != CUDA_SUCCESS) return undo();
         if (cuMemMap(va + off, sz, 0, h, 0) != CUDA_SUCCESS) { cuMemRelease(h); return undo(); }
-        const size_t g0 = off / GRP_BYTES, g1 = std::min(hot.size(), (off + sz + GRP_BYTES - 1) / GRP_BYTES);
+        const size_t g0 = off / group_bytes_, g1 = std::min(hot.size(), (off + sz + group_bytes_ - 1) / group_bytes_);
         double hs = 0;
         for (size_t i = g0; i < g1; i++) hs = std::max(hs, hot[i]);  // a chunk is as hot as its hottest group
         made.push_back({(char*)(uintptr_t)(va + off), sz, (unsigned long long)h, 0, hs, false});
@@ -2571,20 +2709,20 @@ Worker::LoadMargin Worker::load_margin() const {
 void Worker::pfs_alloc_fit(int cap, int cap0, long long keep_b) {
     const int want = cap, want0 = cap0;
     cap0 = std::min(cap0, cap);
-    const long long gb = (long long)GRP_BYTES;
+    const long long gb = (long long)group_bytes_;
     auto room = [&] { return std::max(0LL, (long long)free_bytes() - keep_b - (2LL << 20)) / (2 * gb); };  // groups per half
     pfs_ring_ = pfs_ext_ = nullptr;
     // the ring proper: what fits (keep_b 0: the budget reserved it, so the first try fits), then a few smaller tries
     if (keep_b > 0) cap0 = (int)std::min<long long>(cap0, room());
-    while (cap0 > 0 && !(pfs_ring_ = (char*)dalloc_try((size_t)2 * cap0 * GRP_BYTES))) cap0 = std::min<long long>(cap0 * 7 / 8, room());
+    while (cap0 > 0 && !(pfs_ring_ = (char*)dalloc_try((size_t)2 * cap0 * group_bytes_))) cap0 = std::min<long long>(cap0 * 7 / 8, room());
     if (cap0 < want0) cap = cap0;  // (the extension continues the ring's positions: no extension past a shorter ring)
     if (cap > cap0) {  // the extension: a bt region (expert-cache slots outside big batches)
         int nx = cap - cap0;
         if (keep_b > 0) nx = (int)std::min<long long>(nx, room());
-        while (nx > 0 && !(pfs_ext_ = (char*)dalloc_try((size_t)2 * nx * GRP_BYTES))) nx = std::min<long long>(nx * 7 / 8, room());
+        while (nx > 0 && !(pfs_ext_ = (char*)dalloc_try((size_t)2 * nx * group_bytes_))) nx = std::min<long long>(nx * 7 / 8, room());
         cap = cap0 + nx;
         if (pfs_ext_) {
-            const size_t xb = (size_t)2 * nx * GRP_BYTES;
+            const size_t xb = (size_t)2 * nx * group_bytes_;
             bt_regs_.push_back({pfs_ext_, xb});
             lend_own_.push_back({(uintptr_t)pfs_ext_, 0});
         }
@@ -2685,9 +2823,9 @@ void Worker::load_deferred_groups() {
         for (const Layer& L : L_) if (L.here) mx = std::max(mx, L.ncold);
         const int pfs_mb = env_int("FLASH_PF_STAGE_MB", 512), pfs_xmb = env_int("FLASH_PF_STAGE_XMB", 2048);
         if (pfs_mb > 0 && mx > 0) {
-            const long long cap_b = std::max<long long>((long long)pfs_mb, (long long)pfs_xmb) * 1048576 / GRP_BYTES;
+            const long long cap_b = std::max<long long>((long long)pfs_mb, (long long)pfs_xmb) * 1048576 / group_bytes_;
             const long long ring = std::min<long long>(2LL * mx, cap_b);
-            const long long ring0 = std::min<long long>(ring, (long long)pfs_mb * 1048576 / GRP_BYTES);
+            const long long ring0 = std::min<long long>(ring, (long long)pfs_mb * 1048576 / group_bytes_);
             // no expert budget here, so nothing reserved the ring: it takes what is free above the card's margin
             // (a stage next to a TP rank on its card: the rank's margin stays free), smaller when it does not fit
             pfs_alloc_fit((int)(ring / 2), (int)(ring0 / 2), (long long)(load_margin().total_mb * 1048576.0));
@@ -2696,8 +2834,8 @@ void Worker::load_deferred_groups() {
         for (const Layer& L : L_)
             for (char d : L.cdev) (d ? npeer : nhost)++;
         fprintf(stderr, "[flash] GPU%d stage expert views (TP rank %d): %d layers, cold groups per layer <= %d (%.2f GB from host, "
-                "%.2f GB from peer VRAM), staging ring 2 x %d groups\n", dev_, vown_, p_.l1 - p_.l0, mx, nhost * (double)GRP_BYTES / 1e9,
-                npeer * (double)GRP_BYTES / 1e9, pfs_cap_);
+                "%.2f GB from peer VRAM), staging ring 2 x %d groups\n", dev_, vown_, p_.l1 - p_.l0, mx, nhost * (double)group_bytes_ / 1e9,
+                npeer * (double)group_bytes_ / 1e9, pfs_cap_);
         ec_defer_l_.clear();
         return;
     }
@@ -2728,8 +2866,8 @@ void Worker::load_deferred_groups() {
                 "top of FLASH_EC_MARGIN_MB\n", lm.graph_mb, lm.graph_add_mb);
     const double margin_mb = lm.total_mb;
     // + per layer: gmap, allocation rounding (2 MiB), the cache table (8 B per group)
-    const long long other = (long long)nshared * GRP_BYTES + (long long)ec_defer_l_.size() * (2 << 20) + (long long)gs.size() * 8;
-    long long nres = (long long)((fr - (long long)(margin_mb * 1048576.0) - other) * card_share_) / (long long)GRP_BYTES;
+    const long long other = (long long)nshared * group_bytes_ + (long long)ec_defer_l_.size() * (2 << 20) + (long long)gs.size() * 8;
+    long long nres = (long long)((fr - (long long)(margin_mb * 1048576.0) - other) * card_share_) / (long long)group_bytes_;
     nres = std::max(0LL, std::min<long long>(nres, gs.size()));
     // prefill staging ring (2 x the most cold groups of a layer, capped by FLASH_PF_STAGE_MB): its groups come out of the
     // resident budget (the budget, the per-layer cold counts and the ring size settle in a few rounds)
@@ -2745,18 +2883,18 @@ void Worker::load_deferred_groups() {
     if (pfs_mb > 0) {  // own ring: its groups come out of the resident budget
         const long long nres0 = nres;
         long long ring = 0;
-        const long long cap_b = std::max<long long>((long long)pfs_mb, (long long)pfs_xmb) * 1048576 / GRP_BYTES;
+        const long long cap_b = std::max<long long>((long long)pfs_mb, (long long)pfs_xmb) * 1048576 / group_bytes_;
         for (int it = 0; it < 4; it++) {
             std::map<int, int> per;
             int mx = 0;
             for (size_t i = 0; i < gs.size() - (size_t)nres; i++) mx = std::max(mx, ++per[gs[i].li]);
             ring = std::min<long long>(2LL * mx, cap_b);
-            ring0 = std::min<long long>(ring, (long long)pfs_mb * 1048576 / GRP_BYTES);
+            ring0 = std::min<long long>(ring, (long long)pfs_mb * 1048576 / group_bytes_);
             nres = std::max(0LL, nres0 - ring);
         }
         pfs_cap_ = (int)(ring / 2);
         pfs_cap0_ = (int)(ring0 / 2);
-        pfs_resv_ = ring * (long long)GRP_BYTES;
+        pfs_resv_ = ring * (long long)group_bytes_;
     }
     const size_t ncold = gs.size() - nres;
     std::map<int, std::vector<char>> isc;
@@ -2774,7 +2912,7 @@ void Worker::load_deferred_groups() {
     if (pfs_cap_ > 0) pfs_alloc_fit(pfs_cap_, pfs_cap0_, 0);
     fprintf(stderr, "[flash] GPU%d group load: gather %.1f s, buffer wait %.1f s, copy + repack launches %.1f s\n", dev_, g_tg, g_tw, g_tl);
     fprintf(stderr, "[flash] GPU%d expert budget: %.2f GiB free -> %lld of %zu routed groups on the device, %zu host-backed (%.2f GB)\n",
-            dev_, fr / 1073741824.0, nres, gs.size(), ncold, ncold * (double)GRP_BYTES / 1e9);
+            dev_, fr / 1073741824.0, nres, gs.size(), ncold, ncold * (double)group_bytes_ / 1e9);
     if (!vch_.empty()) {  // coldest chunks move first; the shared expert's last
         std::stable_sort(vch_.begin(), vch_.end(), [](const VChunk& a, const VChunk& b) { return a.hot < b.hot; });
         vadapt_ = true;  // (several workers on a card, mode A: moves only between pipelined prompts, vmove_begin)
@@ -2814,14 +2952,14 @@ void Worker::pfs_init() {
     if (pfs_ext_) {
         pfs_ext_lent_ = false;
         for (const auto& sl : ec_slots_)
-            if (sl.bt && sl.addr >= pfs_ext_ && sl.addr < pfs_ext_ + (size_t)2 * (pfs_cap_ - pfs_cap0_) * GRP_BYTES) { pfs_ext_lent_ = true; break; }
+            if (sl.bt && sl.addr >= pfs_ext_ && sl.addr < pfs_ext_ + (size_t)2 * (pfs_cap_ - pfs_cap0_) * group_bytes_) { pfs_ext_lent_ = true; break; }
     }
     for (int h = 0; h < 2; h++) {
         pfs_runs_[h].clear();
         for (int p = 0; p < pfs_cap_; p++) {
             char* a = ring[(size_t)h * pfs_cap_ + p];
             auto& rs = pfs_runs_[h];
-            if (!rs.empty() && rs.back().addr + (size_t)rs.back().n * GRP_BYTES == a) rs.back().n++;
+            if (!rs.empty() && rs.back().addr + (size_t)rs.back().n * group_bytes_ == a) rs.back().n++;
             else rs.push_back({p, 1, a});
         }
     }
@@ -2847,7 +2985,7 @@ void Worker::pfs_init() {
     }
     if (p_.rank == 0 || env_str("FLASH_PF_STAGE_LOG"))
         fprintf(stderr, "[flash] GPU%d prefill staging ring: 2 x %d groups (%.0f MB, %s, %zu + %zu copies per layer pair; %d of them per half %s)\n", dev_,
-                pfs_cap_, 2.0 * pfs_cap_ * GRP_BYTES / 1e6, "own memory",
+                pfs_cap_, 2.0 * pfs_cap_ * group_bytes_ / 1e6, "own memory",
                 pfs_runs_[0].size(), pfs_runs_[1].size(), pfs_cap_ - pfs_cap0_,
                 pfs_ext_lent_ ? "in the extension, cache slots outside big batches" : "in the extension (own memory)");
 }
@@ -2860,16 +2998,16 @@ void Worker::pfs_copy(int li) {
         const int k = std::min(r.n, n - r.p0);
         if (k <= 0) break;
         if (L.csrc_h.empty()) {
-            CUDA_CHECK(cudaMemcpyAsync(r.addr, L.hgroups_h + (size_t)r.p0 * GRP_BYTES, (size_t)k * GRP_BYTES, cudaMemcpyHostToDevice, dst_));
-            if (link_host_emul()) pp_link_emul((size_t)k * GRP_BYTES, dst_);
+            CUDA_CHECK(cudaMemcpyAsync(r.addr, L.hgroups_h + (size_t)r.p0 * group_bytes_, (size_t)k * group_bytes_, cudaMemcpyHostToDevice, dst_));
+            if (link_host_emul()) pp_link_emul((size_t)k * group_bytes_, dst_);
             continue;
         }
         // shared expert views: one copy per run of contiguous sources (host copies of a TP rank, a peer's resident groups)
         for (int a = 0; a < k;) {
             int e = a + 1;
-            while (e < k && L.csrc_h[r.p0 + e] == L.csrc_h[r.p0 + e - 1] + GRP_BYTES && L.cdev[r.p0 + e] == L.cdev[r.p0 + a]) e++;
-            CUDA_CHECK(cudaMemcpyAsync(r.addr + (size_t)a * GRP_BYTES, L.csrc_h[r.p0 + a], (size_t)(e - a) * GRP_BYTES, cudaMemcpyDefault, dst_));
-            if (link_host_emul()) pp_link_emul((size_t)(e - a) * GRP_BYTES, dst_);
+            while (e < k && L.csrc_h[r.p0 + e] == L.csrc_h[r.p0 + e - 1] + group_bytes_ && L.cdev[r.p0 + e] == L.cdev[r.p0 + a]) e++;
+            CUDA_CHECK(cudaMemcpyAsync(r.addr + (size_t)a * group_bytes_, L.csrc_h[r.p0 + a], (size_t)(e - a) * group_bytes_, cudaMemcpyDefault, dst_));
+            if (link_host_emul()) pp_link_emul((size_t)(e - a) * group_bytes_, dst_);
             a = e;
         }
     }
@@ -2917,17 +3055,17 @@ void Worker::ec_init() {
         std::vector<Layer*> kvl = ls;
         if (has_mtp_) kvl.push_back(&mtp_);
         const size_t asz = (size_t)srows_ * NKV * HD;
-        const int per = (int)(asz / GRP_BYTES);
+        const int per = (int)(asz / group_bytes_);
         for (Layer* L : kvl) {
             if (!L->full || !L->kc) continue;
             for (uint8_t* base : {L->kc, L->vc})
                 for (int s2 = 0; s2 < per; s2++) {
                     EcSlot sl;
-                    sl.off = asz - (size_t)(s2 + 1) * GRP_BYTES;
+                    sl.off = asz - (size_t)(s2 + 1) * group_bytes_;
                     sl.addr = (char*)base + sl.off;
                     sl.ci = -1;
                     sl.live = true;
-                    sl.al = al_arr_ && !kvs_ && sl.off + GRP_BYTES > al_off_;  // also big-batch rows (al_*)
+                    sl.al = al_arr_ && !kvs_ && sl.off + group_bytes_ > al_off_;  // also big-batch rows (al_*)
                     CUDA_CHECK(cudaEventCreateWithFlags(&sl.ev, cudaEventDisableTiming));
                     ec_slots_.push_back(sl);
                 }
@@ -2938,9 +3076,9 @@ void Worker::ec_init() {
         if (kvs_)
             for (Layer* L : kvl) {
                 if (!L->full || !L->ikb) continue;
-                for (int s2 = 0; s2 < (int)(iasz / GRP_BYTES); s2++) {
+                for (int s2 = 0; s2 < (int)(iasz / group_bytes_); s2++) {
                     EcSlot sl;
-                    sl.off = iasz - (size_t)(s2 + 1) * GRP_BYTES;
+                    sl.off = iasz - (size_t)(s2 + 1) * group_bytes_;
                     sl.addr = (char*)L->ikb + sl.off;
                     sl.ci = -1;
                     sl.live = true;
@@ -2962,7 +3100,7 @@ void Worker::ec_init() {
         for (auto& [base, len] : bt_regs_) {
             if (!bt_on) break;
             const size_t a0 = ((size_t)base + 255) & ~(size_t)255, end = (size_t)base + len;
-            for (size_t a = a0; a + GRP_BYTES <= end; a += GRP_BYTES) {
+            for (size_t a = a0; a + group_bytes_ <= end; a += group_bytes_) {
                 EcSlot sl;
                 sl.off = 0;
                 sl.addr = (char*)a;
@@ -2988,7 +3126,7 @@ void Worker::ec_init() {
         CUDA_CHECK(cudaEventRecord(a, ec_cs_));
         for (int i = 0; i < ns; i++) {
             const int ci = ord[i];
-            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[i].addr, ec_src_[ci], GRP_BYTES, cold_kind(), ec_cs_));
+            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[i].addr, ec_src_[ci], group_bytes_, cold_kind(), ec_cs_));
             ec_slots_[i].ci = ci;
             ec_slot_of_[ci] = i;
             ec_tab_h_[ci] = (uintptr_t)ec_slots_[i].addr;
@@ -2997,7 +3135,7 @@ void Worker::ec_init() {
         CUDA_CHECK(cudaEventSynchronize(b));
         float ms = 0;
         CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
-        if (ns && ms > 0) ec_st_.seed_gbs = (double)ns * GRP_BYTES / (ms * 1e6);
+        if (ns && ms > 0) ec_st_.seed_gbs = (double)ns * group_bytes_ / (ms * 1e6);
         CUDA_CHECK(cudaEventDestroy(a));
         CUDA_CHECK(cudaEventDestroy(b));
         ec_st_.slots = ec_slots_.size();
@@ -3019,7 +3157,7 @@ void Worker::ec_freeze(bool on) {
     for (auto& sl : ec_slots_)
         if (sl.fz) {
             sl.fz = false;
-            CUDA_CHECK(cudaMemcpyAsync(sl.addr, ec_src_[sl.ci], GRP_BYTES, cold_kind(), ec_cs_));
+            CUDA_CHECK(cudaMemcpyAsync(sl.addr, ec_src_[sl.ci], group_bytes_, cold_kind(), ec_cs_));
             ec_tab_h_[sl.ci] = (uintptr_t)sl.addr;
             any = true;
         }
@@ -3089,7 +3227,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
         for (auto& sl : ec_slots_) live += sl.live;
         ec_live_pub_.store(live);
         // (cold groups fewer than slots, larger cards: what can ever be live is the demand, else "short" was false pressure, review Low 3)
-        ec_cap_pub_.store((int)std::min<long long>((long long)ec_slots_.size(), cold_bytes() / (long long)GRP_BYTES));
+        ec_cap_pub_.store((int)std::min<long long>((long long)ec_slots_.size(), cold_bytes() / (long long)group_bytes_));
     }
     // copies that landed: switch the table entries to the device slots
     for (auto& sl : ec_slots_)
@@ -3208,7 +3346,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
         CUDA_CHECK(cudaMemcpyAsync(ec_tab_d_, ec_tab_h_, (size_t)ec_n_ * sizeof(uintptr_t), cudaMemcpyHostToDevice, st_));
         ec_dirty_ = false;
     }
-    for (int s2 : killed) CUDA_CHECK(cudaMemsetAsync(ec_slots_[s2].addr, 0, GRP_BYTES, st_));
+    for (int s2 : killed) CUDA_CHECK(cudaMemsetAsync(ec_slots_[s2].addr, 0, group_bytes_, st_));
     if (!copies.empty()) {
         // the copies start after everything queued so far on the work stream (readers of evicted slots, table update)
         CUDA_CHECK(cudaEventRecord(ec_evt_, st_));
@@ -3217,7 +3355,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
         static const unsigned delay = (unsigned)env_int("FLASH_EC_DELAY", 0u);
         if (delay) k_spin<<<1, 1, 0, ec_cs_>>>(delay);
         for (auto& [s2, ci] : copies) {
-            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[s2].addr, ec_src_[ci], GRP_BYTES, cold_kind(), ec_cs_));
+            CUDA_CHECK(cudaMemcpyAsync(ec_slots_[s2].addr, ec_src_[ci], group_bytes_, cold_kind(), ec_cs_));
             CUDA_CHECK(cudaEventRecord(ec_slots_[s2].ev, ec_cs_));
         }
         ec_st_.copies += copies.size();
@@ -3345,20 +3483,20 @@ int Worker::ec_verify(const char* where) {
     if (!ec_vsum_d_) ec_vsum_d_ = (unsigned long long*)dalloc((ec_slots_.size() + 2 * (size_t)std::max(1, pfs_cap_)) * 8);
     CUDA_CHECK(cudaMemsetAsync(ec_vsum_d_, 0, it.size() * 8, st_));  // (all on st_: a non-blocking stream)
     for (size_t k = 0; k < it.size(); k++)
-        k_csum<<<64, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(it[k].dev), GRP_BYTES / 4, ec_vsum_d_ + k);
+        k_csum<<<64, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(it[k].dev), group_bytes_ / 4, ec_vsum_d_ + k);
     std::vector<unsigned long long> d(it.size());
     CUDA_CHECK(cudaMemcpyAsync(d.data(), ec_vsum_d_, it.size() * 8, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
     int bad = 0, bad_ring = 0, bad_cache = 0;
     for (size_t k = 0; k < it.size(); k++) {
         unsigned long long h;
-        if (it[k].ci >= 0) { if (!ec_hsum_[it[k].ci]) ec_hsum_[it[k].ci] = host_csum(it[k].host, GRP_BYTES); h = ec_hsum_[it[k].ci]; }
-        else h = host_csum(it[k].host, GRP_BYTES);
+        if (it[k].ci >= 0) { if (!ec_hsum_[it[k].ci]) ec_hsum_[it[k].ci] = host_csum(it[k].host, group_bytes_); h = ec_hsum_[it[k].ci]; }
+        else h = host_csum(it[k].host, group_bytes_);
         if (h != d[k]) {
             if (it[k].ci < 0) bad_ring++; else bad_cache++;
             if (bad == 0) {  // details of the first mismatch: zero words and the first differing word
-                std::vector<uint32_t> dv(GRP_BYTES / 4);
-                CUDA_CHECK(cudaMemcpy(dv.data(), it[k].dev, GRP_BYTES, cudaMemcpyDeviceToHost));
+                std::vector<uint32_t> dv(group_bytes_ / 4);
+                CUDA_CHECK(cudaMemcpy(dv.data(), it[k].dev, group_bytes_, cudaMemcpyDeviceToHost));
                 const uint32_t* hv = reinterpret_cast<const uint32_t*>(it[k].host);
                 size_t zd = 0, zh = 0, first = (size_t)-1, ndiff = 0;
                 for (size_t w = 0; w < dv.size(); w++) {
@@ -3377,10 +3515,10 @@ int Worker::ec_verify(const char* where) {
     return bad;
 }
 // FLASH_GSUM: per-group sums of nb groups at stride GRP_BYTES (k_csum weights, word index within the group)
-__global__ void k_gsum(const uint32_t* __restrict__ g, unsigned long long* __restrict__ out) {
-    const uint32_t* p = g + (size_t)blockIdx.x * (GRP_BYTES / 4);
+__global__ void k_gsum(const uint32_t* __restrict__ g, unsigned long long* __restrict__ out, size_t group_bytes) {
+    const uint32_t* p = g + (size_t)blockIdx.x * (group_bytes / 4);
     unsigned long long s = 0;
-    for (size_t i = threadIdx.x; i < GRP_BYTES / 4; i += blockDim.x) s += (unsigned long long)p[i] * (1 + (i & 255));
+    for (size_t i = threadIdx.x; i < group_bytes / 4; i += blockDim.x) s += (unsigned long long)p[i] * (1 + (i & 255));
     __shared__ unsigned long long sh[256];
     sh[threadIdx.x] = s;
     __syncthreads();
@@ -3412,7 +3550,7 @@ void Worker::gsum(int nw, unsigned long long* experts, unsigned long long* other
         if (maxdev) {
             unsigned long long* d;
             CUDA_CHECK(cudaMalloc(&d, (size_t)maxdev * 8));
-            k_gsum<<<maxdev, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(L.groups), d);
+            k_gsum<<<maxdev, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(L.groups), d, group_bytes_);
             CUDA_CHECK(cudaMemcpyAsync(dsum.data(), d, (size_t)maxdev * 8, cudaMemcpyDeviceToHost, st_));
             CUDA_CHECK(cudaStreamSynchronize(st_));
             CUDA_CHECK(cudaFree(d));
@@ -3425,7 +3563,7 @@ void Worker::gsum(int nw, unsigned long long* experts, unsigned long long* other
         for (int t = 0; t < 8; t++)
             th.emplace_back([&, t] {
                 for (size_t q = t; q < cold.size(); q += 8)
-                    hs[q] = !L.cdev.empty() && L.cdev[gm[cold[q]] - nd] ? 0ull : host_csum(cold_h(L, gm[cold[q]] - nd), GRP_BYTES);
+                    hs[q] = !L.cdev.empty() && L.cdev[gm[cold[q]] - nd] ? 0ull : host_csum(cold_h(L, gm[cold[q]] - nd), group_bytes_);
             });
         for (auto& x : th) x.join();
         size_t ci = 0;
@@ -5421,7 +5559,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         // only when the whole batch's slots fit the ordered slot path ([qfn-boot-det]: 3 cards 1,900 rows, whole batch
         // over slot windows 0.252 s / float atomics 0.244 s vs per-unit parts 0.237 s, same tokens)
         const bool fits = (size_t)ub[nu] * (TOPK + 1) <= (size_t)moe_slot_rows_ + (bt_taken_ ? moe_slot_rows2_ : 0);
-        if (nmp > 1 && fits && (double)zc * GRP_BYTES > zc_mb * 1048576.0) { pb = mb1; return 1; }
+        if (nmp > 1 && fits && (double)zc * group_bytes_ > zc_mb * 1048576.0) { pb = mb1; return 1; }
         pb = mb;
         return nmp;
     };
@@ -6108,11 +6246,11 @@ void Worker::lend_audit() {
         const EcSlot& sl = ec_slots_[i];
         (sl.bt ? nbt : sl.ik ? nik : nkv)++;
         lend_slots_.push_back({(uintptr_t)sl.addr, (int)i});
-        const uintptr_t a = (uintptr_t)sl.addr, b = a + GRP_BYTES;
+        const uintptr_t a = (uintptr_t)sl.addr, b = a + group_bytes_;
         for (const Reg& r : regs)
             if (a < r.a + r.n && b > r.a && bad++ < 12)
                 fprintf(stderr, "[lendcheck] rank %d OVERLAP: %s slot %zu [%p, +%zu) with %s [%p, +%zu)\n", p_.rank,
-                        sl.bt ? "bt" : sl.ik ? "indexer-key" : "KV-tail", i, (void*)a, (size_t)GRP_BYTES, r.what.c_str(), (void*)r.a, r.n);
+                        sl.bt ? "bt" : sl.ik ? "indexer-key" : "KV-tail", i, (void*)a, group_bytes_, r.what.c_str(), (void*)r.a, r.n);
     }
     // the bt regions themselves must not overlap own regions (slots are 256-aligned inside them)
     for (auto& [base, len] : bt_regs_)
@@ -6129,11 +6267,11 @@ void Worker::lend_use(const void* p, size_t bytes, const char* what) {
     if (!g_lchk || lend_slots_.empty() || !bytes) return;
     static thread_local int nrep = 0;
     const uintptr_t a = (uintptr_t)p, b = a + bytes;
-    auto it = std::lower_bound(lend_slots_.begin(), lend_slots_.end(), std::make_pair(a >= GRP_BYTES ? a - GRP_BYTES + 1 : 0, -1));
+    auto it = std::lower_bound(lend_slots_.begin(), lend_slots_.end(), std::make_pair(a >= group_bytes_ ? a - group_bytes_ + 1 : 0, -1));
     for (; it != lend_slots_.end() && it->first < b; ++it) {
         const EcSlot& sl = ec_slots_[it->second];
         if (sl.ci < 0 || (sl.bt && bt_taken_)) continue;  // empty, or taken back for this big batch
-        if (it->first + GRP_BYTES > a && nrep++ < 12)
+        if (it->first + group_bytes_ > a && nrep++ < 12)
             fprintf(stderr, "[lendcheck] rank %d WRITE into a lent slot: %s [%p, +%zu) hits %s slot %d (group %d) at %p\n", p_.rank, what,
                     p, bytes, sl.bt ? "bt" : sl.ik ? "indexer-key" : "KV-tail", it->second, sl.ci, (void*)it->first);
     }
@@ -6149,7 +6287,10 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(n >= 1 && n <= pfbn_, "flash prefill_batch n=%d", n);
     CHECK(pos + n <= max_ctx_, "flash: context %d > %d", pos + n, max_ctx_);
-    bt_want_ = n > pfbn_base_;
+    static const int pfs_min = env_int("FLASH_PF_STAGE_MIN", 2048);
+    const bool staged = pfs_ring_ && n >= pfs_min && (n + PFM - 1) / PFM > 1;
+    pfs_now_ = staged;
+    bt_want_ = prefill_borrow_tails(format_, n, pfbn_base_, staged, pfs_ext_lent_);
     al_want_ = n > pfbn_mid_;
     CHECK(!bt_want_ || ec_on_ || !ec_n_, "flash: big batch without the expert cache");
     CHECK(!al_want_ || al_room(pos + ctx_off_ + n), "flash: batch of %d rows on the KV tails at context %lld (pf_batch())", n, (long long)(pos + ctx_off_ + n));
@@ -6160,7 +6301,6 @@ void Worker::prefill_batch(const int* tokens, int pos, int n, const bf16* ple_ro
     bt_want_ = al_want_ = false;  // (the next tick gives the tails back to the cache unless it is another big batch)
     // cold groups staged by the copy engine for batches of >= FLASH_PF_STAGE_MIN rows (short ones read only the groups
     // they touch, zero-copy)
-    static const int pfs_min = env_int("FLASH_PF_STAGE_MIN", 2048);
     pfs_now_ = pfs_ring_ && n >= pfs_min && (n + PFM - 1) / PFM > 1;
     // the ring extension: always (own memory) or while the cache has given its slots back (a big batch; the graph key
     // has n, so a replay always sees the same choice)
@@ -6439,13 +6579,15 @@ void Worker::prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const b
         }
     }
     const int nend = (int)pf_end_.size();
-    bt_want_ = n > pfbn_base_;
+    static const int pfs_min = env_int("FLASH_PF_STAGE_MIN", 2048);
+    const bool staged = pfs_ring_ && n >= pfs_min && pf_nch_ > 1;
+    pfs_now_ = staged;
+    bt_want_ = prefill_borrow_tails(format_, n, pfbn_base_, staged, pfs_ext_lent_);
     al_want_ = n > pfbn_mid_;
     CHECK(!bt_want_ || ec_on_ || !ec_n_, "flash: big batch without the expert cache");
     CHECK(!al_want_ || al_room(ctx_abs), "flash: multi batch of %d rows on the KV tails at context %lld (pf_batch())", n, (long long)ctx_abs);
     ec_tick((int)(ctx_abs - ctx_off_), 1);  // KV in RAM: host rows up to the furthest segment end pinned
     bt_want_ = al_want_ = false;
-    static const int pfs_min = env_int("FLASH_PF_STAGE_MIN", 2048);
     pfs_now_ = pfs_ring_ && n >= pfs_min && pf_nch_ > 1;
     pfs_full_ = pfs_ext_ ? (!pfs_ext_lent_ || bt_taken_) : true;
     use(pfb_);
@@ -6520,7 +6662,7 @@ void Worker::prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const b
 void Worker::prefill_batch_mtp(const int* mtp_toks, int pos, int n, int* draft) {
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(has_mtp_ && n >= 1 && n <= pfbn_, "flash prefill_batch_mtp n=%d", n);
-    bt_want_ = n > pfbn_base_;
+    bt_want_ = prefill_borrow_tails(format_, n, pfbn_base_, false, pfs_ext_lent_);
     al_want_ = n > pfbn_mid_;
     CHECK(!al_want_ || al_room(pos + ctx_off_ + n), "flash: MTP batch of %d rows on the KV tails at context %lld", n, (long long)(pos + ctx_off_ + n));
     ec_tick(pos + n, 1);

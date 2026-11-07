@@ -25,6 +25,7 @@
 #include "../kernels/sample.cuh"
 #include "../safetensors.h"
 #include "graph_oom.h"
+#include "checkpoint.h"
 
 namespace flash {
 // a thread that drives the workers (the API caller in run() / each(), the rank threads): the only ones that may take
@@ -186,6 +187,19 @@ constexpr int GRP = 128, NGRP = INTER / GRP;
 constexpr size_t GG_Q = (size_t)2 * GRP * H / 2, GG_S = (size_t)2 * GRP * (H / 128) * 2;
 constexpr size_t GD_Q = (size_t)H * GRP / 2, GD_S = (size_t)H * (GRP / 128) * 2;
 constexpr size_t GRP_BYTES = GG_Q + GG_S + GD_Q + GD_S;
+template<int Bits> struct ExpertLayout {
+    static_assert(Bits == 4 || Bits == 8);
+    static constexpr size_t gate_q = (size_t)2 * GRP * H * Bits / 8;
+    static constexpr size_t gate_s = GG_S;
+    static constexpr size_t down_q = (size_t)H * GRP * Bits / 8;
+    static constexpr size_t down_s = GD_S;
+    static constexpr size_t gs = gate_q;
+    static constexpr size_t dq = gs + gate_s;
+    static constexpr size_t ds = dq + down_q;
+    static constexpr size_t bytes = ds + down_s;
+};
+static_assert(ExpertLayout<4>::bytes == GRP_BYTES);
+static_assert(ExpertLayout<8>::bytes == 998400);
 constexpr int MAXJOB = 896;              // job lists: at least this (3 cards: >= the groups of any card, 2565 x 0.34 + margin);
                                          // a card with more local groups (2 cards: ~1283) sizes them by plan_groups
 constexpr int PF_SHJ = 64;               // prefill: rows per shared-expert job (the shared expert sees every row)
@@ -204,8 +218,9 @@ struct ColdTab {
     __host__ __device__ ColdTab(const uintptr_t* p, unsigned char* t) : ptr(p), touch(t) {}
 };
 #ifdef __CUDACC__
+template<int Bits>
 __device__ __forceinline__ const char* grp_ptr(const char* groups, int li, int ndev, const ColdTab& ct, unsigned* coldcnt) {
-    if (li < ndev) return groups + (size_t)li * GRP_BYTES;
+    if (li < ndev) return groups + (size_t)li * ExpertLayout<Bits>::bytes;
     const int ci = li - ndev;
     const uintptr_t p = ct.ptr[ci];
     ct.touch[ci] = 1;
@@ -250,6 +265,7 @@ struct Layer {
     W8 router8;            // the same INT8 g128 (default: KL at the BF16 floor)
     char* groups = nullptr;   // local expert groups, stride GRP_BYTES (device: indices < ndev)
     char* hgroups = nullptr;  // cold groups in mapped pinned host memory (indices >= ndev): the full host copy
+    W8 ple_key8, ple_val8;
     char* hgroups_h = nullptr;  // the same, host address
     // shared expert views (mode A stage, Worker::set_views): the cold groups have no own host copy; csrc[j] is cold
     // group j's address for the kernels (host-mapped, or a peer card's VRAM), csrc_h[j] the copy source (the same under
@@ -319,7 +335,7 @@ struct HostTables {        // shared by the workers (host memory)
 
 class Worker {
 public:
-    Worker(const Plan& p, int device, const Comm& comm, int max_ctx);
+    Worker(const Plan& p, int device, const Comm& comm, int max_ctx, WeightFormat format);
     void load(const SafeTensors& st, const HostTables& ht, const SafeTensors* mtp = nullptr);
     void alloc_state();             // KV pool for max_ctx, DeltaNet states, buffers
     size_t free_bytes() const;
@@ -388,6 +404,10 @@ public:
     // rows of a prefill batch whose buffers never take memory from the expert cache (the rest of pf_batch() is
     // borrowed from it for the batch, prefill-r3)
     int pf_batch_base() const { return pfbn_base_; }
+    // INT8 staged ring extension borrows expert-cache tails even for base-sized batches.
+    static bool prefill_borrow_tails(WeightFormat format, int n, int base, bool staged, bool extension_lent) {
+        return n > base || (format == WeightFormat::Int8 && staged && extension_lent);
+    }
     // rows of the next prefill batch with r rows left and batches of up to B rows: nominal B - PFM (a tail of <= PFM
     // rows joins the last one); with big batches (B > pf_batch_base()) the last two are balanced when the plain split
     // would leave a tail of <= pf_batch_base() rows and both halves can be big: a small
@@ -421,7 +441,7 @@ public:
     long long cold_bytes() const {
         long long n = 0;
         for (const Layer& L : L_) n += L.ncold;
-        return n * (long long)GRP_BYTES;
+        return n * (long long)group_bytes_;
     }
     void prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const bf16* ple_rows, const int* mtp_toks, int* out,
                        int* draft);
@@ -915,8 +935,8 @@ private:
     uintptr_t* pfs_tab0_d_ = nullptr;   // the table with pfs_cap0_ staged groups per layer
     int pfs_capn() const { return pfs_full_ ? pfs_cap_ : pfs_cap0_; }
     char* pfs_addr(int half, int p) const {
-        return p < pfs_cap0_ ? pfs_ring_ + ((size_t)half * pfs_cap0_ + p) * GRP_BYTES
-                             : pfs_ext_ + ((size_t)half * (pfs_cap_ - pfs_cap0_) + (p - pfs_cap0_)) * GRP_BYTES;
+        return p < pfs_cap0_ ? pfs_ring_ + ((size_t)half * pfs_cap0_ + p) * group_bytes_
+                             : pfs_ext_ + ((size_t)half * (pfs_cap_ - pfs_cap0_) + (p - pfs_cap0_)) * group_bytes_;
     }
     long long pfs_resv_ = 0;            // bytes kept free for the ring by the expert budget
     uintptr_t* pfs_tab_d_ = nullptr;    // per cold group: its ring address (or host address | 1 past pfs_cap_)
@@ -1116,6 +1136,8 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     Plan p_;
     bool dev_first_ = true;  // the first worker on its card (per-card registrations, see the constructor)
     int card_workers_ = 1;
+    WeightFormat format_ = WeightFormat::Int4;
+    size_t group_bytes_ = GRP_BYTES;
     double card_share_ = 1.0;  // the part of the card's free memory this worker's expert cache takes (several stages on a card)
   public:
     void set_card_share(double f) { card_share_ = std::clamp(f, 0.05, 1.0); }

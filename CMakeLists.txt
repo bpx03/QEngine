@@ -135,3 +135,12 @@ foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit kv_dis
     endif()
   endif()
 endforeach()
+
+option(QE_BUILD_FLASH_INT8_TESTS "Build Flash INT8 unit tests" OFF)
+if(QE_BUILD_FLASH_INT8_TESTS)
+  add_executable(flash_checkpoint_unit tests/flash_checkpoint_unit.cpp src/safetensors.cpp)
+  target_include_directories(flash_checkpoint_unit PRIVATE src)
+  add_executable(flash_int8_unit tests/flash_int8_unit.cu $<TARGET_OBJECTS:qkernels>)
+  target_include_directories(flash_int8_unit PRIVATE src)
+  target_link_libraries(flash_int8_unit PRIVATE CUDA::cudart CUDA::cuda_driver)
+endif()

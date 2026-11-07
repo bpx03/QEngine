@@ -3616,9 +3616,16 @@ __global__ void k_qsa_comb(const float* __restrict__ all, int ngpu, int m, const
 }
 
 // ------------------------------------------------------------------ MoE
+template<int Bits>
+__device__ __forceinline__ float moe_scale(const void* p, size_t i) {
+    if constexpr (Bits == 8) return __bfloat162float(static_cast<const bf16*>(p)[i]);
+    else return __half2float(static_cast<const __half*>(p)[i]);
+}
+
 // Router: softmax over 512, top-10 (value desc, index asc), renormalized (norm_topk_prob); shared gate sigmoid.
 // Jobs = local 128-wide intermediate groups of every expert hit by any row (+ the shared expert's local groups),
 // in (expert, group) order; jw[job][t] = routing weight of row t (0 if not routed). One block of 512 threads.
+template <int Bits>
 __global__ void k_route(const float* __restrict__ lg, int m, const int* __restrict__ gmap, const char* __restrict__ groups,
                         MoeJob* __restrict__ jobs, float* __restrict__ jw, int* __restrict__ njobs) {
     __shared__ float red[32];
@@ -3681,12 +3688,12 @@ __global__ void k_route(const float* __restrict__ lg, int m, const int* __restri
         for (int g = 0; g < 5; g++) {
             const int li = gmap[ex * 5 + g];
             if (li < 0) continue;
-            const char* b = groups + (size_t)li * GRP_BYTES;
+            const char* b = groups + (size_t)li * ExpertLayout<Bits>::bytes;
             MoeJob jb;
             jb.gq = reinterpret_cast<const uint4*>(b);
-            jb.gs = reinterpret_cast<const __half*>(b + GG_Q);
-            jb.dq = reinterpret_cast<const uint4*>(b + GG_Q + GG_S);
-            jb.ds = reinterpret_cast<const __half*>(b + GG_Q + GG_S + GD_Q);
+            jb.gs = b + ExpertLayout<Bits>::gs;
+            jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
+            jb.ds = b + ExpertLayout<Bits>::ds;
             jobs[j] = jb;
             for (int t = 0; t < m; t++) {
                 float w = 0.f;
@@ -3718,6 +3725,7 @@ __device__ long long g_rprof[16];
 #else
 #define RP(k) __syncthreads()  // the phase barriers are needed either way
 #endif
+template<int Bits>
 __global__ void __launch_bounds__(512) k_route2(const float* __restrict__ lg, int m, const int* __restrict__ gmap,
                                                 const char* __restrict__ groups, MoeJob* __restrict__ jobs,
                                                 float* __restrict__ jw, int* __restrict__ njobs, int nsplit,
@@ -3817,12 +3825,12 @@ __global__ void __launch_bounds__(512) k_route2(const float* __restrict__ lg, in
         for (int g = 0; g < NGRP; g++) {
             const int li = shared ? shg[g] : gm[g];
             if (li < 0) continue;
-            const char* b = grp_ptr(groups, li, ndev, ct, coldcnt);
+            const char* b = grp_ptr<Bits>(groups, li, ndev, ct, coldcnt);
             MoeJob jb;
             jb.gq = reinterpret_cast<const uint4*>(b);
-            jb.gs = reinterpret_cast<const __half*>(b + GG_Q);
-            jb.dq = reinterpret_cast<const uint4*>(b + GG_Q + GG_S);
-            jb.ds = reinterpret_cast<const __half*>(b + GG_Q + GG_S + GD_Q);
+            jb.gs = b + ExpertLayout<Bits>::gs;
+            jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
+            jb.ds = b + ExpertLayout<Bits>::ds;
             jobs[j] = jb;
             for (int t = 0; t < m; t++) {
                 float w = 0.f;
@@ -3846,6 +3854,7 @@ __global__ void __launch_bounds__(512) k_route2(const float* __restrict__ lg, in
 // Router v3: one block per row computes the row's top-10 (per-warp redux.sync top-10, then the 160 candidates are
 // ranked in parallel: rank = #candidates with a larger key or an equal key and a lower index); the last block to
 // finish builds the jobs of all rows (as k_route2). sel: global scratch [MAXM][TOPK] (idx, weight), cnt: arrival.
+template <int Bits>
 __global__ void __launch_bounds__(512) k_route3(const float* __restrict__ lg, int m, const int* __restrict__ gmap,
                                                 const char* __restrict__ groups, MoeJob* __restrict__ jobs,
                                                 float* __restrict__ jw, int* __restrict__ njobs, int nsplit,
@@ -3936,12 +3945,12 @@ __global__ void __launch_bounds__(512) k_route3(const float* __restrict__ lg, in
         for (int g = 0; g < NGRP; g++) {
             const int li = shared ? shg[g] : gm[g];
             if (li < 0) continue;
-            const char* b = groups + (size_t)li * GRP_BYTES;
+            const char* b = groups + (size_t)li * ExpertLayout<Bits>::bytes;
             MoeJob jb;
             jb.gq = reinterpret_cast<const uint4*>(b);
-            jb.gs = reinterpret_cast<const __half*>(b + GG_Q);
-            jb.dq = reinterpret_cast<const uint4*>(b + GG_Q + GG_S);
-            jb.ds = reinterpret_cast<const __half*>(b + GG_Q + GG_S + GD_Q);
+            jb.gs = b + ExpertLayout<Bits>::gs;
+            jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
+            jb.ds = b + ExpertLayout<Bits>::ds;
             jobs[j] = jb;
             for (int tt = 0; tt < m; tt++) {
                 float w = 0.f;
@@ -4011,6 +4020,7 @@ __global__ void __launch_bounds__(512) k_topk_rows(const float* __restrict__ lg,
     }
 }
 __device__ unsigned long long g_jobstat[MAXM + 1][2];  // debug FLASH_JOBSTAT: per row count {jobs, calls} of k_jobs
+template<int Bits>
 __global__ void __launch_bounds__(512) k_jobs(int m, const int* __restrict__ gmap, const char* __restrict__ groups,
                                               ColdTab ct, int ndev, const int* __restrict__ gsel,
                                               const float* __restrict__ gw, const float* __restrict__ gsh,
@@ -4060,12 +4070,12 @@ __global__ void __launch_bounds__(512) k_jobs(int m, const int* __restrict__ gma
         for (int g = 0; g < NGRP; g++) {
             const int li = shared ? shg[g] : gm[g];
             if (li < 0) continue;
-            const char* b = grp_ptr(groups, li, ndev, ct, coldcnt);
+            const char* b = grp_ptr<Bits>(groups, li, ndev, ct, coldcnt);
             MoeJob jb;
             jb.gq = reinterpret_cast<const uint4*>(b);
-            jb.gs = reinterpret_cast<const __half*>(b + GG_Q);
-            jb.dq = reinterpret_cast<const uint4*>(b + GG_Q + GG_S);
-            jb.ds = reinterpret_cast<const __half*>(b + GG_Q + GG_S + GD_Q);
+            jb.gs = b + ExpertLayout<Bits>::gs;
+            jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
+            jb.ds = b + ExpertLayout<Bits>::ds;
             jobs[j] = jb;
             int nr = 0;  // grouped MoE (jrow): the rows that picked the expert, in row order, weights compacted
             for (int tt = 0; tt < m; tt++) {
@@ -4102,12 +4112,12 @@ __global__ void __launch_bounds__(512) k_jobs(int m, const int* __restrict__ gma
     if (e == 0) nhit = 0;
     __syncthreads();
     auto rec = [&](int j, int li) {
-        const char* b = grp_ptr(groups, li, ndev, ct, coldcnt);
+        const char* b = grp_ptr<Bits>(groups, li, ndev, ct, coldcnt);
         MoeJob jb;
         jb.gq = reinterpret_cast<const uint4*>(b);
-        jb.gs = reinterpret_cast<const __half*>(b + GG_Q);
-        jb.dq = reinterpret_cast<const uint4*>(b + GG_Q + GG_S);
-        jb.ds = reinterpret_cast<const __half*>(b + GG_Q + GG_S + GD_Q);
+        jb.gs = b + ExpertLayout<Bits>::gs;
+        jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
+        jb.ds = b + ExpertLayout<Bits>::ds;
         jobs[j] = jb;
     };
     if (c) {
@@ -4154,6 +4164,7 @@ __global__ void __launch_bounds__(512) k_jobs(int m, const int* __restrict__ gma
 // The last block to finish adds the 5 splits, takes the top-10 of each row with one warp per row (lowest index on
 // ties, as k_topk_rows) and builds the jobs (k_jobs).
 constexpr int RF_TILES = 33, RF_SPLIT = 5;
+template<int Bits>
 __global__ void __launch_bounds__(512) k_route_f(const uint4* __restrict__ q, const bf16* __restrict__ s,
                                                  const bf16* __restrict__ x, int m, float* __restrict__ part,
                                                  unsigned* __restrict__ cnt, float* __restrict__ lg,
@@ -4326,12 +4337,12 @@ __global__ void __launch_bounds__(512) k_route_f(const uint4* __restrict__ q, co
         for (int gg = 0; gg < NGRP; gg++) {
             const int li = shared ? shg[gg] : gm[gg];
             if (li < 0) continue;
-            const char* b = grp_ptr(groups, li, ndev, ct, coldcnt);
+            const char* b = grp_ptr<Bits>(groups, li, ndev, ct, coldcnt);
             MoeJob jb;
             jb.gq = reinterpret_cast<const uint4*>(b);
-            jb.gs = reinterpret_cast<const __half*>(b + GG_Q);
-            jb.dq = reinterpret_cast<const uint4*>(b + GG_Q + GG_S);
-            jb.ds = reinterpret_cast<const __half*>(b + GG_Q + GG_S + GD_Q);
+            jb.gs = b + ExpertLayout<Bits>::gs;
+            jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
+            jb.ds = b + ExpertLayout<Bits>::ds;
             jobs[j] = jb;
             for (int tt = 0; tt < m; tt++) {
                 float w = 0.f;
@@ -4353,21 +4364,24 @@ __global__ void __launch_bounds__(512) k_route_f(const uint4* __restrict__ q, co
 }
 
 // gate_up of every job: one block per (16-row tile of the group's 256 GLU-interleaved rows, job), 4 warps split
-// K = 2560; NT 8-token tiles. Epilogue: act = silu(gate) * up * jw[job][t] -> XH acth[job][t][128]. H16 numerics.
-template <int NT>
+// K = 2560; NT 8-token tiles. Epilogue: act = silu(gate) * up * jw[job][t] -> XH acth[job][t][128]. INT4 = H16
+// numerics (exact-int8 fp16 weights, fp16 sums per 64-k chunk, fp32 flush); W8 = int8 A fragments, one fp32 MMA
+// sum per 128-k group scaled by the group's bf16 scale (the XH activations keep their column order and 1 / 16).
+template <int Bits, int NT>
 __global__ void __launch_bounds__(128) k_moe_gu(const MoeJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                 const float* __restrict__ jw, const __half* __restrict__ x,
                                                 __half* __restrict__ acth, int m) {
+    static_assert(Bits == 4 || Bits == 8, "Bits");
     const int job = blockIdx.y;
     if (job >= *njobs) return;
     const MoeJob jb = jobs[job];
     const int r = blockIdx.x;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = 4;
     const int g = lane >> 2, t4 = lane & 3;
-    constexpr int groups = H >> 7, chunks = H >> 6;
+    constexpr int groups = H >> 7, chunks = (H >> 6) * (Bits / 4), NW = Bits / 2;  // weight uint4 per 128-k group
     const int gb = warp * groups / nwarps, ge = (warp + 1) * groups / nwarps;
     const uint4* qp = jb.gq + (size_t)r * chunks * 32 + lane;
-    const __half* sp = jb.gs + (size_t)r * groups * 16;
+    const void* sp = jb.gs;
     const uint4* xr[NT];
 #pragma unroll
     for (int j = 0; j < NT; j++) {
@@ -4377,45 +4391,88 @@ __global__ void __launch_bounds__(128) k_moe_gu(const MoeJob* __restrict__ jobs,
     float acc[NT][4];
 #pragma unroll
     for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
-    // all of the warp's weights and scales first (5 groups): one memory round trip, which matters for cold groups
-    // read over PCIe from host memory
+    // all of the warp's weights and scales first (5 groups: 10 KB at 4 bits, 20 KB at 8): one memory round trip,
+    // which matters for cold groups read over PCIe from host memory
     constexpr int GW = groups / 4;
-    uint4 wv[GW][2];
+    uint4 wv[GW][NW];
     float sgv[GW][2];
 #pragma unroll
     for (int a2 = 0; a2 < GW; a2++) {
         const int gi = gb + a2;
-        wv[a2][0] = __ldg(qp + (size_t)(2 * gi) * 32);
-        wv[a2][1] = __ldg(qp + (size_t)(2 * gi + 1) * 32);
-        sgv[a2][0] = __half2float(sp[gi * 16 + g]) * kXhScale;
-        sgv[a2][1] = __half2float(sp[gi * 16 + g + 8]) * kXhScale;
+#pragma unroll
+        for (int q = 0; q < NW; q++) wv[a2][q] = __ldg(qp + (size_t)(gi * NW + q) * 32);
+        sgv[a2][0] = moe_scale<Bits>(sp, ((size_t)r * groups + gi) * 16 + g) * kXhScale;
+        sgv[a2][1] = moe_scale<Bits>(sp, ((size_t)r * groups + gi) * 16 + g + 8) * kXhScale;
     }
 #pragma unroll
     for (int a2 = 0; a2 < GW; a2++) {
         const int gi = gb + a2;
         const float sg = sgv[a2][0], sg8 = sgv[a2][1];
-        const uint4 w0 = wv[a2][0], w1 = wv[a2][1];
+        if constexpr (Bits == 4) {
 #pragma unroll
-        for (int c = 0; c < 2; c++) {
-            const int ch = 2 * gi + c;
-            const uint4 wc = c ? w1 : w0;
-            uint32_t hacc[NT][2];
-            uint4 b0[NT], b1[NT];
-#pragma unroll
-            for (int j = 0; j < NT; j++) { hacc[j][0] = hacc[j][1] = 0u; b0[j] = xr[j][(size_t)ch * 8]; b1[j] = xr[j][(size_t)ch * 8 + 1]; }
-            const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-#pragma unroll
-            for (int q = 0; q < 4; q++) {
-                uint32_t a[4];
-                xh_dequant(words[q], a);
+            for (int ch = 0; ch < 2; ch++) {  // 64-k chunks of the group
+                const int chunk = 2 * gi + ch;
+                const uint4 wc = wv[a2][ch];
+                uint32_t hacc[NT][2];
+                uint4 b0[NT], b1[NT];
 #pragma unroll
                 for (int j = 0; j < NT; j++) {
-                    const uint4& bb = (q >> 1) ? b1[j] : b0[j];
-                    xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                    hacc[j][0] = hacc[j][1] = 0u;
+                    b0[j] = xr[j][(size_t)chunk * 8];
+                    b1[j] = xr[j][(size_t)chunk * 8 + 1];
+                }
+                const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    uint32_t a[4];
+                    xh_dequant(words[q], a);
+#pragma unroll
+                    for (int j = 0; j < NT; j++) {
+                        const uint4& bb = (q >> 1) ? b1[j] : b0[j];
+                        xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NT; j++) xh_flush(acc[j], hacc[j], sg, sg8);
+            }
+        } else {
+            // one uint4 per k32 sub-chunk: its word pairs (x, y) and (z, w) are its two 16-k steps, whose XH
+            // activation fragments are (b0.x, b0.y), (b0.z, b0.w) and (b1.x, b1.y), (b1.z, b1.w)
+            float cw[NT][4];
+#pragma unroll
+            for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
+#pragma unroll
+            for (int ch = 0; ch < 2; ch++) {
+                const int chunk = 2 * gi + ch;
+                uint4 b0[NT], b1[NT];
+#pragma unroll
+                for (int j = 0; j < NT; j++) {
+                    b0[j] = xr[j][(size_t)chunk * 8];
+                    b1[j] = xr[j][(size_t)chunk * 8 + 1];
+                }
+#pragma unroll
+                for (int s = 0; s < 2; s++) {
+                    const uint4 wc = wv[a2][2 * ch + s];
+                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                    for (int q = 0; q < 2; q++) {
+                        uint32_t a[4];
+                        a_from_w8(words[2 * q], words[2 * q + 1], a);
+#pragma unroll
+                        for (int j = 0; j < NT; j++) {
+                            const uint4& bb = s ? b1[j] : b0[j];
+                            mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
+                        }
+                    }
                 }
             }
 #pragma unroll
-            for (int j = 0; j < NT; j++) xh_flush(acc[j], hacc[j], sg, sg8);
+            for (int j = 0; j < NT; j++) {
+                acc[j][0] = __fmaf_rn(cw[j][0], sg, acc[j][0]);
+                acc[j][1] = __fmaf_rn(cw[j][1], sg, acc[j][1]);
+                acc[j][2] = __fmaf_rn(cw[j][2], sg8, acc[j][2]);
+                acc[j][3] = __fmaf_rn(cw[j][3], sg8, acc[j][3]);
+            }
         }
     }
     __shared__ float red[4][NT][32][4];
@@ -4461,78 +4518,129 @@ __device__ __forceinline__ void dn_flush(A acc[4], uint32_t h[2], float sg, floa
 }
 __device__ __forceinline__ float dn_out(float v) { return v; }
 __device__ __forceinline__ float dn_out(long long v) { return __ll2float_rn(v) * kDnFxInv; }
+template <bool FX, class Acc>
+__device__ __forceinline__ void dn_add(Acc& acc, float term, float& nf) {
+    if constexpr (FX) { acc += __float2ll_rn(term * kDnFx); nf += term * 0.f; }
+    else acc += term;
+}
 // down of all jobs as ONE GEMV: N = 2560, K = 128 x njobs (job j's K slice = its 128 activations, already weighted).
 // One block per 16-row tile, 8 warps split the jobs; partial sums -> part[t][2560] directly.
 // debug FLASH_MOE_DN_1W=1: warp 0 sums every job in list order (a row's sum independent of the other rows' jobs)
 __device__ int g_moe_dn_1w = 0;
-// FX ([qfn-boot-det] M1, FLASH_ATTN_CHUNK=1 = full batch invariance): exact fixed-point sums (xh_flush_fx); FX = false:
-// float sums, the default (a row's sum then depends on how the job list falls on the 8 warps)
-template <int NT, bool FX = false>
+template <int Bits, int NT, bool FX = false>
 __global__ void __launch_bounds__(256) k_moe_dn(const MoeJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                 const __half* __restrict__ acth, float* __restrict__ part, int m) {
+    static_assert(Bits == 4 || Bits == 8, "Bits");
+    constexpr int NW = Bits / 2;  // one job = one 128-k group: 2 INT4 / 4 W8 weight uint4 per 16-row tile
     const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = 8;
     const int g = lane >> 2, t4 = lane & 3;
     const int nj = *njobs;
-    // the 8 warps split the job list evenly; the sums are exact fixed point (xh_flush_fx), so a row's result does not
-    // depend on how the list (the union of every row's experts) falls on the warps ([qfn-boot-det] M1)
     const int nwj = g_moe_dn_1w ? 1 : nwarps;
     const int jb0 = warp < nwj ? warp * nj / nwj : 0, jb1 = warp < nwj ? (warp + 1) * nj / nwj : 0;
     using Acc = typename std::conditional<FX, long long, float>::type;
-    float nf = 0.f;  // FX: non-finite flag (xh_flush_fx)
+    Acc acc[NT][4];
     __shared__ float nfb;
+    float nf = 0.f;
     if (FX && threadIdx.x == 0) nfb = 0.f;
     if (FX) __syncthreads();
-    Acc acc[NT][4];
 #pragma unroll
-    for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0;
+    for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
     // software pipeline over the jobs: the next job's weights / scales are loaded while this one computes
-    uint4 nw0 = make_uint4(0, 0, 0, 0), nw1 = nw0;
+    uint4 nw[NW];
+#pragma unroll
+    for (int q = 0; q < NW; q++) nw[q] = make_uint4(0, 0, 0, 0);
     float ns0 = 0.f, ns8 = 0.f;
     if (jb0 < jb1) {
         const MoeJob jb = jobs[jb0];
-        const uint4* qp = jb.dq + (size_t)r * 2 * 32 + lane;
-        nw0 = __ldg(qp); nw1 = __ldg(qp + 32);
-        ns0 = __half2float(jb.ds[r * 16 + g]) * kXhScale; ns8 = __half2float(jb.ds[r * 16 + g + 8]) * kXhScale;
+        const uint4* qp = jb.dq + (size_t)r * NW * 32 + lane;
+#pragma unroll
+        for (int q = 0; q < NW; q++) nw[q] = __ldg(qp + (size_t)q * 32);
+        ns0 = moe_scale<Bits>(jb.ds, (size_t)r * 16 + g) * kXhScale;
+        ns8 = moe_scale<Bits>(jb.ds, (size_t)r * 16 + g + 8) * kXhScale;
     }
     for (int jj = jb0; jj < jb1; jj++) {
-        const uint4 w0 = nw0, w1 = nw1;
+        uint4 w[NW];
+#pragma unroll
+        for (int q = 0; q < NW; q++) w[q] = nw[q];
         const float sg = ns0, sg8 = ns8;
         if (jj + 1 < jb1) {
             const MoeJob jn = jobs[jj + 1];
-            const uint4* qn = jn.dq + (size_t)r * 2 * 32 + lane;
-            nw0 = __ldg(qn); nw1 = __ldg(qn + 32);
-            ns0 = __half2float(jn.ds[r * 16 + g]) * kXhScale; ns8 = __half2float(jn.ds[r * 16 + g + 8]) * kXhScale;
+            const uint4* qn = jn.dq + (size_t)r * NW * 32 + lane;
+#pragma unroll
+            for (int q = 0; q < NW; q++) nw[q] = __ldg(qn + (size_t)q * 32);
+            ns0 = moe_scale<Bits>(jn.ds, (size_t)r * 16 + g) * kXhScale;
+            ns8 = moe_scale<Bits>(jn.ds, (size_t)r * 16 + g + 8) * kXhScale;
         }
+        if constexpr (Bits == 4) {
 #pragma unroll
-        for (int c = 0; c < 2; c++) {
-            const uint4 wc = c ? w1 : w0;
-            uint32_t hacc[NT][2];
-            uint4 b0[NT], b1[NT];
-#pragma unroll
-            for (int j = 0; j < NT; j++) {
-                const int tok = 8 * j + g < m ? 8 * j + g : 0;
-                const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + tok) * GRP + t4 * 16);
-                hacc[j][0] = hacc[j][1] = 0u;
-                b0[j] = xr[c * 8];
-                b1[j] = xr[c * 8 + 1];
-            }
-            const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-#pragma unroll
-            for (int q = 0; q < 4; q++) {
-                uint32_t a[4];
-                xh_dequant(words[q], a);
+            for (int c = 0; c < 2; c++) {
+                const uint4 wc = w[c];
+                uint32_t hacc[NT][2];
+                uint4 b0[NT], b1[NT];
 #pragma unroll
                 for (int j = 0; j < NT; j++) {
-                    const uint4& bb = (q >> 1) ? b1[j] : b0[j];
-                    xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                    const int tok = 8 * j + g < m ? 8 * j + g : 0;
+                    const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + tok) * GRP + t4 * 16);
+                    hacc[j][0] = hacc[j][1] = 0u;
+                    b0[j] = xr[c * 8];
+                    b1[j] = xr[c * 8 + 1];
+                }
+                const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    uint32_t a[4];
+                    xh_dequant(words[q], a);
+#pragma unroll
+                    for (int j = 0; j < NT; j++) {
+                        const uint4& bb = (q >> 1) ? b1[j] : b0[j];
+                        xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NT; j++) dn_flush<FX>(acc[j], hacc[j], sg, sg8, nf);
+            }
+        } else {
+            // W8: two k32 sub-chunks per 64-k chunk, all eight 16-k steps of the group in one fp32 MMA sum
+            float cw[NT][4];
+#pragma unroll
+            for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
+#pragma unroll
+            for (int c = 0; c < 2; c++) {
+                uint4 b0[NT], b1[NT];
+#pragma unroll
+                for (int j = 0; j < NT; j++) {
+                    const int tok = 8 * j + g < m ? 8 * j + g : 0;
+                    const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + tok) * GRP + t4 * 16);
+                    b0[j] = xr[c * 8];
+                    b1[j] = xr[c * 8 + 1];
+                }
+#pragma unroll
+                for (int s = 0; s < 2; s++) {
+                    const uint4 wc = w[2 * c + s];
+                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                    for (int q = 0; q < 2; q++) {
+                        uint32_t a[4];
+                        a_from_w8(words[2 * q], words[2 * q + 1], a);
+#pragma unroll
+                        for (int j = 0; j < NT; j++) {
+                            const uint4& bb = s ? b1[j] : b0[j];
+                            mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
+                        }
+                    }
                 }
             }
 #pragma unroll
-            for (int j = 0; j < NT; j++) dn_flush<FX>(acc[j], hacc[j], sg, sg8, nf);
+            for (int j = 0; j < NT; j++) {
+                dn_add<FX>(acc[j][0], cw[j][0] * sg, nf);
+                dn_add<FX>(acc[j][1], cw[j][1] * sg, nf);
+                dn_add<FX>(acc[j][2], cw[j][2] * sg8, nf);
+                dn_add<FX>(acc[j][3], cw[j][3] * sg8, nf);
+            }
         }
     }
     __shared__ Acc red[8][NT][32][4];
-    if (FX && nf != 0.f) nfb = nf;  // (any thread: NaN)
+    if (FX && nf != 0.f) nfb = nf;
 #pragma unroll
     for (int j = 0; j < NT; j++)
 #pragma unroll
@@ -4546,9 +4654,8 @@ __global__ void __launch_bounds__(256) k_moe_dn(const MoeJob* __restrict__ jobs,
 #pragma unroll
             for (int i = 0; i < 4; i++) acc[j][i] += red[w2][j][lane][i];
         const int n0 = 8 * j + 2 * t4, n1 = n0 + 1;
-        const float pz = FX ? nfb : 0.f;  // NaN after a non-finite term in this block, else 0
-        if (n0 < m) { part[(size_t)n0 * H + row0 + g] = dn_out(acc[j][0]) + pz; part[(size_t)n0 * H + row0 + g + 8] = dn_out(acc[j][2]) + pz; }
-        if (n1 < m) { part[(size_t)n1 * H + row0 + g] = dn_out(acc[j][1]) + pz; part[(size_t)n1 * H + row0 + g + 8] = dn_out(acc[j][3]) + pz; }
+        if (n0 < m) { part[(size_t)n0 * H + row0 + g] = dn_out(acc[j][0]) + (FX ? nfb : 0.f); part[(size_t)n0 * H + row0 + g + 8] = dn_out(acc[j][2]) + (FX ? nfb : 0.f); }
+        if (n1 < m) { part[(size_t)n1 * H + row0 + g] = dn_out(acc[j][1]) + (FX ? nfb : 0.f); part[(size_t)n1 * H + row0 + g + 8] = dn_out(acc[j][3]) + (FX ? nfb : 0.f); }
     }
 }
 
@@ -4557,6 +4664,7 @@ __global__ void __launch_bounds__(256) k_moe_dn(const MoeJob* __restrict__ jobs,
 // acth[job][slot][128] holds the job's rows compacted (slot = index in its row list). Per row the arithmetic is the
 // same as k_moe_gu / k_moe_dn (same k order, same per-chunk fp16 sums and fp32 flushes, jobs in list order; a skipped
 // job added +0 there), so with FLASH_MOE_DN_1W=1 a row's result does not depend on the other rows.
+template <int Bits>
 __global__ void __launch_bounds__(128) k_moe_gu_g(const MoeJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                   const int* __restrict__ jrow, const float* __restrict__ jw,
                                                   const __half* __restrict__ x, __half* __restrict__ acth) {
@@ -4569,10 +4677,10 @@ __global__ void __launch_bounds__(128) k_moe_gu_g(const MoeJob* __restrict__ job
     const int r = blockIdx.x;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = 4;
     const int g = lane >> 2, t4 = lane & 3;
-    constexpr int groups = H >> 7, chunks = H >> 6;
+    constexpr int groups = H >> 7, chunks = (H >> 6) * (Bits / 4), NW = Bits / 2;
     const int gb = warp * groups / nwarps;
     const uint4* qp = jb.gq + (size_t)r * chunks * 32 + lane;
-    const __half* sp = jb.gs + (size_t)r * groups * 16;
+    const void* sp = jb.gs;
     const uint4* xr[NT];
 #pragma unroll
     for (int j = 0; j < NT; j++) {
@@ -4584,47 +4692,85 @@ __global__ void __launch_bounds__(128) k_moe_gu_g(const MoeJob* __restrict__ job
 #pragma unroll
     for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
     constexpr int GW = groups / 4;
-    uint4 wv[GW][2];
+    uint4 wv[GW][NW];
     float sgv[GW][2];
 #pragma unroll
     for (int a2 = 0; a2 < GW; a2++) {
         const int gi = gb + a2;
-        wv[a2][0] = __ldg(qp + (size_t)(2 * gi) * 32);
-        wv[a2][1] = __ldg(qp + (size_t)(2 * gi + 1) * 32);
-        sgv[a2][0] = __half2float(sp[gi * 16 + g]) * kXhScale;
-        sgv[a2][1] = __half2float(sp[gi * 16 + g + 8]) * kXhScale;
+#pragma unroll
+        for (int q = 0; q < NW; q++) wv[a2][q] = __ldg(qp + (size_t)(gi * NW + q) * 32);
+        sgv[a2][0] = moe_scale<Bits>(sp, ((size_t)r * groups + gi) * 16 + g) * kXhScale;
+        sgv[a2][1] = moe_scale<Bits>(sp, ((size_t)r * groups + gi) * 16 + g + 8) * kXhScale;
     }
 #pragma unroll
     for (int a2 = 0; a2 < GW; a2++) {
         const int gi = gb + a2;
         const float sg = sgv[a2][0], sg8 = sgv[a2][1];
-        const uint4 w0 = wv[a2][0], w1 = wv[a2][1];
+        if constexpr (Bits == 4) {
 #pragma unroll
-        for (int c = 0; c < 2; c++) {
-            const int ch = 2 * gi + c;
-            const uint4 wc = c ? w1 : w0;
-            uint32_t hacc[NT][2];
-            uint4 b0[NT], b1[NT];
-#pragma unroll
-            for (int j = 0; j < NT; j++) {
-                hacc[j][0] = hacc[j][1] = 0u;
-                if (j < nt) { b0[j] = xr[j][(size_t)ch * 8]; b1[j] = xr[j][(size_t)ch * 8 + 1]; }
-            }
-            const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-#pragma unroll
-            for (int q = 0; q < 4; q++) {
-                uint32_t a[4];
-                xh_dequant(words[q], a);
+            for (int c = 0; c < 2; c++) {
+                const int ch = 2 * gi + c;
+                const uint4 wc = wv[a2][c];
+                uint32_t hacc[NT][2];
+                uint4 b0[NT], b1[NT];
 #pragma unroll
                 for (int j = 0; j < NT; j++) {
-                    if (j < nt) {
-                        const uint4& bb = (q >> 1) ? b1[j] : b0[j];
-                        xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                    hacc[j][0] = hacc[j][1] = 0u;
+                    if (j < nt) { b0[j] = xr[j][(size_t)ch * 8]; b1[j] = xr[j][(size_t)ch * 8 + 1]; }
+                }
+                const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    uint32_t a[4];
+                    xh_dequant(words[q], a);
+#pragma unroll
+                    for (int j = 0; j < NT; j++) {
+                        if (j < nt) {
+                            const uint4& bb = (q >> 1) ? b1[j] : b0[j];
+                            xh_mma(hacc[j], a, (q & 1) ? bb.z : bb.x, (q & 1) ? bb.w : bb.y);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NT; j++) if (j < nt) xh_flush(acc[j], hacc[j], sg, sg8);
+            }
+        } else {
+            // W8: the group's eight 16-k steps accumulate in fp32, then one bf16 scale per output row
+            float cw[NT][4];
+#pragma unroll
+            for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
+#pragma unroll
+            for (int c = 0; c < 2; c++) {
+                const int ch = 2 * gi + c;
+                uint4 b0[NT], b1[NT];
+#pragma unroll
+                for (int j = 0; j < NT; j++)
+                    if (j < nt) { b0[j] = xr[j][(size_t)ch * 8]; b1[j] = xr[j][(size_t)ch * 8 + 1]; }
+#pragma unroll
+                for (int s = 0; s < 2; s++) {
+                    const uint4 wc = wv[a2][2 * c + s];
+                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+                    for (int q = 0; q < 2; q++) {
+                        uint32_t a[4];
+                        a_from_w8(words[2 * q], words[2 * q + 1], a);
+#pragma unroll
+                        for (int j = 0; j < NT; j++)
+                            if (j < nt) {
+                                const uint4& bb = s ? b1[j] : b0[j];
+                                mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
+                            }
                     }
                 }
             }
 #pragma unroll
-            for (int j = 0; j < NT; j++) if (j < nt) xh_flush(acc[j], hacc[j], sg, sg8);
+            for (int j = 0; j < NT; j++)
+                if (j < nt) {
+                    acc[j][0] = __fmaf_rn(cw[j][0], sg, acc[j][0]);
+                    acc[j][1] = __fmaf_rn(cw[j][1], sg, acc[j][1]);
+                    acc[j][2] = __fmaf_rn(cw[j][2], sg8, acc[j][2]);
+                    acc[j][3] = __fmaf_rn(cw[j][3], sg8, acc[j][3]);
+                }
         }
     }
     __shared__ float red[4][NT][32][4];
@@ -4653,7 +4799,7 @@ __global__ void __launch_bounds__(128) k_moe_gu_g(const MoeJob* __restrict__ job
 }
 // down: one block per 16 output rows, 8 warps split the job list (as k_moe_dn); each job's tiles cover only its rows,
 // the fp32 sums live in shared memory per (warp, batch row) and are added over the warps in order at the end
-template <bool FX = false>  // FX: exact fixed-point sums (as k_moe_dn)
+template <int Bits, bool FX = false>  // FX: exact fixed-point sums (as k_moe_dn)
 __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                   const int* __restrict__ jrow, const __half* __restrict__ acth,
                                                   float* __restrict__ part, int m) {
@@ -4661,7 +4807,7 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
     __shared__ Acc sacc[8][MAXM][16];
     __shared__ float nfb;  // FX: NaN after a non-finite term (xh_flush_fx), else 0
     float nf = 0.f;
-    if (threadIdx.x == 0) nfb = 0.f;
+    if (FX && threadIdx.x == 0) nfb = 0.f;
     const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = 8;
     const int g = lane >> 2, t4 = lane & 3;
     for (int i = threadIdx.x; i < 8 * MAXM * 16; i += 256) (&sacc[0][0][0])[i] = 0;
@@ -4674,18 +4820,19 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
     Acc (*sa)[16] = sacc[warp];
     // software pipeline: the next job's weights, scales, row count, first-tile rows and activations are loaded while
     // this one computes (the activation slot g is read even past the count: those MMA columns are discarded)
-    struct Pre { uint4 w0, w1, b[4]; float s0, s8; int cnt, r0, r1; };
+    constexpr int NW = Bits / 2;
+    struct Pre { uint4 w[NW], b[4]; float s0, s8; int cnt, r0, r1; };
     auto load = [&](int jj, Pre& p) {
         const MoeJob jb = jobs[jj];
-        const uint4* qp = jb.dq + (size_t)r * 2 * 32 + lane;
-        p.w0 = __ldg(qp); p.w1 = __ldg(qp + 32);
-        p.s0 = __half2float(jb.ds[r * 16 + g]) * kXhScale; p.s8 = __half2float(jb.ds[r * 16 + g + 8]) * kXhScale;
+        const uint4* qp = jb.dq + (size_t)r * NW * 32 + lane;
+        for (int q = 0; q < NW; q++) p.w[q] = __ldg(qp + q * 32);
+        p.s0 = moe_scale<Bits>(jb.ds, r * 16 + g) * kXhScale; p.s8 = moe_scale<Bits>(jb.ds, r * 16 + g + 8) * kXhScale;
         const int* rl = jrow + jj * (MAXM + 1);
         p.cnt = rl[0]; p.r0 = rl[1 + 2 * t4]; p.r1 = rl[2 + 2 * t4];
         const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + g) * GRP + t4 * 16);
         p.b[0] = xr[0]; p.b[1] = xr[1]; p.b[2] = xr[8]; p.b[3] = xr[9];
     };
-    auto tile = [&](const uint4& w0, const uint4& w1, float sg, float sg8, const uint4* bb4, int cnt, int t0, int row0, int row1) {
+    auto tile = [&](const uint4* w, float sg, float sg8, const uint4* bb4, int cnt, int t0, int row0, int row1) {
         const int n0 = t0 + 2 * t4, n1 = n0 + 1;
         if (n0 >= cnt) row0 = -1;
         if (n1 >= cnt) row1 = -1;
@@ -4694,9 +4841,10 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
         acc[2] = row0 >= 0 ? sa[row0][g + 8] : 0;
         acc[1] = row1 >= 0 ? sa[row1][g] : 0;
         acc[3] = row1 >= 0 ? sa[row1][g + 8] : 0;
+        if constexpr (Bits == 4) {
 #pragma unroll
         for (int c = 0; c < 2; c++) {
-            const uint4 wc = c ? w1 : w0;
+            const uint4 wc = w[c];
             uint32_t hacc[2] = {0u, 0u};
             const uint4 b0 = bb4[c * 2], b1 = bb4[c * 2 + 1];
             const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
@@ -4709,6 +4857,26 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
             }
             dn_flush<FX>(acc, hacc, sg, sg8, nf);
         }
+        } else {
+            float cw[4] = {};
+#pragma unroll
+            for (int c = 0; c < 2; c++) {
+#pragma unroll
+                for (int s = 0; s < 2; s++) {
+                    const uint4 wc = w[2 * c + s];
+                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+                    const uint4 bb = bb4[c * 2 + s];
+#pragma unroll
+                    for (int q = 0; q < 2; q++) {
+                        uint32_t aa[4];
+                        a_from_w8(words[2 * q], words[2 * q + 1], aa);
+                        mma16(cw, aa, q ? bb.z : bb.x, q ? bb.w : bb.y);
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++) dn_add<FX>(acc[i], cw[i] * (i < 2 ? sg : sg8), nf);
+        }
         if (row0 >= 0) { sa[row0][g] = acc[0]; sa[row0][g + 8] = acc[2]; }
         if (row1 >= 0) { sa[row1][g] = acc[1]; sa[row1][g + 8] = acc[3]; }
         __syncwarp();
@@ -4718,14 +4886,14 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
     for (int jj = jb0; jj < jb1; jj++) {
         cur = nxt;
         if (jj + 1 < jb1) load(jj + 1, nxt);
-        tile(cur.w0, cur.w1, cur.s0, cur.s8, cur.b, cur.cnt, 0, cur.r0, cur.r1);
+        tile(cur.w, cur.s0, cur.s8, cur.b, cur.cnt, 0, cur.r0, cur.r1);
         for (int t0 = 8; t0 < cur.cnt; t0 += 8) {  // further tiles (shared expert, popular experts): direct loads
             const int* rl = jrow + jj * (MAXM + 1);
             const int sl = t0 + g < cur.cnt ? t0 + g : 0;
             const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + sl) * GRP + t4 * 16);
             uint4 bb4[4] = {xr[0], xr[1], xr[8], xr[9]};
             const int n0 = t0 + 2 * t4;
-            tile(cur.w0, cur.w1, cur.s0, cur.s8, bb4, cur.cnt, t0, n0 < cur.cnt ? rl[1 + n0] : -1, n0 + 1 < cur.cnt ? rl[2 + n0] : -1);
+            tile(cur.w, cur.s0, cur.s8, bb4, cur.cnt, t0, n0 < cur.cnt ? rl[1 + n0] : -1, n0 + 1 < cur.cnt ? rl[2 + n0] : -1);
         }
     }
     if (FX && nf != 0.f) nfb = nf;
@@ -5520,6 +5688,7 @@ __global__ void __launch_bounds__(256) k_hcu_pf(const uint4* __restrict__ q, con
 }
 // MoE prefill jobs: per expert the rows routed to it (token list + weight), jobs = local groups of hit experts
 // (+ the shared expert: all rows). One block of 512 threads.
+template<int Bits>
 __global__ void __launch_bounds__(512) k_jobs_pf(int C, const int* __restrict__ gmap, const char* __restrict__ groups,
                                                  ColdTab ct, int ndev, const int* __restrict__ gsel,
                                                  const float* __restrict__ gw, const float* __restrict__ gsh,
@@ -5572,12 +5741,12 @@ __global__ void __launch_bounds__(512) k_jobs_pf(int C, const int* __restrict__ 
     for (int i = e; i < C; i += 512) { tl[ta + i] = i; wl[ta + i] = gsh[i]; }
     __syncthreads();
     auto mk = [&](int li) {
-        const char* bp = grp_ptr(groups, li, ndev, ct, nullptr);
+        const char* bp = grp_ptr<Bits>(groups, li, ndev, ct, nullptr);
         MoeJob jb;
         jb.gq = reinterpret_cast<const uint4*>(bp);
-        jb.gs = reinterpret_cast<const __half*>(bp + GG_Q);
-        jb.dq = reinterpret_cast<const uint4*>(bp + GG_Q + GG_S);
-        jb.ds = reinterpret_cast<const __half*>(bp + GG_Q + GG_S + GD_Q);
+        jb.gs = bp + ExpertLayout<Bits>::gs;
+        jb.dq = reinterpret_cast<const uint4*>(bp + ExpertLayout<Bits>::dq);
+        jb.ds = bp + ExpertLayout<Bits>::ds;
         return jb;
     };
     if (cnt[e] > 0) {
@@ -5626,8 +5795,8 @@ __global__ void __launch_bounds__(256) k_moe_gu_pf2(const PfJob* __restrict__ jo
         const PfJob pj = jobs[job];
         const uint4* qp0 = pj.w.gq + (size_t)(2 * warp) * chunks * 32 + lane;
         const uint4* qp1 = pj.w.gq + (size_t)(2 * warp + 1) * chunks * 32 + lane;
-        const __half* sp0 = pj.w.gs + (size_t)(2 * warp) * groups * 16;
-        const __half* sp1 = pj.w.gs + (size_t)(2 * warp + 1) * groups * 16;
+        const __half* sp0 = static_cast<const __half*>(pj.w.gs) + (size_t)(2 * warp) * groups * 16;
+        const __half* sp1 = static_cast<const __half*>(pj.w.gs) + (size_t)(2 * warp + 1) * groups * 16;
         for (int t0 = 0; t0 < pj.n; t0 += TT) {
             const int m = min(TT, pj.n - t0), nt = (m + 7) >> 3;
             // staging: thread i -> token row i / 8, 16-byte piece i % 8 of the 64-column slice
@@ -5757,7 +5926,7 @@ __global__ void __launch_bounds__(128) k_moe_dn_pf(const PfJob* __restrict__ job
                 const int r = rb + tt;
                 const uint4* qp = pj.w.dq + (size_t)r * 2 * 32 + lane;
                 const uint4 w0 = __ldg(qp), w1 = __ldg(qp + 32);
-                const float sg = __half2float(pj.w.ds[r * 16 + g]) * kXhScale, sg8 = __half2float(pj.w.ds[r * 16 + g + 8]) * kXhScale;
+                const float sg = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g]) * kXhScale, sg8 = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g + 8]) * kXhScale;
 #pragma unroll
                 for (int c = 0; c < 2; c++) {
                     const uint4 wc = c ? w1 : w0;
@@ -5900,7 +6069,7 @@ __global__ void __launch_bounds__(128) k_moe_dn_slot(const PfJob* __restrict__ j
                 const int r = rb + tt;
                 const uint4* qp = pj.w.dq + (size_t)r * 2 * 32 + lane;
                 const uint4 w0 = __ldg(qp), w1 = __ldg(qp + 32);
-                const float sg = __half2float(pj.w.ds[r * 16 + g]) * kXhScale, sg8 = __half2float(pj.w.ds[r * 16 + g + 8]) * kXhScale;
+                const float sg = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g]) * kXhScale, sg8 = __half2float(static_cast<const __half*>(pj.w.ds)[r * 16 + g + 8]) * kXhScale;
 #pragma unroll
                 for (int c = 0; c < 2; c++) {
                     const uint4 wc = c ? w1 : w0;

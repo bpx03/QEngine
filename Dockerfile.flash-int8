@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+ARG CUDA_VERSION=13.1.1
+ARG UBUNTU=ubuntu24.04
+ARG BASE_RUNTIME
+FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY src ./src
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DQE_BUILD_FLASH_INT8_TESTS=OFF \
+    && cmake --build build --target qflash flash_run -j 3
+FROM ${BASE_RUNTIME} AS runtime
+COPY --from=build /src/build/libqflash.so /app/build/libqflash.so
+COPY --from=build /src/build/flash_run /app/build/flash_run
