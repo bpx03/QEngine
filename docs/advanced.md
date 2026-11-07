@@ -20,6 +20,7 @@ and uses the default too. In Docker pass them with `-e`.
   - [Qwen3.8-27B](#qwen38-27b)
   - [Server: scheduling, thinking, logs](#server-scheduling-thinking-logs)
   - [Failure handling and host memory](#failure-handling-and-host-memory)
+  - [Disk cache](#disk-cache)
   - [How `FLASH_COMM=auto` / `QE_COMM=auto` choose a path](#how-flash_commauto--qe_commauto-choose-a-path)
 - [Build the Flash-Next model directory yourself](#build-the-flash-next-model-directory-yourself)
 - [Activation steering](#activation-steering)
@@ -94,7 +95,7 @@ How Flash-Next shares the cards; the [README](../README.md#parallel-mode-flash-n
 | `FLASH_PPB_DSHARE` | `0.5` | `pp`: the decoders' share of the time while a prompt is prefilled. |
 | `FLASH_BOX_REPORT` | on for 4+ cards and `pptp` | Logs a `[box]` report at start (build, CUDA archs, driver, per-card PCIe / NUMA / host rate, per-pair peer access and copy rate) for remote diagnosis. `1` turns it on everywhere. |
 
-In `pp`, image input is refused, steering vectors are not loaded (also when `auto` picks `pp` on 4 or more cards),
+In `pp`, image input works since 1.3.5.1 (experimental, lightly tested); `pptp` refuses it. `FLASH_COMM` does not apply to plain `pp`: its stages have no per-layer exchanges, and the rows hop between stages as copies, over P2P or through pinned host memory (`FLASH_PP_P2P`, shown by the `pipeline boundary` start-up line). In `pptp` it applies inside the TP groups. Steering vectors are not loaded (also when `auto` picks `pp` on 4 or more cards),
 `FLASH_KV=ram` makes a 2- or 3-card server run `tp` instead and refuses the start on 4 or more cards, activation
 capture is refused and lookup drafts are off. Structured output and the thinking budget work; a constrained step runs
 through the stages as a batch of one.
@@ -372,6 +373,8 @@ the block mode, which uses the same index map without the paper's training for b
 | `QE_TOKEN_RANK_FILE` | auto | Token ranking of the MTP draft vocabulary (default: `<model dir>/token_rank.bin`, else the server's downloaded copy in `~/.cache/qengine/assets`). |
 | `QE_FETCH_ASSETS` | `1` | `0`: the server does not download missing `model_mtp_ft.safetensors` / `token_rank.bin` from the latest release (it only logs a warning). |
 | `QE_FETCH_WAIT_S` | `120` | Seconds the server start waits for the asset download; after that it starts with the stock head and the download finishes in the background for the next start. | Raise it to always start with the tuned files on a slow link; `0` = never wait. |
+| `QE_KV_SCALES` | unset | Safetensors file with `k_scale` / `v_scale` for a checkpoint without FP8 KV scales, e.g. the `model.safetensors` of the 27B INT4 checkpoint. Without them the KV cache is bf16: half the pool, no KV position split. |
+| `QE_INT8_MTP_FT` | `0` | INT8 checkpoints: `1` uses the fine-tuned MTP head (`model_mtp_ft.safetensors`, trained on INT4 outputs) instead of the checkpoint's own. An explicit `--mtp-file` always wins. |
 | `QE_DRAFT_VOCAB` | `65536` | MTP draft vocabulary size (`0` = full vocabulary). |
 | `QE_DEC_GEMM` | `33` | Batched decode passes of at least this many rows use the W4A8 GEMM instead of the GEMV (`0` = off). |
 | `QE_LOOKUP` | `1` | Lookup drafts from the token history (`0` = off). |
@@ -414,7 +417,7 @@ Pick cards that do not drive a desktop: a display takes 1-2 GB of VRAM and the K
 | `--log-file` / `QE_LOG_FILE` | `auto` | persistent log path (`''` or `0` = off) |
 | `--log-mb` / `QE_LOG_MB` | `64` | size before the log is rotated (3 old files kept) |
 | `--stats-file` | `~/.cache/qengine/stats.json` | all-time monitoring totals |
-| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | 27B persistent prompt cache, its size, and the idle seconds before live conversations are saved; steered conversations are not saved. Flash-Next has no disk cache: the flag stops the start with an error (for the start-up cache directory set `QE_DISK_CACHE`) |
+| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | persistent prompt cache (both models; Flash-Next: see [Disk cache](#disk-cache)), its size, and the idle seconds before live conversations are saved; on the 27B, steered conversations are not saved. The flag also moves the start-up cache there; `QE_DISK_CACHE` alone moves only the start-up cache |
 
 Per-request statistics lines, e.g.:
 
@@ -445,7 +448,8 @@ graphs keep the room); a fast-growing `budget_evictions` under steady traffic me
 |---|---|---|
 | `QE_HANG_S` | `180` | no scheduler progress for this long: open requests fail at once, new ones are refused, diagnostics, exit 75. Also active during a shutdown, with twice the time. A process paused for longer (`docker pause`, SIGSTOP) also exits when it resumes. `0` = off |
 | `QE_HANG_DIAG_S` | `30` | time the watchdog gives its diagnostics (stacks, `nvidia-smi`) before the exit |
-| `QE_HANG_PERSIST_S` | `3600` | watchdog limit while the 27B saves conversations to `--disk-cache` |
+| `QE_HANG_PERSIST_S` | `3600` | watchdog limit while conversations are saved to `--disk-cache` |
+| `QE_DISK_FLUSH_S` | `600` | Flash-Next `--disk-cache`: how long the exit waits for the files in the queue |
 | `QE_EXIT_HOOK_S` | `5` | on a fatal engine error, the time the server gets to send the open requests their error |
 | `FLASH_RUN_TIMEOUT_S` | `120` | Flash-Next engine step monitor; off by itself under `ncu`, `nsys`, `compute-sanitizer` or a debugger unless set; `0` = off |
 | `QE_GRAPH_RESERVE_MB` | `128` | 27B: VRAM per card kept for CUDA graphs. When another process takes all free VRAM, the engine uses it instead of stopping; `0` turns it off |
@@ -477,6 +481,39 @@ spare doesn't do this, since new writes reuse the free room inside slabs. To avo
 archive stays below what your machine can spare with your other programs running (RAM minus their use minus
 `QE_MEM_MARGIN_GB`).
 
+
+### Disk cache
+
+`--disk-cache DIR` keeps conversations in files under `DIR`, so they survive a restart. It is off by default, and without the
+flag nothing changes. On Flash-Next it is experimental (1.3.5.3).
+
+Flash-Next, what it does:
+
+- **When it writes.** When a conversation leaves VRAM (at most once a minute per conversation), after `--persist-idle` seconds
+  with no request, and at shutdown (a second Ctrl-C or `docker stop` ends the wait; give `docker stop` a longer `-t`). The writes
+  run in the background and do not hold up requests. Conversations under 2048 tokens are not written. Steered conversations are, and each file records its steering: the vector's name and contents, mode, layers and scale.
+- **What comes back.** A prompt that matches a file further than anything in memory reads it back into the host archive: all of
+  it when the conversation continues, or only the part up to the last checkpoint in the match, e.g. the end of a shared
+  system prompt. Other conversations keep generating during the read. After `FLASH_DISK_LOAD_S` the prompt prefills instead.
+- **Which files are used.** Only files from the same engine build, the same weights (path, size and date of each file), the
+  same number of cards, the same layout (`tp` and `pp` don't share files, as in the archive), the same YaRN factor. A steered file serves only requests with the same vector contents, mode, layers and scale, and an unsteered file only unsteered requests. A changed or removed vector means its files are no longer used, while unsteered files stay usable. A file
+  from an earlier version is not used, so an upgrade starts empty. Files from another configuration are kept and go first
+  when room is needed. A truncated or damaged file is refused and removed, checked by a checksum on every read, and the prompt
+  prefills.
+- **Size.** Each conversation's file holds its KV and its recurrent states. About 2.3 GB for a 95K-token conversation (measured). The cache stays below
+  `--disk-cache-gb` and keeps 1 GB free on the disk; the least recently used file goes first.
+- **When the disk fails.** A directory it can't write, a full disk or a write error costs only the cache. A warning goes to
+  the log and the server keeps serving. After a failed write, it tries again after a minute, then less often.
+
+Not covered: conversations that didn't fit the host archive are not written, a file is rewritten whole each time, and
+one server per directory (a second one runs without the cache and says so).
+
+| variable | default | what it does |
+|---|---|---|
+| `FLASH_DISK_MIN_TOKENS` | `2048` | shorter conversations are not written |
+| `FLASH_DISK_MIN_S` | `60` | at most one file per conversation per this many seconds when it leaves VRAM |
+| `FLASH_DISK_LOAD_S` | `30` | how long a prompt waits for its file before it prefills |
+| `FLASH_DISK_RESERVE_GB` | `1` | free room left on the disk |
 
 ### How `FLASH_COMM=auto` / `QE_COMM=auto` choose a path
 

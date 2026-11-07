@@ -94,6 +94,7 @@ void qe_mem_guard(void* e);  // host memory pressure: the archive gives memory b
 void qe_persist(void* e);
 int qe_num_archives(void* e);
 int qe_num_disk_archives(void* e);
+int qe_disk_flush(void* e, double seconds);  // optional (Flash-Next): wait for the queued disk cache files; 1 = all written
 
 // ======================================================= TIER 6 "monitor" (all or none; dashboard)
 void qe_slot_info(void* e, int i, long long* out);  // {offset, capacity, cached tokens, active, last use, prio}

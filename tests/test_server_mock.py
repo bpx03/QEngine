@@ -118,15 +118,14 @@ def run(tier0):
                 out.append((int(p[1]), int(p[2]), tok.decode([int(x) for x in p[3:]], skip_special_tokens=False)))
         return out
 
-    # 1. OpenAI, no sampling parameters: generation_config defaults, reasoning / content split
+    # 1. OpenAI, no sampling parameters: the model card's thinking defaults, reasoning / content split
     r = c.post("/v1/chat/completions", json={"model": name, "messages": [
         {"role": "system", "content": "Du bist hilfreich."}, {"role": "user", "content": "Hallo"}]}).json()
     m = r["choices"][0]["message"]
     assert m["reasoning_content"] == "Ich denke darüber nach." and m["content"] == "Hallo! नमस्ते, ฉันสบายดี", m
     assert r["choices"][0]["finish_reason"] == "stop" and r["model"] == name
     s = [l.split() for l in open(log) if l.startswith("S ")][0]
-    want_t = "1.000" if args.profile.is_flash else "0.600"
-    assert s[1:] == [want_t, "0.950", "20"], s
+    assert s[1:] == ["1.000", "0.950", "20"], s
     print("  openai: text + reasoning ok, default sampling", s[1:])
 
     # 2. OpenAI streaming tool call
@@ -296,32 +295,41 @@ def run(tier0):
     m = r["choices"][0]
     assert m["finish_reason"] == "stop" and not m["message"].get("tool_calls") and "<tool_call>" in m["message"]["reasoning_content"], r
     print("  bad fields 400, streamed stops, call in an open block ok")
+    # non-thinking request: the card's non-thinking defaults
+    c.post("/v1/chat/completions", json={"model": name, "messages": [{"role": "user", "content": "Cześć"}],
+                                         "chat_template_kwargs": {"enable_thinking": False}})
+    s = [l.split() for l in open(log) if l.startswith("S ")][-1]
+    assert s[1:] == ["0.700", "0.800", "20"], s
+    print("  openai: non-thinking default sampling", s[1:])
     print("  engine fallbacks:", ", ".join(gen.engine.missing_optional()))
 
 
 def check_disk_cache_flag():
-    """Issue #15: --disk-cache on Flash-Next stops the start with a clear error; the 27B keeps the flag."""
+    """Issue #15: --disk-cache turns the disk tier on for both models; QE_DISK_CACHE alone only moves the start-up cache."""
     env = dict(os.environ)
     os.environ.pop("QE_DISK_CACHE", None)
+    os.environ["FLASH_DISK_CACHE"] = "/nonexistent"  # (only the flag decides)
     d = os.path.join(TMP, "dc")
-    argv = ["--engine-lib", "none", "--metrics-port", "0", "--disk-cache", d]
-    a = app.parse_args(["--model", FLASH] + argv)
+    argv = ["--engine-lib", "none", "--metrics-port", "0"]
+    a = app.parse_args(["--model", FLASH] + argv + ["--disk-cache", d, "--disk-cache-gb", "7"])
     if a.profile.is_flash:
-        try:
-            app.refuse_disk_cache_on_flash(a)
-            assert False, "--disk-cache on Flash-Next did not stop the start"
-        except SystemExit as e:
-            assert "not supported on Flash-Next" in str(e.code), e.code
+        assert os.environ.get("FLASH_DISK_CACHE") == d and float(os.environ["FLASH_DISK_CACHE_GB"]) == 7.0
+        assert os.environ.get("QE_DISK_CACHE") == d
+    os.environ.pop("QE_DISK_CACHE", None)
+    os.environ["FLASH_DISK_CACHE"] = "/nonexistent"
+    os.environ["QE_DISK_CACHE"] = d
+    a = app.parse_args(["--model", FLASH] + argv)
+    assert not a.disk_cache and "FLASH_DISK_CACHE" not in os.environ and os.environ.get("QE_DISK_CACHE") == d
     q27 = os.path.join(HERE, "..", "models", "Qwen3.8-27B-INT4")
     if not os.path.isdir(q27):
         q27 = os.path.expanduser("~/GIT/QEngine/models/Qwen3.8-27B-INT4")
     if os.path.isdir(q27):
-        a = app.parse_args(["--model", q27] + argv)
-        app.refuse_disk_cache_on_flash(a)
-        assert a.disk_cache == d and os.environ.pop("QE_DISK_CACHE") == d
+        os.environ.pop("QE_DISK_CACHE", None)
+        a = app.parse_args(["--model", q27] + argv + ["--disk-cache", d])
+        assert a.disk_cache == d and os.environ.pop("QE_DISK_CACHE") == d and "FLASH_DISK_CACHE" not in os.environ
     os.environ.clear()
     os.environ.update(env)
-    print("  issue #15: --disk-cache stops the start on Flash-Next, unchanged on the 27B")
+    print("  issue #15: --disk-cache sets the Flash-Next tier, QE_DISK_CACHE alone does not, the 27B unchanged")
 
 
 def main():

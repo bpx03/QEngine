@@ -1,6 +1,6 @@
 """CPU-only, no network: the 27B release-asset download on first start (server/assets.py) against a local HTTP server.
 download + sha ok, sha mismatch refused, cached reuse without network, offline warning, QE_FETCH_ASSETS=0,
-the model dir left untouched, an explicit QE_MTP_FILE respected.
+the model dir left untouched, an explicit QE_MTP_FILE respected, an INT8 checkpoint keeping its own MTP head.
   python tests/test_assets.py
 """
 import contextlib
@@ -121,6 +121,68 @@ def main():
     used, env, log = run(model, os.path.join(tmp, "cache4"), base)
     assert used == {} and Handler.hits == [] and log == "", log
     print("present / explicit: pass")
+
+    # 7. INT8 checkpoint (quantization_config num_bits 8): its own MTP head, only the draft ranking is fetched;
+    #    QE_INT8_MTP_FT=1 takes the fine-tuned head again
+    m8 = os.path.join(tmp, "model8")
+    os.makedirs(m8)
+    with open(os.path.join(m8, "config.json"), "w") as f:
+        f.write('{"quantization_config": {"config_groups": {"group_0": {"weights": {"num_bits": 8}}}}}')
+    serve(FILES)
+    used, env, log = run(m8, os.path.join(tmp, "cache5"), base)
+    assert set(used) == {"token_rank.bin"} and "QE_MTP_FILE" not in env and "own MTP head" in log, (used, log)
+    assert "model_mtp_ft.safetensors" not in Handler.hits, Handler.hits
+    assert assets.weight_bits(m8) == 8 and assets.weight_bits(model) is None
+    os.environ["QE_INT8_MTP_FT"] = "1"
+    try:
+        used, env, log = run(m8, os.path.join(tmp, "cache5"), base)
+    finally:
+        del os.environ["QE_INT8_MTP_FT"]
+    assert "model_mtp_ft.safetensors" in used and env["QE_MTP_FILE"].endswith("model_mtp_ft.safetensors"), (used, log)
+    print("INT8 checkpoint MTP head: pass")
+
+    # 8. format check of the checkpoint headers: what the loader would misread stops the start
+    import json
+    import struct
+
+    def ckpt(tensors, name="fmt", shards=False):
+        d = os.path.join(tmp, name)
+        os.makedirs(d, exist_ok=True)
+        if shards:
+            open(os.path.join(d, "model-00001-of-00002.safetensors"), "wb").close()
+            return d
+        hdr, off, blob = {}, 0, b""
+        for k, (dt, shape, raw) in tensors.items():
+            hdr[k] = {"dtype": dt, "shape": shape, "data_offsets": [off, off + len(raw)]}
+            off += len(raw)
+            blob += raw
+        h = json.dumps(hdr).encode()
+        with open(os.path.join(d, "model.safetensors"), "wb") as f:
+            f.write(struct.pack("<Q", len(h)) + h + blob)
+        return d
+
+    N, K = 16, 2048
+    centred = bytes([128]) * (N * K)
+    def m8(q=centred, s_cols=K // 128, ks=K, extra=None, kv=True, pdt="I32", pshape=None):
+        t = {"a.weight_packed": (pdt, pshape or [N, K // 4], q), "a.weight_scale": ("BF16", [N, s_cols], bytes(2 * N * s_cols)),
+             "a.weight_shape": ("I64", [2], struct.pack("<2q", N, ks))}
+        if kv:
+            t["l.k_scale"] = ("BF16", [1], bytes(2))
+        t.update(extra or {})
+        return t
+    good = ckpt(m8(), "good")
+    env = {}
+    assert assets.check_27b_format(good, env) is None and env == {}, env
+    for name, t, want in [("g64", m8(s_cols=K // 64), "group size"), ("zp", m8(extra={"a.weight_zero_point": ("BF16", [1], bytes(2))}), "asymmetric"),
+                          ("signed", m8(q=bytes(N * K)), "w + 128"), ("byte", m8(pdt="I8", pshape=[N, K]), "weight_packed is I8")]:
+        why = assets.check_27b_format(ckpt(t, name), {})
+        assert why and want in why, (name, why)
+    assert "sharded" in assets.check_27b_format(ckpt({}, "shards", shards=True), {})
+    env = {}
+    assert assets.check_27b_format(ckpt(m8(kv=False), "nokv"), env) is None and env == {"QE_KV_FP8": "0"}, env
+    env = {"QE_KV_SCALES": "x"}
+    assert assets.check_27b_format(ckpt(m8(kv=False), "nokv"), env) is None and "QE_KV_FP8" not in env
+    print("checkpoint format check: pass")
     srv.shutdown()
     print("ALL PASS")
 

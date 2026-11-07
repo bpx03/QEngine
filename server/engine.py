@@ -64,6 +64,7 @@ SIGS = {
     "qe_persist": (None, [c_void_p]),
     "qe_num_archives": (c_int, [c_void_p]),
     "qe_num_disk_archives": (c_int, [c_void_p]),
+    "qe_disk_flush": (c_int, [c_void_p, ctypes.c_double]),
     "qe_last_copied": (c_int, [c_void_p]),
     "qe_last_from_archive": (c_int, [c_void_p]),
     "qe_slot_info": (None, [c_void_p, c_int, P_i64]),
@@ -102,16 +103,17 @@ class SequenceFault(RuntimeError):
 class StartRefused(SequenceFault):
     """qe_start_begin refused a prompt (its return code). retry: the refusal can go away when the running sequences
     finish (no room in the KV pool, prompts in flight); the others are final (bad input, too long)."""
-    NO_ROOM, BAD_INPUT, TOO_LONG, BUSY = -1, -2, -3, -4
+    NO_ROOM, BAD_INPUT, TOO_LONG, BUSY, DISK = -1, -2, -3, -4, -5
     MSG = {NO_ROOM: "KV pool full: no room for this prompt next to the running sequences",
            BAD_INPUT: "invalid prompt: a token id outside the vocabulary, or image rows that do not match the images "
                       "(see the server log)",
            TOO_LONG: "prompt is too long for the engine's context",
-           BUSY: "too many prompts are being prefilled at once"}
+           BUSY: "too many prompts are being prefilled at once",
+           DISK: "its conversation is being read back from the disk cache"}
 
     def __init__(self, code):
         self.code = code if code in self.MSG else self.NO_ROOM  # an older engine: -1 = no room
-        self.retry = self.code in (self.NO_ROOM, self.BUSY)
+        self.retry = self.code in (self.NO_ROOM, self.BUSY, self.DISK)
         super().__init__(self.MSG[self.code])
 _TEST_REFUSE = [int(x) for x in (env_str("QE_TEST_START_REFUSE") or "").split(",") if x.strip()]
 REQUIRED = ("qe_create", "qe_destroy", "qe_max_context", "qe_set_sampling", "qe_start3", "qe_spec_step",
@@ -172,8 +174,8 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         self.max_t = L.qe_max_context(self.h)
         self.pool_tokens = L.qe_pool_tokens(self.h) if "qe_pool_tokens" in self.fns else self.max_t
         self.kv_in_ram = bool(L.qe_kv_in_ram(self.h)) if "qe_kv_in_ram" in self.fns else False
-        # parallel mode of the run (FLASH_PAR / the boot-time pick); mode B (pipeline stages) serves no
-        # images: those requests are refused with a clear message instead of reaching the engine
+        # parallel mode of the run (FLASH_PAR / the boot-time pick); PP x TP serves no images: those
+        # requests are refused with a clear message instead of reaching the engine
         self.par = {"mode": "tp"}
         if "qe_par_info" in self.fns:
             buf = ctypes.create_string_buffer(2048)
@@ -181,15 +183,17 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             raw = buf.value.decode(errors="replace")
             try:
                 self.par = json.loads(raw or "{}") or {"mode": "tp"}
-            except ValueError as ex:  # (review server F9: never silently tp, mode B must keep vision off)
+            except ValueError as ex:  # (review server F9: never silently tp, PP x TP must keep vision off)
                 m = re.search(r'"mode":\s*"(\w+)"', raw)
                 self.par = {"mode": m.group(1) if m else "tp"}
+                if '"pptp"' in raw:
+                    self.par["pptp"] = True
                 print(f"WARNING engine parallel-mode info is not valid JSON ({ex}); mode {self.par['mode']} from the "
                       f"raw text: {raw[:300]!r}", flush=True)
-        if self.par.get("mode") == "pp":  # (grammar-constrained steps run as batches of one through the stages)
+        if self.par.get("mode") == "pp" and "pptp" in self.par:
             self.caps["vision"] = False
-            self.refused = {"vision": "image input is not supported with FLASH_PAR=pp (pipeline stages); run the server "
-                                      "with FLASH_PAR=tp"}
+            self.refused = {"vision": "image input is not supported with FLASH_PAR=pptp; run the server with "
+                                      "FLASH_PAR=tp or pp"}
         else:
             self.refused = {}
         n = L.qe_num_slots(self.h) if "qe_num_slots" in self.fns else 1
@@ -478,9 +482,13 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         return self.lib.qe_num_disk_archives(self.h) if "qe_num_disk_archives" in self.fns else 0
 
     def persist(self):
-        """Archive every live slot (memory + disk cache) and wait for the disk writes."""
+        """Archive every live slot (memory + disk cache). 27B: waits for the disk writes; Flash-Next: disk_flush waits."""
         if "qe_persist" in self.fns:
             self.lib.qe_persist(self.h)
+
+    def disk_flush(self, seconds):
+        """Flash-Next: persist() only queues the files; wait for them, at most `seconds`. True: all written."""
+        return bool(self.lib.qe_disk_flush(self.h, float(seconds))) if "qe_disk_flush" in self.fns else True
 
     def fault_count(self):
         """NaN guard faults so far (each failed one request)."""

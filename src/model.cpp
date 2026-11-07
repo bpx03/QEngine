@@ -887,29 +887,49 @@ Worker::~Worker() {
         if (s) cudaStreamDestroy(s);
 }
 
+// QE_KV_SCALES: side file of FP8 KV scales (opened once, shared by the GPU threads)
+static const SafeTensors* kv_scale_file() {
+    static const std::unique_ptr<SafeTensors> f = []() -> std::unique_ptr<SafeTensors> {
+        const char* p = env_str("QE_KV_SCALES");
+        if (!p) return nullptr;
+        std::unique_ptr<SafeTensors> s(new SafeTensors);
+        s->open(p);
+        printf("KV cache scales from %s\n", p);
+        return s;
+    }();
+    return f.get();
+}
+
 W4 Worker::load_w4(const SafeTensors& st, const std::vector<RowSpec>& rows, int c0, int c1,
                    bool glu) {
+    // bits per weight from the packed width and the group-128 scales (compressed-tensors pack-quantized: int32 words
+    // of 8 nibbles or 4 bytes): 4 = the INT4 layout, 8 = Q8 (an INT8 checkpoint)
     const TensorInfo& t0 = st.get(rows[0].name + ".weight_packed");
-    const int K = t0.shape[1] * 8;
+    const int K = (int)st.get(rows[0].name + ".weight_scale").shape[1] * 128;
+    const int bits = (int)(32 * t0.shape[1] / K);
+    CHECK((bits == 4 || bits == 8) && t0.shape[1] * 32 == (int64_t)K * bits, "%s: packed width %d for K %d",
+          rows[0].name.c_str(), (int)t0.shape[1], K);
+    const int wpr = K * bits / 32, bpk = bits / 4;  // int32 words per source row, nibble slots per k (bytes = k * bpk / 2)
     if (c0 < 0) { c0 = 0; c1 = K; }
     const int kl = c1 - c0;
     int n = 0;
     for (auto& r : rows) n += r.r1 - r.r0;
-    CHECK(n % 16 == 0 && kl % 128 == 0 && c0 % 128 == 0, "w4 %s n=%d k=%d", rows[0].name.c_str(),
+    CHECK(n % 16 == 0 && kl % 128 == 0 && c0 % 128 == 0, "w%d %s n=%d k=%d", bits, rows[0].name.c_str(),
           n, kl);
-    int32_t* tq = (int32_t*)g_scratch_q.get((size_t)n * kl / 2);
+    const size_t rowb = (size_t)kl * bpk / 2, srow = (size_t)K * bpk / 2;  // bytes per row: slice / source
+    int32_t* tq = (int32_t*)g_scratch_q.get((size_t)n * rowb);
     bf16* ts = (bf16*)g_scratch_s.get((size_t)n * (kl / 128) * 2);
     int off = 0;
     for (auto& r : rows) {
         const TensorInfo& q = st.get(r.name + ".weight_packed");
         const TensorInfo& s = st.get(r.name + ".weight_scale");
-        CHECK(q.shape[1] * 8 == K, "K mismatch in %s", r.name.c_str());
+        CHECK(q.shape[1] == wpr && s.shape[1] * 128 == K, "K / bits mismatch in %s", r.name.c_str());
         const int h = r.r1 - r.r0;
         // H2D on the stream of the repack (as the Flash-Next loaders, qfn_prefill_r4): a plain cudaMemcpy2D from the
         // pageable (mmapped) file runs on the legacy stream and may return before its DMA lands, and `stream` is
         // non-blocking: the repack could read the reused scratch while it still held the previous tensor
-        CUDA_CHECK(cudaMemcpy2DAsync(tq + (size_t)off * (kl / 8), kl / 2,
-                                     q.data + ((size_t)r.r0 * (K / 8) + c0 / 8) * 4, K / 2, kl / 2, h,
+        CUDA_CHECK(cudaMemcpy2DAsync((char*)tq + (size_t)off * rowb, rowb,
+                                     q.data + (size_t)r.r0 * srow + (size_t)c0 * bpk / 2, srow, rowb, h,
                                      cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpy2DAsync(ts + (size_t)off * (kl / 128), kl / 128 * 2,
                                      s.data + ((size_t)r.r0 * (K / 128) + c0 / 128) * 2, K / 128 * 2,
@@ -920,20 +940,26 @@ W4 Worker::load_w4(const SafeTensors& st, const std::vector<RowSpec>& rows, int 
     w.n = n;
     w.k = kl;
     w.glu = glu;
-    uint4* dq = (uint4*)dalloc(w4_qbytes(n, kl), true);
+    w.bits = bits;
+    if (bits == 8) has_q8_ = true;
+    uint4* dq = (uint4*)dalloc((size_t)n * rowb, true);
     bf16* ds = (bf16*)dalloc(w4_sbytes(n, kl), true);
+    auto repack = [&](const int32_t* q, const bf16* sc) {
+        if (bits == 8) repack_q8(q, sc, n, kl, dq, ds, stream);
+        else repack_w4(q, sc, n, kl, dq, ds, stream);
+    };
     if (glu) {  // interleave gate/up rows per 16-row tile, via a temporary copy
         int32_t* gq;
         bf16* gs;
-        CUDA_CHECK(cudaMalloc(&gq, (size_t)n * kl / 2));
+        CUDA_CHECK(cudaMalloc(&gq, (size_t)n * rowb));
         CUDA_CHECK(cudaMalloc(&gs, (size_t)n * (kl / 128) * 2));
-        glu_interleave_rows(tq, ts, n, kl, gq, gs, stream);
-        repack_w4(gq, gs, n, kl, dq, ds, stream);
+        glu_interleave_rows(tq, ts, n, kl, gq, gs, stream, bits);
+        repack(gq, gs);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaFree(gq));
         CUDA_CHECK(cudaFree(gs));
     } else {
-        repack_w4(tq, ts, n, kl, dq, ds, stream);
+        repack(tq, ts);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     w.q = dq;
@@ -1137,9 +1163,15 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
             L.fa.o = load_w4(st, {{a + "o_proj", 0, H}}, p_.o_heads.b * 256, p_.o_heads.e * 256);
             L.fa.q_norm = load_bf16(st, a + "q_norm.weight", -1, -1);
             L.fa.k_norm = load_bf16(st, a + "k_norm.weight", -1, -1);
-            if (st.has(a + "k_scale") && st.has(a + "v_scale")) {
+            // FP8 KV scales: the checkpoint's, else QE_KV_SCALES (a safetensors file with the same k_scale / v_scale
+            // names, e.g. the INT4 checkpoint of the same model: K / V activations are the model's, not the weight
+            // format's), else a bf16 cache (half the pool)
+            const SafeTensors* kss = st.has(a + "k_scale") && st.has(a + "v_scale") ? &st : nullptr;
+            if (!kss && kv_scale_file() && kv_scale_file()->has(a + "k_scale") && kv_scale_file()->has(a + "v_scale"))
+                kss = kv_scale_file();
+            if (kss) {
                 auto scalar = [&](const std::string& n) {
-                    const TensorInfo& t = st.get(n);
+                    const TensorInfo& t = kss->get(n);
                     uint32_t u = (uint32_t)((const uint16_t*)t.data)[0] << 16;
                     float v;
                     memcpy(&v, &u, 4);
@@ -1201,6 +1233,11 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         L.down = load_w4(st, {{pre + "mlp.down_proj", 0, H}}, p_.inter.b, p_.inter.e);
     }
     final_norm_ = load_bf16(st, "model.language_model.norm.weight", -1, -1);
+    if (has_q8_) {  // INT8 checkpoint: the producers' W4A8 prequantization is off (gemm.cu gemm_q8_model)
+        gemm_q8_model(true);
+        if (rank == 0) printf("INT8 layer weights (Q8 layout): decode %s, prefill %s\n",
+                              gemv_h16_on() ? "H16 GEMV" : "bf16 GEMV", env_int("QE_PREFILL_INT8", 1) ? "W8A8" : "fp16-acc");
+    }
     if (mtp_st) {
         load_mtp(*mtp_st);
         const bool w4 = env_int("QE_DRAFT_HEAD_W4", 1) != 0;
@@ -1685,7 +1722,11 @@ void Worker::forward(int m, bool logits, bool spec) {
                 mm4(L.dn.in, xn_, H, proj_, proj_ld_, m, st, xhx, H);
                 if (xhx)  // XH path (m <= rows_cap_): bf16 xn_ is not written for this norm
                     gemv_w16h(L.dn.abh, xhx, H, ab_, 2 * dsh_.ab_pad, m, st, kAbSplits, abs);
-                else if (m <= kMaxGemvTokens)
+                else if (m <= rows_cap_)
+                    // every decode-path row count (a lookup verification of 9..16 rows included) takes the GEMV, as
+                    // forward_batch does: gemm_w16 here (it served m > 8 before) sums in another order, so with
+                    // QE_GEMV_H16=0 a sequence verifying lookup drafts alone differed from the same sequence in a
+                    // batched step (test_pool batch == alone with lookup; the H16 path never had this branch)
                     gemv_w16(L.dn.ab, xn_, H, ab_, 2 * dsh_.ab_pad, m, st, kAbSplits, abs);
                 else
                     gemm_w16(L.dn.ab, xn_, H, ab_, 2 * dsh_.ab_pad, m, st, kAbSplits, abs);
@@ -1774,7 +1815,7 @@ bool Worker::allreduce_early(int m, const bf16* norm, const W4& w, float* y, int
                              bool join, int site) {
     static const int ll16 = env_int("QE_LL16", 1);
     static const int ranks = env_int("QE_EARLY_RANKS", 7);  // GPUs using it
-    if (!(early_gemv_mask() & site) || !((ranks >> rank) & 1) || !h16_ || ngpu_ < 2 || m > 8 || !use_ll_ || ll16 <= 0 || m < ll16 || !xh_xn_)
+    if (w.bits != 4 || !(early_gemv_mask() & site) || !((ranks >> rank) & 1) || !h16_ || ngpu_ < 2 || m > 8 || !use_ll_ || ll16 <= 0 || m < ll16 || !xh_xn_)
         return false;
     static const int depth = env_int("QE_EARLY_DEPTH", -1);
     static const bool fused = env_set("QE_EARLY_FUSED") ? env_int("QE_EARLY_FUSED", true) != 0 : true;

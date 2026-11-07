@@ -570,7 +570,7 @@ bool skinny_use(int n, int m) {
 }
 
 bool skinny_w4(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
-    if (m < 1 || m > 32 || w.n % 16 || w.k % 128 || ldx % 8) return false;
+    if (w.bits != 4 || m < 1 || m > 32 || w.n % 16 || w.k % 128 || ldx % 8) return false;  // INT4 only (Q8: gemv.cu)
     const int tiles = w.n / 16, groups = w.k / 128;
     const int nw = pick_warps(tiles, groups, true);
     const int NT = (m + 7) / 8;
@@ -605,7 +605,7 @@ bool skinny_w4(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m, cu
 
 bool skinny_w4h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, cudaStream_t st,
                 __half* yh, int ldyh) {
-    if (m < 1 || m > 32 || w.n % 16 || w.k % 128 || ldx % 64) return false;
+    if (w.bits != 4 || m < 1 || m > 32 || w.n % 16 || w.k % 128 || ldx % 64) return false;
     const int tiles = w.n / 16, groups = w.k / 128;
     const int nw = pick_warps(tiles, groups, true);
     const int NT = (m + 7) / 8;

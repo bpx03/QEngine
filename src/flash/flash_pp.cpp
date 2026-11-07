@@ -725,20 +725,23 @@ void PpEngine::srv_run(int s, long long g) {
             rows.resize((size_t)e.m * H);
             jb.ngram(e.i, e.m, rows.data());
         }
+        const int* dids = jb.dev.empty() ? jb.ids.data() : jb.dev.data();  // what the devices embed
         std::vector<int> mt;
         if (last && jb.mtp)
-            for (int r = 0; r < e.m; r++) mt.push_back(e.i + r + 1 < jb.n ? jb.ids[e.i + r + 1] : -1);
+            for (int r = 0; r < e.m; r++) mt.push_back(e.i + r + 1 < jb.n ? dids[e.i + r + 1] : -1);
         int o = -1, d = -2;
         std::atomic<bool> nf{false};
         each(s, [&](int r, Worker* w) {
             w->use_slot(jb.slot, jb.base);
             w->ws_ensure();  // (a batched decode step in between left the bound slot's state in its storage)
+            // image prompt: this micro-batch's M-RoPE rows (one table per worker, other prompts' micro-batches run in between)
+            if (!jb.r3.empty()) w->set_rope_chunk(jb.slot, e.i, e.m, jb.r3.data());
             io(s, r, w, true, (int)(g & 1));
             // (use_slot made the head constrained; every head rank masks its vocabulary slice)
             if (last && e.final && jb.mask0) w->upload_mask(jb.mask0, 1);
             int o1 = -1, d1 = -2;
             std::vector<int> mt1 = mt;
-            w->prefill_batch(jb.ids.data() + e.i, e.i, e.m, s == sple_ ? rows.data() : nullptr, &o1, last && jb.mtp ? mt1.data() : nullptr,
+            w->prefill_batch(dids + e.i, e.i, e.m, s == sple_ ? rows.data() : nullptr, &o1, last && jb.mtp ? mt1.data() : nullptr,
                              e.final, last && jb.mtp ? &d1 : nullptr);
             if (last && jb.mtp && d1 == -2) {
                 if (e.final) mt1[e.m - 1] = o1;

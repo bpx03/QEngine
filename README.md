@@ -25,6 +25,12 @@ the default settings:
 
 (1.3.5, November 6, 2026; method under [Benchmarks](#benchmarks).)
 
+**What is new in 1.3.5.3 (experimental, not `latest`):** a disk cache for Qwen3.8-Flash-Next: with `--disk-cache DIR` its conversations survive a restart, as on the 27B. Off by default. See [the archive section](#both-models-context-and-the-kv-archive). Lightly tested. Also new: sampling defaults per reply mode from the model cards, so non-thinking replies get presence penalty 1.5 and 27B thinking gets temperature 1.0; not measured yet, see [API](#api).
+
+**What is new in 1.3.5.2 (experimental, not `latest`):** optional INT8 layer weights for Qwen3.8-27B: closer to BF16, slower, with a smaller KV pool. See [Qwen3.8-27B](#qwen38-27b). Lightly tested; INT4 stays the default.
+
+**What is new in 1.3.5.1 (experimental, not `latest`):** image input in `FLASH_PAR=pp`, and start-up log lines that say what the pipeline modes really do. Lightly tested, so feedback is welcome. The stable version is 1.3.5.
+
 **What is new in 1.3.5:** mostly fixes, from every open issue and my own code reviews: a use-after-free in the 27B archive, disk cache fixes, a reply parser that no longer depends on where a decode step ends, stop strings that no longer leak, one eviction order for both models, and memory taken by other programs no longer takes the server down. New: 27B context up to 1M (`--max-ctx`, opt-in), sparse attention for long prompts (`--lsa`, opt-in), faster Flash-Next prefill, and a decode transport that picks itself per machine. `--disk-cache` on Flash-Next now stops the start with an error ([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.5)).
 
 **What is new in 1.3.4.3:** the default thinking budget can be set per reasoning effort
@@ -126,7 +132,7 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 ```
 
 - Without `QE_MODEL` the container serves `/app/models/Qwen3.8-27B-INT4`.
-- Images: `latest` / `1.3.5` (text only, ~0.4 GB download) and `vision` / `1.3.5-vision` (with the image encoder, ~3.2 GB download).
+- Images: `latest` / `1.3.5` (text only, ~0.4 GB download) and `vision` / `1.3.5-vision` (with the image encoder, ~3.2 GB download). Experimental: `1.3.5.3` and `1.3.5.3-vision` (also `1.3.5.2`, `1.3.5.2-vision`, `1.3.5.1`, `1.3.5.1-vision`).
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`; `QE_DEVICES`, if set, wins over `QE_GPUS`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -283,7 +289,7 @@ always `tp`. Settings of the pick and the pipeline: [docs/advanced.md](docs/adva
 | mostly long uncached prompts (RAG, long documents, short answers) | `FLASH_PAR=pp`, or `FLASH_PAR_AUTO_P=32768` to let `auto` decide on that basis |
 | uneven or mixed cards | leave `auto`: it calibrates each card and picks `pp` with a split by speed when that wins |
 | 4 or more cards | leave `auto` (= `pp`); exactly 4 cards with P2P between all of them: try `FLASH_PAR=tp` ([why](#4-or-more-cards)); if your cards pair up on P2P, try `FLASH_PAR=pptp FLASH_PP_MAP=0,1\|2,3` |
-| image input, steering vectors or `FLASH_KV=ram` needed | `FLASH_PAR=tp` (2-3 cards) |
+| steering vectors or `FLASH_KV=ram` needed | `FLASH_PAR=tp` (2-3 cards) |
 
 ```bash
 FLASH_PAR=pp server/run.sh 8080 --model models/Qwen3.8-Flash-Next-QE-INT4
@@ -319,7 +325,7 @@ decode most. The prompts and method differ from the headline table, so compare r
 third of its compute (a test setting), the split moved 4 layers off it: prefill about 30 % and decode 13 % faster than
 an equal split.
 
-**What `pp` and `pptp` do not serve**: image input (refused with a clear message), steering vectors (not loaded),
+**What `pp` and `pptp` do not serve**: image input in `pptp` (refused with a clear message; `pp` serves images since 1.3.5.1, experimental), steering vectors (not loaded),
 `FLASH_KV=ram` (on 2 or 3 cards the server runs `tp` instead and logs it; on 4 or more cards the start is refused with
 a message), activation capture; lookup drafts are off. Structured output and the thinking budget work as in `tp`
 (a constrained step runs through the stages as a batch of one).
@@ -561,6 +567,47 @@ sha256sum -c SHA256SUMS
 
 `QE_FETCH_ASSETS=0` turns the download off; the start waits for it at most `QE_FETCH_WAIT_S` (120) seconds.
 
+#### INT8 weights (27B, opt-in, experimental)
+
+INT4 stays the default. Pointing the server at an 8-bit checkpoint runs the INT8 layer weights: closer to the BF16 model
+and slower, because a decode step reads twice the weight bytes. Three cards are recommended; one card can't hold them.
+The weights are at [bpx03/Qwen3.8-27B-INT8-QEngine](https://huggingface.co/bpx03/Qwen3.8-27B-INT8-QEngine).
+
+```bash
+hf download bpx03/Qwen3.8-27B-INT8-QEngine --local-dir models/Qwen3.8-27B-INT8
+server/run.sh 8080 --model models/Qwen3.8-27B-INT8     # Docker: -e QE_MODEL=/app/models/Qwen3.8-27B-INT8
+```
+
+To build one from the official BF16 weights (no GPU, no calibration data; Python packages in `requirements-ref.txt`):
+
+```bash
+hf download Qwen/Qwen3.8-27B --local-dir models/Qwen3.8-27B-BF16
+python3 tools/quant_int8.py --src models/Qwen3.8-27B-BF16 --out models/Qwen3.8-27B-INT8 \
+    --kv-from models/Qwen3.8-27B-INT4     # copies the FP8 KV scales, which keep the full KV pool
+```
+
+INT8 KL and top-1 are from 1.3.5.2. Everything else, the INT4 KL and top-1 included, is from November 1, on older code, and not
+rerun since; 3 cards:
+
+| metric | INT8 | INT4 | INT8 / INT4 |
+|---|---:|---:|---:|
+| KL vs BF16, mean (320 positions) | 6.66e-4 | 1.47e-2 | 22× closer |
+| top-1 match with BF16 | 99.7 % | 95.3 % | |
+| decode narrative / code, tok/s | 184.6 / 276.7 | 266.6 / 387.7 | 0.69 / 0.71 |
+| prefill 10K / 90K, tok/s | 4,816 / 4,098 | 6,077 / 4,866 | 0.79 / 0.84 |
+| agent c=8, output tok/s | 810 | 1,215 | 0.67 |
+| KV pool, 32 slots, 262K context, tokens | 566,272 | 932,864 | 0.61 |
+
+The 8-pack has not run on INT8, so whether the lower KL gives better answers in real tasks is not known yet.
+
+**Your own checkpoint** goes in through `--model`. The engine reads one `model.safetensors` (not shards),
+compressed-tensors pack-quantized, symmetric, group 128: `weight_packed` int32 `[N][K/4]` with bytes LSB-first and the
+stored value `w + 128`, `weight_scale` bf16 `[N][K/128]`, tensor names as in the 27B INT4 checkpoint. A format it would
+misread stops the start with the reason. Without FP8 KV scales it runs a bf16 KV cache with half the pool and no position
+split (`QE_KV_SCALES=<a 27B INT4 model.safetensors>` borrows the scales; this fallback has not run on cards). INT8
+checkpoints use their own `model_mtp.safetensors`, not the fine-tuned head (`QE_INT8_MTP_FT=1` uses it). Not tried:
+`lued/Qwen3.8-27B-INT8-W8A16-MTP`; it is sharded, so the start refuses it as it is.
+
 #### Long documents (27B, opt-in)
 
 Above 262K tokens the 27B needs YaRN (`--max-ctx 512K` or `1M`), and for prompts that long most of the time goes to
@@ -585,8 +632,10 @@ request of that server, short ones too, so run a separate server for long docume
 - **Pinned system prompts**: the KV and state at the end of each agent kind's system prompt and tools are kept apart
   from the archive (`FLASH_PREFIX_GB` / `QE_PREFIX_GB`, 8 GB), so a new agent of that kind starts after its system
   prompt even when the archive is full.
-- There is no disk cache by default; the 27B has an optional one (`--disk-cache DIR`). Flash-Next has none, so its
-  conversations do not survive a restart: it accepts the flag and warns at start.
+- There is no disk cache by default. With `--disk-cache DIR` (both models, 200 GB at most, `--disk-cache-gb`) conversations
+  are also written to files and survive a restart: a conversation that returns is read back instead of recomputed. Flash-Next
+  has it since 1.3.5.3, experimental; details in
+  [docs/advanced.md](docs/advanced.md#disk-cache). A failing disk costs only the cache; the server keeps serving.
 
 ## API
 
@@ -615,9 +664,13 @@ followed by a literal `</think>`.
 **Structured output**: `response_format` with `json_object` or `json_schema`, enforced in the engine (llguidance
 grammars) together with speculative decoding. Stop sequences are supported.
 
-**Sampling**: the model's `generation_config.json` defaults (the 27B uses temperature 0.6), overridable per request
-or with `--temperature`, `--top-p`, `--top-k`, `--min-p`. `presence_penalty` and `frequency_penalty` are applied on
-the GPU (server defaults: `--presence-penalty`, `--frequency-penalty`).
+**Sampling**: values a request doesn't send come from the Qwen3.8 model cards, per reply mode. Thinking: temperature 1.0,
+top_p 0.95, top_k 20, min_p 0, presence penalty 0. Non-thinking: temperature 0.7, top_p 0.80, top_k 20, min_p 0, presence
+penalty 1.5. `--temperature`, `--top-p`, `--top-k`, `--min-p` and `--presence-penalty` set one value for both modes, and a
+value in the request wins. Greedy requests (temperature 0) get no penalty. The cards warn that a higher presence penalty may
+occasionally mix languages and slightly lower quality: `--presence-penalty 0`, or `presence_penalty: 0` in a request, turns
+it off. These defaults have not been measured here, including the speed cost of presence 1.5 and tool calls under it.
+`presence_penalty` and `frequency_penalty` are applied on the GPU.
 
 **Thinking and reasoning effort**: thinking is on by default (`--think 0` turns it off by default;
 `chat_template_kwargs.enable_thinking` per request). `reasoning_effort` (`xhigh` = the template default, `high` is the
@@ -820,8 +873,9 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `QE_THINK_TAIL` | `auto` | room kept for the answer: 1/8 of `max_tokens`, 64 to 2048 tokens; a number; `0` = off |
 | `--empty-retry` / `QE_EMPTY_RETRY` | `2` | resample a non-streamed empty reply up to N times; `0` = off |
 | `--vision` | `0` | `1`: image input (Docker: the `vision` image) |
-| `--temperature`, `--top-p`, `--top-k`, `--min-p` | the model's | sampling defaults for requests that send none |
-| `--presence-penalty`, `--frequency-penalty` | `0` | penalties for sampled requests that send none |
+| `--temperature`, `--top-p`, `--top-k`, `--min-p` | model card, per mode: `1.0`, `0.95`, `20`, `0` thinking; `0.7`, `0.80`, `20`, `0` non-thinking | sampling defaults for requests that send none; a set value applies to both modes |
+| `--presence-penalty` | model card, per mode: `0` thinking, `1.5` non-thinking | presence penalty for sampled requests that send none; a set value applies to both modes |
+| `--frequency-penalty` | `0` | frequency penalty for sampled requests that send none |
 | `--served-name` | per model | the model id in the API |
 | `--host`, `--port`, `--metrics-port` | `127.0.0.1`, `8080`, `9393` | where the API and the monitoring listen (`--metrics-port 0` = off) |
 | `QE_HANG_S` | `180` | server watchdog in seconds; `0` = off |
@@ -870,7 +924,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `QE_PREFIX_GB` | `8` (less below 64 GB of RAM) | host RAM for pinned system prompts |
 | `QE_COMM` | `auto` | prefill transfer path: `auto`, `p2p`, `ce`, `host` |
 | `QE_FETCH_ASSETS` | `1` | `0`: do not download the tuned MTP head and draft ranking |
-| `--disk-cache DIR` | off | 27B: persistent prompt cache that survives restarts. Flash-Next has none: the flag stops the start with an error |
+| `--disk-cache DIR` | off | persistent prompt cache that survives restarts (Flash-Next: experimental, since 1.3.5.3) |
 
 ## Benchmarks
 

@@ -124,8 +124,9 @@ NO_ROOM_S = env_float("QE_NO_ROOM_S", 10.0)
 NOPROG_STEPS = env_int("QE_NO_PROGRESS_STEPS", 64)
 NOPROG_S = env_float("QE_NO_PROGRESS_S", 10.0)
 PAUSE_TIMEOUT_S = env_float("QE_PAUSE_TIMEOUT_S", 900.0)  # deadline of a reply waiting for VRAM another process holds (preemption pauses: none)
-# the hang deadline while the slots are persisted to the disk cache (27B --disk-cache: idle and at shutdown)
+# the hang deadline while the slots are persisted to the disk cache (--disk-cache: idle and at shutdown)
 HANG_PERSIST_S = env_float("QE_HANG_PERSIST_S", 3600.0)
+DISK_FLUSH_S = env_float("QE_DISK_FLUSH_S", 600.0)  # Flash-Next --disk-cache: how long the exit waits for the queued files
 
 
 QE_HANG_DIAG_S = env_float("QE_HANG_DIAG_S", 30.0)  # hang monitor: time for the diagnostics before the hard exit
@@ -796,12 +797,13 @@ class Generator:
         # models) plus those two tokens by name
         self.eos = set(prof.eos_ids) | {self.tok.token_to_id(t) for t in ("<|im_end|>", "<|endoftext|>")
                                         if self.tok.token_to_id(t) is not None}
-        sd = prof.sampling(args.temperature, args.top_p, args.top_k, args.min_p)
-        args.temperature = sd.pop("temperature")
-        self.sampling_defaults = sd
-        print("sampling defaults (when the request has none): temperature %.2f, top_p %.2f, top_k %d, min_p %.2f"
-              % (args.temperature, self.sampling_defaults["top_p"], self.sampling_defaults["top_k"],
-                 self.sampling_defaults["min_p"]), flush=True)
+        self.sampling_defaults = {t: prof.sampling(t, args.temperature, args.top_p, args.top_k, args.min_p, args.presence_penalty)
+                                  for t in (True, False)}
+        for t, name in ((True, "thinking"), (False, "non-thinking")):
+            sd = self.sampling_defaults[t]
+            print("sampling defaults, %s (when the request has none): temperature %.2f, top_p %.2f, top_k %d, min_p %.2f, "
+                  "presence_penalty %.2f" % (name, sd["temperature"], sd["top_p"], sd["top_k"], sd["min_p"], sd["presence_penalty"]),
+                  flush=True)
         self.vision = None
         if args.vision:  # before the engine, so that its KV cache planning sees the memory used
             from vision import VisionEncoder
@@ -824,7 +826,7 @@ class Generator:
         # structured output (response_format): llguidance matchers, masks written into the engine
         self.grammars = None
         print(f"engine parallel mode: {self.engine.par.get('mode', 'tp')} ({self.engine.par.get('why', '')})", flush=True)
-        if self.vision is not None and not self.engine.has("vision"):  # (mode B: no image input on the pipeline stages)
+        if self.vision is not None and not self.engine.has("vision"):  # (PP x TP: no image input)
             print(f"--vision ignored: {self.engine.refused.get('vision', 'the engine has no image input')}", flush=True)
             self.vision = None
         if self.engine.has("grammar"):
@@ -879,8 +881,8 @@ class Generator:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if env_str("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
             # sampling mode: requests normally carry a temperature (Claude Code does), and the
-            # server default is 0.6
-            print(f"graph warm-up: {self.engine.warmup(greedy=args.temperature <= 0):.1f}s", flush=True)
+            # server defaults sample too
+            print(f"graph warm-up: {self.engine.warmup(greedy=self.sampling_defaults[True]['temperature'] <= 0):.1f}s", flush=True)
         self.engine.set_concurrent(True)
         self.cv = threading.Condition()
         self.queue = []
@@ -1535,7 +1537,8 @@ class Generator:
                     # Only a refusal that can go away (no room, prompts in flight) and only while something runs (idle,
                     # nothing can change: the refusal is final); bad input / too long fail at once with their message
                     t_ref = getattr(admit, "t_refused", None) or time.monotonic()
-                    retry = isinstance(ex, StartRefused) and ex.retry and (active or prefills) and not self.stopping
+                    # (a disk cache read ends by itself, also with nothing running)
+                    retry = isinstance(ex, StartRefused) and ex.retry and (active or prefills or ex.code == StartRefused.DISK) and not self.stopping
                     if retry and time.monotonic() - t_ref < START_RETRY_S:
                         admit.t_refused = t_ref
                         admit.n_refused = getattr(admit, "n_refused", 0) + 1
@@ -1766,12 +1769,12 @@ class Job:
 
     def begin_start(self):
         g, e, p = self.gen, self.gen.engine, self.p
+        # values the client does not send (Claude Code sends none): the model card's for this reply's mode, or
+        # --temperature / --top-p / ... Sampling at temperature 1 without them (top_p 1, top_k 40) lets tail tokens
+        # break tool-call syntax.
+        d = g.sampling_defaults[bool(p.get("thinking", True))]
         temp = p.get("temperature")
-        temp = g.args.temperature if temp is None else temp
-        # top_p / top_k / min_p the client does not send (Claude Code sends none): the model's
-        # recommended values (generation_config.json, --top-p / --top-k). Sampling at temperature
-        # 1 without them (top_p 1, top_k 40) lets tail tokens break tool-call syntax.
-        d = g.sampling_defaults
+        temp = d["temperature"] if temp is None else temp
         self.max_new = p.get("max_tokens") or (e.max_t - len(self.ids) - 16)
         self.stops = [s for s in (p.get("stop") or []) if s]
         self.t0 = time.time()
@@ -1785,7 +1788,7 @@ class Job:
         # stay greedy: deterministic checks); the loop guard raises presence and seeds it with the repeated reply
         pres, freq = p.get("presence_penalty"), p.get("frequency_penalty")
         explicit = pres is not None or freq is not None
-        pres = float(pres if pres is not None else (getattr(g.args, "presence_penalty", 0.0) if temp > 0 else 0.0))
+        pres = float(pres if pres is not None else (d["presence_penalty"] if temp > 0 else 0.0))
         freq = float(freq if freq is not None else (getattr(g.args, "frequency_penalty", 0.0) if temp > 0 else 0.0))
         guard = getattr(self.ids, "guard", None)
         seed = []
@@ -2235,7 +2238,7 @@ async def complete(gen, ids, params, aff, thinking, tools):
     bytes are already sent. usage.completion_tokens counts the tokens of every try; finish_reason is the last try's."""
     tries = max(0, getattr(gen.args, "empty_retry", 0))
     temp = params.get("temperature")
-    temp = gen.args.temperature if temp is None else temp
+    temp = gen.sampling_defaults[bool(thinking)]["temperature"] if temp is None else temp
     if (params.get("grammar") is not None or temp <= 0 or params.get("seed") is not None or params.get("ignore_eos")
             or params.get("stop")):
         tries = 0
@@ -2648,7 +2651,8 @@ def build_app(gen: Generator, args):
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
                   "grammar": grammar, "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
-                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
+                  "thinking": reply_thinking(gen, ids, kw)}
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(reply_thinking(gen, ids, kw))
 
@@ -2796,7 +2800,8 @@ def build_app(gen: Generator, args):
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
                   "stop": [stop] if isinstance(stop, str) else stop, "grammar": grammar, "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
-                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
+                  "thinking": reply_thinking(gen, ids, kw)}
         mid = "msg_" + uuid.uuid4().hex[:24]
         parser = Parser(reply_thinking(gen, ids, kw))
         stop_map = {"stop": "end_turn", "length": "max_tokens"}
@@ -2949,10 +2954,10 @@ def parse_args(argv=None):
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
     ap.add_argument("--temperature", type=float, default=None,
-                    help="default when request has none (27B 0.6, Flash-Next generation_config 1.0)")
-    ap.add_argument("--top-p", type=float, default=None, help="default when request has none (generation_config)")
-    ap.add_argument("--top-k", type=int, default=None, help="default when request has none (generation_config)")
-    ap.add_argument("--min-p", type=float, default=None, help="default when request has none (generation_config)")
+                    help="default when request has none, both modes (model card: thinking 1.0, non-thinking 0.7)")
+    ap.add_argument("--top-p", type=float, default=None, help="default when request has none, both modes (model card: thinking 0.95, non-thinking 0.80)")
+    ap.add_argument("--top-k", type=int, default=None, help="default when request has none, both modes (model card: 20)")
+    ap.add_argument("--min-p", type=float, default=None, help="default when request has none, both modes (model card: 0)")
     ap.add_argument("--mtp-file", default=None,
                     help="MTP head weights for the engine (sets $QE_MTP_FILE; default: the engine's own choice, "
                          "for 27B model_mtp_ft.safetensors when present, else downloaded once from the latest "
@@ -3047,9 +3052,9 @@ def parse_args(argv=None):
                          "structured output or client stop sequences (0 = off); env QE_EMPTY_RETRY")
     ap.add_argument("--loop-guard-tokens", type=int, default=600,
                     help="end a reply whose last N+ tokens are one short fragment repeated (0 = off)")
-    ap.add_argument("--presence-penalty", type=float, default=env_float("QE_PRESENCE_PENALTY", 0.0),
+    ap.add_argument("--presence-penalty", type=float, default=env_float("QE_PRESENCE_PENALTY", None),
                     help="presence penalty of sampled requests that send none (Claude Code's Anthropic API never "
-                         "does); env QE_PRESENCE_PENALTY")
+                         "does), both modes (model card: thinking 0, non-thinking 1.5); env QE_PRESENCE_PENALTY")
     ap.add_argument("--frequency-penalty", type=float, default=env_float("QE_FREQUENCY_PENALTY", 0.0),
                     help="frequency penalty of sampled requests that send none; env QE_FREQUENCY_PENALTY")
     ap.add_argument("--loop-guard-turns", type=int, default=env_int("QE_LOOP_GUARD_TURNS", 3),
@@ -3072,9 +3077,8 @@ def parse_args(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--disk-cache", default="",
-                    help="27B: directory of a persistent prompt cache surviving restarts (default off: "
-                         "conversations live in GPU slots and host memory only). Flash-Next has no disk cache: "
-                         "the flag is accepted, ignored with a warning at start")
+                    help="directory of a persistent prompt cache surviving restarts (default off: "
+                         "conversations live in GPU slots and host memory only)")
     ap.add_argument("--stats-file", default="~/.cache/qengine/stats.json",
                     help="all-time monitoring totals (dashboard)")
     ap.add_argument("--disk-cache-gb", type=float, default=200)
@@ -3115,19 +3119,19 @@ def parse_args(argv=None):
     if args.mtp_file:
         os.environ["QE_MTP_FILE"] = args.mtp_file
     elif env_str("QE_MTP_FILE") is None and os.path.exists(ft):
-        os.environ["QE_MTP_FILE"] = ft
+        import assets  # 27B INT8 checkpoints keep their own head unless QE_INT8_MTP_FT=1 (Flash-Next's D2 has INT8 groups too: unchanged)
+        if args.profile.is_flash or assets.use_mtp_ft(args.model):
+            os.environ["QE_MTP_FILE"] = ft
     if args.disk_cache:  # (also the directory of the start-up cache, comm_cache.h: on Flash-Next too)
         os.environ["QE_DISK_CACHE"] = args.disk_cache
         os.environ["QE_DISK_CACHE_GB"] = str(args.disk_cache_gb)
-    return args
-
-
-def refuse_disk_cache_on_flash(args):
-    """Flash-Next has no disk tier (issue #15). A warning goes unread and the user believes conversations survive a
-    restart, so stop before the load. The start-up cache of the link probe has its own variable: QE_DISK_CACHE."""
+    # Flash-Next: its disk tier has its own variables. QE_DISK_CACHE alone only moves the start-up cache there (documented),
+    # so setting it never turns the tier on; without the flag it is off
+    os.environ.pop("FLASH_DISK_CACHE", None)
     if args.disk_cache and args.profile.is_flash:
-        sys.exit("error: --disk-cache is not supported on Flash-Next yet (only the 27B has it): remove the flag. "
-                 "Conversations do not survive a restart on Flash-Next. For the directory of the start-up cache, set QE_DISK_CACHE.")
+        os.environ["FLASH_DISK_CACHE"] = args.disk_cache
+        os.environ["FLASH_DISK_CACHE_GB"] = str(args.disk_cache_gb)
+    return args
 
 
 def start_log(args):
@@ -3153,9 +3157,11 @@ def main():
     args = parse_args()
     start_log(args)
     print("QEngine %s (build %s)" % version_info(args.engine_lib or env_str("QE_LIB")), flush=True)
-    refuse_disk_cache_on_flash(args)
     if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
         import assets
+        why = assets.check_27b_format(args.model)
+        if why:
+            sys.exit(print(f"[server] {why}", flush=True) or 3)
         assets.ensure(args.model)
     try:  # kill -USR1 <pid>: Python stacks of every thread (the native ones: gdb -p <pid>)
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
@@ -3186,6 +3192,14 @@ def main():
     if args.disk_cache:
         t0 = time.time()
         gen.run_on_engine(gen.engine.persist)
+        # Flash-Next queues its files: wait for them (bounded: a hung disk must not hold the exit), then what a full archive
+        # could not take before those writes let go of their memory
+        flushed = gen.engine.disk_flush(DISK_FLUSH_S)
+        if flushed and "qe_disk_flush" in gen.engine.fns:
+            gen.run_on_engine(gen.engine.persist)
+            flushed = gen.engine.disk_flush(DISK_FLUSH_S)
+        if not flushed:
+            print(f"shutdown: disk cache writes still running after {DISK_FLUSH_S:.0f}s, not waiting (the unfinished file is dropped at the next start)", flush=True)
         print(f"shutdown: slots saved in {time.time() - t0:.1f}s", flush=True)
     gen.engine.set_exit_hook(None)
     # end here, as the re-raised signal did before: no interpreter / CUDA teardown while engine threads still run

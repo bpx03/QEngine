@@ -9,6 +9,11 @@
 #include "../env.h"
 #include "../kernels/watchdog.cuh"
 #include <dirent.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <csignal>
+#include <limits.h>
 #include <cuda_profiler_api.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -27,6 +32,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <new>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <future>
@@ -41,6 +47,7 @@
 #include "flash_steer.h"
 #include "guard_rule.h"
 #include "kv_evict.h"
+#include "kv_disk.h"
 #include "../host_mem.h"
 #include "../host_budget.h"
 [[noreturn]] void qe_wd_host_timeout(const char* what);  // kernels/watchdog.cu: report + exit 75
@@ -290,6 +297,11 @@ struct Conv {
     unsigned long long used = 0, affinity = 0;
     double last_ms = 0;                       // wall time of its last start / release (the active main's FLASH_MAIN_STALE_S)
     long long steer = -1;                     // steering key it was computed with (FE::steer_key): KV / states never serve another
+    // the disk cache (FE::dk): its file, what that file holds, when it was last queued; dk_no: a part read back for a branch, never written
+    std::string dk_path;
+    uint64_t dk_sig = 0;
+    double dk_ms = -1e18;
+    bool dk_no = false;
 };
 
 // A pinned prefix (FLASH_PREFIX_GB): the KV rows [0, n) and the committed state at n of a system end (the server's
@@ -583,6 +595,7 @@ struct FE {
     // prefix match, the checkpoints and the archive: different keys never share KV
     std::vector<SteerSpec> steer;
     int steer_def = -1, steer_vec = -1, steer_mode = 0, steer_lo = 0, steer_hi = -1;
+    std::vector<uint64_t> steer_hash;  // --disk-cache: what each vector applies (kvd::steer_id), only when the tier is asked for
     float steer_scale = 1.f;
     std::string steer_json = "{\"default\": null, \"vectors\": []}";
     // key = vector | mode | lo | hi | scale bits (-1: off); steer_unkey decodes it
@@ -1064,6 +1077,7 @@ struct FE {
             const bool keep_it = budget && kve::reachable(*c);
             const int id = c->id, prio = c->prio, kept = c->kv_n;
             const size_t u0 = hpool.used();
+            if (dk && keep_it && q.synced && !q.fault) dk_enqueue(*c, false);
             if (!keep_it) forget(c);
             if (part && keep_it)
                 fprintf(stderr, "[qflash] archive: conversation %d (%zu tokens, prio %d) left VRAM, the archive could not take all of it: "
@@ -1315,8 +1329,9 @@ struct FE {
         };
         return kve::make_room(need, eff_budget(), [&] { return aused(); },
             [&] {
-                std::vector<const void*> pinned;  // (a pinned prefix keeps its blobs alive)
+                std::vector<const void*> pinned;  // (a pinned prefix keeps its blobs alive, a disk write in progress too)
                 for (auto& x : pins) { pinned.push_back(x.kv.get()); pinned.push_back(x.st.get()); }
+                if (dk) dk->held(pinned);
                 return kve::freeable(convs, may_go, pinned, [](const HBlob& b) { return blob_bytes(b); });
             },
             [&]() -> Conv* {
@@ -1459,6 +1474,492 @@ struct FE {
         fprintf(stderr, "[qflash] archive: pinned system prefix %d tokens of slot %d (%.2f GB: KV %.2f + state %.2f; "
                         "pinned %.2f of %.2f GB, %zu prefixes, %.1f ms)\n", pos, s, need / 1e9, (need - blob_bytes(*st)) / 1e9,
                 blob_bytes(*st) / 1e9, pin_used / 1e9, pin_budget / 1e9, pins.size(), now_ms() - t0);
+    }
+    // ---- the disk cache (--disk-cache, kv_disk.h): a tier under the host archive. Null: off,
+    // and none of the code below runs. Only this thread (the scheduler's) touches the index; the writer gets immutable blobs and
+    // returns results; a read runs on its own thread into blobs nobody else sees until dk_commit. A disk failure costs the cache,
+    // never a request: a failed read means a normal prefill, a failed write a conversation that stays in memory only.
+    struct DkEnt {
+        std::string path;
+        kvd::Meta m;
+        bool own = false;      // false: a valid file of another configuration or a longer context: not loaded, counts in the LRU
+        uint64_t bytes = 0;
+        double last_s = 0;     // wall clock, the file's modification time: LRU across restarts
+        double fail_ms = -1e18;  // a read failed: not tried again for a while
+    };
+    struct DkLoad {
+        std::string path;
+        kvd::Meta m;
+        int L = 0;
+        long long steer = -1;  // the key of the request it was read for: its steering, in this run's numbering (the same id)
+        bool whole = false;
+        std::vector<std::pair<size_t, std::shared_ptr<HBlob>>> items;  // the blob's index in m, its memory
+        int fd = -1;
+        std::thread th;
+        std::atomic<bool> done{false};
+        bool ok = false, damaged = false;
+        double t0 = 0;
+    };
+    std::unique_ptr<kvd::Writer> dk;
+    std::unique_ptr<DkLoad> dk_load;
+    std::string dk_dir, dk_fp;
+    std::list<DkEnt> dk_idx;
+    uint64_t dk_budget = 0, dk_reserve = 0, dk_used = 0, dk_inflight = 0;  // dk_used: files + what queued writes will take
+    int dk_min = 2048, dk_lock = -1;
+    double dk_min_ms = 60000, dk_load_ms = 30000, dk_retry_at = 0, dk_backoff = 60000, dk_room_log = -1e18;
+    std::atomic<int> dk_n{0};
+    std::atomic<long long> dk_b{0};
+    static double wall_s() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+    void dk_count() {
+        int n = 0;
+        long long b = 0;
+        for (auto& x : dk_idx)
+            if (x.own) { n++; b += (long long)x.bytes; }
+        dk_n = n;
+        dk_b = b;
+    }
+    void dk_drop(const std::string& path) {
+        for (auto it = dk_idx.begin(); it != dk_idx.end(); ++it)
+            if (it->path == path) {
+                dk_used -= std::min(dk_used, it->bytes);
+                dk_idx.erase(it);
+                break;
+            }
+        unlink(path.c_str());
+    }
+    // room for `need` more bytes in the budget and on the disk (the LRU file goes first, also another configuration's), false
+    // without deleting anything when even that would not make room
+    bool dk_room(uint64_t need) {
+        if (need > dk_budget) return false;
+        auto disk_short = [&](uint64_t extra) {
+            struct statvfs v;
+            if (statvfs(dk_dir.c_str(), &v) != 0) return false;
+            return (uint64_t)v.f_bavail * v.f_frsize + extra < need + dk_inflight + dk_reserve;
+        };
+        uint64_t files = 0;
+        for (auto& x : dk_idx) files += x.bytes;
+        if (disk_short(files)) return false;
+        while (dk_used + need > dk_budget || disk_short(0)) {
+            auto lru = dk_idx.end();
+            for (auto it = dk_idx.begin(); it != dk_idx.end(); ++it)
+                if (lru == dk_idx.end() || it->last_s < lru->last_s) lru = it;
+            if (lru == dk_idx.end()) return false;
+            fprintf(stderr, "[qflash] disk cache: removed %s (%.2f GB, least recently used)\n", lru->path.c_str(), lru->bytes / 1e9);
+            const std::string p = lru->path;
+            dk_drop(p);
+        }
+        dk_count();
+        return true;
+    }
+    // what a file of this conversation would hold, as a value: a new blob or length means a new file
+    static uint64_t dk_sig(const Conv& c) {
+        std::vector<uint64_t> v{(uint64_t)c.toks.size(), (uint64_t)c.kv_n, (uint64_t)(uintptr_t)c.end.get()};
+        for (auto& g : c.segs) v.push_back((uint64_t)(uintptr_t)g.get());
+        for (auto& x : c.ck) v.push_back((uint64_t)(uintptr_t)x.get());
+        return kvd::hash_bytes(v.data(), v.size() * 8) | 1;
+    }
+    // Queue a file of a conversation whose copy in host memory is whole: nothing is copied, the writer holds the blobs. Not a
+    // short one. force: the idle save / shutdown; else (it left VRAM) at most one
+    // file per conversation per FLASH_DISK_MIN_S, and not behind a slow disk: it stays in memory and the next save has it.
+    void dk_enqueue(Conv& c, bool force) {
+        if (!dk || c.dk_no || (int)c.toks.size() < dk_min) return;
+        const double t = now_ms();
+        if (t < dk_retry_at) return;
+        const uint64_t sig = dk_sig(c);
+        if (sig == c.dk_sig || (!force && (t - c.dk_ms < dk_min_ms || dk->queued() >= 8))) return;
+        kvd::Job j;
+        j.key = c.id;
+        j.m.fp = dk_fp;
+        j.m.steer = dk_steer_id(c.steer);
+        j.m.toks = c.toks;
+        j.m.ng = ng;
+        const int n = c.toks.size(), kv = std::min(c.kv_n, n);
+        j.m.kv_n = kv;
+        auto add = [&](const std::shared_ptr<HBlob>& b, int kind, int x, int y, int pend, int st_kind) {
+            kvd::BlobMeta bm;
+            bm.kind = kind; bm.a = x; bm.b = y; bm.pend = pend; bm.st_kind = st_kind;
+            std::vector<const char*> ps;
+            for (int r = 0; r < ng; r++) {
+                bm.size.push_back(b->n[r]);
+                ps.push_back(b->p[r]);
+            }
+            j.m.blobs.push_back(std::move(bm));
+            j.ptr.push_back(std::move(ps));
+            j.hold.push_back(b);
+        };
+        for (auto& g : c.segs)
+            if (g->t0 < kv) add(g, kvd::KV_SEG, g->t0, g->t1, 0, 0);
+        int states = 0;
+        if (c.end && c.end->pos == n && kv >= n) {
+            add(c.end, kvd::END_STATE, c.end->pos, c.end->prev_m, c.end->pend, c.end->kind);
+            states++;
+        }
+        for (auto& x : c.ck)
+            if (x != c.end && x->pos > 0 && x->pos <= kv) {
+                add(x, kvd::CK_STATE, x->pos, x->prev_m, x->pend, x->kind);
+                states++;
+            }
+        if (!states) return;
+        const uint64_t need = kvd::data_bytes(j.m) + (uint64_t)n * 4 + j.m.blobs.size() * (uint64_t)(20 + 16 * ng) + dk_fp.size() + 64;
+        if (!dk_room(need)) {
+            if (t - dk_room_log > 60000) {
+                dk_room_log = t;
+                fprintf(stderr, "[qflash] disk cache: no room for conversation %d (%d tokens, %.2f GB; budget %.0f GB, %.2f GB used): it stays in memory only\n",
+                        c.id, n, need / 1e9, dk_budget / (double)(1ull << 30), dk_used / 1e9);
+            }
+            return;
+        }
+        char name[64];
+        // (the fingerprint in the name: the same text under another configuration is another file, never replaced by this one)
+        snprintf(name, sizeof name, "/%016llx_%d.qfk", (unsigned long long)(kvd::hash_bytes(c.toks.data(), (size_t)n * 4) ^ kvd::hash_bytes(dk_fp.data(), dk_fp.size()) ^
+                                                                (j.m.steer.empty() ? 0 : kvd::hash_bytes(j.m.steer.data(), j.m.steer.size()))), n);
+        j.path = dk_dir + name;
+        j.old_path = c.dk_path;
+        c.dk_sig = sig;
+        c.dk_ms = t;
+        dk_used += need;
+        dk_inflight += need;
+        dk->push(std::move(j), need);
+    }
+    // finished writes into the index, a finished read into the archive
+    void dk_reap() {
+        if (!dk) return;
+        if (dk_load && dk_load->done.load()) dk_commit();
+        for (kvd::Done& d : dk->take_done()) {
+            dk_used -= std::min(dk_used, d.reserved);
+            dk_inflight -= std::min(dk_inflight, d.reserved);
+            Conv* c = nullptr;
+            for (auto& x : convs)
+                if (x.id == d.key) c = &x;
+            if (d.ok) {
+                dk_drop_entry(d.path);
+                DkEnt en;
+                en.path = d.path;
+                en.bytes = d.m.data_off + d.m.total;
+                en.last_s = wall_s();
+                en.own = true;
+                en.m = std::move(d.m);
+                dk_used += en.bytes;
+                dk_idx.push_back(std::move(en));
+                // the file it replaces, also when another write came between
+                if (!d.old_path.empty() && d.old_path != d.path) dk_drop(d.old_path);
+                if (c) {
+                    if (!c->dk_path.empty() && c->dk_path != d.path) dk_drop(c->dk_path);
+                    c->dk_path = d.path;
+                }
+                dk_backoff = 60000;
+                dk_retry_at = 0;
+                fprintf(stderr, "[qflash] disk cache: saved %zu tokens, %.2f GB in %.1f s (%s)\n", dk_idx.back().m.toks.size(),
+                        dk_idx.back().bytes / 1e9, d.ms / 1000.0, d.path.c_str());
+            } else if (!d.cancelled) {
+                if (c) c->dk_sig = 0;
+                dk_retry_at = now_ms() + dk_backoff;
+                fprintf(stderr, "[qflash] disk cache: write failed (%s): %s; no new writes for %.0f s, the conversation stays in memory only\n",
+                        strerror(d.err), d.path.c_str(), dk_backoff / 1000.0);
+                dk_backoff = std::min(dk_backoff * 2, 600000.0);
+            }
+        }
+        dk_count();
+    }
+    // (the index entry only: the file on disk was just replaced)
+    void dk_drop_entry(const std::string& path) {
+        for (auto it = dk_idx.begin(); it != dk_idx.end(); ++it)
+            if (it->path == path) {
+                dk_used -= std::min(dk_used, it->bytes);
+                dk_idx.erase(it);
+                return;
+            }
+    }
+    // the engine's steering key as a file holds it (its index is valid only in this run); -1: empty
+    std::string dk_steer_id(long long key) const {
+        if (key < 0) return "";
+        int vec, mode, lo, hi;
+        float scale;
+        steer_unkey(key, vec, mode, lo, hi, scale);
+        return kvd::steer_id(steer[vec].name, steer_hash[vec], mode, lo, hi, scale);
+    }
+    // the longest start a file offers for this prompt: its end (the whole conversation continues), else the last state in the match.
+    // Only files computed with this request's steering, as best() does for conversations
+    struct DkPlan { DkEnt* e = nullptr; int L = 0; bool whole = false; };
+    DkPlan dk_plan(const int* ids, int n) {
+        DkPlan b;
+        const double t = now_ms();
+        const std::string want = dk_steer_id(steer_key());
+        for (auto& x : dk_idx) {
+            if (!x.own || t - x.fail_ms < 600000 || x.m.steer != want) continue;
+            const std::vector<int>& k = x.m.toks;
+            int M = 0;
+            const int lim = std::min<int>(k.size(), n);
+            while (M < lim && k[M] == ids[M]) M++;
+            int L = 0;
+            bool whole = false;
+            for (auto& bl : x.m.blobs) {
+                if (bl.kind == kvd::END_STATE && M == (int)k.size() && M < n && bl.a == M && x.m.kv_n >= M) { L = M; whole = true; }
+                else if (bl.kind == kvd::CK_STATE && !whole && bl.a <= M && bl.a < n && bl.a <= x.m.kv_n) L = std::max(L, bl.a);
+            }
+            if (L > b.L || (L == b.L && L > 0 && b.e && x.last_s > b.e->last_s)) b = DkPlan{&x, L, whole};
+        }
+        return b;
+    }
+    // Read a file (all of it when the conversation continues, else the rows below L and the state at L) in the background.
+    // Its blobs take archive room now, in the one eviction order; what they push out may be on disk too. false: not possible
+    bool dk_begin(const DkPlan& pl) {
+        auto l = std::make_unique<DkLoad>();
+        l->path = pl.e->path;
+        l->m = pl.e->m;
+        l->L = pl.L;
+        l->whole = pl.whole;
+        l->steer = steer_key();
+        const kvd::Meta& m = l->m;
+        std::vector<size_t> use;
+        uint64_t tot = 0;
+        for (size_t i = 0; i < m.blobs.size(); i++) {
+            const kvd::BlobMeta& b = m.blobs[i];
+            const bool want = pl.whole || (b.kind == kvd::KV_SEG ? b.a < pl.L : b.kind == kvd::CK_STATE && b.a == pl.L);
+            if (!want) continue;
+            use.push_back(i);
+            for (uint64_t x : b.size) tot += (x + 4095) / 4096 * 4096;
+        }
+        auto refuse = [&](const char* why) {
+            pl.e->fail_ms = now_ms();
+            fprintf(stderr, "[qflash] disk cache: %s not read back (%s, %.2f GB); the prompt prefills\n", l->path.c_str(), why, tot / 1e9);
+            return false;
+        };
+        if (tot > eff_budget()) return refuse("larger than the archive allows");
+        if ((l->fd = open(l->path.c_str(), O_RDONLY | O_CLOEXEC)) < 0) return refuse(strerror(errno));
+        for (size_t i : use) {
+            const kvd::BlobMeta& b = m.blobs[i];
+            std::vector<size_t> sz(b.size.begin(), b.size.end());
+            std::shared_ptr<HBlob> h;
+            if (b.kind == kvd::KV_SEG) {
+                auto g = new_blob<Seg>(sz, nullptr);
+                if (g) { g->t0 = b.a; g->t1 = b.b; }
+                h = g;
+            } else {
+                auto x = new_blob<State>(sz, nullptr);
+                if (x) { x->pos = b.a; x->prev_m = b.b; x->pend = b.pend; x->kind = b.st_kind; }
+                h = x;
+            }
+            if (!h) {
+                close(l->fd);
+                return refuse("no room in the archive");
+            }
+            l->items.emplace_back(i, std::move(h));
+        }
+        l->t0 = now_ms();
+        DkLoad* p = l.get();
+        try {
+            p->th = std::thread([p] {
+                bool ok = true, damaged = false;
+                for (auto& it : p->items) {
+                    for (size_t r = 0; ok && r < it.second->p.size(); r++) {
+                        const uint64_t off = kvd::blob_off(p->m, it.first, (int)r), sz = p->m.blobs[it.first].size[r];
+                        if (!kvd::read_all(p->fd, it.second->p[r], sz, off)) ok = false;
+                        else if (kvd::hash_bytes(it.second->p[r], sz) != p->m.blobs[it.first].hash[r]) { ok = false; damaged = true; }
+                    }
+                }
+#ifdef POSIX_FADV_DONTNEED
+                posix_fadvise(p->fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+                close(p->fd);
+                p->ok = ok;
+                p->damaged = damaged;
+                p->done = true;
+            });
+        } catch (const std::exception& ex) {
+            close(l->fd);
+            return refuse(ex.what());
+        }
+        dk_load = std::move(l);
+        return true;
+    }
+    // the read is done: a conversation of the archive (slot -1), found by best() like any other, or the file refused
+    void dk_commit() {
+        std::unique_ptr<DkLoad> l = std::move(dk_load);
+        l->th.join();
+        const double ms = now_ms() - l->t0;
+        DkEnt* en = nullptr;
+        for (auto& x : dk_idx)
+            if (x.path == l->path) en = &x;
+        if (!l->ok) {
+            fprintf(stderr, "[qflash] disk cache: %s refused (%s): the prompt prefills\n", l->path.c_str(),
+                    l->damaged ? "checksum mismatch, file removed" : "read error");
+            if (l->damaged) dk_drop(l->path);
+            else if (en) en->fail_ms = now_ms();
+            dk_count();
+            return;
+        }
+        Conv d;
+        d.id = next_id++;
+        d.steer = l->steer;
+        d.used = ++tick;
+        d.last_ms = now_ms();
+        const std::vector<int>& k = l->m.toks;
+        d.toks.assign(k.begin(), l->whole ? k.end() : k.begin() + l->L);
+        d.kv_n = l->whole ? l->m.kv_n : std::min(l->m.kv_n, l->L);
+        size_t bytes = 0;
+        for (auto& it : l->items) {
+            const kvd::BlobMeta& b = l->m.blobs[it.first];
+            bytes += it.second->bytes;
+            if (b.kind == kvd::KV_SEG) d.segs.push_back(std::static_pointer_cast<Seg>(it.second));
+            else if (b.kind == kvd::END_STATE) d.end = std::static_pointer_cast<State>(it.second);
+            else d.ck.push_back(std::static_pointer_cast<State>(it.second));
+        }
+        d.dk_no = !l->whole;
+        if (l->whole) {
+            d.dk_path = l->path;
+            d.dk_sig = dk_sig(d);
+        }
+        const int id = d.id;
+        convs.push_back(std::move(d));
+        utimensat(AT_FDCWD, l->path.c_str(), nullptr, 0);  // recently used
+        if (en) en->last_s = wall_s();
+        fprintf(stderr, "[qflash] disk cache: conversation %d read back, %d of %zu tokens, %.2f GB in %.2f s (%s)\n", id, l->whole ? (int)k.size() : l->L,
+                k.size(), bytes / 1e9, ms / 1000.0, l->path.c_str());
+    }
+    // Before a start picks its source: a file that beats what memory offers by at least ckpt_min tokens comes into the archive
+    // first. 0: go on (best() sees whatever is there now). 1: being read while other sequences run: the server tries again, they
+    // keep generating. With nothing else running this waits here. Never longer than FLASH_DISK_LOAD_S, then the prompt prefills
+    // and the read still ends in the archive.
+    int dk_prepare(const int* ids, int n) {
+        dk_reap();
+        const DkPlan pl = dk_plan(ids, n);
+        if (!pl.e || pl.L < best(ids, n, false).L + ckpt_min) return 0;
+        if (dk_load) {
+            if (dk_load->path != pl.e->path || dk_load->L != pl.L) return 0;  // one read at a time: this prompt does not wait for another's
+        } else if (!dk_begin(pl)) {
+            return 0;
+        }
+        bool busy = !pfs.empty();
+        for (auto& q : sl) busy |= q.active;
+        if (busy && now_ms() - dk_load->t0 < dk_load_ms) return 1;
+        while (!dk_load->done.load() && now_ms() - dk_load->t0 < dk_load_ms) usleep(1000);
+        if (dk_load->done.load()) dk_commit();
+        else fprintf(stderr, "[qflash] disk cache: %s still being read after %.0f s: the prompt prefills\n", dk_load->path.c_str(), dk_load_ms / 1000.0);
+        return 0;
+    }
+    // the idle save and shutdown (nothing generates): every conversation with a whole copy. Idle ones that still lack a copy get
+    // one now, evicting in the one order: what they push out has its file already (or a write in the queue)
+    void dk_persist() {
+        dk_reap();
+        for (auto& c : convs)
+            if (c.slot < 0 || (sl[c.slot].synced && !sl[c.slot].active && !sl[c.slot].fault)) dk_enqueue(c, true);
+        for (int s = 0; s < (int)sl.size(); s++) {
+            Slot& q = sl[s];
+            if (!q.conv || q.synced || q.active || q.fault) continue;
+            drain();
+            if (sync(s) && q.synced) dk_enqueue(*q.conv, true);
+        }
+    }
+    // Everything that shapes a file's bytes: format, build (kernels and layouts change between builds), weights (path, every
+    // safetensors file's size and date), card count and layout (TP / pipeline stages, bytes of a period and of a state per card),
+    // KV in RAM or VRAM, YaRN, the n-gram table and the router. Files with anything else are refused.
+    std::string dk_fingerprint(const std::string& model) {
+        std::ostringstream fp;
+        char rp[PATH_MAX];
+        fp << "qfk2|build " << qe_internal_build_id() << "|" << (realpath(model.c_str(), rp) ? rp : model.c_str());
+        std::vector<std::string> files;
+        if (DIR* d = opendir(model.c_str())) {
+            while (dirent* de = readdir(d)) {
+                const std::string n = de->d_name;
+                if (n.size() > 12 && n.compare(n.size() - 12, 12, ".safetensors") == 0) files.push_back(n);
+            }
+            closedir(d);
+        }
+        std::sort(files.begin(), files.end());
+        for (auto& n : files) {
+            struct stat st;
+            if (stat((model + "/" + n).c_str(), &st) == 0) fp << "|" << n << ":" << st.st_size << ":" << st.st_mtime;
+        }
+        fp << "|g" << ng << "|layout " << layout << "|ctx-period " << period << "|kv " << (W[0]->kv_stream() ? "ram" : "vram");
+        char y[48];
+        snprintf(y, sizeof y, "|yarn %.17g", yarn_factor());
+        fp << y;
+        for (const char* v : {"FLASH_NGRAM", "FLASH_ROUTE", "FLASH_ROUTER8"})
+            if (const char* x = env_str(v)) fp << "|" << v << "=" << x;
+        for (int r = 0; r < ng; r++) {
+            std::vector<Worker::Piece> a, b, c;
+            W[r]->kv_pieces_at(0, 0, period, a);
+            W[r]->state_pieces_of(0, false, b);
+            W[r]->state_pieces_of(0, true, c);
+            fp << "|" << bytes_of(a) << "," << bytes_of(b) << "," << bytes_of(c);
+        }
+        return fp.str();
+    }
+    // a file passed its header: are its pieces exactly what this engine would copy? (xfer stops the process on a mismatch)
+    bool dk_fits(const kvd::Meta& m) {
+        if (m.ng != ng) return false;
+        for (auto& b : m.blobs)
+            for (int r = 0; r < ng; r++) {
+                std::vector<Worker::Piece> ps;
+                if (b.kind == kvd::KV_SEG) W[r]->kv_pieces_at(0, b.a, b.b, ps);
+                else W[r]->state_pieces_of(0, b.pend != 0, ps);
+                if (bytes_of(ps) != b.size[r]) return false;
+            }
+        return true;
+    }
+    // At the end of the start (after the calibration, which drives the engine through the C API). Never stops the start
+    void dk_init(const std::string& model) {
+        const char* dir = env_str("FLASH_DISK_CACHE");
+        if (!dir || !*dir) return;
+        auto off = [&](const std::string& why) {
+            fprintf(stderr, "[qflash] WARNING: disk cache off for this run: %s. Conversations do not survive a restart; everything else works as usual\n", why.c_str());
+        };
+        if (!budget) return off("it needs the host archive (FLASH_KV_ARCHIVE_GB or the host-RAM plan gave it 0)");
+        dk_dir = dir;
+        for (size_t i = 1; i <= dk_dir.size(); i++)  // (mkdir -p; an error shows at the lock file)
+            if (i == dk_dir.size() || dk_dir[i] == '/') mkdir(dk_dir.substr(0, i).c_str(), 0755);
+        dk_lock = open((dk_dir + "/.qfk.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (dk_lock < 0) return off(dk_dir + " is not writable: " + strerror(errno));
+        if (flock(dk_lock, LOCK_EX | LOCK_NB) != 0) return off(dk_dir + " is in use by another server");
+        dk_budget = (uint64_t)(std::max(0.0, env_double("FLASH_DISK_CACHE_GB", 200.0)) * (1ull << 30));
+        dk_reserve = (uint64_t)(std::max(0.0, env_double("FLASH_DISK_RESERVE_GB", 1.0)) * (1ull << 30));
+        dk_min = env_int("FLASH_DISK_MIN_TOKENS", dk_min);
+        dk_min_ms = env_double("FLASH_DISK_MIN_S", dk_min_ms / 1000.0) * 1000.0;
+        dk_load_ms = env_double("FLASH_DISK_LOAD_S", dk_load_ms / 1000.0) * 1000.0;
+        dk_fp = dk_fingerprint(model);
+        int other = 0, bad = 0, unfit = 0;
+        if (DIR* d = opendir(dk_dir.c_str())) {
+            while (dirent* de = readdir(d)) {
+                const std::string nm = de->d_name, path = dk_dir + "/" + nm;
+                auto ends = [&](const char* x) { const size_t k = strlen(x); return nm.size() > k && nm.compare(nm.size() - k, k, x) == 0; };
+                if (ends(".qfk.part")) { unlink(path.c_str()); continue; }
+                if (!ends(".qfk")) continue;
+                DkEnt en;
+                en.path = path;
+                const char* why = "";
+                const kvd::Read v = kvd::read_header(path, dk_fp, en.m, &why);
+                if (v == kvd::RD_NOT_OURS) continue;
+                if (v == kvd::RD_BAD) {
+                    fprintf(stderr, "[qflash] disk cache: refused and removed %s: %s\n", path.c_str(), why);
+                    unlink(path.c_str());
+                    bad++;
+                    continue;
+                }
+                struct stat st;
+                if (stat(path.c_str(), &st) != 0) continue;
+                en.bytes = (uint64_t)st.st_size;
+                en.last_s = (double)st.st_mtime;
+                en.own = v == kvd::RD_OK && (int)en.m.toks.size() <= ctx && dk_fits(en.m);
+                if (v == kvd::RD_OTHER) other++;
+                else if (!en.own) unfit++;
+                if (!en.own) en.m = kvd::Meta{};
+                dk_used += en.bytes;
+                dk_idx.push_back(std::move(en));
+            }
+            closedir(d);
+        }
+        dk_room(0);
+        dk_count();
+        std::signal(SIGXFSZ, SIG_IGN);  // (a file size limit is a failed write, not the end of the server)
+        try {
+            dk = std::make_unique<kvd::Writer>();
+        } catch (const std::exception& ex) {
+            return off(ex.what());
+        }
+        fprintf(stderr, "[qflash] disk cache %s: %d conversations, %.2f GB (budget %.0f GB); refused: %d of another build, model or layout (kept, removed when room is needed), "
+                        "%d that do not fit this configuration, %d damaged (removed)\n",
+                dk_dir.c_str(), dk_n.load(), dk_b.load() / 1e9, dk_budget / (double)(1ull << 30), other, unfit, bad);
     }
     // best cached start for ids[0, n): conversation, positions reused, state to load (null: the live end of a slot)
     // best cached start for ids[0, n): conversation, positions reused, state to load (null: the live end of a slot);
@@ -1816,6 +2317,8 @@ static void ppb_submit(FE* e, FE::Pf& pf) {
     j->slot = pf.slot;
     j->base = e->sl[pf.slot].base;
     j->ids = pf.ids;
+    j->dev = pf.dev;
+    j->r3 = pf.r3;
     j->i0 = pf.i;
     j->n = pf.n;
     j->mtp = e->k > 0;
@@ -2284,6 +2787,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         e->comm = comm_create(e->ng, ARU_MAX * H, H);
         comm_enable_p2p(e->comm, e->devs.data());
         e->comm.dcal_want = true;  // decode collectives: timed on real decode steps at the end of qe_create (decode_calibrate)
+        e->comm.pp_stages = par == flash_pp::Par::PP;  // (log text; auto picks below and says so there)
         comm_select_path(e->comm, e->devs.data(), "FLASH_COMM", true);  // probe + prefill transfer path (before the workers)
     }
     {  // the host -> card link (expert staging): sizes the prefill batches on slow links (flash.h probe_host_link)
@@ -2364,9 +2868,11 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                               po.pp_req[i], po.pp_agg[i]);
         }
         static const char* const kPath[3] = {"P2P", "copy engine", "host-staged"};
-        fprintf(stderr, "[qflash] parallel mode: %s (%s); probe: %d cards, peer access %s, TP exchanges %s (+%.3f ms/token, +%.1f ms/step), "
-                "host link %.1f GB/s%s\n", flash_pp::par_name(par), why.c_str(), e->ng, in.p2p ? "yes" : "no",
-                kPath[std::clamp(in.tp_path, 0, 2)], po.x_ms_tok, po.x_ms_step, in.h2d / 1e9, est);
+        fprintf(stderr, "[qflash] parallel mode: %s (%s); probe: %d cards, peer access %s, TP exchanges %s%s (+%.3f ms/token, +%.1f ms/step), "
+                "host link %.1f GB/s%s\n", flash_pp::par_name(par), why.c_str(), e->ng, pptp ? "per group" : in.p2p ? "yes" : "no",  // (PP x TP: no card-wide probe, the stage lines below say)
+                par == flash_pp::Par::PP && !pptp ? "(not used in this mode) would be " : "", pptp ? "per group" : kPath[std::clamp(in.tp_path, 0, 2)], po.x_ms_tok, po.x_ms_step, in.h2d / 1e9, est);
+        if (par == flash_pp::Par::PP && !forced && e->ng <= 3)  // (auto: the [comm] lines above were printed before this pick)
+            fprintf(stderr, "[comm] the prefill transfers above are the TP path: the pipeline stages have no per-layer exchanges\n");
         for (char& ch : why) if (ch == '"' || ch == '\\' || (unsigned char)ch < 0x20) ch = '\'';  // (JSON below: review server F9)
         char js[1400];
         snprintf(js, sizeof js, "{\"mode\": \"%s\", \"forced\": %s, \"why\": \"%s\", \"cards\": %d, \"peer_access\": %s, \"tp_exchange_path\": \"%s\", "
@@ -2605,6 +3111,8 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         }
         for (int r = 0; r < e->ng; r++) e->W[r]->set_steer(nv, lo.data(), hi.data(), w.data());
         e->steer_json = steer_info_json(e->steer, e->steer_def);
+        if (const char* dc = env_str("FLASH_DISK_CACHE"); dc && *dc)  // (before the weights go: the disk cache's identity of a vector)
+            for (auto& x : e->steer) e->steer_hash.push_back(kvd::hash_bytes(x.w.data(), x.w.size() * sizeof(float)));
         for (auto& x : e->steer) x.w.clear();
         fprintf(stderr, "steering: %d vector(s), default %s\n", nv, e->steer_def >= 0 ? e->steer[e->steer_def].name.c_str() : "off");
     } else {
@@ -2796,14 +3304,15 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         }
     }
     if (e->comm.dcal && (e->ppb || !e->comm.p2p)) {  // mode B: the stages have their own 1-card comms (review L4)
-        fprintf(stderr, "[comm] decode collectives: no calibration (%s), P2P SM stores\n",
-                e->ppb ? "pipeline mode B: its stages do not use the TP collectives" : "no peer access");
+        if (e->ppb) fprintf(stderr, "[comm] decode collectives: none across cards, no calibration (pipeline mode B: its stages do not use the TP collectives)\n");
+        else fprintf(stderr, "[comm] decode collectives: no calibration (%s), P2P SM stores\n", "no peer access");
         comm_free_decode_host(e->comm);
         e->comm.dcal = false;
     }
     if (e->comm.dcal)  // (expert split, context and slots in the cache key: they change the decode step)
         decode_calibrate(e, model_dir, std::string("split ") + (split_s ? split_s : "") + " ctx " + std::to_string(e->ctx) +
                                            " slots " + std::to_string(e->sl.size()));
+    e->dk_init(model);
     fprintf(stderr, "[qflash %.0fs] ready, context %d\n", secs(), e->ctx);
     for (Worker* w : e->W) w->set_serving();  // (the whole load done: the VRAM-pressure check and serving-time reclaims start)
     if (e->pph)
@@ -2814,6 +3323,11 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
 void qe_destroy(void* p) {
     FE* e = (FE*)p;
     if (!e) return;
+    if (e->dk_load) {  // (its blobs and fd belong to the read thread until it ends)
+        e->dk_load->th.join();
+        e->dk_load.reset();
+    }
+    e->dk.reset();  // the queued files are written first
     e->drain();
     e->pp_drop();
     for (auto& x : e->pfs) e->ppb_quiesce(x.slot, true);
@@ -2880,7 +3394,7 @@ void qe_set_no_lookup(void* p, int slot, int off) {
 }
 
 // qe_start_begin refusals (the server requeues NO_ROOM / BUSY while sequences run, fails the others at once)
-enum { QE_START_NO_ROOM = -1, QE_START_BAD_INPUT = -2, QE_START_TOO_LONG = -3, QE_START_BUSY = -4 };
+enum { QE_START_NO_ROOM = -1, QE_START_BAD_INPUT = -2, QE_START_TOO_LONG = -3, QE_START_BUSY = -4, QE_START_DISK = -5 };
 // the first id that would read past the embedding table (outside [0, VOCAB); image rows >= kImgToken allowed when
 // img), else -1
 static int check_ids(const int* ids, int n, bool img = true) {
@@ -2930,8 +3444,8 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     }
     int img_cnt = 0;
     for (int i = 0; i < n; i++) img_cnt += ids[i] >= kImgToken;
-    if (img_cnt && e->ppb) {
-        fprintf(stderr, "[qflash] start: image prompts are not supported with FLASH_PAR=pp (pipeline stages); run with FLASH_PAR=tp\n");
+    if (img_cnt && e->ppb && e->ppb->nstage() != e->ng) {
+        fprintf(stderr, "[qflash] start: image prompts are not supported with FLASH_PAR=pptp; run with FLASH_PAR=tp or pp\n");
         return QE_START_BAD_INPUT;
     }
     if (img_cnt != img_rows || (img_cnt && (!img || !rope3))) {
@@ -2939,6 +3453,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
                 img_cnt && !rope3 ? ", no positions" : "");
         return QE_START_BAD_INPUT;
     }
+    if (e->dk && e->dk_prepare(ids, n)) return QE_START_DISK;  // (a conversation being read back: nothing changed here)
     e->drain();
     e->no_ahead = false;
     const long long sk = e->steer_key();  // qe_set_steering before the start (the server sets it for every request)
@@ -3149,6 +3664,9 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         for (auto& x : e->pfs)
             if (x.img_n) base = std::max(base, x.img0 + x.img_n);
         if ((size_t)(base + img_cnt) > e->img_cap) {
+            // (mode B: the micro-batches of other prompts in the stage queues read the old table until it is replaced)
+            if (e->ppb)
+                for (auto& x : e->pfs) e->ppb_quiesce(x.slot, false);
             const size_t cap = std::max<size_t>(base + img_cnt, 2 * e->img_cap);
             bf16* t = nullptr;
             CUDA_CHECK(cudaSetDevice(e->devs[0]));
@@ -4486,6 +5004,7 @@ void qe_mem_guard(void* p) {  // (also the idle reclaim: the next request decode
     FE* e = (FE*)p;
     e->mem_guard();
     if (!e->ppb) e->reclaim_idle();
+    if (e->dk) e->dk_reap();
 }
 int qe_archive_more(void* p, long long budget) {
     FE* e = (FE*)p;
@@ -4514,8 +5033,17 @@ int qe_archive_more(void* p, long long budget) {
     }
     return 1;
 }
-void qe_persist(void* p) {  // no disk cache: archive the idle resident sequences
+// archive the idle resident sequences; with the disk cache queue their files, without waiting for the disk: a request arriving
+// during an idle save starts at once. qe_disk_flush waits (shutdown)
+void qe_persist(void* p) {
     while (!qe_archive_more(p, 1LL << 40)) {}
+    FE* e = (FE*)p;
+    if (e->dk) e->dk_persist();
+}
+// until the queued files are written, at most `seconds`; 1: all done (or no disk cache), 0: the time ran out. Any thread
+int qe_disk_flush(void* p, double seconds) {
+    FE* e = (FE*)p;
+    return !e->dk || e->dk->wait(seconds) ? 1 : 0;
 }
 int qe_num_archives(void* p) {
     FE* e = (FE*)p;
@@ -4523,7 +5051,7 @@ int qe_num_archives(void* p) {
     for (auto& v : e->convs) c += v.end || !v.ck.empty();
     return c;
 }
-int qe_num_disk_archives(void*) { return 0; }
+int qe_num_disk_archives(void* p) { return ((FE*)p)->dk_n.load(); }
 
 // ---- monitor tier
 void qe_slot_info(void* p, int i, long long* out) {
@@ -4541,8 +5069,8 @@ void qe_archive_info(void* p, double* out) {
     FE* e = (FE*)p;
     out[0] = qe_num_archives(p);
     out[1] = (double)e->hpool.used();
-    out[2] = 0;
-    out[3] = 0;
+    out[2] = e->dk_n.load();
+    out[3] = (double)e->dk_b.load();
     out[4] = (double)e->hpool.pinned();
     out[5] = (double)std::min(e->hpool.used(), e->hpool.pinned());
 }

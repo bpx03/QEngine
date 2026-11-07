@@ -121,10 +121,14 @@ add_dependencies(qflash qe_build_id)
 
 # CPU unit tests of the comm rules and the exchange flag protocol (no GPU): ctest
 enable_testing()
-foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit)
+foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit kv_disk_unit)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cpp)  # the Docker build stage has no tests/
     add_executable(${t} tests/${t}.cpp)
     target_include_directories(${t} PRIVATE src)
     add_test(NAME ${t} COMMAND ${t})
+    if(t STREQUAL kv_disk_unit)
+      find_package(Threads REQUIRED)
+      target_link_libraries(${t} PRIVATE Threads::Threads)
+    endif()
   endif()
 endforeach()

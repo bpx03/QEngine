@@ -7,10 +7,13 @@ given), the missing ones are fetched from the latest release into ~/.cache/qengi
 qengine-cache), checked against the release's SHA256SUMS, renamed into place atomically and handed to the engine
 through QE_MTP_FILE / QE_TOKEN_RANK_FILE. The model dir is never written (Docker mounts it read-only). Valid cached
 files are reused without network. Any failure only logs a warning: the engine starts with the stock head.
+INT8 checkpoints (quantization_config num_bits 8) keep their own MTP head: the fine-tuned one is neither fetched nor
+set unless QE_INT8_MTP_FT=1 (use_mtp_ft).
 QE_FETCH_ASSETS=0 turns the download off; QE_ASSETS_URL / QE_ASSETS_DIR override the source / cache dir.
 Dependency-free (urllib, hashlib).
 """
 import hashlib
+import json
 import os
 import urllib.request
 
@@ -25,6 +28,89 @@ TIMEOUT = 30  # seconds per socket operation (connect / each read), not for the 
 
 def _log(msg):
     print(f"[server] assets: {msg}", flush=True)
+
+
+def weight_bits(model_dir):
+    """Bits of the checkpoint's quantized layer weights (compressed-tensors quantization_config), None if unknown."""
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            q = json.load(f).get("quantization_config") or {}
+        bits = [g.get("weights", {}).get("num_bits") for g in (q.get("config_groups") or {}).values()]
+        bits = [b for b in bits if isinstance(b, int)]
+        return max(bits) if bits else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def use_mtp_ft(model_dir):
+    """Whether the fine-tuned MTP head (model_mtp_ft.safetensors) applies to this checkpoint. It was tuned on the
+    hidden states of the INT4 model; an INT8 checkpoint runs its own (stock BF16) head
+    unless QE_INT8_MTP_FT=1. An explicit --mtp-file / QE_MTP_FILE always wins (callers check it first)."""
+    if weight_bits(model_dir) == 8 and env_int("QE_INT8_MTP_FT", 0) == 0:
+        return False
+    return True
+
+
+def _refuse_format(what):
+    return (f"{what}. The 27B engine reads one model.safetensors in the compressed-tensors pack-quantized layout: INT4 or "
+            "symmetric INT8, group 128, weight_packed int32 [N][K/8] or [N][K/4] with the stored value w + offset, "
+            "weight_scale bf16 [N][K/128]. tools/quant_int8.py builds an INT8 one from the BF16 weights.")
+
+
+def check_27b_format(model_dir, env=None):
+    """Header check of a 27B checkpoint before the engine maps it: what the loader would misread stops the start here.
+    Returns the reason (None: fine). A checkpoint without FP8 KV scales runs with a bf16 KV cache: the position split of
+    the KV heads needs FP8, so this also sets QE_KV_FP8=0 for it."""
+    env = os.environ if env is None else env
+    path = os.path.join(model_dir, "model.safetensors")
+    if not os.path.exists(path):
+        if any(f.endswith(".safetensors") and f.startswith("model-") or f == "model.safetensors.index.json"
+               for f in os.listdir(model_dir)):
+            return _refuse_format(f"{model_dir}: sharded checkpoint, no model.safetensors")
+        return None  # (no weights at all: the engine's own error; tokenizer-only directories of the mock tests)
+    try:
+        with open(path, "rb") as f:
+            n = int.from_bytes(f.read(8), "little")
+            if n > os.path.getsize(path) - 8:
+                return None  # (not a safetensors file: the engine says so)
+            h = json.loads(f.read(n))
+            data = 8 + n
+            q8 = None
+            for k, p in h.items():
+                if not k.endswith(".weight_packed"):
+                    continue
+                b = k[: -len(".weight_packed")]
+                if b + ".weight_zero_point" in h:
+                    return _refuse_format(f"{b}: asymmetric weights (weight_zero_point)")
+                s, sh = h.get(b + ".weight_scale"), h.get(b + ".weight_shape")
+                if p["dtype"] != "I32" or len(p["shape"]) != 2:
+                    return _refuse_format(f"{b}: weight_packed is {p['dtype']} {p['shape']}")
+                if not s or s["dtype"] != "BF16" or len(s["shape"]) != 2:
+                    return _refuse_format(f"{b}: weight_scale is {s and (s['dtype'], s['shape'])}")
+                K = s["shape"][1] * 128
+                if sh and sh["dtype"] == "I64":
+                    f.seek(data + sh["data_offsets"][0])
+                    Kt = int.from_bytes(f.read(16)[8:], "little")
+                    if Kt != K:
+                        return _refuse_format(f"{b}: group size {Kt / s['shape'][1]:g}, not 128")
+                if p["shape"][1] * 32 not in (K * 4, K * 8):
+                    return _refuse_format(f"{b}: packed width {p['shape'][1]} for {K} columns")
+                if p["shape"][1] * 32 == K * 8 and q8 is None:
+                    q8 = p
+            if q8:  # stored value w + 128: most bytes sit around 128 (raw two's complement would sit around 0 / 255)
+                f.seek(data + q8["data_offsets"][0])
+                u = f.read(65536)
+                if sum(64 <= c < 192 for c in u) * 2 < len(u):
+                    return _refuse_format("INT8 weights are not stored as w + 128 (signed bytes?)")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as ex:
+        _log(f"format check skipped: {ex}")
+        return None
+    if (not any(k.endswith("k_scale") for k in h) and not (env.get("QE_KV_SCALES") or "").strip()
+            and not (env.get("QE_KV_FP8") or "").strip()):
+        env["QE_KV_FP8"] = "0"
+        _log("no FP8 KV scales in the checkpoint: bf16 KV cache, half the context pool, no KV position split "
+             "(QE_KV_SCALES=<a 27B INT4 model.safetensors> uses its scales)")
+    return None
 
 
 def _sha256(path):
@@ -92,7 +178,12 @@ def ensure(model_dir, env=None, cache=None, base=None, timeout=TIMEOUT):
     for the ones taken from the cache. Returns {file: path used} for the cached / downloaded ones."""
     env = os.environ if env is None else env
     want = []
-    if not os.path.exists(os.path.join(model_dir, MTP_FT)) and not (env.get("QE_MTP_FILE") or "").strip():
+    ft_on = use_mtp_ft(model_dir)
+    if not ft_on and not (env.get("QE_MTP_FILE") or "").strip():
+        _log("INT8 checkpoint: the checkpoint's own MTP head (the fine-tuned head was trained on INT4 hidden states; "
+             "QE_INT8_MTP_FT=1 uses it)")
+    if (ft_on and not os.path.exists(os.path.join(model_dir, MTP_FT))
+            and not (env.get("QE_MTP_FILE") or "").strip()):
         want.append((MTP_FT, "QE_MTP_FILE"))
     if not os.path.exists(os.path.join(model_dir, TOKEN_RANK)) and not (env.get("QE_TOKEN_RANK_FILE") or "").strip():
         want.append((TOKEN_RANK, "QE_TOKEN_RANK_FILE"))
