@@ -22,9 +22,11 @@ COPY CMakeLists.txt ./
 COPY src ./src
 # same flags as the main image (sm_86, Release, distro GCC 13); only the Flash targets, no libqengine
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DQE_BUILD_FLASH_INT8_TESTS=OFF \
-    && cmake --build build --target qflash flash_run -j 3 \
-    && nm -D --defined-only build/libqflash.so | awk '{print $NF}' \
-         | grep -E '^qe_' && echo 'libqflash must not export libqengine symbols' && exit 1 || :
+    && cmake --build build --target qflash flash_run -j 3
+# libqflash ships the Flash engine only: exporting a libqengine qe_* symbol would mean the two
+# engines got linked together and the server could load the wrong one through the same handle
+RUN test -f build/libqflash.so -a -f build/flash_run \
+    && ! nm -D --defined-only build/libqflash.so | awk '{print $NF}' | grep -qE '^qe_'
 
 FROM ${BASE_RUNTIME} AS runtime
 COPY --from=build /src/build/libqflash.so /app/build/libqflash.so
