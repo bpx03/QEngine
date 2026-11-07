@@ -229,7 +229,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     comm_ = comm_create(devices.size(), kChunk * cfg_.hidden, cfg_.hidden);
     devs_ = devices;
     if (comm_enable_p2p(comm_, devices.data()))
-        printf("P2P: decode all-reduce GPU to GPU (peer access between all %zu GPUs)\n", devices.size());
+        printf("P2P: peer access between all %zu GPUs (the paths: [comm] prefill transfers, [comm] decode collectives)\n", devices.size());
     // startup probe + prefill transfer path (QE_COMM=auto|p2p|ce|host): the copy-engine prefill all-reduce stays the
     // default; p2p = SM-store all-reduce; host (or auto when host staging is markedly faster than both peer paths,
     // e.g. GPUs on different NUMA nodes behind slow links): no peer access, every collective through host memory
@@ -1385,6 +1385,16 @@ void Engine::constrain(int slot, bool on) {
     pool_->run([&](int r) { workers_[r]->set_constrained(slot, on); });
 }
 
+void Engine::logits_capture(int slot, bool on) {
+    pool_->run([&](int r) { workers_[r]->set_lp(slot, on); });
+}
+
+bool Engine::logits_read(int slot, int row, float* out) {
+    if (row < 0 || row > kMaxSpecK) return false;
+    for (auto& w : workers_) w->lp_read(slot, row, out);
+    return true;
+}
+
 void Engine::use_slot(int i) {
     lk_slot_ = -1;  // the device lookup history is the current sequence's
     cur_ = i;
@@ -2343,6 +2353,7 @@ void Engine::disk_init() {
     // v3: archives written before the KV-pool compaction fix (23781c9) may hold overwritten rows
     fp << "v3|" << (realpath(model_dir_.c_str(), rp) ? rp : model_dir_.c_str());
     if (env_str("QE_MTP_FILE")) fp << "|mtp:" << env_str("QE_MTP_FILE");
+    if (env_str("QE_KV_SCALES")) fp << "|kvs:" << env_str("QE_KV_SCALES");  // FP8 KV scales from a side file
     for (const char* f : {"/model.safetensors", "/model_mtp.safetensors"}) {
         struct stat stt;
         if (stat((model_dir_ + f).c_str(), &stt) == 0) fp << "|" << stt.st_size << ":" << stt.st_mtime;

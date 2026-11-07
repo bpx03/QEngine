@@ -687,6 +687,8 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     const bool con0 = con_;
     con_ = nseg == 1 && p_.last() && slots[0] < (int)con_slot_.size() && con_slot_[slots[0]] != 0;
     CHECK(!con_ || k + 1 <= MASK_ROWS, "flash batch: a constrained step of %d rows (mask rows %d)", k + 1, MASK_ROWS);
+    float* const lp0 = lp_h_;
+    lp_h_ = con_ ? lp_of(slots[0]) : nullptr;
     // per-slot sampling: the bound slot's live parameters (counter) back to its row first, reloaded after the step
     bsamp_ = false;
     for (int i = 0; i < nseg; i++) bsamp_ |= sson_.at(slots[i]) != 0;
@@ -699,7 +701,9 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     // allocations); an instantiate OOM drops every cached graph and retries, else the step runs eagerly
     static const bool graphs = env_int("FLASH_GRAPH", 1);
     auto it = bgraphs_.find(key);
-    if (!graphs || dump_ || env_str("FLASH_BDUMP") || it == bgraphs_.end()) {
+    if (lp_on()) {  // logprobs: eager (the copy's host buffer is per slot, this graph is not)
+        batch_body(nseg, k);
+    } else if (!graphs || dump_ || env_str("FLASH_BDUMP") || it == bgraphs_.end()) {
         if (graphs) bgraphs_[key] = nullptr;
         batch_body(nseg, k);
     } else {
@@ -730,6 +734,7 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     pp_skip_out_ = false;
     if (bsamp_) CUDA_CHECK(cudaMemcpyAsync(sp_, spslot_ + cur_slot_, sizeof(SampleParams), cudaMemcpyDeviceToDevice, st_));
     con_ = con0;
+    lp_h_ = lp0;
     CUDA_CHECK(cudaEventRecord(ev1_, st_));
 }
 

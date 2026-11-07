@@ -21,6 +21,10 @@ struct W4 {
     // GLU layout (MLP gate_up): each 16-row tile holds 8 gate rows then the 8 matching up rows,
     // and the output is act[t][i] = bf16(silu(gate_i) * up_i) with n / 2 columns.
     bool glu = false;
+    // 8: the Q8 layout of an INT8 checkpoint (q8_layout.h; q holds n * k bytes, s as for INT4). Every launcher that
+    // takes a W4 dispatches on it: the H16 / bf16 decode GEMV and the prefill GEMM have Q8 kernels, the INT4-only
+    // fast paths (skinny, wide gemv_w4hx, early GEMV, W4A8 prequantization) decline Q8 matrices.
+    int bits = 4;
 };
 struct W16 {
     const uint4* w = nullptr;
@@ -134,6 +138,8 @@ bool gemm_i8_prequant_out(const bf16* x, int t, int k, int row0, int8_t** xq, fl
 // W4A8 kernel variant (QE_PREFILL_INT8_KERNEL): 1 = gemm_i8t_kernel (compact scale records
 // {sx0, C0, sx1, C1}), 0 = gemm_i8_kernel of master ({sx, -M sx} pairs)
 int gemm_i8_variant();
+// INT8 checkpoint loaded (Q8 layer matrices): disables the producers' W4A8 prequantization (gemm_i8_prequant*)
+void gemm_q8_model(bool on);
 
 // Pull the first `bytes` of a weight matrix into L2 (evict_last) - run on a side stream while an
 // all-reduce leaves DRAM idle, so the next GEMV starts from L2.
@@ -148,16 +154,21 @@ void repack_w4(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst
 void quantize_w4_rtn(const bf16* src, int n, int k, int32_t* dst_q, bf16* dst_s, cudaStream_t st);
 // Reorder rows [gate 0..I) [up 0..I) of a compressed-tensors int4 matrix (+ scales) into the
 // GLU tile order (8 gate rows, 8 up rows, ...), in place via the scratch copies.
+// bits: 4 (int32 [N][K/8]) or 8 (int32 [N][K/4])
 void glu_interleave_rows(const int32_t* src_q, const bf16* src_s, int n, int k, int32_t* dst_q,
-                         bf16* dst_s, cudaStream_t st);
+                         bf16* dst_s, cudaStream_t st, int bits = 4);
+// Repack a row-major compressed-tensors INT8 matrix (pack-quantized 8-bit: int32 [N][K/4], bytes LSB-first,
+// stored value u = w + 128) plus bf16 scales [N][K/128] into the Q8 layout (q8_layout.h).
+void repack_q8(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st);
 // Repack a row-major bf16 matrix [N][K] into the W16 layout.
 void repack_w16(const bf16* src, int n, int k, uint4* dst, cudaStream_t st);
 
 inline size_t w4_qbytes(int n, int k) { return (size_t)n * k / 2; }
 inline size_t w4_sbytes(int n, int k) { return (size_t)n * (k / 128) * sizeof(bf16); }
 inline size_t w16_bytes(int n, int k) { return (size_t)n * k * sizeof(bf16); }
+inline size_t wq_bytes(const W4& w) { return w.bits == 8 ? (size_t)w.n * w.k : w4_qbytes(w.n, w.k); }
 inline void prefetch_l2(const W4& w, size_t cap, cudaStream_t st) {
-    prefetch_l2(w.q, std::min(cap, w4_qbytes(w.n, w.k)), st);
+    prefetch_l2(w.q, std::min(cap, wq_bytes(w)), st);
 }
 
 // A linear layer stored as INT4, INT8 (decode-only) or BF16.

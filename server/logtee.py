@@ -43,6 +43,13 @@ def install(path, max_mb=64, keep=3, header=""):
     os.dup2(w, 2)
     os.close(w)
     os.close(out)
+    reattach(header)
+    return child.pid
+
+
+def reattach(header=""):
+    """The process side of a tee: line buffering, crash stacks, the header. Alone after the engine's restart in the same
+    process (exec keeps fd 1 / fd 2 on the running tee's pipe, a second tee would write every line twice)."""
     # the C stdio stdout is fully buffered on a pipe: line-buffered, so an abort() loses at most a partial line
     try:
         libc = ctypes.CDLL(None)
@@ -56,7 +63,6 @@ def install(path, max_mb=64, keep=3, header=""):
     faulthandler.enable(all_threads=True)  # SIGSEGV / SIGABRT / SIGBUS: Python stacks of every thread
     if header:
         print(header, flush=True)
-    return child.pid
 
 
 # ----------------------------------------------------------------------------- the tee process

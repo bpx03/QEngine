@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(ROOT, "server"))
 from engine import Engine
 from tokenizers import Tokenizer
 
-MODEL = os.path.join(ROOT, "models", "Qwen3.8-27B-INT4")
+MODEL = os.environ.get("QE_MODEL", os.path.join(ROOT, "models", "Qwen3.8-27B-INT4"))
 tok = Tokenizer.from_file(os.path.join(MODEL, "tokenizer.json"))
 text = open(os.path.join(ROOT, "tests", "data", "cache_text.txt")).read()
 N = int(os.environ.get("POOL_GEN", "1200"))

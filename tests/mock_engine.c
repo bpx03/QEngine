@@ -23,7 +23,7 @@ typedef struct {
 #ifdef MOCK_GRAMMAR
     unsigned* mask;
     int io[32];
-    int con, ncon;
+    int con, ncon, stepc;
 #endif
 } Mock;
 
@@ -89,6 +89,9 @@ int qe_start3(void* e, const int* ids, int n, int k, unsigned long long affinity
     m->cur = m->next++ % m->nrep;
     m->rpos = 1;
     push(m, m->replies[m->cur][0]);
+#ifdef MOCK_GRAMMAR
+    m->stepc = 1;
+#endif
     return m->replies[m->cur][0];
 }
 #ifdef MOCK_GRAMMAR
@@ -120,6 +123,7 @@ static int con_step(Mock* m, int* out) {
     }
     m->io[0] = 0;
     m->ncon++;
+    m->stepc = c;
     if (m->limit > 0) m->limit -= c;
     return c;
 }
@@ -184,4 +188,23 @@ void qe_constrain(void* e, int slot, int on) {
     if (m->log) fprintf(m->log, "K %d\n", on), fflush(m->log);
 }
 int qe_constrained(void* e, int slot) { (void)slot; return ((Mock*)e)->con; }
+// logprobs: raw logits of a row, fixed pattern around the token the row emitted (tests/test_server_mock.py check_logprobs)
+void qe_logits_capture(void* e, int slot, int on) {
+    Mock* m = e;
+    (void)slot;
+    if (m->log) fprintf(m->log, "L %d\n", on), fflush(m->log);
+}
+int qe_logits_read(void* e, int slot, int row, float* out) {
+    Mock* m = e;
+    (void)slot;
+    if (row < 0 || row >= m->stepc) return 0;
+    const int t = m->seq[m->nseq - m->stepc + row];
+    for (int i = 0; i < 248320; i++) out[i] = -50.f;
+    for (int i = 0; i < 30; i++) out[(t + i) % 248320] = 3.f - 0.5f * i;
+    const char* lp = getenv("QE_MOCK_LP");  // nan: one NaN logit; allnan: no finite logit; norow: the read fails
+    if (lp && !strcmp(lp, "norow")) return 0;
+    if (lp && !strcmp(lp, "nan")) out[(t + 40) % 248320] = 0.f / 0.f;
+    if (lp && !strcmp(lp, "allnan")) for (int i = 0; i < 248320; i++) out[i] = 0.f / 0.f;
+    return 248320;
+}
 #endif

@@ -901,6 +901,7 @@ void gemv_x_init() {
 // TR (warps = tiles per block, QE_W4HX_TR) and S (stages, QE_W4HX_S): experiments; defaults measured
 bool gemv_w4hx(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, cudaStream_t st, __half* yh,
                int ldyh) {
+    if (w.bits != 4) return false;  // INT4 only (Q8 rows go through gemv_w4h's Q8 kernels)
     int dev;
     CUDA_CHECK(cudaGetDevice(&dev));
     if (!g_red[dev] || m < 9 || m > 64 || w.n % 16 || w.k % 128 || ldx % 64) return false;

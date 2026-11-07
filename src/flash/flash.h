@@ -431,6 +431,10 @@ public:
     // grammar-constrained decoding: the bound slot verifies kv caller drafts (upload_drafts) with a mask per row
     // (upload_mask: [rows][MASK_WORDS] bits, row j = allowed after the pending token and drafts 1..j) and drafts kd
     void set_constrained(int slot, bool on);
+    // logprobs (constrained slots): the target head's raw logits of every step of the slot go to a per-slot host buffer,
+    // before the mask; lp_read: row of the slot's last step into out[token] (head ranks; the others do nothing)
+    void set_lp(int slot, bool on);
+    void lp_read(int slot, int row, float* out);
     bool constrained() const { return con_; }
     void upload_mask(const unsigned* host, int rows);
     void upload_drafts(const int* d, int n);
@@ -688,6 +692,16 @@ private:
     unsigned* mask_d_ = nullptr;       // constrained: masks of the bound slot's step (device)
     bool con_ = false;                 // the bound slot is grammar-constrained
     std::vector<char> con_slot_;
+    std::vector<float*> lp_host_;      // logprobs: per slot, pinned [MASK_ROWS][vocab slice]; kept once allocated
+    std::vector<char> lp_slot_;
+    std::vector<int> lp_map_;          // this card's row -> token
+    float* lp_h_ = nullptr;            // the bound slot's (a constrained batch of one: that slot's) buffer, null: off
+    float* lp_of(int s) const { return lp_slot_.empty() || !lp_slot_[s] ? nullptr : lp_host_[s]; }
+    void lp_copy(int m) {              // (stream order: after this head's gemv, before its mask; lp_on(): never in a graph)
+        if (lp_h_) CUDA_CHECK(cudaMemcpyAsync(lp_h_, logits_, (size_t)std::min(m, (int)MASK_ROWS) * (p_.voc1 - p_.voc0) * 4,
+                                              cudaMemcpyDeviceToHost, st_));
+    }
+    bool lp_on() const { return con_ && lp_h_; }
     std::map<long long, cudaGraphExec_t> cgraph_;  // constrained step graphs (sampling, selection, kv, kd)
     SampleParams* spslot_ = nullptr;  // per slot (device): the bound slot's live copy is sp_
     std::vector<char> sson_;          // per slot: sampling on (temperature > 0)

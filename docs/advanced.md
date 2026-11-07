@@ -20,6 +20,7 @@ and uses the default too. In Docker pass them with `-e`.
   - [Qwen3.8-27B](#qwen38-27b)
   - [Server: scheduling, thinking, logs](#server-scheduling-thinking-logs)
   - [Failure handling and host memory](#failure-handling-and-host-memory)
+  - [Disk cache](#disk-cache)
   - [How `FLASH_COMM=auto` / `QE_COMM=auto` choose a path](#how-flash_commauto--qe_commauto-choose-a-path)
 - [Build the Flash-Next model directory yourself](#build-the-flash-next-model-directory-yourself)
 - [Activation steering](#activation-steering)
@@ -37,6 +38,7 @@ and uses the default too. In Docker pass them with `-e`.
 | `FLASH_EC_RECLAIM_FAST_S` | `2` | The idle wait used while the expert cache is short of slots (see `FLASH_EC_RECLAIM_S`). | A larger value keeps idle conversations in VRAM longer under pressure. |
 | `FLASH_EC_RECLAIM_MAIN_S` | `30` | The idle wait for the active main agent thread, used only under the pressure described for `FLASH_EC_RECLAIM_S`, and only when its own region frees at least 1/16 of the pool. Its next turn is restored from host memory. | `0` keeps an active main thread in VRAM until a request needs the room. |
 | `FLASH_MAIN_STALE_S` | `300` | A conversation holding a main agent thread's turn counts as an active main for this many seconds after its last use. One order frees memory everywhere (archive room, host RAM, VRAM slots, idle reclaim): least recently used whole conversation first, active mains after all the others. This is an order, not a guarantee: an active main goes when nothing else is left, and the loss is logged with its tokens and bytes. An idle main never makes a request wait: it moves to the archive, or is lost with a log line if nothing fits. A generating conversation never leaves VRAM; its archive copy may be dropped, since its slot holds the state. | A larger value keeps old sessions' main threads longer. |
+| `FLASH_SLOT_LOG` | `0` | `1` logs KV cache events on stderr: each request's start (tokens reused and from where), archive writes, slot moves, evictions, pauses and resumes. | Set it to see why a conversation left VRAM or was recomputed, or to attach to a bug report. |
 | `--burst-wait` (server) | `5` | ms: on an idle server the first request waits until none has arrived for this long (at most 30 ms), so a burst of requests shares one prefill batch. | `0` starts at once. |
 | `FLASH_KV_RAM_LAZY` | `0` | With `FLASH_KV=ram`: `0` pins the whole host-RAM pool at start; `1` pins it in 443 MB slabs per card as the conversations grow (only on GPUs that can use registered host memory directly; otherwise the pool is pinned at start). | `1` if the pinned RAM should grow only with use. |
 | `FLASH_MAX_PREFILLS` | `8` | Prompts that may be in the prefill at the same time. While several are waiting, they share prefill batches (the expert weights are read once for all of them). | Rarely; lower it to limit how many requests start prefilling together. |
@@ -44,6 +46,7 @@ and uses the default too. In Docker pass them with `-e`.
 | `FLASH_PF_STAGE_XMB` | `1024` (`2048` on `FLASH_PAR=pp` stages) | Size cap (MB per card) of the ring that stages host-backed expert groups for large prefill batches. The part above 512 MB is lent to the expert cache between large prefill batches and taken back for each one. It matters on 2 cards, where about half of the expert groups live in host RAM; on 3 cards 512 MB already hold a layer. | `0` restores the fixed 512 MB ring (to rule it out while debugging); otherwise leave it. |
 | `FLASH_NGRAM` | auto | n-gram embedding table: `int8` when `ngram_int8.safetensors` exists in the model directory, else `bf16`. | Set `bf16` to force the BF16 table (needs the original shard and 102 GB of pinned RAM). |
 | `FLASH_NGRAM_PIN` | set by the host-RAM plan (`1` when the table fits) | `0`: disk mode, the INT8 n-gram table is read through the file mapping instead of being pinned; `1`: pinned even if the plan says it does not fit (see [Host memory](../README.md#host-memory-flash-next) in the README; measurements under [Disk mode](#disk-mode-for-the-n-gram-table)). | Leave unset: the start-up picks it from the RAM. |
+| `QE_NUMA` | unset | Machines with several NUMA nodes (both models): the nodes of the pinned host buffers (n-gram table, host-backed experts, staging buffers), e.g. `0,1,2,3`; several nodes interleave the pages, one prefers it. Unset: each card's node from sysfs, and when sysfs does not know it (`numa_node` -1, `GPU NUMA ID: N/A` in `nvidia-smi topo -m`, seen on Threadripper Pro boards set to several nodes) the pages are interleaved over all nodes, logged once at start. No effect on a single-node machine. | Set it to keep the buffers on chosen nodes. |
 | `FLASH_WEIGHTS_COLD` | `1` | After the load, the engine drops the page cache of the model files it no longer reads: every weight file, and the n-gram table file too when the table is pinned. In disk mode the table's file is kept, so the weights' page cache (about 70 GB, read last) no longer pushes the table out. The mappings stay valid; nothing reads them during serving. | `0` keeps the page cache (only to rule it out). |
 | `FLASH_TP_SPIN_US` | `5000` | Tensor parallel: µs a helper thread (one per card after the first) spins after its last job before it sleeps until the next one. The jobs of a decode step and consecutive steps come within this window, so serving speed is unchanged, and an idle server uses no CPU (1.3.4.2 and earlier: one core per helper). | `-1` spins all the time (the old behaviour). |
 | `FLASH_NGRAM_SPIN_MS` | `50` | Disk mode: ms the row-copy thread of each card spins after the last request; then it only polls, every 50 µs during the first second and every 1 ms after, so an idle server costs almost no CPU (1.3.4.2 and earlier: about a third of a core per card). The first decode step after a pause waits at most one poll. | `-1` spins all the time; `0` polls at every step (slower). |
@@ -94,8 +97,8 @@ How Flash-Next shares the cards; the [README](../README.md#parallel-mode-flash-n
 | `FLASH_PPB_DSHARE` | `0.5` | `pp`: the decoders' share of the time while a prompt is prefilled. |
 | `FLASH_BOX_REPORT` | on for 4+ cards and `pptp` | Logs a `[box]` report at start (build, CUDA archs, driver, per-card PCIe / NUMA / host rate, per-pair peer access and copy rate) for remote diagnosis. `1` turns it on everywhere. |
 
-In `pp`, image input is refused, steering vectors are not loaded (also when `auto` picks `pp` on 4 or more cards),
-`FLASH_KV=ram` makes a 2- or 3-card server run `tp` instead and refuses the start on 4 or more cards, activation
+In `pp`, image input works since 1.3.5.1 (experimental, lightly tested); `pptp` refuses it. `FLASH_COMM` does not apply to plain `pp`: its stages have no per-layer exchanges, and the rows hop between stages as copies, over P2P or through pinned host memory (`FLASH_PP_P2P`, shown by the `pipeline boundary` start-up line). In `pptp` it applies inside the TP groups. Steering vectors are not loaded (also when `auto` picks `pp` on 4 or more cards),
+`FLASH_KV=ram` makes a 2- or 3-card server run `tp` instead; on 4 cards `auto` runs `tp` with verified peer access and otherwise refuses the start (since 1.3.5.4; before it, refused); on 5 or more cards the start is refused, activation
 capture is refused and lookup drafts are off. Structured output and the thinking budget work; a constrained step runs
 through the stages as a batch of one.
 
@@ -372,6 +375,8 @@ the block mode, which uses the same index map without the paper's training for b
 | `QE_TOKEN_RANK_FILE` | auto | Token ranking of the MTP draft vocabulary (default: `<model dir>/token_rank.bin`, else the server's downloaded copy in `~/.cache/qengine/assets`). |
 | `QE_FETCH_ASSETS` | `1` | `0`: the server does not download missing `model_mtp_ft.safetensors` / `token_rank.bin` from the latest release (it only logs a warning). |
 | `QE_FETCH_WAIT_S` | `120` | Seconds the server start waits for the asset download; after that it starts with the stock head and the download finishes in the background for the next start. | Raise it to always start with the tuned files on a slow link; `0` = never wait. |
+| `QE_KV_SCALES` | unset | Safetensors file with `k_scale` / `v_scale` for a checkpoint without FP8 KV scales, e.g. the `model.safetensors` of the 27B INT4 checkpoint. Without them the KV cache is bf16: half the pool, no KV position split. |
+| `QE_INT8_MTP_FT` | `0` | INT8 checkpoints: `1` uses the fine-tuned MTP head (`model_mtp_ft.safetensors`, trained on INT4 outputs) instead of the checkpoint's own. An explicit `--mtp-file` always wins. |
 | `QE_DRAFT_VOCAB` | `65536` | MTP draft vocabulary size (`0` = full vocabulary). |
 | `QE_DEC_GEMM` | `33` | Batched decode passes of at least this many rows use the W4A8 GEMM instead of the GEMV (`0` = off). |
 | `QE_LOOKUP` | `1` | Lookup drafts from the token history (`0` = off). |
@@ -414,7 +419,7 @@ Pick cards that do not drive a desktop: a display takes 1-2 GB of VRAM and the K
 | `--log-file` / `QE_LOG_FILE` | `auto` | persistent log path (`''` or `0` = off) |
 | `--log-mb` / `QE_LOG_MB` | `64` | size before the log is rotated (3 old files kept) |
 | `--stats-file` | `~/.cache/qengine/stats.json` | all-time monitoring totals |
-| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | 27B persistent prompt cache, its size, and the idle seconds before live conversations are saved; steered conversations are not saved. Flash-Next has no disk cache: the flag stops the start with an error (for the start-up cache directory set `QE_DISK_CACHE`) |
+| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | persistent prompt cache (both models; Flash-Next: see [Disk cache](#disk-cache)), its size, and the idle seconds before live conversations are saved; on the 27B, steered conversations are not saved. The flag also moves the start-up cache there; `QE_DISK_CACHE` alone moves only the start-up cache |
 
 Per-request statistics lines, e.g.:
 
@@ -445,7 +450,8 @@ graphs keep the room); a fast-growing `budget_evictions` under steady traffic me
 |---|---|---|
 | `QE_HANG_S` | `180` | no scheduler progress for this long: open requests fail at once, new ones are refused, diagnostics, exit 75. Also active during a shutdown, with twice the time. A process paused for longer (`docker pause`, SIGSTOP) also exits when it resumes. `0` = off |
 | `QE_HANG_DIAG_S` | `30` | time the watchdog gives its diagnostics (stacks, `nvidia-smi`) before the exit |
-| `QE_HANG_PERSIST_S` | `3600` | watchdog limit while the 27B saves conversations to `--disk-cache` |
+| `QE_HANG_PERSIST_S` | `3600` | watchdog limit while conversations are saved to `--disk-cache` |
+| `QE_DISK_FLUSH_S` | `600` | Flash-Next `--disk-cache`: how long the exit waits for the files in the queue |
 | `QE_EXIT_HOOK_S` | `5` | on a fatal engine error, the time the server gets to send the open requests their error |
 | `FLASH_RUN_TIMEOUT_S` | `120` | Flash-Next engine step monitor; off by itself under `ncu`, `nsys`, `compute-sanitizer` or a debugger unless set; `0` = off |
 | `QE_GRAPH_RESERVE_MB` | `128` | 27B: VRAM per card kept for CUDA graphs. When another process takes all free VRAM, the engine uses it instead of stopping; `0` turns it off |
@@ -477,6 +483,39 @@ spare doesn't do this, since new writes reuse the free room inside slabs. To avo
 archive stays below what your machine can spare with your other programs running (RAM minus their use minus
 `QE_MEM_MARGIN_GB`).
 
+
+### Disk cache
+
+`--disk-cache DIR` keeps conversations in files under `DIR`, so they survive a restart. It is off by default, and without the
+flag nothing changes. On Flash-Next it is experimental (1.3.5.3).
+
+Flash-Next, what it does:
+
+- **When it writes.** When a conversation leaves VRAM (at most once a minute per conversation), after `--persist-idle` seconds
+  with no request, and at shutdown (a second Ctrl-C or `docker stop` ends the wait; give `docker stop` a longer `-t`). The writes
+  run in the background and do not hold up requests. Conversations under 2048 tokens are not written. Steered conversations are, and each file records its steering: the vector's name and contents, mode, layers and scale.
+- **What comes back.** A prompt that matches a file further than anything in memory reads it back into the host archive: all of
+  it when the conversation continues, or only the part up to the last checkpoint in the match, e.g. the end of a shared
+  system prompt. Other conversations keep generating during the read. After `FLASH_DISK_LOAD_S` the prompt prefills instead.
+- **Which files are used.** Only files from the same engine build, the same weights (path, size and date of each file), the
+  same number of cards, the same layout (`tp` and `pp` don't share files, as in the archive), the same YaRN factor. A steered file serves only requests with the same vector contents, mode, layers and scale, and an unsteered file only unsteered requests. A changed or removed vector means its files are no longer used, while unsteered files stay usable. A file
+  from an earlier version is not used, so an upgrade starts empty. Files from another configuration are kept and go first
+  when room is needed. A truncated or damaged file is refused and removed, checked by a checksum on every read, and the prompt
+  prefills.
+- **Size.** Each conversation's file holds its KV and its recurrent states. About 2.3 GB for a 95K-token conversation (measured). The cache stays below
+  `--disk-cache-gb` and keeps 1 GB free on the disk; the least recently used file goes first.
+- **When the disk fails.** A directory it can't write, a full disk or a write error costs only the cache. A warning goes to
+  the log and the server keeps serving. After a failed write, it tries again after a minute, then less often.
+
+Not covered: conversations that didn't fit the host archive are not written, a file is rewritten whole each time, and
+one server per directory (a second one runs without the cache and says so).
+
+| variable | default | what it does |
+|---|---|---|
+| `FLASH_DISK_MIN_TOKENS` | `2048` | shorter conversations are not written |
+| `FLASH_DISK_MIN_S` | `60` | at most one file per conversation per this many seconds when it leaves VRAM |
+| `FLASH_DISK_LOAD_S` | `30` | how long a prompt waits for its file before it prefills |
+| `FLASH_DISK_RESERVE_GB` | `1` | free room left on the disk |
 
 ### How `FLASH_COMM=auto` / `QE_COMM=auto` choose a path
 
@@ -527,6 +566,10 @@ all-reduce benchmark predicts this: on 3× RTX 3090 at x16 the SM-store tax read
 faster. `QE_DECODE_CAL=0` uses the rule above instead (decode leaves P2P when the prefill rule does);
 `flash_run` always does. `QE_DECODE_COMM=p2p` or `host` forces the path; without peer access everything goes
 through host memory anyway.
+
+Since 1.3.5.4, the `[qflash] parallel mode` line shows the prefill path, and decode's path when it is already known. With `auto` it says "timed at the end of the start-up", and a closing line gives the result per mode.
+
+On exactly 4 cards `auto` needs the data check: with `QE_COMM_CHECK=0`, or a forced `FLASH_COMM` on a transport that failed it, it keeps `pp`. `FLASH_RUN_TIMEOUT_S` (120 s) also bounds that check; if it stalls, the server restarts in `pp`. `QE_P2P=0` or `FLASH_PAR=pp` skips the check.
 
 Rarely needed settings of this measurement: `QE_DECODE_CAL_WARM` (3) warm-up steps per leg, `QE_DECODE_CAL_K` (3)
 MTP drafts per step, `QE_DECODE_CAL_NB` (4, Flash-Next) sequences in the batched leg (`0` = none), `QE_DECODE_CAL_PAUSE_MS` (3000) the

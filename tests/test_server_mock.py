@@ -118,15 +118,14 @@ def run(tier0):
                 out.append((int(p[1]), int(p[2]), tok.decode([int(x) for x in p[3:]], skip_special_tokens=False)))
         return out
 
-    # 1. OpenAI, no sampling parameters: generation_config defaults, reasoning / content split
+    # 1. OpenAI, no sampling parameters: the model card's thinking defaults, reasoning / content split
     r = c.post("/v1/chat/completions", json={"model": name, "messages": [
         {"role": "system", "content": "Du bist hilfreich."}, {"role": "user", "content": "Hallo"}]}).json()
     m = r["choices"][0]["message"]
     assert m["reasoning_content"] == "Ich denke darüber nach." and m["content"] == "Hallo! नमस्ते, ฉันสบายดี", m
     assert r["choices"][0]["finish_reason"] == "stop" and r["model"] == name
     s = [l.split() for l in open(log) if l.startswith("S ")][0]
-    want_t = "1.000" if args.profile.is_flash else "0.600"
-    assert s[1:] == [want_t, "0.950", "20"], s
+    assert s[1:] == ["1.000", "0.950", "20"], s
     print("  openai: text + reasoning ok, default sampling", s[1:])
 
     # 2. OpenAI streaming tool call
@@ -296,36 +295,161 @@ def run(tier0):
     m = r["choices"][0]
     assert m["finish_reason"] == "stop" and not m["message"].get("tool_calls") and "<tool_call>" in m["message"]["reasoning_content"], r
     print("  bad fields 400, streamed stops, call in an open block ok")
+    # non-thinking request: the card's non-thinking defaults
+    c.post("/v1/chat/completions", json={"model": name, "messages": [{"role": "user", "content": "Cześć"}],
+                                         "chat_template_kwargs": {"enable_thinking": False}})
+    s = [l.split() for l in open(log) if l.startswith("S ")][-1]
+    assert s[1:] == ["0.700", "0.800", "20"], s
+    print("  openai: non-thinking default sampling", s[1:])
     print("  engine fallbacks:", ", ".join(gen.engine.missing_optional()))
 
 
 def check_disk_cache_flag():
-    """Issue #15: --disk-cache on Flash-Next stops the start with a clear error; the 27B keeps the flag."""
+    """Issue #15: --disk-cache turns the disk tier on for both models; QE_DISK_CACHE alone only moves the start-up cache."""
     env = dict(os.environ)
     os.environ.pop("QE_DISK_CACHE", None)
+    os.environ["FLASH_DISK_CACHE"] = "/nonexistent"  # (only the flag decides)
     d = os.path.join(TMP, "dc")
-    argv = ["--engine-lib", "none", "--metrics-port", "0", "--disk-cache", d]
-    a = app.parse_args(["--model", FLASH] + argv)
+    argv = ["--engine-lib", "none", "--metrics-port", "0"]
+    a = app.parse_args(["--model", FLASH] + argv + ["--disk-cache", d, "--disk-cache-gb", "7"])
     if a.profile.is_flash:
-        try:
-            app.refuse_disk_cache_on_flash(a)
-            assert False, "--disk-cache on Flash-Next did not stop the start"
-        except SystemExit as e:
-            assert "not supported on Flash-Next" in str(e.code), e.code
+        assert os.environ.get("FLASH_DISK_CACHE") == d and float(os.environ["FLASH_DISK_CACHE_GB"]) == 7.0
+        assert os.environ.get("QE_DISK_CACHE") == d
+    os.environ.pop("QE_DISK_CACHE", None)
+    os.environ["FLASH_DISK_CACHE"] = "/nonexistent"
+    os.environ["QE_DISK_CACHE"] = d
+    a = app.parse_args(["--model", FLASH] + argv)
+    assert not a.disk_cache and "FLASH_DISK_CACHE" not in os.environ and os.environ.get("QE_DISK_CACHE") == d
     q27 = os.path.join(HERE, "..", "models", "Qwen3.8-27B-INT4")
     if not os.path.isdir(q27):
         q27 = os.path.expanduser("~/GIT/QEngine/models/Qwen3.8-27B-INT4")
     if os.path.isdir(q27):
-        a = app.parse_args(["--model", q27] + argv)
-        app.refuse_disk_cache_on_flash(a)
-        assert a.disk_cache == d and os.environ.pop("QE_DISK_CACHE") == d
+        os.environ.pop("QE_DISK_CACHE", None)
+        a = app.parse_args(["--model", q27] + argv + ["--disk-cache", d])
+        assert a.disk_cache == d and os.environ.pop("QE_DISK_CACHE") == d and "FLASH_DISK_CACHE" not in os.environ
     os.environ.clear()
     os.environ.update(env)
-    print("  issue #15: --disk-cache stops the start on Flash-Next, unchanged on the 27B")
+    print("  issue #15: --disk-cache sets the Flash-Next tier, QE_DISK_CACHE alone does not, the 27B unchanged")
+
+
+def check_logprobs():
+    """Issue #10: the fields, the 400s, the numbers (mock logits: raw pattern around the emitted token, log-softmax over the
+    whole vocabulary), the streaming shape, reasoning / tool-call / stop tokens, a forced close, requests without the fields."""
+    import numpy as np
+    so = os.path.join(TMP, "mock_lp.so")
+    subprocess.check_call(["gcc", "-O2", "-shared", "-fPIC", "-DMOCK_GRAMMAR", "-o", so, os.path.join(HERE, "mock_engine.c")])
+    log = os.path.join(TMP, "log_lp.txt")
+    script = os.path.join(TMP, "script_lp.txt")
+    args = app.parse_args(["--model", FLASH, "--engine-lib", so, "--metrics-port", "0",
+                           "--stats-file", os.path.join(TMP, "stats_lp.json")])
+    tok, _, _ = args.profile.tokenizer()
+    enc = lambda x: tok.encode(x, add_special_tokens=False).ids  # noqa: E731
+    think = "".join(f"Step {i}: check case {i * 7 % 13}.\n" for i in range(1, 40))
+    plain, multi = "The capital of France is Paris.", "Cześć! नमस्ते, ฉันสบายดี"
+    replies = [plain, plain, plain, plain, multi, "Reason here.\n</think>\n\n" + plain, "Reason here.\n</think>\n\n" + plain,
+               "abc xyz def", "abc xyz def", "Run it.\n</think>\n\n" + CALL_X, think + "</think>\n\nDone now.",
+               "\n\n" + plain + "\n", plain, plain, plain]
+    with open(script, "w") as f:
+        for r in replies:
+            f.write(",".join(map(str, enc(r + "<|im_end|>"))) + "\n")
+    os.environ["QE_MOCK_SCRIPT"], os.environ["QE_MOCK_LOG"] = script, log
+    gen = app.Generator(args)
+    c = TestClient(app.build_app(gen, args))
+    msgs = [{"role": "user", "content": "hi"}]
+    off = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+    on = {"chat_template_kwargs": {"enable_thinking": True}, "temperature": 0}
+
+    def post(**kw):
+        return c.post("/v1/chat/completions", json=dict({"model": "x", "messages": msgs, "max_tokens": 400}, **kw))
+
+    for bad, field in (({"logprobs": True, "top_logprobs": 21}, "top_logprobs"), ({"logprobs": True, "top_logprobs": -1}, "top_logprobs"),
+                       ({"top_logprobs": 5}, "top_logprobs"), ({"logprobs": False, "top_logprobs": 5}, "top_logprobs"),
+                       ({"logprobs": True, "top_logprobs": 1.5}, "top_logprobs"), ({"logprobs": True, "top_logprobs": True}, "top_logprobs"),
+                       ({"logprobs": "yes"}, "logprobs")):
+        r = post(**bad)
+        assert r.status_code == 400 and r.json()["error"]["param"] == field, (bad, r.text)
+    x = np.full(248320, -50.0)
+    x[:30] = 3.0 - 0.5 * np.arange(30)
+    want = x - np.log(np.exp(x).sum())
+
+    def check_entries(ents, text, top):
+        assert "".join(e["token"] for e in ents) == text, ents
+        assert b"".join(bytes(e["bytes"]) for e in ents) == text.encode(), ents
+        for e in ents:
+            assert abs(e["logprob"] - want[0]) < 1e-6, e
+            assert len(e["top_logprobs"]) == top
+            assert [abs(a["logprob"] - want[i]) < 1e-6 for i, a in enumerate(e["top_logprobs"])] == [True] * top, e
+            assert not top or e["top_logprobs"][0]["bytes"] == e["bytes"], e
+
+    r = post(logprobs=False, top_logprobs=0, **off)
+    assert r.status_code == 200 and "logprobs" not in r.json()["choices"][0], r.text  # (ignored before: still accepted)
+    # no fields: the key stays away, the constraint and the capture too
+    r = post(**off).json()
+    assert r["choices"][0]["message"]["content"] == plain and "logprobs" not in r["choices"][0], r
+    assert not [ln for ln in open(log) if ln[0] in "KL"]
+    r = post(logprobs=True, top_logprobs=5, **off).json()
+    assert r["choices"][0]["message"]["content"] == plain
+    check_entries(r["choices"][0]["logprobs"]["content"], plain, 5)
+    assert [ln.split()[1] for ln in open(log) if ln[0] in "L"] == ["1"], "capture on once"
+    # streamed, multi-byte: the same entries on the chunks; top_logprobs default 0
+    ev = sse_events(post(logprobs=True, stream=True, **off).text)
+    assert all("logprobs" in e["choices"][0] for e in ev if e["choices"])
+    ents = [x for e in ev if e["choices"] and e["choices"][0]["logprobs"] for x in e["choices"][0]["logprobs"]["content"]]
+    check_entries(ents, plain, 0)
+    assert sum(1 for e in ev if e["choices"] and e["choices"][0]["logprobs"]) > 1, "more than one chunk carries entries"
+    r = post(logprobs=True, top_logprobs=20, **off).json()
+    assert r["choices"][0]["message"]["content"] == multi
+    check_entries(r["choices"][0]["logprobs"]["content"], multi, 20)
+    # reasoning: none of its tokens, nor </think> and the newlines after it
+    r = post(logprobs=True, top_logprobs=1, **on).json()
+    assert r["choices"][0]["message"]["reasoning_content"] and r["choices"][0]["message"]["content"] == plain, r
+    check_entries(r["choices"][0]["logprobs"]["content"], plain, 1)
+    ev = sse_events(post(logprobs=True, stream=True, **on).text)
+    assert not [e for e in ev if e["choices"] and "reasoning_content" in e["choices"][0]["delta"] and e["choices"][0]["logprobs"]]
+    check_entries([x for e in ev if e["choices"] and e["choices"][0]["logprobs"] for x in e["choices"][0]["logprobs"]["content"]], plain, 0)
+    # a stop string: nothing past the cut, streamed or not
+    r = post(logprobs=True, stop=["xyz"], **off).json()
+    assert r["choices"][0]["message"]["content"].strip() == "abc" and r["choices"][0]["finish_reason"] == "stop", r
+    assert "".join(e["token"] for e in r["choices"][0]["logprobs"]["content"]).strip() == "abc", r
+    ev = sse_events(post(logprobs=True, stop=["xyz"], stream=True, **off).text)
+    assert "".join(x["token"] for e in ev if e["choices"] and e["choices"][0]["logprobs"] for x in e["choices"][0]["logprobs"]["content"]).strip() == "abc", ev
+    # a tool call: its tokens are not content
+    r = post(logprobs=True, tools=TOOLS_OAI, **on).json()
+    assert r["choices"][0]["message"]["tool_calls"] and r["choices"][0]["logprobs"]["content"] == [], r
+    # a forced close of <think>: the slot stays constrained (one token per step), the answer gets its entries
+    r = post(logprobs=True, thinking_budget=16, **dict(on, max_tokens=400)).json()
+    assert r["choices"][0]["message"]["content"] == "Done now.", r
+    check_entries(r["choices"][0]["logprobs"]["content"], "Done now.", 0)
+    # whitespace around the reply: with logprobs the non-streamed content stays unstripped, the entries join to it
+    r = post(logprobs=True, **off).json()
+    text = "\n\n" + plain + "\n"
+    assert r["choices"][0]["message"]["content"] == text, r
+    check_entries(r["choices"][0]["logprobs"]["content"], text, 0)
+    # non-finite logits: valid JSON, no 500 (one NaN row, then a row with no finite value); a missing row: no entry
+    for mode, n in (("nan", 7), ("allnan", 7), ("norow", 0)):
+        os.environ["QE_MOCK_LP"] = mode
+        r = post(logprobs=True, top_logprobs=2, **off)
+        os.environ.pop("QE_MOCK_LP")
+        assert r.status_code == 200, r.text
+        json.loads(r.text, parse_constant=lambda c: 1 / 0)
+        ents = r.json()["choices"][0]["logprobs"]["content"]
+        assert len(ents) >= n and all(e["logprob"] <= 0 for e in ents), ents
+        assert mode != "norow" or ents == [], ents
+        assert mode != "allnan" or ents[0]["logprob"] == -9999.0, ents
+    print("  logprobs: fields, 400s, values, streaming, reasoning, stop, tool call, forced close, whitespace, NaN, no row")
+    # an engine library without the read-back: a clear 400, not a reply without numbers
+    so0 = build_mock(False)
+    args0 = app.parse_args(["--model", FLASH, "--engine-lib", so0, "--metrics-port", "0",
+                            "--stats-file", os.path.join(TMP, "stats_lp0.json")])
+    c0 = TestClient(app.build_app(app.Generator(args0), args0))
+    r = c0.post("/v1/chat/completions", json={"model": "x", "messages": msgs, "logprobs": True})
+    assert r.status_code == 400 and "no logits" in r.json()["error"]["message"], r.text
+    print("  logprobs: no read-back in the engine library: 400")
 
 
 def main():
     check_disk_cache_flag()
+    check_logprobs()
     for tier0 in (True, False):
         print(f"mock engine {'TIER 0 only' if tier0 else 'TIER 0 + 1'} ({FLASH}):")
         os.environ["QE_MOCK_KV_RAM"] = "0" if tier0 else "1"  # tier 1: /v1/models reports kv_cache "ram"

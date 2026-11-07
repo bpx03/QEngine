@@ -390,7 +390,11 @@ class ThinkControl:
                     break
             if self.failed or self.fi >= len(self.fz):
                 self.fz = None
-                e.constrain(j.slot, False)
+                if j.lp is None:
+                    e.constrain(j.slot, False)
+                else:  # logprobs: stays constrained for its logits, every token allowed again
+                    e.mask_buffer(j.slot).fill(0xFFFFFFFF)
+                    e.constrain(j.slot, True)
                 return
             self._plan()
             return

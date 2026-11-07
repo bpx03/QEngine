@@ -87,6 +87,8 @@ struct SeqSlot {
     // the graphs of a constrained slot (row j: the grammar state after drafts 1..j)
     unsigned* mask = nullptr;
     bool constrained = false;
+    float* lp = nullptr;          // logprobs: pinned host [kMaxSpecK + 1][vocab slice] (set_lp); kept once allocated
+    bool lp_on = false;
     LookupDev lk;                 // lookup drafts of batched steps: this sequence's history (QE_LKB, lk_init)
     int* pos8 = nullptr;          // device: spec.pos + 8 / mtp_pos + 8 (second attention segment of > 8 rows)
     int* mpos8 = nullptr;
@@ -322,7 +324,12 @@ public:
     void upload_drafts(int i, const int* host, int n);
     size_t mask_words() const { return ((size_t)c_.vocab + 31) / 32; }
     bool constrained = false;
-    int mode() const { return (sampling ? 1 : 0) | (constrained ? 2 : 0) | (attn_rs_ ? 4 : 0) | (lsa_use_ ? 8 : 0); }
+    int mode() const { return (sampling ? 1 : 0) | (constrained ? 2 : 0) | (attn_rs_ ? 4 : 0) | (lsa_use_ ? 8 : 0) | (lp_on_ ? 16 : 0); }
+    // logprobs (constrained slots): the target head's raw logits go to the slot's host buffer, before the mask (a mode
+    // bit: only that slot's graphs, keyed by slot, hold the copy). lp_read: row of the slot's last step, this card's slice
+    void set_lp(int i, bool on);
+    void lp_read(int i, int row, float* out);
+    bool lp_on_ = false;
     // LSA for the next forward (single sequence): set from the host-known position (QE_LSA_DEC_MIN / QE_LSA_PF_MIN);
     // lsa_step clusters the slot's blocks before `pos` (eager, before the step's graph) and sets lsa_use_; only with
     // bind (a prefill that uses LSA) may it take the bucket cache over from another slot
@@ -454,6 +461,7 @@ private:
     int* pos_mb_ = nullptr;  // position of the second micro-batch
     AttnShape layer_shape(const Layer* L, int win = 0) const;  // ash_ + kv format/scales (nullptr = MTP)
     bool kv_fp8_ = true;
+    bool has_q8_ = false;  // an INT8 checkpoint: some layer matrices in the Q8 layout (load_w4)
     float mtp_ks_ = 0.f, mtp_vs_ = 0.f;  // fp8 scales of the MTP layer cache (max over layers)
     float mtp_sc_mul_ = env_double("QE_MTP_SCALE", 1.f);
     bool mtp_fp8() const {
@@ -471,7 +479,11 @@ private:
     // (speculative verification), else mask 0 on every row (prompt chunk))
     void mask_current(int rows, bool per_row) {
         if (constrained) head_masks_.push_back({0, rows, slots_.at(cur_slot_).mask, per_row ? mask_words() : 0});
+        lp_rows_ = lp_on_ ? rows : 0;  // the next target head's rows for logprobs
+        lp_all_ = per_row;             // every row (verification), else the last (a prompt chunk's end)
     }
+    int lp_rows_ = 0;
+    bool lp_all_ = false;
     // lm_head + gathered top-k candidates per row -> topk_all_ (sampling path)
     void head_topk(const Lin& w, const bf16* x, int m);
     bf16* load_bf16(const SafeTensors& st, const std::string& name, int b, int e);

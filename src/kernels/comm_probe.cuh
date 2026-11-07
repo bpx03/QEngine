@@ -11,6 +11,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -153,18 +154,61 @@ int gpu_link_width(int device) {
     return w > 0 ? w : -1;
 }
 
-int numa_nodes() {
-    int n = 0;
+static std::vector<int> numa_node_ids() {
+    std::vector<int> v;
     if (DIR* d = opendir("/sys/devices/system/node")) {
         while (dirent* e = readdir(d))
-            if (!strncmp(e->d_name, "node", 4) && e->d_name[4] >= '0' && e->d_name[4] <= '9') n++;
+            if (!strncmp(e->d_name, "node", 4) && e->d_name[4] >= '0' && e->d_name[4] <= '9') v.push_back(atoi(e->d_name + 4));
         closedir(d);
     }
-    return std::max(1, n);
+    std::sort(v.begin(), v.end());
+    return v;
 }
 
-void numa_place(void* p, size_t n, const std::vector<int>& nodes) {
-    if (nodes.empty() || numa_nodes() < 2 || !p || !n) return;
+int numa_nodes() {
+    return std::max(1, (int)numa_node_ids().size());
+}
+
+// QE_NUMA: comma-separated node ids for every placed host buffer (comm_rule.h numa_pick); a bad token warns and is skipped
+static const std::vector<int>& numa_forced() {
+    static const std::vector<int> v = [] {
+        std::vector<int> r;
+        const char* e = env_str("QE_NUMA");
+        for (const char* p = e; p && *p;) {
+            char* end = nullptr;
+            const long x = strtol(p, &end, 10);
+            const char* q = end;
+            while (*q == ' ') q++;
+            if (end == p || x < 0 || x > 127 || (*q && *q != ',')) {
+                fprintf(stderr, "[comm] NUMA: QE_NUMA=%s: expected node ids like 0,1,2,3; a bad entry skipped\n", e);
+                q = strchr(p, ',');
+                if (!q) break;
+            } else {
+                r.push_back((int)x);
+            }
+            p = *q ? q + 1 : q;
+        }
+        return r;
+    }();
+    return v;
+}
+
+void numa_place(void* p, size_t n, const std::vector<int>& want) {
+    static const std::vector<int> all = numa_node_ids();
+    if (want.empty() || all.size() < 2 || !p || !n) return;
+    const std::vector<int> nodes = numa_pick(want, numa_forced(), all);
+    const bool forced = !numa_forced().empty(),
+               unknown = std::find_if(want.begin(), want.end(), [](int x) { return x >= 0; }) == want.end();
+    static std::atomic<bool> told{false};
+    if ((forced || unknown) && !told.exchange(true)) {  // once per process
+        std::string s;
+        for (int x : nodes) s += (s.empty() ? "" : ",") + std::to_string(x);
+        if (forced)
+            fprintf(stderr, "[comm] NUMA: QE_NUMA sets the host buffers' nodes (first buffer: %s)\n", s.c_str());
+        else
+            fprintf(stderr, "[comm] NUMA: the GPUs' nodes are unknown (sysfs numa_node -1): host buffers interleaved over "
+                            "nodes %s; QE_NUMA sets them\n", s.c_str());
+    }
     unsigned long mask[2] = {0, 0};
     for (int x : nodes)
         if (x >= 0 && x < 128) mask[x / 64] |= 1ul << (x % 64);
@@ -189,7 +233,7 @@ static void* comm_host_words(size_t bytes, int node) {
     const size_t pg = 4096, cap = (bytes + pg - 1) / pg * pg;
     void* p = nullptr;
     CHECK(posix_memalign(&p, pg, cap) == 0 && p, "comm: decode host words");
-    if (node >= 0) numa_place(p, cap, {node});
+    numa_place(p, cap, {node});
     memset(p, 0, cap);
     CUDA_CHECK(cudaHostRegister(p, cap, cudaHostRegisterPortable | cudaHostRegisterMapped));
     void* d = nullptr;
@@ -369,9 +413,10 @@ static void comm_select_decode(Comm& c, const int* devices, bool staged, bool pr
     c.dxfer = x;
     c.dcal = cal;
     if (cal) {
-        fprintf(stderr, "[comm] decode collectives: auto, timed on real decode steps at the end of the start-up (P2P SM stores "
-                        "vs pinned host memory); the rule alone would pick %s (%s: %s)\n",
-                x == kXferHost ? "host memory" : "P2P", d.why, rule.why);
+        if (!c.pp_stages)  // (FLASH_PAR=pp: no calibration, the engine logs that at the end of the start-up)
+            fprintf(stderr, "[comm] decode collectives: auto, timed on real decode steps at the end of the start-up (P2P SM stores "
+                            "vs pinned host memory); the rule alone would pick %s (%s: %s)\n",
+                    x == kXferHost ? "host memory" : "P2P", d.why, rule.why);
         return;
     }
     char mb[200] = "";
@@ -876,6 +921,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
         x = staged || ng < 2 ? kXferP2P : kXferCE;  // the engine's default
         why = ng > 1 ? "auto, probe off" : "one GPU";
     }
+    bool forced_bad = false;  // a forced mode keeps a transport the data check found corrupt
     // the P2P data check (issue #2): auto never keeps a transport that corrupted data; a forced mode only warns, loudly
     if (ng > 1 && c.p2p && chk > 0) {
         // every P2P collective stores into the peers (decode LL16 included); the 27B engine (not staged) runs its
@@ -900,6 +946,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
             if (bad_st) add("SM stores");
             if (!p2p_bad.empty() && x == kXferP2P) add("pairs " + p2p_bad);
             if (bad_ce && (x == kXferCE || !staged)) add("copy engine");
+            forced_bad = !what.empty();
             if (!what.empty())
                 fprintf(stderr, "[comm] WARNING: %s=%s is forced, but the P2P data check found corrupt transfers on this "
                                 "machine (%s): outputs may be wrong (NaN faults). Use %s=auto.\n",
@@ -1005,9 +1052,11 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
     if (const char* e = env_str("QE_COMM_PULLM")) pm = (unsigned)strtoul(e, nullptr, 16), pairs += " (QE_COMM_PULLM override)";  // test: mixed pairs
     c.pullm = x == kXferP2P && staged ? pm : 0u;
     CUDA_CHECK(cudaSetDevice(prev));
+    c.p2p_verified = c.p2p && chk > 0 && !forced_bad;
+    const char* tp_only = c.pp_stages ? "no per-layer exchanges in the pipeline stages (rows hop over the boundaries below); TP would use " : "";
     if (c.pullm || (x == kXferP2P && staged && ng > 1 && c.p2p))
-        fprintf(stderr, "[comm] prefill transfers: %s, pairs %s (%s=%s, %s)\n", comm_path_name(x), pairs.c_str(), env, want.c_str(), why);
+        fprintf(stderr, "[comm] prefill transfers: %s%s, pairs %s (%s=%s, %s)\n", tp_only, comm_path_name(x), pairs.c_str(), env, want.c_str(), why);
     else
-    fprintf(stderr, "[comm] prefill transfers: %s (%s=%s, %s)\n", comm_path_name(x), env, want.c_str(), why);
+    fprintf(stderr, "[comm] prefill transfers: %s%s (%s=%s, %s)\n", tp_only, comm_path_name(x), env, want.c_str(), why);
     return x;
 }
