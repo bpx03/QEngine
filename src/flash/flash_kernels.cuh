@@ -4379,7 +4379,7 @@ __global__ void __launch_bounds__(128) k_moe_gu(const MoeJob* __restrict__ jobs,
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = 4;
     const int g = lane >> 2, t4 = lane & 3;
     constexpr int groups = H >> 7, chunks = (H >> 6) * (Bits / 4), NW = Bits / 2;  // weight uint4 per 128-k group
-    const int gb = warp * groups / nwarps, ge = (warp + 1) * groups / nwarps;
+    const int gb = warp * groups / nwarps;  // this warp's 128-k groups, as GW-wide chunk runs
     const uint4* qp = jb.gq + (size_t)r * chunks * 32 + lane;
     const void* sp = jb.gs;
     const uint4* xr[NT];
