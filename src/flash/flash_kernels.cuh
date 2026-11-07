@@ -287,6 +287,44 @@ __device__ __forceinline__ void a_from_w8(uint32_t lo, uint32_t hi, uint32_t a[4
     a[2] = s8x2_f16(__byte_perm(hi, 0, 0x4140));
     a[3] = s8x2_f16(__byte_perm(hi, 0, 0x4342));
 }
+// W8 expert accumulation for one 128-k group (the callers are the W8 sides of `if constexpr (Bits == 4)`):
+// the group's four weight uint4 are its two 64-k chunks c as two k32 steps s each, word pairs (x, y) and (z, w)
+// being the two 16-k steps whose XH activation fragments are (b0[c].x, b0[c].y), (b0[c].z, b0[c].w) and
+// (b1[c].x, b1[c].y), (b1[c].z, b1[c].w). One fp32 MMA sum over the group's eight steps, then the bf16 group
+// scale folds once. Tiles [0, nt) run, the executed set under the callers' row clamp, nt = min(NT, (m + 7) >> 3);
+// the fold runs over all NT because folding a dead tile only touches registers that never reach memory.
+template <int NT>
+__device__ __forceinline__ void w8_group_acc(int nt, const uint4* wv, const uint4* b0, const uint4* b1,
+                                             float* acc, float sg, float sg8) {
+    float cw[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
+#pragma unroll
+    for (int c = 0; c < 2; c++)
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const uint4 wc = wv[2 * c + s];
+            const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+#pragma unroll
+            for (int q = 0; q < 2; q++) {
+                uint32_t a[4];
+                a_from_w8(words[2 * q], words[2 * q + 1], a);
+#pragma unroll
+                for (int j = 0; j < NT; j++) {
+                    if (j >= nt) break;
+                    const uint4& bb = s ? b1[c * NT + j] : b0[c * NT + j];
+                    mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
+                }
+            }
+        }
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+        acc[j * 4 + 0] = __fmaf_rn(cw[j][0], sg, acc[j * 4 + 0]);
+        acc[j * 4 + 1] = __fmaf_rn(cw[j][1], sg, acc[j * 4 + 1]);
+        acc[j * 4 + 2] = __fmaf_rn(cw[j][2], sg8, acc[j * 4 + 2]);
+        acc[j * 4 + 3] = __fmaf_rn(cw[j][3], sg8, acc[j * 4 + 3]);
+    }
+}
 __device__ __forceinline__ uint32_t f2h2(float a, float b) {
     __half2 h = __floats2half2_rn(a, b);
     return *reinterpret_cast<uint32_t*>(&h);
@@ -4235,43 +4273,17 @@ __global__ void __launch_bounds__(128) k_moe_gu(const MoeJob* __restrict__ jobs,
                 for (int j = 0; j < NT; j++) xh_flush(acc[j], hacc[j], sg, sg8);
             }
         } else {
-            // one uint4 per k32 sub-chunk: its word pairs (x, y) and (z, w) are its two 16-k steps, whose XH
-            // activation fragments are (b0.x, b0.y), (b0.z, b0.w) and (b1.x, b1.y), (b1.z, b1.w)
-            float cw[NT][4];
-#pragma unroll
-            for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
+            uint4 b0[2][NT], b1[2][NT];
 #pragma unroll
             for (int ch = 0; ch < 2; ch++) {
                 const int chunk = 2 * gi + ch;
-                uint4 b0[NT], b1[NT];
 #pragma unroll
                 for (int j = 0; j < NT; j++) {
-                    b0[j] = xr[j][(size_t)chunk * 8];
-                    b1[j] = xr[j][(size_t)chunk * 8 + 1];
-                }
-#pragma unroll
-                for (int s = 0; s < 2; s++) {
-                    const uint4 wc = wv[a2][2 * ch + s];
-                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-#pragma unroll
-                    for (int q = 0; q < 2; q++) {
-                        uint32_t a[4];
-                        a_from_w8(words[2 * q], words[2 * q + 1], a);
-#pragma unroll
-                        for (int j = 0; j < NT; j++) {
-                            const uint4& bb = s ? b1[j] : b0[j];
-                            mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
-                        }
-                    }
+                    b0[ch][j] = xr[j][(size_t)chunk * 8];
+                    b1[ch][j] = xr[j][(size_t)chunk * 8 + 1];
                 }
             }
-#pragma unroll
-            for (int j = 0; j < NT; j++) {
-                acc[j][0] = __fmaf_rn(cw[j][0], sg, acc[j][0]);
-                acc[j][1] = __fmaf_rn(cw[j][1], sg, acc[j][1]);
-                acc[j][2] = __fmaf_rn(cw[j][2], sg8, acc[j][2]);
-                acc[j][3] = __fmaf_rn(cw[j][3], sg8, acc[j][3]);
-            }
+            w8_group_acc<NT>(NT, wv[a2], &b0[0][0], &b1[0][0], &acc[0][0], sg, sg8);
         }
     }
     __shared__ float red[4][NT][32][4];
@@ -4399,42 +4411,25 @@ __global__ void __launch_bounds__(256) k_moe_dn(const MoeJob* __restrict__ jobs,
                 for (int j = 0; j < NT; j++) dn_flush<FX>(acc[j], hacc[j], sg, sg8, nf);
             }
         } else {
-            // W8: two k32 sub-chunks per 64-k chunk, all eight 16-k steps of the group in one fp32 MMA sum
-            float cw[NT][4];
+            uint4 b0[2][NT], b1[2][NT];
 #pragma unroll
-            for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
-#pragma unroll
-            for (int c = 0; c < 2; c++) {
-                uint4 b0[NT], b1[NT];
+            for (int c = 0; c < 2; c++)
 #pragma unroll
                 for (int j = 0; j < NT; j++) {
                     const int tok = 8 * j + g < m ? 8 * j + g : 0;
                     const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + tok) * GRP + t4 * 16);
-                    b0[j] = xr[c * 8];
-                    b1[j] = xr[c * 8 + 1];
+                    b0[c][j] = xr[c * 8];
+                    b1[c][j] = xr[c * 8 + 1];
                 }
+            if constexpr (FX) {
+                float term[NT][4] = {};
+                w8_group_acc<NT>(NT, w, &b0[0][0], &b1[0][0], &term[0][0], sg, sg8);
 #pragma unroll
-                for (int s = 0; s < 2; s++) {
-                    const uint4 wc = w[2 * c + s];
-                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
+                for (int j = 0; j < NT; j++)
 #pragma unroll
-                    for (int q = 0; q < 2; q++) {
-                        uint32_t a[4];
-                        a_from_w8(words[2 * q], words[2 * q + 1], a);
-#pragma unroll
-                        for (int j = 0; j < NT; j++) {
-                            const uint4& bb = s ? b1[j] : b0[j];
-                            mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
-                        }
-                    }
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < NT; j++) {
-                dn_add<FX>(acc[j][0], cw[j][0] * sg, nf);
-                dn_add<FX>(acc[j][1], cw[j][1] * sg, nf);
-                dn_add<FX>(acc[j][2], cw[j][2] * sg8, nf);
-                dn_add<FX>(acc[j][3], cw[j][3] * sg8, nf);
+                    for (int i = 0; i < 4; i++) dn_add<true>(acc[j][i], term[j][i], nf);
+            } else {
+                w8_group_acc<NT>(NT, w, &b0[0][0], &b1[0][0], &acc[0][0], sg, sg8);
             }
         }
     }
@@ -4534,42 +4529,15 @@ __global__ void __launch_bounds__(128) k_moe_gu_g(const MoeJob* __restrict__ job
                 for (int j = 0; j < NT; j++) if (j < nt) xh_flush(acc[j], hacc[j], sg, sg8);
             }
         } else {
-            // W8: the group's eight 16-k steps accumulate in fp32, then one bf16 scale per output row
-            float cw[NT][4];
-#pragma unroll
-            for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
+            uint4 b0[2][NT], b1[2][NT];  // past-nt tiles stay unloaded, the helper stops at nt and their folds are dead
 #pragma unroll
             for (int c = 0; c < 2; c++) {
                 const int ch = 2 * gi + c;
-                uint4 b0[NT], b1[NT];
 #pragma unroll
                 for (int j = 0; j < NT; j++)
-                    if (j < nt) { b0[j] = xr[j][(size_t)ch * 8]; b1[j] = xr[j][(size_t)ch * 8 + 1]; }
-#pragma unroll
-                for (int s = 0; s < 2; s++) {
-                    const uint4 wc = wv[a2][2 * c + s];
-                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-#pragma unroll
-                    for (int q = 0; q < 2; q++) {
-                        uint32_t a[4];
-                        a_from_w8(words[2 * q], words[2 * q + 1], a);
-#pragma unroll
-                        for (int j = 0; j < NT; j++)
-                            if (j < nt) {
-                                const uint4& bb = s ? b1[j] : b0[j];
-                                mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
-                            }
-                    }
-                }
+                    if (j < nt) { b0[c][j] = xr[j][(size_t)ch * 8]; b1[c][j] = xr[j][(size_t)ch * 8 + 1]; }
             }
-#pragma unroll
-            for (int j = 0; j < NT; j++)
-                if (j < nt) {
-                    acc[j][0] = __fmaf_rn(cw[j][0], sg, acc[j][0]);
-                    acc[j][1] = __fmaf_rn(cw[j][1], sg, acc[j][1]);
-                    acc[j][2] = __fmaf_rn(cw[j][2], sg8, acc[j][2]);
-                    acc[j][3] = __fmaf_rn(cw[j][3], sg8, acc[j][3]);
-                }
+            w8_group_acc<NT>(nt, wv[a2], &b0[0][0], &b1[0][0], &acc[0][0], sg, sg8);
         }
     }
     __shared__ float red[4][NT][32][4];
@@ -4659,24 +4627,15 @@ __global__ void __launch_bounds__(256) k_moe_dn_g(const MoeJob* __restrict__ job
                 dn_flush<FX>(acc, hacc, sg, sg8, nf);
             }
         } else {
-            float cw[4] = {};
+            const uint4 hb0[2] = {bb4[0], bb4[2]}, hb1[2] = {bb4[1], bb4[3]};
+            if constexpr (FX) {
+                float term[4] = {};
+                w8_group_acc<1>(1, w, hb0, hb1, term, sg, sg8);
 #pragma unroll
-            for (int c = 0; c < 2; c++) {
-#pragma unroll
-                for (int s = 0; s < 2; s++) {
-                    const uint4 wc = w[2 * c + s];
-                    const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-                    const uint4 bb = bb4[c * 2 + s];
-#pragma unroll
-                    for (int q = 0; q < 2; q++) {
-                        uint32_t a[4];
-                        a_from_w8(words[2 * q], words[2 * q + 1], a);
-                        mma16(cw, a, q ? bb.z : bb.x, q ? bb.w : bb.y);
-                    }
-                }
+                for (int i = 0; i < 4; i++) dn_add<true>(acc[i], term[i], nf);
+            } else {
+                w8_group_acc<1>(1, w, hb0, hb1, acc, sg, sg8);
             }
-#pragma unroll
-            for (int i = 0; i < 4; i++) dn_add<FX>(acc[i], cw[i] * (i < 2 ? sg : sg8), nf);
         }
         if (row0 >= 0) { sa[row0][g] = acc[0]; sa[row0][g + 8] = acc[2]; }
         if (row1 >= 0) { sa[row1][g] = acc[1]; sa[row1][g + 8] = acc[3]; }
@@ -5754,35 +5713,7 @@ __global__ void __launch_bounds__(128) k_moe_dn_pf(const PfJob* __restrict__ job
                         for (int j = 0; j < NT; j++) xh_flush(acc[tt][j], hacc[j], sg, sg8);
                     }
                 } else {
-                    // W8: two k32 sub-chunks per 64-k chunk, the group's eight steps in one fp32 MMA sum
-                    float cw[NT][4];
-#pragma unroll
-                    for (int j = 0; j < NT; j++) cw[j][0] = cw[j][1] = cw[j][2] = cw[j][3] = 0.f;
-#pragma unroll
-                    for (int c = 0; c < 2; c++)
-#pragma unroll
-                        for (int s = 0; s < 2; s++) {
-                            const uint4 wc = w[2 * c + s];
-                            const uint32_t words[4] = {wc.x, wc.y, wc.z, wc.w};
-#pragma unroll
-                            for (int q = 0; q < 2; q++) {
-                                uint32_t a[4];
-                                a_from_w8(words[2 * q], words[2 * q + 1], a);
-#pragma unroll
-                                for (int j = 0; j < NT; j++) {
-                                    if (8 * j >= m) break;
-                                    const uint4& bb = s ? b1[c][j] : b0[c][j];
-                                    mma16(cw[j], a, q ? bb.z : bb.x, q ? bb.w : bb.y);
-                                }
-                            }
-                        }
-#pragma unroll
-                    for (int j = 0; j < NT; j++) {
-                        acc[tt][j][0] = __fmaf_rn(cw[j][0], sg, acc[tt][j][0]);
-                        acc[tt][j][1] = __fmaf_rn(cw[j][1], sg, acc[tt][j][1]);
-                        acc[tt][j][2] = __fmaf_rn(cw[j][2], sg8, acc[tt][j][2]);
-                        acc[tt][j][3] = __fmaf_rn(cw[j][3], sg8, acc[tt][j][3]);
-                    }
+                    w8_group_acc<NT>(min(NT, (m + 7) >> 3), w, &b0[0][0], &b1[0][0], &acc[tt][0][0], sg, sg8);
                 }
             }
         }
