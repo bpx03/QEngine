@@ -3622,94 +3622,11 @@ __device__ __forceinline__ float moe_scale(const void* p, size_t i) {
     else return __half2float(static_cast<const __half*>(p)[i]);
 }
 
-// Router: softmax over 512, top-10 (value desc, index asc), renormalized (norm_topk_prob); shared gate sigmoid.
-// Jobs = local 128-wide intermediate groups of every expert hit by any row (+ the shared expert's local groups),
-// in (expert, group) order; jw[job][t] = routing weight of row t (0 if not routed). One block of 512 threads.
-template <int Bits>
-__global__ void k_route(const float* __restrict__ lg, int m, const int* __restrict__ gmap, const char* __restrict__ groups,
-                        MoeJob* __restrict__ jobs, float* __restrict__ jw, int* __restrict__ njobs) {
-    __shared__ float red[32];
-    __shared__ float wsel[MAXM][TOPK];
-    __shared__ int isel[MAXM][TOPK];
-    __shared__ float bv[16];
-    __shared__ int bi[16];
-    __shared__ int cnt[NE + 1];
-    const int e = threadIdx.x;
-    bool hit = false;
-    for (int t = 0; t < m; t++) {
-        const float x = lg[t * 528 + e];
-        const float mx = block_max<512>(x, red);
-        const float ex = __expf(x - mx);
-        const float den = block_sum<512>(ex, red);
-        const float pr = ex / den;
-        bool taken = false;
-        float tot = 0.f;
-        for (int k = 0; k < TOPK; k++) {
-            float v = taken ? -1.f : pr;
-            int idx = e;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) {
-                const float v2 = __shfl_xor_sync(0xffffffffu, v, o);
-                const int i2 = __shfl_xor_sync(0xffffffffu, idx, o);
-                if (v2 > v || (v2 == v && i2 < idx)) { v = v2; idx = i2; }
-            }
-            __syncthreads();
-            if ((e & 31) == 0) { bv[e >> 5] = v; bi[e >> 5] = idx; }
-            __syncthreads();
-            if (e == 0) {
-                float V = bv[0]; int I = bi[0];
-                for (int w = 1; w < 16; w++) if (bv[w] > V || (bv[w] == V && bi[w] < I)) { V = bv[w]; I = bi[w]; }
-                wsel[t][k] = V; isel[t][k] = I;
-            }
-            __syncthreads();
-            if (isel[t][k] == e) taken = true;
-            tot += wsel[t][k];
-        }
-        hit |= taken;
-        __syncthreads();
-        if (e < TOPK) wsel[t][e] /= tot;
-        __syncthreads();
-    }
-    // local groups per expert (gmap[e * 5 + g] = local index or -1); expert NE = shared (always)
-    auto ngr = [&](int ex) { int c = 0; for (int g = 0; g < 5; g++) c += gmap[ex * 5 + g] >= 0; return c; };
-    cnt[e] = hit ? ngr(e) : 0;
-    if (e == 0) cnt[NE] = ngr(NE);
-    __syncthreads();
-    // exclusive prefix over 513 entries (thread e owns e; thread 0 also NE): simple serial-chunk scan
-    __shared__ int pre[NE + 1];
-    if (e == 0) {
-        int a = 0;
-        for (int i = 0; i <= NE; i++) { pre[i] = a; a += cnt[i]; }
-        *njobs = a;
-    }
-    __syncthreads();
-    auto emit = [&](int ex, bool shared) {
-        int j = pre[ex];
-        for (int g = 0; g < 5; g++) {
-            const int li = gmap[ex * 5 + g];
-            if (li < 0) continue;
-            const char* b = groups + (size_t)li * ExpertLayout<Bits>::bytes;
-            MoeJob jb;
-            jb.gq = reinterpret_cast<const uint4*>(b);
-            jb.gs = b + ExpertLayout<Bits>::gs;
-            jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
-            jb.ds = b + ExpertLayout<Bits>::ds;
-            jobs[j] = jb;
-            for (int t = 0; t < m; t++) {
-                float w = 0.f;
-                if (shared) w = sigm(lg[t * 528 + NE]);
-                else for (int k = 0; k < TOPK; k++) if (isel[t][k] == ex) w = wsel[t][k];
-                jw[j * MAXM + t] = w;
-            }
-            j++;
-        }
-    };
-    if (cnt[e]) emit(e, false);
-    if (e == 0) emit(NE, true);
-}
+
 // Faster router: top-10 on the logits (softmax is monotonic; with norm_topk_prob the full denominator cancels:
 // w_i = exp(l_i - l_max) / sum_sel exp(l_j - l_max)). Per warp a local top-10 by warp argmax, warp 0 merges the
-// 16 x 10 candidates. Ties: value desc, index asc. Jobs as k_route. 512 threads.
+// 16 x 10 candidates. Ties: value desc, index asc. Jobs: the hit experts' local 128-wide groups and the shared
+// expert's, in (expert, group) order; jw[job][t] = row t's routing weight (0 if not routed). 512 threads.
 __device__ __forceinline__ void warp_argmax(float& v, int& i) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -3851,125 +3768,7 @@ __global__ void __launch_bounds__(512) k_route2(const float* __restrict__ lg, in
         *njobs = total + ns;
     }
 }
-// Router v3: one block per row computes the row's top-10 (per-warp redux.sync top-10, then the 160 candidates are
-// ranked in parallel: rank = #candidates with a larger key or an equal key and a lower index); the last block to
-// finish builds the jobs of all rows (as k_route2). sel: global scratch [MAXM][TOPK] (idx, weight), cnt: arrival.
-template <int Bits>
-__global__ void __launch_bounds__(512) k_route3(const float* __restrict__ lg, int m, const int* __restrict__ gmap,
-                                                const char* __restrict__ groups, MoeJob* __restrict__ jobs,
-                                                float* __restrict__ jw, int* __restrict__ njobs, int nsplit,
-                                                int* __restrict__ gsel, float* __restrict__ gw, unsigned* __restrict__ cnt) {
-    __shared__ unsigned ck[16 * TOPK];
-    __shared__ int ci2[16 * TOPK];
-    __shared__ float wv[TOPK];
-    __shared__ int wi[TOPK];
-    __shared__ unsigned s_last;
-    const int e = threadIdx.x, warp = e >> 5, lane = e & 31, t = blockIdx.x;
-    float x = 0.f;
-    for (int sp = 0; sp < nsplit; sp++) x += lg[((size_t)sp * MAXM + t) * 528 + e];
-    unsigned key = fkey(x);
-    for (int k = 0; k < TOPK; k++) {
-        const unsigned M = __reduce_max_sync(0xffffffffu, key);
-        const unsigned b = __ballot_sync(0xffffffffu, key == M);
-        const int l = __ffs(b) - 1;
-        if (lane == l) key = 0u;
-        if (lane == 0) { ck[warp * TOPK + k] = M; ci2[warp * TOPK + k] = warp * 32 + l; }
-    }
-    __syncthreads();
-    if (e < 16 * TOPK) {
-        const unsigned mk = ck[e];
-        const int mi = ci2[e];
-        int rank = 0;
-        for (int j = 0; j < 16 * TOPK; j++) {
-            const unsigned kj = ck[j];
-            rank += kj > mk || (kj == mk && ci2[j] < mi);
-        }
-        if (rank < TOPK) { wv[rank] = kfloat(mk); wi[rank] = mi; }
-    }
-    __syncthreads();
-    if (e < 32) {
-        const float v = e < TOPK ? __expf(wv[e] - wv[0]) : 0.f;
-        float tot = v;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(0xffffffffu, tot, o);
-        if (e < TOPK) { gsel[t * TOPK + e] = wi[e]; gw[t * TOPK + e] = v / tot; }
-    }
-    // last row block builds the jobs
-    __syncthreads();
-    if (e == 0) {
-        __threadfence();
-        s_last = atomicAdd(cnt, 1u) == (unsigned)m - 1;
-    }
-    __syncthreads();
-    if (!s_last) return;
-    __shared__ int isel[MAXM][TOPK];
-    __shared__ float wsel[MAXM][TOPK];
-    __shared__ int hitm[NE];
-    __shared__ float shw[MAXM];
-    __shared__ int shg[NGRP];
-    __shared__ int wtot[16];
-    hitm[e] = 0;
-    if (e < m) {
-        float xx = 0.f;
-        for (int sp = 0; sp < nsplit; sp++) xx += lg[((size_t)sp * MAXM + e) * 528 + NE];
-        shw[e] = sigm(xx);
-    }
-    if (e >= 32 && e < 32 + NGRP) shg[e - 32] = gmap[NE * NGRP + e - 32];
-    int gm[NGRP];
-#pragma unroll
-    for (int g = 0; g < NGRP; g++) gm[g] = gmap[e * NGRP + g];
-    __syncthreads();
-    if (e < m * TOPK) {
-        const int tt = e / TOPK, k = e % TOPK;
-        const int id = __ldcg(gsel + tt * TOPK + k);
-        isel[tt][k] = id;
-        wsel[tt][k] = __ldcg(gw + tt * TOPK + k);
-        hitm[id] = 1;
-    }
-    __syncthreads();
-    int c = 0;
-    if (hitm[e])
-#pragma unroll
-        for (int g = 0; g < NGRP; g++) c += gm[g] >= 0;
-    int inc = c;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        const int n = __shfl_up_sync(0xffffffffu, inc, o);
-        if (lane >= o) inc += n;
-    }
-    if (lane == 31) wtot[warp] = inc;
-    __syncthreads();
-    int base = 0, total = 0;
-    for (int w = 0; w < 16; w++) { if (w < warp) base += wtot[w]; total += wtot[w]; }
-    auto emit = [&](int ex, int j, bool shared) {
-        for (int g = 0; g < NGRP; g++) {
-            const int li = shared ? shg[g] : gm[g];
-            if (li < 0) continue;
-            const char* b = groups + (size_t)li * ExpertLayout<Bits>::bytes;
-            MoeJob jb;
-            jb.gq = reinterpret_cast<const uint4*>(b);
-            jb.gs = b + ExpertLayout<Bits>::gs;
-            jb.dq = reinterpret_cast<const uint4*>(b + ExpertLayout<Bits>::dq);
-            jb.ds = b + ExpertLayout<Bits>::ds;
-            jobs[j] = jb;
-            for (int tt = 0; tt < m; tt++) {
-                float w = 0.f;
-                if (shared) w = shw[tt];
-                else for (int k = 0; k < TOPK; k++) if (isel[tt][k] == ex) w = wsel[tt][k];
-                jw[j * MAXM + tt] = w;
-            }
-            j++;
-        }
-    };
-    if (c) emit(e, base + inc - c, false);
-    if (e == 0) {
-        int ns = 0;
-        for (int g = 0; g < NGRP; g++) ns += shg[g] >= 0;
-        emit(NE, total, true);
-        *njobs = total + ns;
-        *cnt = 0u;
-    }
-}
+
 // Router v4: (a) k_topk_rows: one block per row, top-10 by per-warp redux.sync + parallel ranking of the 160
 // candidates (ties by index), renormalized weights -> gsel/gw [MAXM][10] and the shared gate -> gsh[MAXM];
 // (b) k_jobs: one block builds the jobs of all rows (hit experts' local groups in (expert, group) order + shared).
@@ -4391,7 +4190,7 @@ __global__ void __launch_bounds__(128) k_moe_gu(const MoeJob* __restrict__ jobs,
     float acc[NT][4];
 #pragma unroll
     for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
-    // all of the warp's weights and scales first (5 groups: 10 KB at 4 bits, 20 KB at 8): one memory round trip,
+    // all of the warp's weights and scales first (5 groups: 5 KB at 4 bits, 10 KB at 8): one memory round trip,
     // which matters for cold groups read over PCIe from host memory
     constexpr int GW = groups / 4;
     uint4 wv[GW][NW];
@@ -5780,7 +5579,7 @@ __global__ void __launch_bounds__(512) k_jobs_pf(int C, const int* __restrict__ 
         *njobs = j;
     }
 }
-// fp16 gate_up of a prefill job (the engine runs W4A8 k_moe_gu_q; kept as the fp16 reference of tools/mb/mb_moe.cu):
+// fp16 gate_up of a prefill job (the engine runs W4A8 k_moe_gu_q<4>; INT4 reference, replaced for W8 by k_moe_gu_q<8>):
 // act[off + i][128] = silu(g) * u * w. One block per job covers all 256 gate_up rows (8 warps x 2 16-row tiles) for
 // 32-token tiles; the tokens' x K-slices (64 columns) are staged once per block in shared memory by cp.async (double
 // buffer). Per element: 64-column fp16 chunks flushed with the group scale, the K order sequential.
@@ -6021,8 +5820,8 @@ __global__ void __launch_bounds__(128) k_moe_dn_pf(const PfJob* __restrict__ job
         }
     }
 }
-// down of a prefill job into the slot buffer (fp16 act; the engine runs W4A8 k_moe_dn_q, this stays the reference of
-// tools/mb/mb_moe.cu): the expert output of every (row, expert) slot of the
+// down of a prefill job into the slot buffer (fp16 act; the engine runs W4A8 k_moe_dn_q<4>; INT4 reference, replaced
+// for W8 by k_moe_dn_q<8>): the expert output of every (row, expert) slot of the
 // token lists is stored (fp16, x 1/16) instead of added to the row's partial by fp32 atomics (the atomics bound the
 // kernel: ~28K per row); k_moe_sum adds a row's 11 slots in a fixed order. Same tiles and arithmetic as k_moe_dn_pf.
 constexpr float kSlotScale = 16.f;
