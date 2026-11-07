@@ -947,7 +947,8 @@ private:
     ColdTab stab(const Layer& L) const { return ColdTab((pfs_full_ ? pfs_tab_d_ : pfs_tab0_d_) + L.coff, pfs_touch_d_ + L.coff); }
     void pfs_init();
     void pfs_copy(int li);
-    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool bt = false; int prev = -1; bool ik = false; bool fz = false; bool al = false; };  // al: a KV-array tail that is also mapped as big-batch rows (al_*)  // ik: in the tail of an indexer-key array (KV streaming)  // bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
+    // al: a KV-array tail also mapped as big-batch rows; ik: an indexer-key tail; bt: a big-batch tail.
+    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool bt = false; int prev = -1; bool ik = false; bool fz = false; bool al = false; };
     std::vector<float> ec_prior_;
     std::vector<EcSlot> ec_slots_;
     std::vector<int> ec_slot_of_;      // cold group -> slot or -1
@@ -1428,8 +1429,8 @@ private:
     void mkstream(cudaStream_t* s, unsigned flags, int prio);
     int vown_ = -1;
     void view_groups(Layer& L, int li);  // li = -1: the MTP block
-    const char* cold_h(const Layer& L, int j) const { return L.csrc_h.empty() ? L.hgroups_h + (size_t)j * GRP_BYTES : L.csrc_h[j]; }
-    const char* cold_d(const Layer& L, int j) const { return L.csrc.empty() ? L.hgroups + (size_t)j * GRP_BYTES : L.csrc[j]; }
+    const char* cold_h(const Layer& L, int j) const { return L.csrc_h.empty() ? L.hgroups_h + (size_t)j * group_bytes_ : L.csrc_h[j]; }
+    const char* cold_d(const Layer& L, int j) const { return L.csrc.empty() ? L.hgroups + (size_t)j * group_bytes_ : L.csrc[j]; }
     // copies out of the cold sources: host -> device (TP), or any (views: peer VRAM too)
     cudaMemcpyKind cold_kind() const { return vtp_.empty() ? cudaMemcpyHostToDevice : cudaMemcpyDefault; }
     void* pp_rx_[2] = {};
