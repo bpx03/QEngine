@@ -4,7 +4,7 @@
 The 27B route preserves the pinned upstream converter: symmetric INT8, group 128, with BF16 MTP passthrough.
 The QFN route converts the explicitly selected attention, shared-expert, fused-expert, PLE, and MTP matrices;
 all other source tensors are preserved. Its 128 n-gram tables are excluded and refer to --ngram-from instead.
-The current QEngine does not support QFN INT8 expert weights, so QFN output is not executable by that runtime.
+The Flash-Next engine (src/flash/) loads QFN output; the 27B engine (libqengine) reads INT4 weights only.
 
 RTN uses BF16(absmax / 127), nearest-even rounding, and clamp [-127, 127]. --search N searches N clip ratios in
 [0.80, 1], with ratio 1 always included. No calibration data or GPU required.

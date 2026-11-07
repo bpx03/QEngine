@@ -599,6 +599,26 @@ from 455 to 580 tok/s on 3 cards and from 233 to 332 tok/s on 2 cards (October 3
 because short-request throughput is about 12 % lower (the indexer keys and block cache take VRAM from the experts).
 Details: [docs/advanced.md](docs/advanced.md#kv-cache-in-host-ram-flash-next).
 
+#### QFN INT8 (W8) checkpoints
+
+`tools/quant_int8.py --src <bf16 dir> --out <dir> --ngram-from <table> --kv-from ''` writes
+`model.safetensors`, `model_mtp.safetensors` and `qfn-int8-manifest.json`. Selected matrices use
+`.weight_packed` (offset-binary INT8 codes), `.weight_scale` (BF16, group 128) and `.weight_shape` (I64).
+The manifest selects body/MTP files and the external 128-shard n-gram table; mount that dependency at its recorded
+path. Format selection never depends on `config.json`. Existing upstream mixed INT4/W8 checkpoints remain supported.
+
+Selected matrices: routed and shared experts, DeltaNet projections, QSA q/k/v/o, PLE key/value and MTP attention,
+experts and fc_embedding/fc_hidden. Other tensors remain byte-identical. `--check <dir> --src <bf16 dir>`
+re-quantizes and compares codes, scales and headers.
+
+Native W8 uses lossless repacking into the existing W8 layout. INT8 expert groups use BF16 scales and FP32
+tensor-core accumulation per 128-k group; INT4 keeps its existing arithmetic. Residency, cold staging and borrowed
+prefill storage use the selected format's group size. No quality or throughput equivalence is claimed.
+
+Build acceptance fixtures with `-DQE_BUILD_FLASH_INT8_TESTS=ON`: `flash_checkpoint_unit` validates manifests and
+headers; `flash_int8_unit` checks repacking, arithmetic and residency. `INT8_MODEL=<dir>` adds real-checkpoint rows.
+`Dockerfile.flash-int8` overlays the Flash binaries and fixtures on `--build-arg BASE_RUNTIME=<current image>`.
+
 ### Qwen3.8-27B
 
 - INT4 weights repacked at load (a few seconds, no conversion) into tensor-core layouts; `lm_head` in INT8.
