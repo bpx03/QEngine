@@ -14,7 +14,7 @@ static int fails = 0;
 template<class T> struct Device {
     T* p = nullptr;
     explicit Device(size_t n) { CUDA_CHECK(cudaMalloc(&p, n * sizeof(T))); }
-    ~Device() { cudaFree(p); }
+    ~Device() { CUDA_CHECK(cudaFree(p)); }
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
 };
