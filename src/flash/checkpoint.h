@@ -299,16 +299,9 @@ struct Checkpoint {
         if(std::filesystem::exists(path) && !is_file(path))
             fail(path,"manifest","regular file","non-file path");
         if (!is_file(path)) {
-            const auto config_path=resolve_path(directory,"config.json");
-            if(is_file(config_path)) {
-                const auto config=parse_json(read_file(config_path),config_path);
-                if(config.has("quantization_config") && config["quantization_config"].has("config_groups"))
-                    for(const auto& group:config["quantization_config"]["config_groups"].obj) {
-                        if(group.second.has("weights") && group.second["weights"].has("num_bits")
-                            && integer(group.second["weights"],"num_bits",config_path)==8)
-                            throw std::runtime_error(config_path+": INT8 Flash checkpoint requires qfn-int8-manifest.json");
-                    }
-            }
+            // the format comes from the tensor headers below, never from config.json: an AutoRound INT4
+            // directory legitimately carries quantization_config groups with 8-bit entries (its lm_head /
+            // KV quantizers), and reading the format there would refuse a working INT4 checkpoint
             std::vector<std::string> files;
             for (const auto& e : std::filesystem::directory_iterator(directory)) {
                 const auto name=e.path().filename().string();
