@@ -412,6 +412,19 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
             }
             expected_act[size_t(t)*GRP+c]=xh_round(float(gate/(1+std::exp(-gate))*up*weights[t]));
         }
+        if constexpr(!BuildJobs) {  // with BuildJobs the device router emits its own job list, not this one
+            // gu_q writes act[aoff + p] from the list position off + p (input row tl[off + p], weight wl[off + p]):
+            // check the rows the ng > 0 jobs wrote (their ng == 0 pair duplicates them, rows past n stay memset)
+            std::vector<__half> saved_host(size_t(nact)*GRP);
+            CUDA_CHECK(cudaMemcpy(saved_host.data(),saved.p,saved_host.size()*2,cudaMemcpyDeviceToHost));
+            std::vector<float> act_actual,act_expected;
+            for (const PfJob& pj : descriptors) if (pj.ng > 0)
+                for (int p = 0; p < pj.n; ++p) for (int c = 0; c < GRP; ++c) {
+                    act_actual.push_back(__half2float(saved_host[size_t(pj.aoff+p)*GRP+host_xh_pos(c)])*16.f);
+                    act_expected.push_back(expected_act[size_t(pj.off+p)*GRP+c]);
+                }
+            compare(act_actual,act_expected,1e-3);
+        }
         const auto qact=quantized_values(expected_act,GRP);
         std::vector<float> slot_expected(size_t(m)*H),float_expected(size_t(m)*H,0);
         for(int t=0;t<m;++t) for(int r=0;r<H;++r) {
