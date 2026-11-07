@@ -125,9 +125,10 @@ static float xh_round(float value) {
 template<int Bits> struct GroupFixture {
     std::vector<int> gate, down;
     std::vector<char> packed;
-    float scale;
+    static float scale_at(int row,int group) {  // distinct per (row, group), exact in both bf16 and fp16 scales
+        return (Bits==8?1.f/8192.f:1.f/512.f)*(1.f+((row*5+group*3)%4)/16.f);
+    }
     GroupFixture() : gate(size_t(2*GRP)*H),down(size_t(H)*GRP),packed(ExpertLayout<Bits>::bytes) {
-        scale=Bits==8?1.f/8192.f:1.f/512.f;
         const int bound=Bits==8?127:7;
         for(size_t i=0;i<gate.size();++i) gate[i]=int((i*17+i/H*11)%(2*bound+1))-bound;
         for(size_t i=0;i<down.size();++i) down[i]=int((i*13+i/GRP*3)%(2*bound+1))-bound;
@@ -143,7 +144,8 @@ template<int Bits> struct GroupFixture {
         } else {
             for(size_t i=0;i<values.size();++i) source[i/2]|=uint8_t(values[i]+8)<<((i%2)*4);
         }
-        std::vector<bf16> scales(size_t(n)*(k/128),__float2bfloat16(scale));
+        std::vector<bf16> scales(size_t(n)*(k/128));
+        for (int row=0;row<n;++row) for (int group=0;group<k/128;++group) scales[size_t(row)*(k/128)+group]=__float2bfloat16(scale_at(row,group));
         Device<uint8_t> src(source.size()),q(source.size()); Device<bf16> ss(scales.size()),s(scales.size());
         CUDA_CHECK(cudaMemcpy(src.p,source.data(),source.size(),cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(ss.p,scales.data(),scales.size()*2,cudaMemcpyHostToDevice));
@@ -153,7 +155,9 @@ template<int Bits> struct GroupFixture {
         CUDA_CHECK(cudaMemcpy(packed.data()+qo,q.p,source.size(),cudaMemcpyDeviceToHost));
         if constexpr(Bits==8) CUDA_CHECK(cudaMemcpy(packed.data()+so,s.p,scales.size()*2,cudaMemcpyDeviceToHost));
         else {
-            std::vector<__half> hs(scales.size(),__float2half_rn(scale));
+            std::vector<__half> hs(scales.size());  // scales live in the slot layout repack_scales_kernel writes
+            for (int row=0;row<n;++row) for (int group=0;group<k/128;++group)
+                hs[size_t((row/16)*(k/128)+group)*16+row%16]=__float2half_rn(scale_at(row,group));
             std::memcpy(packed.data()+so,hs.data(),hs.size()*2);
         }
     }
@@ -254,15 +258,15 @@ template<int Bits> static void expert_case() {
             double g=0,u=0;
             for(int k=0;k<H;++k) {
                 const float v=__half2float(input[size_t(t)*H+host_xh_pos(k)])*16.f;
-                g+=group.gate[size_t(gate_row)*H+k]*double(group.scale)*v;
-                u+=group.gate[size_t(gate_row+8)*H+k]*double(group.scale)*v;
+                g+=group.gate[size_t(gate_row)*H+k]*double(group.scale_at(gate_row,k/128))*v;
+                u+=group.gate[size_t(gate_row+8)*H+k]*double(group.scale_at(gate_row+8,k/128))*v;
             }
             expected_act[(size_t(j)*m+t)*GRP+c]=xh_round(float(g/(1+std::exp(-g))*u*weights[j*MAXM+t]));
         }
         for(int t=0;t<m;++t) for(int r=0;r<H;++r) {
             double v=0;
             for(int j=0;j<2;++j) for(int c=0;c<GRP;++c)
-                v+=group.down[size_t(r)*GRP+c]*double(group.scale)*expected_act[(size_t(j)*m+t)*GRP+c];
+                v+=group.down[size_t(r)*GRP+c]*double(group.scale_at(r,0))*expected_act[(size_t(j)*m+t)*GRP+c];
             expected[size_t(t)*H+r]=float(v);
         }
         std::vector<float> first;
@@ -403,8 +407,8 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
             const int r=(c/8)*16+c%8; double gate=0,up=0;
             for(int k=0;k<H;++k) {
                 const float value=qinput[size_t(tokens[t])*H+k];
-                gate+=group.gate[size_t(r)*H+k]*double(group.scale)*value;
-                up+=group.gate[size_t(r+8)*H+k]*double(group.scale)*value;
+                gate+=group.gate[size_t(r)*H+k]*double(group.scale_at(r,k/128))*value;
+                up+=group.gate[size_t(r+8)*H+k]*double(group.scale_at(r+8,k/128))*value;
             }
             expected_act[size_t(t)*GRP+c]=xh_round(float(gate/(1+std::exp(-gate))*up*weights[t]));
         }
@@ -413,7 +417,7 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
         for(int t=0;t<m;++t) for(int r=0;r<H;++r) {
             double qv=0,v=0;
             for(int c=0;c<GRP;++c) {
-                const double weight=group.down[size_t(r)*GRP+c]*double(group.scale)*2;
+                const double weight=group.down[size_t(r)*GRP+c]*double(group.scale_at(r,0))*2;
                 qv+=weight*qact[size_t(t)*GRP+c]; v+=weight*expected_act[size_t(t)*GRP+c];
             }
             slot_expected[size_t(t)*H+r]=__half2float(__float2half_rn(float(qv)/16.f))*16.f;
