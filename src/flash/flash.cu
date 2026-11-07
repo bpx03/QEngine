@@ -25,6 +25,7 @@
 #include <chrono>
 #include <functional>
 #include <sys/mman.h>
+#include <cuda.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -35,13 +36,16 @@
 //
 // The only environment write of this engine, here because no engine thread exists yet (the server keeps numpy's OpenBLAS
 // pool from starting before this: server/app.py): setenv may realloc environ and a getenv on another thread then walks
-// freed memory (issue #11). Any other setting is a variable.
+// freed memory (issue #11). Any other setting is a variable. When CUDA is already up (torch for --vision), the write comes
+// too late to change anything and other threads exist: skipped, the engine loads its kernels itself (preload_kernels).
 //
 // The GEMM autotuner picks per process by timing (choices and so the rounding differ between processes); the cost model's
 // choice is as fast for the flash shapes (text 928 prefill 169.6 vs 169.7 ms) and the same in every process: off unless
 // QE_GEMM_TUNE is set explicitly.
 __attribute__((constructor)) static void qe_process_env() {
-    if (!env_set("CUDA_MODULE_LOADING")) setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // empty = unset (env.h)
+    int nd = 0;  // the driver API does not start CUDA: NOT_INITIALIZED until someone has
+    if (!env_set("CUDA_MODULE_LOADING") && cuDeviceGetCount(&nd) == CUDA_ERROR_NOT_INITIALIZED)
+        setenv("CUDA_MODULE_LOADING", "EAGER", 1);  // empty = unset (env.h)
     gemm_tune_default(false);
 }
 
