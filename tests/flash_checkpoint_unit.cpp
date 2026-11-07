@@ -4,14 +4,15 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <cstdio>
 #include <stdexcept>
 #include <vector>
 
 namespace fs=std::filesystem;
 using namespace flash;
 using namespace flash::checkpoint_detail;
-static void require(bool condition,const char* why) { if(!condition) throw std::runtime_error(why); }
+static int fails=0;
+#define require(c,why) do { if(!(c)) { fprintf(stderr,"FAIL %s:%d: %s\n",__FILE__,__LINE__,(why)); ++fails; } } while(0)
 template<class F> static void rejects(F&& run) {
     bool rejected=false;
     try { run(); } catch(const std::runtime_error&) { rejected=true; }
@@ -150,6 +151,6 @@ int main() {
         bad=records; bad.back().shape={2560,5120}; rejects([&] { validate_inventory(bad,spec,"unsupported MTP FC"); });
         bad=records; bad.push_back(converted("model.language_model.layers.0.self_attn.q_proj",{12288,2560}));
         rejects([&] { validate_inventory(bad,spec,"mixed mixer families"); });
-        std::cout<<"flash_checkpoint_unit: PASS\n"; return 0;
-    } catch(const std::exception& e) { std::cerr<<"flash_checkpoint_unit: "<<e.what()<<'\n'; return 1; }
+        if(fails) return 1; printf("flash_checkpoint_unit: ok\n"); return 0;
+    } catch(const std::exception& e) { fprintf(stderr,"flash_checkpoint_unit: %s\n",e.what()); return 1; }
 }

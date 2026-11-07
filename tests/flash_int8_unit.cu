@@ -8,7 +8,9 @@
 #include <vector>
 
 using namespace flash;
-static void require(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
+static int fails = 0;
+#define require(ok, why) \
+    do { if (!(ok)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (why)); ++fails; } } while (0)
 template<class T> struct Device {
     T* p = nullptr;
     explicit Device(size_t n) { CUDA_CHECK(cudaMalloc(&p, n * sizeof(T))); }
@@ -20,12 +22,15 @@ static uint16_t bits(bf16 x) { uint16_t v; std::memcpy(&v, &x, 2); return v; }
 static void compare(const std::vector<float>& actual, const std::vector<float>& expected, double tolerance) {
     double error = 0, norm = 0;
     require(actual.size() == expected.size(), "output extent");
+    if (actual.size() != expected.size()) return;
+    bool nonfinite = false;
     for (size_t i = 0; i < actual.size(); ++i) {
-        require(std::isfinite(actual[i]), "nonfinite output");
+        nonfinite = nonfinite || !std::isfinite(actual[i]);
         const double d = actual[i] - expected[i]; error += d*d; norm += double(expected[i])*expected[i];
     }
+    require(!nonfinite, "nonfinite output");
     const double relative = std::sqrt(error / std::max(norm, 1e-30));
-    if (relative > tolerance) { std::fprintf(stderr,"normalized RMS %.9g exceeds %.9g\n",relative,tolerance); throw std::runtime_error("numerical mismatch"); }
+    if (relative > tolerance) { std::fprintf(stderr,"FAIL normalized RMS %.9g exceeds %.9g\n",relative,tolerance); ++fails; }
 }
 // Invert fragments by enumerating their lane/register fields, independent of repack's row-major traversal.
 static void packing_case(int n, int k, std::vector<uint8_t> source={},std::vector<bf16> scales={}) {
@@ -463,7 +468,6 @@ static void real_samples(const std::string& model) {
         packing_case(16,H,std::move(gate_codes),std::move(gate_scales));
         packing_case(16,GRP,std::move(down_codes),std::move(down_scales));
     }
-    std::puts("real expert boundary samples: code/scale bits and W8 math PASS");
 }
 int main() {
     try {
@@ -477,7 +481,8 @@ int main() {
         prefill_case<4,64>(); prefill_case<8,64>(); prefill_case<8,128>();
         prefill_case<4,64,true>(); prefill_case<8,64,true>();
         if(const char* model=std::getenv("INT8_MODEL")) real_samples(model);
-        std::puts("flash_int8_unit: repack, row GEMV/GEMM, expert decode/prefill and residency PASS");
+        if (fails) return 1;
+        std::printf("flash_int8_unit: ok\n");
         return 0;
     } catch(const std::exception& e) { std::fprintf(stderr,"flash_int8_unit: %s\n",e.what()); return 1; }
 }
