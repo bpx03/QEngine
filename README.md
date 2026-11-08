@@ -774,6 +774,8 @@ request of that server, short ones too, so run a separate server for long docume
 - **Pinned system prompts**: the KV and state at the end of each agent kind's system prompt and tools are kept apart
   from the archive (`FLASH_PREFIX_GB` / `QE_PREFIX_GB`, 8 GB), so a new agent of that kind starts after its system
   prompt even when the archive is full.
+- The archive grows its pinned slabs only between engine jobs: the coordinating thread drains every participating GPU
+  before `cudaHostRegister`, so slab growth can pause dispatch but never races running kernels.
 - There is no disk cache by default. With `--disk-cache DIR` (both models, 200 GB at most, `--disk-cache-gb`) conversations
   are also written to files and survive a restart: a conversation that returns is read back instead of recomputed. Flash-Next
   has it since 1.3.5.3, experimental; details in

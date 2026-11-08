@@ -113,63 +113,79 @@ public:
         { std::lock_guard<std::mutex> l(mu_); stop_ = true; }
         cv_.notify_all();
         if (th_.joinable()) th_.join();
+        std::lock_guard<std::mutex> l(mu_);
+        if (pending_) ::free(pending_);
     }
-    // pins slabs in the background while less than `headroom` pinned bytes are free (on demand: a full budget of
-    // 2 MB pages takes minutes to fault in next to a large page cache), up to `budget`, and only while the host
+    // pins slabs only when the coordinating thread has drained all GPU work
+    // while less than `headroom` pinned bytes are free, up to `budget`, and only while the host
     // keeps its margin (host_mem.h: MemAvailable - margin >= two slabs; else it waits and retries)
     void start(size_t budget, size_t slab, size_t headroom) {
-        if (!budget || !slab) return;
         th_ = std::thread([this, budget, slab, headroom] {
             double secs = 0;
             bool held = false;
-            while (!stop_) {
+            while (true) {
+                size_t sz;
                 {
                     std::unique_lock<std::mutex> l(mu_);
                     cv_.wait(l, [&] { return stop_ || (pinned_ < budget && pinned_ < used_ + headroom); });
                     if (stop_) return;
+                    sz = std::min(slab, budget - pinned_);
                 }
-                const size_t sz = std::min(slab, budget - pinned_);
                 if (qe_hostmem::headroom(true) < sz + slab) {  // the host is short of memory: not now
                     if (!held)
                         fprintf(stderr, "[qflash] archive pool: pinning held at %.1f GB (MemAvailable %.1f GB, margin %.1f GB)\n",
-                                pinned_ / 1e9, qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9);
+                                pinned() / 1e9, qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9);
                     held = true;
                     std::unique_lock<std::mutex> l(mu_);
                     cv_.wait_for(l, std::chrono::seconds(2), [&] { return stop_.load(); });
+                    if (stop_) return;
                     continue;
                 }
-                if (held) fprintf(stderr, "[qflash] archive pool: pinning resumed at %.1f GB\n", pinned_ / 1e9);
+                if (held) fprintf(stderr, "[qflash] archive pool: pinning resumed at %.1f GB\n", pinned() / 1e9);
                 held = false;
                 const auto t0 = std::chrono::steady_clock::now();
                 void* p = nullptr;
-                if (posix_memalign(&p, 1 << 21, sz) != 0 || !p) break;
+                if (posix_memalign(&p, 1 << 21, sz) != 0 || !p) return;
                 static const bool thp = env_int("FLASH_ARCHIVE_THP", 1);
                 if (thp) madvise(p, sz, MADV_HUGEPAGE);
                 memset(p, 0, sz);  // fault the pages in without the driver
-                bool reg_ok;
-                {
-                    // (no QeWdSlow here: a background registration of 1 GB slabs, minutes long at boot, would keep the
-                    // device watchdog from catching a real hang; reviews Flash-Next M6 / 27B L5)
-                    reg_ok = !stop_ && cudaHostRegister(p, sz, cudaHostRegisterPortable) == cudaSuccess;
-                }
-                if (!reg_ok) {
-                    cudaGetLastError();
-                    ::free(p);
-                    if (stop_) break;
+                std::unique_lock<std::mutex> l(mu_);
+                if (stop_) { ::free(p); return; }
+                pending_ = p;
+                pending_size_ = sz;
+                pending_result_ = cudaSuccess;
+                cv_.notify_all();
+                cv_.wait(l, [&] { return stop_ || pending_ == nullptr; });
+                if (stop_) return;
+                if (pending_result_ != cudaSuccess) {
                     fprintf(stderr, "[qflash] archive pool: cudaHostRegister failed at %.1f GB pinned, retrying in 10 s\n", pinned_ / 1e9);
-                    std::unique_lock<std::mutex> l(mu_);
                     cv_.wait_for(l, std::chrono::seconds(10), [&] { return stop_.load(); });
+                    if (stop_) return;
                     continue;
                 }
                 secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                std::lock_guard<std::mutex> l(mu_);
-                slabs_.push_back(Slab{(char*)p, sz, {{0, sz}}});
-                pinned_ += sz;
-                qe_hostmem::charged() += sz;
                 if (env_int("FLASH_SLOT_LOG", 0))
                     fprintf(stderr, "[qflash] archive pool: %.1f GB pinned (%.1f s), %.2f GB used\n", pinned_ / 1e9, secs, used_ / 1e9);
             }
         });
+    }
+    template<class Quiesce>
+    void register_pending(Quiesce&& quiesce) {
+        std::lock_guard<std::mutex> l(mu_);
+        if (!pending_) return;
+        quiesce();
+        pending_result_ = cudaHostRegister(pending_, pending_size_, cudaHostRegisterPortable);
+        if (pending_result_ == cudaSuccess) {
+            slabs_.push_back(Slab{(char*)pending_, pending_size_, {{0, pending_size_}}});
+            pinned_ += pending_size_;
+            qe_hostmem::charged() += pending_size_;
+        } else {
+            cudaGetLastError();
+            ::free(pending_);
+        }
+        pending_ = nullptr;
+        pending_size_ = 0;
+        cv_.notify_all();
     }
     char* alloc(size_t bytes, bool& pinned) {
         bytes = (bytes + 4095) / 4096 * 4096;
@@ -246,6 +262,9 @@ private:
     std::thread th_;
     std::atomic<bool> stop_{false};
     size_t pinned_ = 0, used_ = 0, pused_ = 0;
+    void* pending_ = nullptr;
+    size_t pending_size_ = 0;
+    cudaError_t pending_result_ = cudaSuccess;
 };
 
 // one host buffer per GPU: a KV segment or a recurrent state
@@ -696,6 +715,15 @@ struct FE {
     };
     void run(const char* tag = "job") {
         flash::tl_serving = true;
+        hpool.register_pending([this] {
+            int original;
+            CUDA_CHECK(cudaGetDevice(&original));
+            for (int r = 0; r < ng; r++) {
+                CUDA_CHECK(cudaSetDevice(devs[r]));
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
+            CUDA_CHECK(cudaSetDevice(original));
+        });
         run_tag.store(tag);
         qe_diag::job_tag().store(tag);
         if (ppb) {  // the stage threads (one per card); the bound slot first (the prefill flow re-binds between micro-batches)
