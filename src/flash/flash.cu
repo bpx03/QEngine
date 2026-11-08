@@ -1011,9 +1011,12 @@ W8 load_w8_packed(const SafeTensors& tensors, int n, int k, const std::vector<In
         }
         CUDA_CHECK(cudaMemcpyAsync(db, hb, qn, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(db + qb, hb + qb, sn, cudaMemcpyHostToDevice, stream));
-        repack_w8((const int32_t*)db, (const bf16*)(db + qb), rows, k, const_cast<uint4*>(out.q) + (size_t)tile * k / 16,
-                  const_cast<bf16*>(out.s) + (size_t)tile * (k / 128), stream);
-}
+        repack_w8((const int32_t*)db, (const bf16*)(db + qb), rows, k,
+                  const_cast<uint4*>(out.q) + (size_t)tile*k/16,
+                  const_cast<bf16*>(out.s) + (size_t)tile*(k/128), stream);
+        CUDA_CHECK(cudaEventRecord(ev[bi], stream));
+        rec[bi] = true;
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     for (auto& x : ev) CUDA_CHECK(cudaEventDestroy(x));
     return out;
@@ -1608,9 +1611,11 @@ void Worker::load_groups(const SafeTensors& st, Layer& L, const std::string& pre
         CUDA_CHECK(cudaMemcpyAsync(db, hb, (size_t)n * SG, cudaMemcpyHostToDevice, st_));
         for (int b = 0; b < n; b++) {
             const int k = ks[j0 + b];
-            const bool host_group = gm[k] >= L.ndev;
-            char* dst = host_group ? (int8 ? cold + (size_t)b * group_bytes_ : L.hgroups + (size_t)(gm[k] - L.ndev) * group_bytes_)
-                                   : L.groups + (size_t)gm[k] * group_bytes_;
+            const int local = gm[k];
+            const bool host_group = local >= L.ndev;
+            char* dst = host_group
+                ? (int8 ? cold + (size_t)b * group_bytes_ : L.hgroups + (size_t)(local - L.ndev) * group_bytes_)
+                : L.groups + (size_t)local * group_bytes_;
             int32_t* dgq = (int32_t*)(db + (size_t)b * SG);
             uint16_t* dgs = (uint16_t*)(dgq + gqw);
             int32_t* ddq = (int32_t*)(dgs + gsw);
@@ -2866,7 +2871,9 @@ void Worker::load_deferred_groups() {
                 "top of FLASH_EC_MARGIN_MB\n", lm.graph_mb, lm.graph_add_mb);
     const double margin_mb = lm.total_mb;
     // + per layer: gmap, allocation rounding (2 MiB), the cache table (8 B per group)
-    const long long other = (long long)nshared * group_bytes_ + (long long)ec_defer_l_.size() * (2 << 20) + (long long)gs.size() * 8;
+    const long long packed_scratch = format_==WeightFormat::Int8 ? 3LL*64*group_bytes_ : 0;
+    const long long other = (long long)nshared * group_bytes_ + (long long)ec_defer_l_.size() * (2 << 20)
+        + (long long)gs.size() * 8 + packed_scratch;
     long long nres = (long long)((fr - (long long)(margin_mb * 1048576.0) - other) * card_share_) / (long long)group_bytes_;
     nres = std::max(0LL, std::min<long long>(nres, gs.size()));
     // prefill staging ring (2 x the most cold groups of a layer, capped by FLASH_PF_STAGE_MB): its groups come out of the
@@ -2906,6 +2913,7 @@ void Worker::load_deferred_groups() {
         load_groups(*d.st, L_[d.li], d.pre, isc[d.li]);
         g_load_drop.done(d.st, d.pre);  // (load_groups read the mapping synchronously)
     }
+    g_s3.release();
     ec_defer_l_.clear();
     g_hs.release();
     // (the budget above kept the ring's bytes free: it fits unless the estimate was off; then smaller, never an abort)
@@ -6580,15 +6588,14 @@ void Worker::prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const b
     }
     const int nend = (int)pf_end_.size();
     static const int pfs_min = env_int("FLASH_PF_STAGE_MIN", 2048);
-    const bool staged = pfs_ring_ && n >= pfs_min && pf_nch_ > 1;
-    pfs_now_ = staged;
-    bt_want_ = prefill_borrow_tails(format_, n, pfbn_base_, staged, pfs_ext_lent_);
+    pfs_now_ = pfs_ring_ && n >= pfs_min && pf_nch_ > 1;
+    bt_want_ = prefill_borrow_tails(format_, n, pfbn_base_, pfs_now_, pfs_ext_lent_);
     al_want_ = n > pfbn_mid_;
     CHECK(!bt_want_ || ec_on_ || !ec_n_, "flash: big batch without the expert cache");
     CHECK(!al_want_ || al_room(ctx_abs), "flash: multi batch of %d rows on the KV tails at context %lld (pf_batch())", n, (long long)ctx_abs);
     ec_tick((int)(ctx_abs - ctx_off_), 1);  // KV in RAM: host rows up to the furthest segment end pinned
     bt_want_ = al_want_ = false;
-    pfs_now_ = pfs_ring_ && n >= pfs_min && pf_nch_ > 1;
+
     pfs_full_ = pfs_ext_ ? (!pfs_ext_lent_ || bt_taken_) : true;
     use(pfb_);
     pf_ = true;

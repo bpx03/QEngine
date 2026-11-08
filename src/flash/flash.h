@@ -404,7 +404,9 @@ public:
     // rows of a prefill batch whose buffers never take memory from the expert cache (the rest of pf_batch() is
     // borrowed from it for the batch, prefill-r3)
     int pf_batch_base() const { return pfbn_base_; }
-    // INT8 staged ring extension borrows expert-cache tails even for base-sized batches.
+    // a prefill batch takes the expert cache's lent tails (bt_want_, reclaimed by the following ec_tick): rows past
+    // the base buffer always do; an INT8 batch staged by the copy engine also does while the ring extension lives in
+    // cache slots, so the staging gets the whole ring (pfs_full_) instead of running capped through pfs_cap0_
     static bool prefill_borrow_tails(WeightFormat format, int n, int base, bool staged, bool extension_lent) {
         return n > base || (format == WeightFormat::Int8 && staged && extension_lent);
     }

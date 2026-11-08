@@ -1,7 +1,8 @@
-# only what the image needs: CMakeLists.txt, src/, server/, vectors/, tools/flash_kl_ref.py, requirements.txt, LICENSE, VERSION
+# only what the image needs: CMakeLists.txt, src/, tests/, server/, vectors/, requirements.txt, LICENSE
 *
 !CMakeLists.txt
 !src/
+!tests/
 !server/
 !vectors/
 !tools/flash_kl_ref.py

@@ -1,5 +1,6 @@
 #include "flash/flash_kernels.cuh"
 #include "flash/flash_pfq.cuh"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -10,13 +11,20 @@
 using namespace flash;
 static int fails = 0;
 #define require(ok, why) \
-    do { if (!(ok)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (why)); ++fails; } } while (0)
+    do { if (!(ok)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, (why)); throw std::runtime_error(why); } } while (0)
 template<class T> struct Device {
     T* p = nullptr;
     explicit Device(size_t n) { CUDA_CHECK(cudaMalloc(&p, n * sizeof(T))); }
     ~Device() { CUDA_CHECK(cudaFree(p)); }
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
+};
+struct Pinned {
+    uint8_t* p = nullptr;
+    explicit Pinned(size_t n) { CUDA_CHECK(cudaHostAlloc((void**)&p, n, cudaHostAllocPortable)); }
+    ~Pinned() { if (p) CUDA_CHECK(cudaFreeHost(p)); }
+    Pinned(const Pinned&) = delete;
+    Pinned& operator=(const Pinned&) = delete;
 };
 static uint16_t bits(bf16 x) { uint16_t v; std::memcpy(&v, &x, 2); return v; }
 static void compare(const std::vector<float>& actual, const std::vector<float>& expected, double tolerance) {
@@ -32,7 +40,18 @@ static void compare(const std::vector<float>& actual, const std::vector<float>& 
     const double relative = std::sqrt(error / std::max(norm, 1e-30));
     if (relative > tolerance) { std::fprintf(stderr,"FAIL normalized RMS %.9g exceeds %.9g\n",relative,tolerance); ++fails; }
 }
-// Invert fragments by enumerating their lane/register fields, independent of repack's row-major traversal.
+// Compare through lane/register coordinates, independent of repack's row-major traversal.
+static void check_packed_mapping(const uint8_t* packed, const bf16* packed_s, int n, int k,
+                                 const std::vector<uint8_t>& source, const std::vector<bf16>& scales) {
+    for (int tile=0;tile<n/16;++tile) for (int chunk=0;chunk<k/32;++chunk) for (int lane=0;lane<32;++lane)
+        for (int step=0;step<2;++step) for (int half=0;half<2;++half) for (int high=0;high<2;++high) for (int odd=0;odd<2;++odd) {
+            const int row=tile*16+lane/4+high*8, col=chunk*32+step*16+half*8+(lane%4)*2+odd;
+            const size_t p=(((size_t(tile)*(k/32)+chunk)*32+lane)*16)+step*8+(half*2+high)*2+odd;
+            require(packed[p]==uint8_t(source[size_t(row)*k+col]^0x80),"INT8 code bits changed");
+        }
+    for(int r=0;r<n;++r) for(int g=0;g<k/128;++g)
+        require(bits(packed_s[(size_t(r/16)*(k/128)+g)*16+r%16])==bits(scales[size_t(r)*(k/128)+g]),"BF16 scale bits changed");
+}
 static void packing_case(int n, int k, std::vector<uint8_t> source={},std::vector<bf16> scales={}) {
     if(source.empty()) {
         source.resize(size_t(n)*k);
@@ -59,14 +78,7 @@ static void packing_case(int n, int k, std::vector<uint8_t> source={},std::vecto
     std::vector<uint8_t> packed(source.size()); std::vector<bf16> packed_s(scales.size());
     CUDA_CHECK(cudaMemcpy(packed.data(),dst.p,packed.size(),cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(packed_s.data(),ds.p,packed_s.size()*2,cudaMemcpyDeviceToHost));
-    for(int tile=0;tile<n/16;++tile) for(int chunk=0;chunk<k/32;++chunk) for(int lane=0;lane<32;++lane)
-        for(int step=0;step<2;++step) for(int half=0;half<2;++half) for(int high=0;high<2;++high) for(int odd=0;odd<2;++odd) {
-            const int row=tile*16+lane/4+high*8, col=chunk*32+step*16+half*8+(lane%4)*2+odd;
-            const size_t p=(((size_t(tile)*(k/32)+chunk)*32+lane)*16)+step*8+(half*2+high)*2+odd;
-            require(packed[p]==uint8_t(source[size_t(row)*k+col]^0x80),"INT8 code bits changed");
-        }
-    for(int r=0;r<n;++r) for(int g=0;g<k/128;++g)
-        require(bits(packed_s[(size_t(r/16)*(k/128)+g)*16+r%16])==bits(scales[size_t(r)*(k/128)+g]),"BF16 scale bits changed");
+    check_packed_mapping(packed.data(),packed_s.data(),n,k,source,scales);
     W8 w{reinterpret_cast<uint4*>(dst.p),ds.p,n,k};
     for(int m : {1,2,3,8,9,16,17,32,33,64,65}) {
         const int ldx=k+16, ldy=n+16;
@@ -371,6 +383,83 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
         CUDA_CHECK(cudaMemcpy(wl.p,weights.data(),m*4,cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(x.p,input.data(),input.size()*2,cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemset(act.p,0,size_t(nact)*GRP*2));
+        std::vector<float> dn_pf_baseline[2]; std::vector<__half> dn_q_baseline[2];  // per-variant byte baselines across the four placements (BuildJobs)
+        auto run_jobs=[&](const std::vector<PfJob>& list) {  // every kernel over the job list of the current placement
+            k_xh_to_q<G><<<m,H/16>>>(x.p,xq.p,xqs.p);
+            k_moe_gu_q<Bits,G,1><<<2*nj,256>>>(jobs.p,count.p,tl.p,wl.p,xq.p,xqs.p,act.p);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(saved.p,act.p,size_t(nact)*GRP*2,cudaMemcpyDeviceToDevice));
+            std::vector<float> expected_act(size_t(m)*GRP);
+            for(int t=0;t<m;++t) for(int c=0;c<GRP;++c) {
+                const int r=(c/8)*16+c%8; double gate=0,up=0;
+                for(int k=0;k<H;++k) {
+                    const float value=qinput[size_t(tokens[t])*H+k];
+                    gate+=group.gate[size_t(r)*H+k]*double(group.scale_at(r,k/128))*value;
+                    up+=group.gate[size_t(r+8)*H+k]*double(group.scale_at(r+8,k/128))*value;
+                }
+                expected_act[size_t(t)*GRP+c]=xh_round(float(gate/(1+std::exp(-gate))*up*weights[t]));
+            }
+            // gu_q writes act[aoff + p] from the list position off + p (input row tl[off + p], weight wl[off + p]):
+            // check the rows the ng > 0 jobs wrote (their ng == 0 pair duplicates them, rows past n stay memset);
+            // with BuildJobs the list is the device router's (aoffs compact the groups per expert, not per 64-row job)
+            std::vector<__half> saved_host(size_t(nact)*GRP);
+            CUDA_CHECK(cudaMemcpy(saved_host.data(),saved.p,saved_host.size()*2,cudaMemcpyDeviceToHost));
+            std::vector<float> act_actual,act_expected;
+            for (const PfJob& pj : list) if (pj.ng > 0)
+                for (int p = 0; p < pj.n; ++p) for (int c = 0; c < GRP; ++c) {
+                    act_actual.push_back(__half2float(saved_host[size_t(pj.aoff+p)*GRP+host_xh_pos(c)])*16.f);
+                    act_expected.push_back(expected_act[size_t(pj.off+p)*GRP+c]);
+                }
+            compare(act_actual,act_expected,1e-3);
+            const auto qact=quantized_values(expected_act,GRP);
+            std::vector<float> slot_expected(size_t(m)*H),float_expected(size_t(m)*H,0);
+            for(int t=0;t<m;++t) for(int r=0;r<H;++r) {
+                double qv=0,v=0;
+                for(int c=0;c<GRP;++c) {
+                    const double weight=group.down[size_t(r)*GRP+c]*double(group.scale_at(r,0))*2;
+                    qv+=weight*qact[size_t(t)*GRP+c]; v+=weight*expected_act[size_t(t)*GRP+c];
+                }
+                slot_expected[size_t(t)*H+r]=__half2float(__float2half_rn(float(qv)/16.f))*16.f;
+                float_expected[size_t(tokens[t])*H+r]+=float(v);
+            }
+            for(bool deterministic : {false,true}) {
+                CUDA_CHECK(cudaMemset(output.p,0,size_t(m)*H*4));
+                CUDA_CHECK(cudaMemset(fixed.p,0,size_t(m)*H*8));
+                k_moe_dn_pf<Bits,2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,tl.p,saved.p,output.p,deterministic?fixed.p:nullptr);
+                if(deterministic) k_fx_to_f<<<256,256>>>(fixed.p,output.p,size_t(m)*H);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<float> actual(size_t(m)*H);
+                CUDA_CHECK(cudaMemcpy(actual.data(),output.p,actual.size()*4,cudaMemcpyDeviceToHost));
+                compare(actual,float_expected,1e-2);
+                if constexpr(BuildJobs) {  // same variant, same bytes at every placement (the RMS compare above alone would pass on per-placement drift)
+                    std::vector<float>& ref = dn_pf_baseline[deterministic?1:0];
+                    if (ref.empty()) ref = actual;
+                    else require(ref.size() == actual.size() && std::memcmp(ref.data(), actual.data(), actual.size()*4) == 0,
+                        deterministic ? "deterministic dn_pf outputs differ across placements"
+                                      : "non-deterministic dn_pf outputs differ across placements");
+                }
+            }
+            k_act_to_q<<<(nact*8+255)/256,256>>>(act.p,nact);
+            const int split=m/2; SlotBuf slot{slots.p,split,slots.p+size_t(split)*H};
+            for(int tile : {1,2}) {
+                CUDA_CHECK(cudaMemset(slots.p,0,size_t(m)*H*2));  // dn_q only rewrites the rows its jobs cover: every tile starts from zeroed slots
+                if(tile==1) k_moe_dn_q<Bits,1><<<dim3(H/16/4,nj),128>>>(jobs.p,count.p,act.p,slot);
+                else k_moe_dn_q<Bits,2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,act.p,slot);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<__half> halves(size_t(m)*H); std::vector<float> actual(halves.size());
+                CUDA_CHECK(cudaMemcpy(halves.data(),slots.p,halves.size()*2,cudaMemcpyDeviceToHost));
+                for(size_t i=0;i<actual.size();++i) actual[i]=__half2float(halves[i])*16.f;
+                compare(actual,slot_expected,1e-2);
+                if constexpr(BuildJobs) {  // rows are slot-ordered, the slot order is the router's atomic fill order: compare by token
+                    std::vector<__half> ordered(halves.size());
+                    for(int s=0;s<m;++s) std::copy_n(halves.data()+size_t(s)*H,H,ordered.data()+size_t(tokens[s])*H);
+                    std::vector<__half>& ref = dn_q_baseline[tile-1];
+                    if (ref.empty()) ref = std::move(ordered);
+                    else require(ref.size() == ordered.size() && std::memcmp(ref.data(), ordered.data(), ordered.size()*2) == 0,
+                        tile==1 ? "dn_q tile 1 slot rows differ across placements" : "dn_q tile 2 slot rows differ across placements");
+                }
+            }
+        };
         if constexpr(BuildJobs) {
             Device<int> map((NE+1)*NGRP),selected(size_t(m)*TOPK);
             Device<float> route_weights(size_t(m)*TOPK),shared_weights(m);
@@ -385,79 +474,146 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
             CUDA_CHECK(cudaMemcpy(selected.p,ids.data(),ids.size()*4,cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(route_weights.p,rw.data(),rw.size()*4,cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemset(shared_weights.p,0,m*4));
-            k_jobs_pf<Bits><<<1,512>>>(m,map.p,device.p,nullptr,2,selected.p,route_weights.p,
-                shared_weights.p,jobs.p,tl.p,wl.p,count.p,nullptr);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaMemcpy(tokens.data(),tl.p,m*4,cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(weights.data(),wl.p,m*4,cudaMemcpyDeviceToHost));
-            std::vector<int> occurrences(m,0);
-            for(int i=0;i<m;++i) {
-                require(tokens[i]>=0 && tokens[i]<m,"prefill router emitted out-of-range token");
-                ++occurrences[tokens[i]];
-                require(weights[i]==0.5f+float(tokens[i]%3)/16.f,"prefill route weight belongs to another token");
-            }
-            for(int times:occurrences) require(times==1,"prefill router lost/duplicated token");
-        }
-        k_xh_to_q<G><<<m,H/16>>>(x.p,xq.p,xqs.p);
-        k_moe_gu_q<Bits,G,1><<<2*nj,256>>>(jobs.p,count.p,tl.p,wl.p,xq.p,xqs.p,act.p);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(saved.p,act.p,size_t(nact)*GRP*2,cudaMemcpyDeviceToDevice));
-        std::vector<float> expected_act(size_t(m)*GRP);
-        for(int t=0;t<m;++t) for(int c=0;c<GRP;++c) {
-            const int r=(c/8)*16+c%8; double gate=0,up=0;
-            for(int k=0;k<H;++k) {
-                const float value=qinput[size_t(tokens[t])*H+k];
-                gate+=group.gate[size_t(r)*H+k]*double(group.scale_at(r,k/128))*value;
-                up+=group.gate[size_t(r+8)*H+k]*double(group.scale_at(r+8,k/128))*value;
-            }
-            expected_act[size_t(t)*GRP+c]=xh_round(float(gate/(1+std::exp(-gate))*up*weights[t]));
-        }
-        if constexpr(!BuildJobs) {  // with BuildJobs the device router emits its own job list, not this one
-            // gu_q writes act[aoff + p] from the list position off + p (input row tl[off + p], weight wl[off + p]):
-            // check the rows the ng > 0 jobs wrote (their ng == 0 pair duplicates them, rows past n stay memset)
-            std::vector<__half> saved_host(size_t(nact)*GRP);
-            CUDA_CHECK(cudaMemcpy(saved_host.data(),saved.p,saved_host.size()*2,cudaMemcpyDeviceToHost));
-            std::vector<float> act_actual,act_expected;
-            for (const PfJob& pj : descriptors) if (pj.ng > 0)
-                for (int p = 0; p < pj.n; ++p) for (int c = 0; c < GRP; ++c) {
-                    act_actual.push_back(__half2float(saved_host[size_t(pj.aoff+p)*GRP+host_xh_pos(c)])*16.f);
-                    act_expected.push_back(expected_act[size_t(pj.off+p)*GRP+c]);
+            // grp_ptr must resolve the pair (mapping 0,1 are expert 0's groups) at every placement: resident (ndev
+            // covers both, no table read), mapped host (entries tagged |1), device cache and staging ring (untagged
+            // entries, ndev=0: the stand-ins for the slots the expert cache lends; the cold table itself is the real one)
+            const size_t bytes=group.packed.size();
+            Device<char> cache(2*bytes),stage(2*bytes);
+            char* host=nullptr; char* mapped=nullptr;
+            CUDA_CHECK(cudaHostAlloc(&host,2*bytes,cudaHostAllocMapped));
+            std::memcpy(host,group.packed.data(),bytes); std::memcpy(host+bytes,group.packed.data(),bytes);
+            CUDA_CHECK(cudaHostGetDevicePointer(&mapped,host,0));
+            CUDA_CHECK(cudaMemcpy(cache.p,host,2*bytes,cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(stage.p,host,2*bytes,cudaMemcpyHostToDevice));
+            Device<uintptr_t> cold_ptr(2); Device<unsigned char> touch(2);
+            for(int place=0;place<4;++place) {
+                const bool table=place>0;  // the resident placement never reaches the table (li < ndev)
+                const uintptr_t base=place==0?reinterpret_cast<uintptr_t>(device.p)
+                    :place==1?reinterpret_cast<uintptr_t>(mapped)
+                    :place==2?reinterpret_cast<uintptr_t>(cache.p):reinterpret_cast<uintptr_t>(stage.p);
+                const uintptr_t tag=place==1?uintptr_t(1):uintptr_t(0);  // host-mapped entries carry |1, grp_ptr strips it
+                const uintptr_t cold[2]={base|tag,(base+bytes)|tag};
+                CUDA_CHECK(cudaMemcpy(cold_ptr.p,cold,sizeof(cold),cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemset(touch.p,0,2)); CUDA_CHECK(cudaMemset(count.p,0,4));
+                CUDA_CHECK(cudaMemset(act.p,0,size_t(nact)*GRP*2));
+                k_jobs_pf<Bits><<<1,512>>>(m,map.p,device.p,table?ColdTab(cold_ptr.p,touch.p):ColdTab(),table?0:2,
+                    selected.p,route_weights.p,shared_weights.p,jobs.p,tl.p,wl.p,count.p,nullptr);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                int njobs=0; CUDA_CHECK(cudaMemcpy(&njobs,count.p,4,cudaMemcpyDeviceToHost));
+                require(njobs==2*((m+PF_SHJ-1)/PF_SHJ),"prefill router emitted the wrong job count");
+                std::vector<PfJob> emitted(njobs);
+                CUDA_CHECK(cudaMemcpy(emitted.data(),jobs.p,njobs*sizeof(PfJob),cudaMemcpyDeviceToHost));
+                for(int j=0;j<njobs;++j) {  // expert 0's chunks x local groups: group k is the placement's copy li=k
+                    const int q=j/2,k=j%2; const MoeJob& gj=emitted[j].w;
+                    require(reinterpret_cast<uintptr_t>(gj.gq)==base+uintptr_t(k)*bytes,"job gate_up address");
+                    require(reinterpret_cast<uintptr_t>(gj.gs)==base+uintptr_t(k)*bytes+ExpertLayout<Bits>::gs,"job gate_up scale address");
+                    require(reinterpret_cast<uintptr_t>(gj.dq)==base+uintptr_t(k)*bytes+ExpertLayout<Bits>::dq,"job down address");
+                    require(reinterpret_cast<uintptr_t>(gj.ds)==base+uintptr_t(k)*bytes+ExpertLayout<Bits>::ds,"job down scale address");
+                    require(emitted[j].off==q*PF_SHJ && emitted[j].n==std::min(PF_SHJ,m-q*PF_SHJ),"prefill job row extent");
+                    require(emitted[j].aoff==k*m+q*PF_SHJ && emitted[j].ng==(k==0?2:0),"prefill job activation layout");
                 }
-            compare(act_actual,act_expected,1e-3);
-        }
-        const auto qact=quantized_values(expected_act,GRP);
-        std::vector<float> slot_expected(size_t(m)*H),float_expected(size_t(m)*H,0);
-        for(int t=0;t<m;++t) for(int r=0;r<H;++r) {
-            double qv=0,v=0;
-            for(int c=0;c<GRP;++c) {
-                const double weight=group.down[size_t(r)*GRP+c]*double(group.scale_at(r,0))*2;
-                qv+=weight*qact[size_t(t)*GRP+c]; v+=weight*expected_act[size_t(t)*GRP+c];
+                unsigned char touched[2]={0,0};
+                CUDA_CHECK(cudaMemcpy(touched,touch.p,2,cudaMemcpyDeviceToHost));
+                require(table?(touched[0]==1&&touched[1]==1):(touched[0]==0&&touched[1]==0),
+                    "cold-group table touch does not match the placement");  // every read through the table touches
+                CUDA_CHECK(cudaMemcpy(tokens.data(),tl.p,m*4,cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(weights.data(),wl.p,m*4,cudaMemcpyDeviceToHost));
+                std::vector<int> occurrences(m,0);
+                for(int i=0;i<m;++i) {
+                    require(tokens[i]>=0 && tokens[i]<m,"prefill router emitted out-of-range token");
+                    ++occurrences[tokens[i]];
+                    require(weights[i]==0.5f+float(tokens[i]%3)/16.f,"prefill route weight belongs to another token");
+                }
+                for(int times:occurrences) require(times==1,"prefill router lost/duplicated token");
+                run_jobs(emitted);
             }
-            slot_expected[size_t(t)*H+r]=__half2float(__float2half_rn(float(qv)/16.f))*16.f;
-            float_expected[size_t(tokens[t])*H+r]+=float(v);
-        }
-        for(bool deterministic : {false,true}) {
-            CUDA_CHECK(cudaMemset(output.p,0,size_t(m)*H*4));
-            CUDA_CHECK(cudaMemset(fixed.p,0,size_t(m)*H*8));
-            k_moe_dn_pf<Bits,2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,tl.p,saved.p,output.p,deterministic?fixed.p:nullptr);
-            if(deterministic) k_fx_to_f<<<256,256>>>(fixed.p,output.p,size_t(m)*H);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            std::vector<float> actual(size_t(m)*H);
-            CUDA_CHECK(cudaMemcpy(actual.data(),output.p,actual.size()*4,cudaMemcpyDeviceToHost));
-            compare(actual,float_expected,1e-2);
-        }
-        k_act_to_q<<<(nact*8+255)/256,256>>>(act.p,nact);
-        const int split=m/2; SlotBuf slot{slots.p,split,slots.p+size_t(split)*H};
-        for(int tile : {1,2}) {
-            if(tile==1) k_moe_dn_q<Bits,1><<<dim3(H/16/4,nj),128>>>(jobs.p,count.p,act.p,slot);
-            else k_moe_dn_q<Bits,2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,act.p,slot);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            std::vector<__half> halves(size_t(m)*H); std::vector<float> actual(halves.size());
-            CUDA_CHECK(cudaMemcpy(halves.data(),slots.p,halves.size()*2,cudaMemcpyDeviceToHost));
-            for(size_t i=0;i<actual.size();++i) actual[i]=__half2float(halves[i])*16.f;
-            compare(actual,slot_expected,1e-2);
-        }
+            CUDA_CHECK(cudaFreeHost(host));
+        } else run_jobs(descriptors);
     }
+}
+static uint8_t group_code(int group, int plane, int row, int col) {
+    const unsigned key = (unsigned)(group*7919 + plane*104729 + row*37 + col*101);
+    switch (key % 23) {
+        case 0: return 0;
+        case 1: return 128;
+        case 2: return 255;
+        case 3: return 1;
+        case 4: return 254;
+        default: return (uint8_t)(key*29u + row*7u + col*13u);
+    }
+}
+static bf16 group_scale(int group, int plane, int row, int part) {
+    return __float2bfloat16(0.5f + float((group*13 + plane*29 + row*3 + part*7) % 97) / 64.f);
+}
+static void make_group_record(int group, char* record) {
+    auto* gate = (uint8_t*)record;
+    auto* gs = (bf16*)(record + ExpertLayout<8>::gs);
+    auto* down = (uint8_t*)(record + ExpertLayout<8>::dq);
+    auto* ds = (bf16*)(record + ExpertLayout<8>::ds);
+    for (int half=0;half<2;++half) for (int i=0;i<GRP;++i) {
+        const int row=(i/8)*16+half*8+i%8;
+        for (int c=0;c<H;++c) gate[(size_t)row*H+c]=group_code(group,half,i,c);
+        for (int part=0;part<H/128;++part) gs[(size_t)row*(H/128)+part]=group_scale(group,half,i,part);
+    }
+    for (int row=0;row<H;++row) {
+        for (int c=0;c<GRP;++c) down[(size_t)row*GRP+c]=group_code(group,2,row,c);
+        ds[row]=group_scale(group,2,row,0);
+    }
+}
+static void cold_group_copy_case() {
+    constexpr int BATCH=4, GROUPS=2*BATCH+1;
+    constexpr size_t GB=ExpertLayout<8>::bytes;
+    Pinned staging(2*BATCH*GB), output(GROUPS*GB);
+    Device<uint8_t> staged_device(2*BATCH*GB), scratch(BATCH*GB);
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    cudaEvent_t events[2];
+    for (auto& event : events) CUDA_CHECK(cudaEventCreateWithFlags(&event,cudaEventDisableTiming));
+    bool recorded[2]={false,false};
+    for (int first=0,batch=0;first<GROUPS;first+=BATCH,++batch) {
+        const int slot=batch&1, count=std::min(BATCH,GROUPS-first);
+        if (recorded[slot]) CUDA_CHECK(cudaEventSynchronize(events[slot]));
+        char* hb=(char*)staging.p+(size_t)slot*BATCH*GB;
+        char* db=(char*)staged_device.p+(size_t)slot*BATCH*GB;
+        for (int b=0;b<count;++b) make_group_record(first+b,hb+(size_t)b*GB);
+        CUDA_CHECK(cudaMemcpyAsync(db,hb,(size_t)count*GB,cudaMemcpyHostToDevice,stream));
+        for (int b=0;b<count;++b) {
+            char* src=db+(size_t)b*GB;
+            char* dst=(char*)scratch.p+(size_t)b*GB;
+            repack_w8((const int32_t*)src,(const bf16*)(src+ExpertLayout<8>::gs),2*GRP,H,
+                      (uint4*)dst,(bf16*)(dst+ExpertLayout<8>::gs),stream);
+            repack_w8((const int32_t*)(src+ExpertLayout<8>::dq),(const bf16*)(src+ExpertLayout<8>::ds),H,GRP,
+                      (uint4*)(dst+ExpertLayout<8>::dq),(bf16*)(dst+ExpertLayout<8>::ds),stream);
+            CUDA_CHECK(cudaMemcpyAsync(output.p+(size_t)(first+b)*GB,dst,GB,cudaMemcpyDeviceToHost,stream));
+        }
+        CUDA_CHECK(cudaEventRecord(events[slot],stream));
+        recorded[slot]=true;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (auto& event : events) CUDA_CHECK(cudaEventDestroy(event));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    bool saw_zero=false,saw_center=false,saw_max=false,saw_one=false,saw_near_max=false;
+    for (int group=0;group<GROUPS;++group) {
+        std::vector<uint8_t> gate((size_t)2*GRP*H), down((size_t)H*GRP);
+        std::vector<bf16> gs((size_t)2*GRP*(H/128)), ds(H);
+        for (int half=0;half<2;++half) for (int i=0;i<GRP;++i) {
+            const int row=(i/8)*16+half*8+i%8;
+            for (int c=0;c<H;++c) {
+                const uint8_t code=group_code(group,half,i,c);
+                gate[(size_t)row*H+c]=code;
+                saw_zero|=code==0; saw_center|=code==128; saw_max|=code==255; saw_one|=code==1; saw_near_max|=code==254;
+            }
+            for (int part=0;part<H/128;++part) gs[(size_t)row*(H/128)+part]=group_scale(group,half,i,part);
+        }
+        for (int row=0;row<H;++row) {
+            for (int c=0;c<GRP;++c) down[(size_t)row*GRP+c]=group_code(group,2,row,c);
+            ds[row]=group_scale(group,2,row,0);
+        }
+        const char* got=(const char*)output.p+(size_t)group*GB;
+        check_packed_mapping((const uint8_t*)got,(const bf16*)(got+ExpertLayout<8>::gs),2*GRP,H,gate,gs);
+        check_packed_mapping((const uint8_t*)(got+ExpertLayout<8>::dq),(const bf16*)(got+ExpertLayout<8>::ds),H,GRP,down,ds);
+    }
+    require(saw_zero&&saw_center&&saw_max&&saw_one&&saw_near_max,"cold group codes cover zero and byte extremes");
 }
 static void real_samples(const std::string& model) {
     SafeTensors tensors;
@@ -486,11 +642,33 @@ static void real_samples(const std::string& model) {
         packing_case(16,GRP,std::move(down_codes),std::move(down_scales));
     }
 }
+static void prefill_borrow_tails_case() {  // Worker::prefill_borrow_tails with a base of 2560 rows (host only, no CUDA)
+    struct Row { int n; WeightFormat format; bool staged, lent, want; };
+    static const Row rows[]={
+        // at or below the base buffer: INT4 never takes the cache tails; INT8 only while it stages cold groups AND the
+        // ring extension still lives in cache slots (then the staging needs the whole ring back)
+        {512,WeightFormat::Int4,false,false,false},{512,WeightFormat::Int4,false,true,false},{512,WeightFormat::Int4,true,false,false},{512,WeightFormat::Int4,true,true,false},
+        {512,WeightFormat::Int8,false,false,false},{512,WeightFormat::Int8,false,true,false},{512,WeightFormat::Int8,true,false,false},{512,WeightFormat::Int8,true,true,true},
+        {2047,WeightFormat::Int4,false,false,false},{2047,WeightFormat::Int4,false,true,false},{2047,WeightFormat::Int4,true,false,false},{2047,WeightFormat::Int4,true,true,false},
+        {2047,WeightFormat::Int8,false,false,false},{2047,WeightFormat::Int8,false,true,false},{2047,WeightFormat::Int8,true,false,false},{2047,WeightFormat::Int8,true,true,true},
+        {2048,WeightFormat::Int4,false,false,false},{2048,WeightFormat::Int4,false,true,false},{2048,WeightFormat::Int4,true,false,false},{2048,WeightFormat::Int4,true,true,false},
+        {2048,WeightFormat::Int8,false,false,false},{2048,WeightFormat::Int8,false,true,false},{2048,WeightFormat::Int8,true,false,false},{2048,WeightFormat::Int8,true,true,true},
+        {2560,WeightFormat::Int4,false,false,false},{2560,WeightFormat::Int4,false,true,false},{2560,WeightFormat::Int4,true,false,false},{2560,WeightFormat::Int4,true,true,false},
+        {2560,WeightFormat::Int8,false,false,false},{2560,WeightFormat::Int8,false,true,false},{2560,WeightFormat::Int8,true,false,false},{2560,WeightFormat::Int8,true,true,true},
+        // past the base buffer the batch takes the tails whatever the format or the staging
+        {2561,WeightFormat::Int4,false,false,true},{2561,WeightFormat::Int4,false,true,true},{2561,WeightFormat::Int4,true,false,true},{2561,WeightFormat::Int4,true,true,true},
+        {2561,WeightFormat::Int8,false,false,true},{2561,WeightFormat::Int8,false,true,true},{2561,WeightFormat::Int8,true,false,true},{2561,WeightFormat::Int8,true,true,true},
+    };
+    for(const Row& r : rows)
+        require(Worker::prefill_borrow_tails(r.format,r.n,2560,r.staged,r.lent)==r.want,"prefill borrow-tails rule");
+}
 int main() {
     try {
         CUDA_CHECK(cudaSetDevice(0));
         gemv_workspace_init();
+        prefill_borrow_tails_case();
         packing_case(16,128); packing_case(32,256); packing_case(48,640); packing_case(32,2560);
+        cold_group_copy_case();
         for(int one_warp : {0,1}) {
             CUDA_CHECK(cudaMemcpyToSymbol(g_moe_dn_1w,&one_warp,sizeof(one_warp)));
             expert_case<4>(); expert_case<8>();
