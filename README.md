@@ -2,6 +2,8 @@
 
 ![QEngine: fast local AI on RTX 3000, 4000 and 5000 series cards](docs/img/qengine.jpg)
 
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support%20QEngine-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/bpx03)
+
 QEngine is a source-available inference engine for two models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
 nothing extra to install or set for any of them (tuned on the RTX 3090):
 
@@ -91,6 +93,7 @@ an older version, please upgrade.
 - [Benchmarks](#benchmarks)
 - [Troubleshooting and FAQ](#troubleshooting-and-faq)
 - [Repository layout and tests](#repository-layout-and-tests)
+- [Support](#support)
 - [Changelog, license, disclaimer](#changelog)
 
 More settings, measurements and the troubleshooting table: [docs/advanced.md](docs/advanced.md).
@@ -1091,6 +1094,13 @@ Most other tests need the GPUs and a model (`QE_TEST_MODEL`, `QE_LIB=build/libqf
 
 Every release has notes on the [releases page](https://github.com/bpx03/QEngine/releases), with the fixes, new
 settings and how to upgrade.
+
+## Support
+
+QEngine is built and tested on one machine at home, and every release goes through long benchmark, quality and
+stress runs before it ships. If it saves you money or lets you run something you couldn't before, you can
+[buy me a coffee](https://buymeacoffee.com/bpx03). It pays for power, disks and memory for new models, and the time
+it takes to fix the bugs you report. Bug reports and benchmark results from your own hardware help just as much.
 
 ## License
 
