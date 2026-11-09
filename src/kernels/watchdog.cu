@@ -222,7 +222,22 @@ void qe_fatal_begin() {
     if (g_wd && !g_wd->abort) g_wd->abort = 0xFFu;  // peers' waits trap at their next check
 }
 
+static std::atomic<void (*)()> g_load_oom_fallback{nullptr};
+static std::atomic<bool> g_fallback_any{false};
+void qe_set_load_oom_fallback(void (*fn)(), bool any_cuda_error) {
+    g_fallback_any.store(any_cuda_error);
+    g_load_oom_fallback.store(fn);
+}
+bool qe_load_oom_fallback_armed() { return g_load_oom_fallback.load() != nullptr; }
+void qe_load_oom_fallback() {
+    if (void (*fn)() = g_load_oom_fallback.load()) fn();
+}
+
 [[noreturn]] void qe_fatal_cuda(int err, const char* file, int line) {
+    if (((cudaError_t)err == cudaErrorMemoryAllocation || g_fallback_any.load()) && qe_load_oom_fallback_armed()) {
+        fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorName((cudaError_t)err), file, line);
+        qe_load_oom_fallback();
+    }
     qe_fatal_begin();
     if (g_fatal.exchange(1)) {  // another thread reports and ends the process
         for (;;) pause();

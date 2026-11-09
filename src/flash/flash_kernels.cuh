@@ -978,7 +978,7 @@ __global__ void __launch_bounds__(128) k_dn_rec(const float* __restrict__ cv, in
         const float qq = block_sum<128>(q * q, red), kk = block_sum<128>(k * k, red);
         qs[j] = q * rsqrtf(qq + 1e-6f) * rsqrtf(128.f);
         ks[j] = k * rsqrtf(kk + 1e-6f);
-        const float b = ab[(size_t)t * 2 * vl + hv], a = ab[(size_t)t * 2 * vl + vl + hv];
+        const float b = ab[(size_t)t * dn_ab_ld(vl) + hv], a = ab[(size_t)t * dn_ab_ld(vl) + vl + hv];
         const float beta = sigm(b);
         const float xa = a + dt;
         const float sp = xa > 20.f ? xa : log1pf(__expf(xa));
@@ -1027,7 +1027,7 @@ __global__ void __launch_bounds__(128) k_dn_rec2(const float* __restrict__ cv, i
         qs[t] = q * rsqrtf(qq + 1e-6f) * rsqrtf(128.f);
         ks[t] = k * rsqrtf(kk + 1e-6f);
         __syncthreads();
-        const float b = ab[(size_t)r * 2 * vl + hv], a = ab[(size_t)r * 2 * vl + vl + hv];
+        const float b = ab[(size_t)r * dn_ab_ld(vl) + hv], a = ab[(size_t)r * dn_ab_ld(vl) + vl + hv];
         const float beta = sigm(b);
         const float xa = a + dt;
         const float spl = xa > 20.f ? xa : log1pf(__expf(xa));
@@ -1129,7 +1129,7 @@ __global__ void k_dn_qk(const float* __restrict__ cv, int ch, int kl, int vl, in
     const int r = blockIdx.x, kh = blockIdx.y, t = threadIdx.x;
     if (kh == kl) {
         for (int hv = t; hv < vl; hv += blockDim.x) {
-            const float b = ab[(size_t)r * 2 * vl + hv], a = ab[(size_t)r * 2 * vl + vl + hv];
+            const float b = ab[(size_t)r * dn_ab_ld(vl) + hv], a = ab[(size_t)r * dn_ab_ld(vl) + vl + hv];
             const float xa = a + dtb[hv];
             const float spl = xa > 20.f ? xa : log1pf(__expf(xa));
             gb[(size_t)r * 2 * vl + hv] = __expf(A[hv] * spl);
@@ -1191,7 +1191,7 @@ __global__ void __launch_bounds__(128) k_dn_rec_d(const float* __restrict__ cv, 
         qs[t] = q * rsqrtf(qq + 1e-6f) * rsqrtf(128.f);
         ks[t] = k * rsqrtf(kk + 1e-6f);
         __syncthreads();
-        const float b = ab[(size_t)r * 2 * vl + hv], a = ab[(size_t)r * 2 * vl + vl + hv];
+        const float b = ab[(size_t)r * dn_ab_ld(vl) + hv], a = ab[(size_t)r * dn_ab_ld(vl) + vl + hv];
         const float beta = sigm(b);
         const float xa = a + dt;
         const float spl = xa > 20.f ? xa : log1pf(__expf(xa));

@@ -90,7 +90,9 @@ struct Comm {
     uint2* hpag[4] = {nullptr, nullptr, nullptr, nullptr};
     bool hview = false;      // this Comm is a comm_decode_view (its pll / pag are the host words)
     bool hfence = false;     // host view: fence the reader's clears once per thread (comm_host_fence)
+    bool p2p_verified = false;  // comm_select_path: peer access on, the data check ran, nothing it found was left in use
     bool dcal_want = false;  // set by the engine before comm_select_path: it times real decode steps on both paths
+    bool pp_stages = false;  // log text only (engine, before comm_select_path): FLASH_PAR=pp, the stages do not use this path
     bool dcal = false;       // auto with both candidates allocated: the engine's start-up calibration picks (flash_capi)
     bool dcal_fresh = false; // QE_DECODE_COMM=remeasure: the calibration ignores its start-up cache (and rewrites it)
 };

@@ -126,6 +126,10 @@ public:
     int* spec_io(int slot);
     void constrain(int slot, bool on);
     bool constrained(int slot) const { return seqs_.at(slot).constrained; }
+    // logprobs: a constrained slot (constrain first; ends with it) keeps the target head's raw logits of its steps and its
+    // prompt end, before the mask. logits_read: row of the last step in token order; false: bad row
+    void logits_capture(int slot, bool on);
+    bool logits_read(int slot, int row, float* out);
     // temperature <= 0 selects greedy decoding
     // presence / frequency penalty of the current slot (after set_sampling, which turns it off): its counts
     // restart with the distinct seed tokens, then follow the reply. set_no_lookup: no lookup drafts for the slot's

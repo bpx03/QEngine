@@ -90,6 +90,19 @@ int main() {
         EXPECT(comm_decode_rule(rep.leave_p2p, 0.f, 0.f, 1.5f).x == 2);   // no microbench: the rule alone
         EXPECT(comm_decode_rule(rep.leave_p2p, 10.f, 41.f, 4.f).x == 0);  // host pathologically slower: P2P kept
     }
+    {  // numa_pick: QE_NUMA over the caller, else the known nodes, else all nodes (sysfs -1, PR #16)
+        using V = std::vector<int>;
+        const V all{0, 1, 2, 3};
+        EXPECT(numa_pick({}, {}, all).empty());                  // no placement asked
+        EXPECT(numa_pick({}, {0, 1}, all).empty());              // QE_NUMA does not add placement
+        EXPECT(numa_pick({2}, {}, all) == V{2});                 // known node: unchanged
+        EXPECT(numa_pick({1, 3}, {}, all) == (V{1, 3}));
+        EXPECT(numa_pick({-1}, {}, all) == all);                 // unknown: all nodes
+        EXPECT(numa_pick({-1, 2}, {}, all) == V{2});             // the known one wins
+        EXPECT(numa_pick({2}, {0, 1, 1, -1}, all) == (V{0, 1}));  // QE_NUMA replaces it, duplicates / negatives dropped
+        EXPECT(numa_pick({-1}, {3}, all) == V{3});
+        EXPECT(numa_pick({-1}, {-1}, all).empty());              // QE_NUMA of nothing usable: no placement
+    }
     if (fails) return 1;
     printf("comm_rule_unit: ok\n");
     return 0;

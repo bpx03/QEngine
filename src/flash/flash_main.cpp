@@ -285,7 +285,7 @@ int main(int argc, char** argv) {
         set_card_ranks(std::vector<int>(devs.begin(), devs.begin() + ng));  // (a card listed twice: SM partitions)
         comm = comm_create(ng, ARU_MAX * H, H);
         const bool p2p = comm_enable_p2p(comm, devs.data());
-        printf("all-reduce: %s\n", p2p ? "P2P" : "host memory");
+        printf("peer access: %s\n", p2p ? "yes" : "no");  // (the paths: the [comm] lines below)
         comm_select_path(comm, devs.data(), "FLASH_COMM", true);
         {  // the host -> card link (expert staging): sizes the prefill batches on slow links (flash.h probe_host_link)
             const double g = probe_host_link(devs);

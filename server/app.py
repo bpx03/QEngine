@@ -124,8 +124,9 @@ NO_ROOM_S = env_float("QE_NO_ROOM_S", 10.0)
 NOPROG_STEPS = env_int("QE_NO_PROGRESS_STEPS", 64)
 NOPROG_S = env_float("QE_NO_PROGRESS_S", 10.0)
 PAUSE_TIMEOUT_S = env_float("QE_PAUSE_TIMEOUT_S", 900.0)  # deadline of a reply waiting for VRAM another process holds (preemption pauses: none)
-# the hang deadline while the slots are persisted to the disk cache (27B --disk-cache: idle and at shutdown)
+# the hang deadline while the slots are persisted to the disk cache (--disk-cache: idle and at shutdown)
 HANG_PERSIST_S = env_float("QE_HANG_PERSIST_S", 3600.0)
+DISK_FLUSH_S = env_float("QE_DISK_FLUSH_S", 600.0)  # Flash-Next --disk-cache: how long the exit waits for the queued files
 
 
 QE_HANG_DIAG_S = env_float("QE_HANG_DIAG_S", 30.0)  # hang monitor: time for the diagnostics before the hard exit
@@ -244,6 +245,59 @@ class Template:
 # ----------------------------------------------------------------------------- detokenizer
 
 
+# GPT-2 byte-level alphabet of the tokenizers we serve (ByteLevel decoder): token text -> the token's own bytes
+_BYTES = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+_BYTE_OF = {chr(b): b for b in _BYTES}
+_BYTE_OF.update({chr(256 + i): b for i, b in enumerate(b for b in range(256) if b not in _BYTES)})
+
+
+class LpText(str):
+    """Reply text that carries the logprobs entries (attribute lp) of its tokens to the HTTP side."""
+
+
+def token_bytes(tok, t):
+    """The UTF-8 bytes of one token (a token may hold part of a character)."""
+    s = tok.id_to_token(int(t)) or ""
+    return bytes(_BYTE_OF[c] for c in s) if all(c in _BYTE_OF for c in s) else s.encode()
+
+
+def logprob_entry(tok, logits, t, top):
+    """OpenAI logprobs entry of token t: raw logits of the target model through log-softmax over the whole vocabulary,
+    before temperature, top-p / top-k / min-p and penalties. -9999.0 (OpenAI's value): a token the head does not reach."""
+    import numpy as np
+    x = logits.astype(np.float64)
+    bad = ~np.isfinite(x)
+    if bad.any():  # (the 27B has no guard on the head's input) never NaN in the JSON: those tokens count as unreachable
+        print(f"WARNING logprobs: {int(bad.sum())} non-finite logits at token {t}", flush=True)
+        x[bad] = -np.inf
+    m = x.max()
+    lp = x - (m + np.log(np.exp(x - m).sum())) if np.isfinite(m) else np.full_like(x, -np.inf)
+
+    def one(i):
+        b = token_bytes(tok, i)
+        return {"token": b.decode("utf-8", "replace"), "logprob": max(float(lp[i]), -9999.0), "bytes": list(b)}
+
+    tops = []
+    if top > 0:
+        ids = np.argpartition(-x, top - 1)[:top]
+        tops = [one(i) for i in ids[np.argsort(-x[ids], kind="stable")]]
+    return dict(one(t), top_logprobs=tops)
+
+
+def logprob_params(body):
+    """(logprobs, top_logprobs) of a chat request: None without logprobs, else the alternatives per token; a string:
+    what is wrong with the fields."""
+    lp, top = body.get("logprobs"), body.get("top_logprobs")
+    if lp is not None and not isinstance(lp, bool):
+        return "logprobs must be a boolean"
+    if top is not None:
+        if isinstance(top, bool) or not isinstance(top, int) or not 0 <= top <= 20:
+            return f"top_logprobs must be an integer between 0 and 20, got {top!r}"
+        if top and not lp:
+            return "top_logprobs requires logprobs to be true"
+    return (top or 0) if lp else None
+
+
 class Detok:
     """Incremental detokenization that never emits half of a multi-byte character. marks: {token id:
     text} for the reply parser's tags (server/content_markers.py): those tokens come out with their `<`
@@ -317,6 +371,20 @@ def bad_param(body, stop_key, keys):
         except (TypeError, ValueError, OverflowError):
             return k, f"{k} must be a number"
     return None
+
+
+def context_line(asked, e):
+    """The start-up line of the context: requested (--max-ctx), the KV pool and the context served per conversation
+    (/v1/models max_model_len, /props n_ctx, the request length check). The served one is never above the pool: a
+    smaller pool lowers it, the server starts anyway (club-3090 #1966)."""
+    ln = f"context: requested {asked} tokens, KV pool {e.pool_tokens} tokens, served {e.max_t} tokens per conversation"
+    if e.max_t >= asked:
+        return ln
+    if getattr(e, "max_t_engine", e.max_t) > e.max_t:
+        why = "the engine reported more than its KV pool"
+    else:
+        why = "by the engine (KV pool, GPU memory or the YaRN factor; see its start-up lines)"
+    return f"{ln} (lowered: {why}; longer requests get 400 context_length_exceeded)"
 
 
 def reply_thinking(gen, ids, kw):
@@ -796,12 +864,13 @@ class Generator:
         # models) plus those two tokens by name
         self.eos = set(prof.eos_ids) | {self.tok.token_to_id(t) for t in ("<|im_end|>", "<|endoftext|>")
                                         if self.tok.token_to_id(t) is not None}
-        sd = prof.sampling(args.temperature, args.top_p, args.top_k, args.min_p)
-        args.temperature = sd.pop("temperature")
-        self.sampling_defaults = sd
-        print("sampling defaults (when the request has none): temperature %.2f, top_p %.2f, top_k %d, min_p %.2f"
-              % (args.temperature, self.sampling_defaults["top_p"], self.sampling_defaults["top_k"],
-                 self.sampling_defaults["min_p"]), flush=True)
+        self.sampling_defaults = {t: prof.sampling(t, args.temperature, args.top_p, args.top_k, args.min_p, args.presence_penalty)
+                                  for t in (True, False)}
+        for t, name in ((True, "thinking"), (False, "non-thinking")):
+            sd = self.sampling_defaults[t]
+            print("sampling defaults, %s (when the request has none): temperature %.2f, top_p %.2f, top_k %d, min_p %.2f, "
+                  "presence_penalty %.2f" % (name, sd["temperature"], sd["top_p"], sd["top_k"], sd["min_p"], sd["presence_penalty"]),
+                  flush=True)
         self.vision = None
         if args.vision:  # before the engine, so that its KV cache planning sees the memory used
             from vision import VisionEncoder
@@ -815,6 +884,7 @@ class Generator:
                              lib_path=getattr(args, "engine_lib", None) or None,
                              vocab=prof.vocab_size)
         self.dstats = engine_stats.DraftStats(self.engine)  # per-slot draft counters (qe_draft_stats)
+        print(context_line(args.max_ctx, self.engine), flush=True)
         if not self.engine.has("stops"):  # no undo of the steps past a stop sequence
             global STOP_ROLLBACK
             STOP_ROLLBACK = 0
@@ -824,7 +894,7 @@ class Generator:
         # structured output (response_format): llguidance matchers, masks written into the engine
         self.grammars = None
         print(f"engine parallel mode: {self.engine.par.get('mode', 'tp')} ({self.engine.par.get('why', '')})", flush=True)
-        if self.vision is not None and not self.engine.has("vision"):  # (mode B: no image input on the pipeline stages)
+        if self.vision is not None and not self.engine.has("vision"):  # (PP x TP: no image input)
             print(f"--vision ignored: {self.engine.refused.get('vision', 'the engine has no image input')}", flush=True)
             self.vision = None
         if self.engine.has("grammar"):
@@ -879,8 +949,8 @@ class Generator:
             self.metrics.serve(args.metrics_host, args.metrics_port)
         if env_str("QE_WARMUP", "1") != "0":  # pre-build decode graphs (no first-use stalls)
             # sampling mode: requests normally carry a temperature (Claude Code does), and the
-            # server default is 0.6
-            print(f"graph warm-up: {self.engine.warmup(greedy=args.temperature <= 0):.1f}s", flush=True)
+            # server defaults sample too
+            print(f"graph warm-up: {self.engine.warmup(greedy=self.sampling_defaults[True]['temperature'] <= 0):.1f}s", flush=True)
         self.engine.set_concurrent(True)
         self.cv = threading.Condition()
         self.queue = []
@@ -1318,6 +1388,29 @@ class Generator:
                 hit = True
         return hit
 
+    def step_logprobs(self, j, active, tr):
+        """One step of a logprobs reply, alone (single-sequence path): the engine keeps its raw logits per slot until its
+        next step. Tokens are fed one by one: each reads its own row. Returns the tokens of the step."""
+        e = self.engine
+        if self.cur_slot != j.slot:
+            e.resume(j.slot)
+            self.cur_slot = j.slot
+        ts = time.time()
+        self.beat("step")
+        toks = e.step()
+        if not toks:
+            self.cur_slot = -1
+        tr("step", ts, 1, len(toks))
+        self.metrics.step([j], [len(toks)], time.time() - ts)
+        self.faults(active)  # (all of them: a settle in pp can file another slot's fault)
+        if j.finished:
+            return 0
+        for i, t in enumerate(toks):
+            j.lp_row = i
+            j.feed([t])
+        self.no_progress(j, len(toks))
+        return len(toks)
+
     def no_progress(self, j, n):
         """A sequence that gets no token for NOPROG_STEPS steps and NOPROG_S seconds while it is not paused fails
         with an error (and the pool state is logged) instead of looping silently (issue #3 D2)."""
@@ -1535,7 +1628,8 @@ class Generator:
                     # Only a refusal that can go away (no room, prompts in flight) and only while something runs (idle,
                     # nothing can change: the refusal is final); bad input / too long fail at once with their message
                     t_ref = getattr(admit, "t_refused", None) or time.monotonic()
-                    retry = isinstance(ex, StartRefused) and ex.retry and (active or prefills) and not self.stopping
+                    # (a disk cache read ends by itself, also with nothing running)
+                    retry = isinstance(ex, StartRefused) and ex.retry and (active or prefills or ex.code == StartRefused.DISK) and not self.stopping
                     if retry and time.monotonic() - t_ref < START_RETRY_S:
                         admit.t_refused = t_ref
                         admit.n_refused = getattr(admit, "n_refused", 0) + 1
@@ -1565,7 +1659,8 @@ class Generator:
                 prefills = []
             if not self.queue and not active and not prefills:
                 continue
-            e.set_lookahead(not prefills)  # no step queued ahead of a prefill chunk
+            # no step queued ahead of a prefill chunk, nor next to a logprobs reply's own steps (it would be undone each time)
+            e.set_lookahead(not prefills and not any(j.lp is not None for j in active))
             if prefills:
                 # prompt chunks interleaved with decode steps of the running sequences: small
                 # chunks while others decode (they keep generating), whole ones otherwise
@@ -1661,8 +1756,20 @@ class Generator:
                     near = j.tc is not None and j.tc.near()  # a forced close may come: nothing decoded ahead of it
                     if (j.stops and STOP_ROLLBACK) or j.tc is not None:
                         e.set_no_ahead(j.slot, stop or near)
-                if len(active) == 1:
-                    j = active[0]
+                others = active
+                if any(j.lp is not None for j in active):  # logprobs replies step alone, the others as usual
+                    others = [j for j in active if j.lp is None]
+                    got = 0
+                    for j in active:
+                        if j.lp is not None and not j.finished:
+                            got += self.step_logprobs(j, active, tr)
+                    others = [j for j in others if not j.finished]
+                    if not others and not got and not prefills:  # paused / waiting: no hot spin (N-L7)
+                        time.sleep(0.02)
+                if not others:
+                    pass
+                elif len(others) == 1:
+                    j = others[0]
                     if self.cur_slot != j.slot:
                         e.resume(j.slot)
                         self.cur_slot = j.slot
@@ -1676,10 +1783,10 @@ class Generator:
                     if STEP_PROF:
                         p1 = _pc()
                     tr("step", ts, 1, len(toks))
-                    self.metrics.step(active, [len(toks)], time.time() - ts)
+                    self.metrics.step(others, [len(toks)], time.time() - ts)
                     if STEP_PROF:
                         p2 = _pc()
-                    if self.faults(active) or j.finished:
+                    if self.faults(others) or j.finished:
                         continue
                     j.feed(toks)
                     self.no_progress(j, len(toks))
@@ -1695,16 +1802,16 @@ class Generator:
                     self.cur_slot = -1  # batch steps undo the queued-ahead single step
                     ts = time.time()
                     self.beat("batch step")
-                    res = e.step_batch([j.slot for j in active])
-                    tr("batch", ts, len(active), sum(len(r) for r in res))
-                    self.metrics.step(active, [len(r) for r in res], time.time() - ts)
+                    res = e.step_batch([j.slot for j in others])
+                    tr("batch", ts, len(others), sum(len(r) for r in res))
+                    self.metrics.step(others, [len(r) for r in res], time.time() - ts)
                     tf = time.time()
-                    self.faults(active)
-                    for j, toks in zip(active, res):
+                    self.faults(others)
+                    for j, toks in zip(others, res):
                         if not j.finished:
                             j.feed(toks)
                             self.no_progress(j, len(toks))
-                    tr("feed", tf, len(active))
+                    tr("feed", tf, len(others))
                     if not any(res) and not prefills:  # every slot paused / waiting: no hot spin (N-L7; not while a prompt prefills, R4-L2)
                         time.sleep(0.02)
             except Exception as ex:
@@ -1743,10 +1850,13 @@ class Job:
     stop_sent = 0  # stop sequences: the length of text_all that went to the client (stop_scan)
     answer_at = 0  # stop sequences match from here; None: a guard-opened thinking turn whose answer has not begun (stop_from)
     answer_max = None  # a guard-opened thinking turn: the client's max_tokens, for the answer alone
+    lp = None  # OpenAI logprobs: top_logprobs of each token, None: off (no engine or token work at all)
+    lp_row = 0  # logprobs: the row of the token being fed
 
     def __init__(self, gen, ids, p, on_text, cancelled, affinity):
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
         self.affinity = affinity
+        self.lp = p.get("logprobs")
         self.grammar, self.grammar_s, self.gsteps = None, 0.0, 0  # structured output (begin_start)
         self.glk = None  # TokenLookup of a constrained reply (grammar.py)
         self.done = threading.Event()
@@ -1766,12 +1876,12 @@ class Job:
 
     def begin_start(self):
         g, e, p = self.gen, self.gen.engine, self.p
+        # values the client does not send (Claude Code sends none): the model card's for this reply's mode, or
+        # --temperature / --top-p / ... Sampling at temperature 1 without them (top_p 1, top_k 40) lets tail tokens
+        # break tool-call syntax.
+        d = g.sampling_defaults[bool(p.get("thinking", True))]
         temp = p.get("temperature")
-        temp = g.args.temperature if temp is None else temp
-        # top_p / top_k / min_p the client does not send (Claude Code sends none): the model's
-        # recommended values (generation_config.json, --top-p / --top-k). Sampling at temperature
-        # 1 without them (top_p 1, top_k 40) lets tail tokens break tool-call syntax.
-        d = g.sampling_defaults
+        temp = d["temperature"] if temp is None else temp
         self.max_new = p.get("max_tokens") or (e.max_t - len(self.ids) - 16)
         self.stops = [s for s in (p.get("stop") or []) if s]
         self.t0 = time.time()
@@ -1785,7 +1895,7 @@ class Job:
         # stay greedy: deterministic checks); the loop guard raises presence and seeds it with the repeated reply
         pres, freq = p.get("presence_penalty"), p.get("frequency_penalty")
         explicit = pres is not None or freq is not None
-        pres = float(pres if pres is not None else (getattr(g.args, "presence_penalty", 0.0) if temp > 0 else 0.0))
+        pres = float(pres if pres is not None else (d["presence_penalty"] if temp > 0 else 0.0))
         freq = float(freq if freq is not None else (getattr(g.args, "frequency_penalty", 0.0) if temp > 0 else 0.0))
         guard = getattr(self.ids, "guard", None)
         seed = []
@@ -1811,6 +1921,57 @@ class Job:
             self.grammar.fill(e.mask_buffer(self.slot)[0])
             e.constrain(self.slot, True)
             self.grammar_s += time.perf_counter() - tg
+        if self.lp is not None:  # the raw logits per token: a constrained slot with every token allowed (engine.capture_logits)
+            if self.grammar is None:
+                e.mask_buffer(self.slot).fill(0xFFFFFFFF)
+                e.constrain(self.slot, True)
+            e.capture_logits(self.slot)
+            self.lp_mode = "reasoning" if p["thinking"] else "content"  # (as Parser)
+            self.lp_lead, self.lp_fresh, self.lp_held, self.lp_out = False, True, [], []
+
+    def lp_token(self, t):
+        """The entry of a reply token that goes to choices[].logprobs.content, else None: OpenAI has no field for reasoning
+        or tool-call tokens. By token ids, as Parser by the marked tags: <think> .. </think> and the newlines after it, a
+        real <tool_call> and all that follows."""
+        g = self.gen
+        ti = g.think_ids
+        if self.lp_mode == "tool":
+            return None
+        if self.lp_mode == "reasoning":
+            if t == ti.end:
+                self.lp_mode, self.lp_lead, self.lp_fresh = "content", True, True
+            return None
+        if self.lp_fresh and t == ti.start:
+            self.lp_mode = "reasoning"
+            return None
+        if t == g.tok.token_to_id("<tool_call>"):
+            self.lp_mode = "tool"
+            return None
+        text = g.tok.decode([t], skip_special_tokens=False)
+        if self.lp_lead and not text.strip("\n"):
+            return None
+        self.lp_lead = False
+        if text.strip():
+            self.lp_fresh = False
+        x = g.engine.logits_row(self.slot, self.lp_row)
+        if x is None:
+            print(f"WARNING logprobs: no row {self.lp_row} for token {t}: no entry", flush=True)
+            return None
+        return logprob_entry(g.tok, x, t, self.lp)
+
+    def lp_attach(self, s, entry):
+        """Entries go with the text that reached the client: an entry whose token ends past a stop's cut, or in text held
+        back for a stop that may still come, waits (and past the cut never goes)."""
+        end = len(self.text_all)
+        if entry is not None:
+            self.lp_held.append((entry, end))
+        sent = self.stop_sent if self.stops else end
+        while self.lp_held and self.lp_held[0][1] <= sent:
+            self.lp_out.append(self.lp_held.pop(0)[0])
+        if s and self.lp_out:
+            s = LpText(s)
+            s.lp, self.lp_out = self.lp_out, []
+        return s
 
     def finish_start(self):
         """The prompt is prefilled: first token, then this job decodes with the others."""
@@ -1924,6 +2085,7 @@ class Job:
                 pending = pending[:i]
                 break
         self.n += len(pending)
+        entry = self.lp_token(pending[0]) if self.lp is not None and pending else None
         if self.tc is not None:
             self.tc.track(pending)
             if self.answer_max is not None and not self.tc.open:  # thinking done: max_tokens for the answer from here
@@ -1953,6 +2115,8 @@ class Job:
         elif s:
             self.text_all += unmark(s)  # the text itself (stops); on_text gets the marked text
             self.text_mk += s
+        if self.lp is not None:
+            s = self.lp_attach(s, entry)
         if s:
             if STEP_PROF:
                 q0 = _pc()
@@ -2101,6 +2265,8 @@ class Job:
                           "cache_src": self.src,
                           "completion_tokens": self.n, "finish": self.finish, "slot": self.slot,
                           "prefill_s": self.t1 - self.t0, "decode_s": t2 - self.t1}
+            if self.lp is not None:
+                self.stats["logprobs"] = self.lp_out  # (entries no text carried: the HTTP side's last chunk)
             if ds is not None:
                 self.stats["drafts"] = ds  # [steps, MTP drafted, accepted, lookup drafted, accepted]
             if trimmed is not None:
@@ -2235,14 +2401,14 @@ async def complete(gen, ids, params, aff, thinking, tools):
     bytes are already sent. usage.completion_tokens counts the tokens of every try; finish_reason is the last try's."""
     tries = max(0, getattr(gen.args, "empty_retry", 0))
     temp = params.get("temperature")
-    temp = gen.args.temperature if temp is None else temp
+    temp = gen.sampling_defaults[bool(thinking)]["temperature"] if temp is None else temp
     if (params.get("grammar") is not None or temp <= 0 or params.get("seed") is not None or params.get("ignore_eos")
             or params.get("stop")):
         tries = 0
     spent, spent_s, first = 0, 0.0, None
     for attempt in range(tries + 1):
         parser = Parser(thinking)
-        parts = {"reasoning": "", "content": ""}
+        parts = {"reasoning": "", "content": "", "logprobs": []}
         st = None
         p = dict(params, empty_retry=(attempt, tries)) if tries else params  # the empty-reply WARNING says retry k/N
         async for item in fault_events(stream_bridge(gen, ids, p, aff)):
@@ -2252,9 +2418,12 @@ async def complete(gen, ids, params, aff, thinking, tools):
                 st = item
                 for kind, t in parser.feed("", final=True, promote=st.get("promote_call", False)):
                     parts[kind] += t
+                parts["logprobs"] += st.get("logprobs", ())
             else:
                 for kind, t in parser.feed(item):
                     parts[kind] += t
+                if type(item) is LpText:
+                    parts["logprobs"] += item.lp
         if first is None:
             first = st
         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
@@ -2317,10 +2486,17 @@ def log_stats(kind, st):
 
 
 # reasoning efforts qwen38_syssafe.jinja knows: 'high' renders as 'xhigh', 'medium' adds no instruction, and
-# any other value ('none', typos) renders as 'medium' (the model's own template raises instead); the server rewrites
-# 'max' to 'xhigh' and 'minimal' to 'low' before rendering (think_budget.QWEN_RULES.client)
+# any other value (typos) renders as 'medium' (the model's own template raises instead); the server rewrites
+# 'max' to 'xhigh' and 'minimal' to 'low' before rendering (think_budget.QWEN_RULES.client), and 'none' (the
+# OpenAI "no reasoning" value, any case) to enable_thinking=false before any template sees it (template_kwargs)
 KNOWN_EFFORTS = ("xhigh", "high", "medium", "low")
 CLIENT_EFFORTS = ("max", "minimal")
+NO_EFFORT = "none"
+
+
+def is_no_effort(e):
+    """The effort means "no reasoning" (OpenAI `none`; case and surrounding blanks ignored)."""
+    return isinstance(e, str) and e.strip().lower() == NO_EFFORT
 
 
 EMPTY_THINK = "<think>\n\n</think>\n\n"  # the template's generation prompt with enable_thinking=false
@@ -2337,23 +2513,42 @@ def guard_budget(ids, budget, src):
 
 def template_kwargs(body, default_think, default_effort=None, anthropic=False):
     """Template variables of a request. Effort: the request's chat_template_kwargs.reasoning_effort, else its
-    top-level reasoning_effort (OpenAI field, also read on the Anthropic path), else (anthropic: /v1/messages)
-    output_config.effort, else --reasoning-effort (default_effort; None = the template's own default, xhigh).
-    A null value counts as not sent."""
+    top-level reasoning_effort (OpenAI field, also read on the Anthropic path), else reasoning.effort (OpenAI
+    Responses / OpenRouter object, both paths), else (anthropic: /v1/messages) output_config.effort, else
+    --reasoning-effort (default_effort; None = the template's own default, xhigh).
+    A null value counts as not sent.
+
+    Effort `none` (any case, surrounding blanks ignored): thinking off, i.e. the variables of enable_thinking=false
+    (reasoning_effort is dropped, so the prompt is byte for byte that of enable_thinking=false). A `none` the request
+    sends (any of the fields above) wins over its own enable_thinking: true, as enable_thinking: false wins over an
+    effort (any "off" wins). The server default `none` (--reasoning-effort) only sets the default: a request that
+    turns thinking on itself (chat_template_kwargs.enable_thinking: true, thinking.type enabled / adaptive) thinks with
+    the template's own default effort, one that names an effort thinks at that effort."""
     kw = dict(body.get("chat_template_kwargs") or {})
     th = body.get("thinking")
-    if isinstance(th, dict) and th.get("type") == "disabled":
+    th_type = th.get("type") if isinstance(th, dict) else None
+    if th_type == "disabled":
         kw.setdefault("enable_thinking", False)
+    from_request = True
     if kw.get("reasoning_effort") is None:
         kw.pop("reasoning_effort", None)
         eff = body.get("reasoning_effort")
+        rs = body.get("reasoning")  # OpenAI Responses / OpenRouter: reasoning: {"effort": ...}
+        if eff is None and isinstance(rs, dict):
+            eff = rs.get("effort")
         oc = body.get("output_config")
         if eff is None and anthropic and isinstance(oc, dict):
             eff = oc.get("effort")
         if eff is None:
-            eff = default_effort
+            eff, from_request = default_effort, False
         if eff is not None:
             kw["reasoning_effort"] = eff
+    if is_no_effort(kw.get("reasoning_effort")):
+        del kw["reasoning_effort"]
+        # (only a real bool is a switch: the template tests `is true` / `is false`, so 0 or "false" still think)
+        asked_on = kw.get("enable_thinking") is True or th_type in ("enabled", "adaptive")
+        if from_request or not asked_on:
+            kw["enable_thinking"] = False
     kw.setdefault("enable_thinking", default_think)
     return kw
 
@@ -2606,6 +2801,11 @@ def build_app(gen: Generator, args):
                                        "presence_penalty", "frequency_penalty"))
         if bad:
             return JSONResponse({"error": {"message": bad[1], "type": "invalid_request_error", "param": bad[0]}}, status_code=400)
+        logprobs = logprob_params(body)
+        if isinstance(logprobs, str) or (logprobs is not None and not gen.engine.has("logprobs")):
+            msg = logprobs if isinstance(logprobs, str) else "logprobs: this engine library has no logits read-back"
+            return JSONResponse({"error": {"message": msg, "type": "invalid_request_error", "param": "top_logprobs"
+                                           if "top_logprobs" in msg else "logprobs"}}, status_code=400)
         tools = body.get("tools")
         kw = gen.effort_rules.client_effort(template_kwargs(body, args.think, args.reasoning_effort))
         try:
@@ -2648,7 +2848,10 @@ def build_app(gen: Generator, args):
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
                   "grammar": grammar, "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
-                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
+                  "thinking": reply_thinking(gen, ids, kw)}
+        if logprobs is not None:
+            params["logprobs"] = logprobs
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(reply_thinking(gen, ids, kw))
 
@@ -2667,9 +2870,16 @@ def build_app(gen: Generator, args):
 
         if body.get("stream"):
             async def sse():
+                lp_buf = []  # logprobs entries that wait for a content chunk (the parser may hold text back)
+
                 def chunk(delta, finish=None, extra=None):
                     d = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": model_name,
                          "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                    if logprobs is not None:
+                        d["choices"][0]["logprobs"] = None
+                        if lp_buf and ("content" in delta and delta["content"] or finish):
+                            d["choices"][0]["logprobs"] = {"content": list(lp_buf)}
+                            lp_buf.clear()
                     if extra:
                         d.update(extra)
                     return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
@@ -2696,6 +2906,7 @@ def build_app(gen: Generator, args):
                         if calls:
                             yield chunk({"tool_calls": tool_calls_out(calls)})
                         finish = "tool_calls" if calls else st["finish"]
+                        lp_buf.extend(st.get("logprobs", ()))
                         yield chunk({}, finish)
                         # usage in its own chunk with empty choices (OpenAI stream_options.include_usage)
                         yield "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
@@ -2708,6 +2919,8 @@ def build_app(gen: Generator, args):
                         return
                     if STEP_PROF:
                         a0 = _pc()
+                    if type(item) is LpText:
+                        lp_buf.extend(item.lp)
                     for kind, t in parser.feed(item):
                         c = chunk({"reasoning_content" if kind == "reasoning" else "content": t})
                         if STEP_PROF:
@@ -2726,15 +2939,18 @@ def build_app(gen: Generator, args):
                                 status_code=500)
         parser, parts, st, calls = r
         msg = {"role": "assistant", "content": parts["content"].strip() or (None if calls else "")}
+        if logprobs is not None and msg["content"]:  # as streamed: the entries join to exactly this text
+            msg["content"] = parts["content"]
         if parts["reasoning"]:
             msg["reasoning_content"] = parts["reasoning"].strip()
         if calls:
             msg["tool_calls"] = [{k: v for k, v in c.items() if k != "index"} for c in tool_calls_out(calls)]
         log_stats("chat", st)
+        choice = {"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else st["finish"]}
+        if logprobs is not None:
+            choice["logprobs"] = {"content": parts["logprobs"]}
         return {"id": rid, "object": "chat.completion", "created": created, "model": model_name,
-                "choices": [{"index": 0, "message": msg,
-                             "finish_reason": "tool_calls" if calls else st["finish"]}],
-                "usage": usage(st)}
+                "choices": [choice], "usage": usage(st)}
 
     # ---------------- Anthropic messages ----------------
     @app.post("/v1/messages/count_tokens")
@@ -2796,7 +3012,8 @@ def build_app(gen: Generator, args):
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
                   "stop": [stop] if isinstance(stop, str) else stop, "grammar": grammar, "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
-                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty")}
+                  "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
+                  "thinking": reply_thinking(gen, ids, kw)}
         mid = "msg_" + uuid.uuid4().hex[:24]
         parser = Parser(reply_thinking(gen, ids, kw))
         stop_map = {"stop": "end_turn", "length": "max_tokens"}
@@ -2937,7 +3154,8 @@ def parse_args(argv=None):
                     help="chat template (default: server/templates/qwen38_syssafe.jinja, else the model's own)")
     ap.add_argument("--devices", default=None,
                     help="GPU indices within CUDA_VISIBLE_DEVICES (default: every visible GPU, else 0,1,2); "
-                         "Flash-Next: 2 or 3 cards: tp; 4+ cards: pp (pipeline stages; see the README)")
+                         "Flash-Next: 2 or 3 cards: tp; 4 cards: tp with peer access between all of them, else pp; "
+                         "5+ cards: pp (pipeline stages; see the README)")
     def ctx_arg(v):  # 262144, 256K, 1M (K = 1024 tokens)
         m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*", v)
         if not m:
@@ -2945,14 +3163,16 @@ def parse_args(argv=None):
         return int(float(m.group(1)) * {"": 1, "k": 1024, "m": 1024 * 1024}[m.group(2).lower()])
     ap.add_argument("--max-ctx", type=ctx_arg, default=262144,
                     help="context per conversation (default 262144); above 262144 (up to 1M) turns on YaRN RoPE "
-                         "scaling, factor context / 262144 (27B: QE_YARN, Flash-Next: FLASH_YARN, and needs FLASH_KV=ram)")
+                         "scaling, factor context / 262144 (27B: QE_YARN, Flash-Next: FLASH_YARN, and needs FLASH_KV=ram). "
+                         "Never above the KV pool: a smaller pool lowers it and the server starts anyway (start-up line "
+                         "'context: requested ..., KV pool ..., served ...')")
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
     ap.add_argument("--temperature", type=float, default=None,
-                    help="default when request has none (27B 0.6, Flash-Next generation_config 1.0)")
-    ap.add_argument("--top-p", type=float, default=None, help="default when request has none (generation_config)")
-    ap.add_argument("--top-k", type=int, default=None, help="default when request has none (generation_config)")
-    ap.add_argument("--min-p", type=float, default=None, help="default when request has none (generation_config)")
+                    help="default when request has none, both modes (model card: thinking 1.0, non-thinking 0.7)")
+    ap.add_argument("--top-p", type=float, default=None, help="default when request has none, both modes (model card: thinking 0.95, non-thinking 0.80)")
+    ap.add_argument("--top-k", type=int, default=None, help="default when request has none, both modes (model card: 20)")
+    ap.add_argument("--min-p", type=float, default=None, help="default when request has none, both modes (model card: 0)")
     ap.add_argument("--mtp-file", default=None,
                     help="MTP head weights for the engine (sets $QE_MTP_FILE; default: the engine's own choice, "
                          "for 27B model_mtp_ft.safetensors when present, else downloaded once from the latest "
@@ -2965,16 +3185,20 @@ def parse_args(argv=None):
     ap.add_argument("--think", type=int, default=1, help="default enable_thinking")
     ap.add_argument("--reasoning-effort", default=env_str("QE_REASONING_EFFORT"),
                     help="default reasoning effort for requests that send none (xhigh, high = xhigh, max = xhigh, "
-                         "medium, low, minimal = low; "
-                         "a request's reasoning_effort or chat_template_kwargs.reasoning_effort wins; other values "
+                         "medium, low, minimal = low, none = thinking off unless a request turns it on or names an "
+                         "effort; "
+                         "a request's reasoning_effort, chat_template_kwargs.reasoning_effort or reasoning.effort "
+                         "wins, and a "
+                         "request's none turns thinking off (as enable_thinking=false, also over its own "
+                         "enable_thinking=true); other values "
                          "render as medium); env QE_REASONING_EFFORT; default: unset = the template's own (xhigh)")
     ap.add_argument("--thinking-budget", default=env_str("QE_THINKING_BUDGET"),
                     help="default thinking budget in tokens for requests that send none (0 = off): at the budget the "
                          "server closes <think> with a short wrap-up and the model answers. One number for every "
                          "request, or a budget per reasoning effort, e.g. low:4096,medium:16384,xhigh:32768 with an "
                          "optional default:N (or *:N) for the rest; the effort is the one the prompt is rendered with "
-                         "(Qwen3.8: high / max = xhigh, minimal = low, unknown = medium; an entry < 0 = no budget for "
-                         "that effort). A malformed value stops the start-up. A request's thinking.budget_tokens (Anthropic) / "
+                         "(Qwen3.8: high / max = xhigh, minimal = low, unknown = medium; none = thinking off, no "
+                         "server budget; an entry < 0 = no budget for that effort). A malformed value stops the start-up. A request's thinking.budget_tokens (Anthropic) / "
                          "thinking_budget (OpenAI, also in chat_template_kwargs; aliases thinking_token_budget, "
                          "max_thinking_tokens, custom_params.thinking_budget, reasoning.max_tokens) wins, a negative "
                          "one turns it off; env QE_THINKING_BUDGET")
@@ -3047,9 +3271,9 @@ def parse_args(argv=None):
                          "structured output or client stop sequences (0 = off); env QE_EMPTY_RETRY")
     ap.add_argument("--loop-guard-tokens", type=int, default=600,
                     help="end a reply whose last N+ tokens are one short fragment repeated (0 = off)")
-    ap.add_argument("--presence-penalty", type=float, default=env_float("QE_PRESENCE_PENALTY", 0.0),
+    ap.add_argument("--presence-penalty", type=float, default=env_float("QE_PRESENCE_PENALTY", None),
                     help="presence penalty of sampled requests that send none (Claude Code's Anthropic API never "
-                         "does); env QE_PRESENCE_PENALTY")
+                         "does), both modes (model card: thinking 0, non-thinking 1.5); env QE_PRESENCE_PENALTY")
     ap.add_argument("--frequency-penalty", type=float, default=env_float("QE_FREQUENCY_PENALTY", 0.0),
                     help="frequency penalty of sampled requests that send none; env QE_FREQUENCY_PENALTY")
     ap.add_argument("--loop-guard-turns", type=int, default=env_int("QE_LOOP_GUARD_TURNS", 3),
@@ -3072,9 +3296,8 @@ def parse_args(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--disk-cache", default="",
-                    help="27B: directory of a persistent prompt cache surviving restarts (default off: "
-                         "conversations live in GPU slots and host memory only). Flash-Next has no disk cache: "
-                         "the flag is accepted, ignored with a warning at start")
+                    help="directory of a persistent prompt cache surviving restarts (default off: "
+                         "conversations live in GPU slots and host memory only)")
     ap.add_argument("--stats-file", default="~/.cache/qengine/stats.json",
                     help="all-time monitoring totals (dashboard)")
     ap.add_argument("--disk-cache-gb", type=float, default=200)
@@ -3097,9 +3320,10 @@ def parse_args(argv=None):
         ap.error(f"--thinking-budget / QE_THINKING_BUDGET: {ex}")
     if args.reasoning_effort is not None:
         args.reasoning_effort = args.reasoning_effort.strip().lower() or None  # '' = unset, like the env var
-    if args.reasoning_effort is not None and args.reasoning_effort not in KNOWN_EFFORTS + CLIENT_EFFORTS:
+    if args.reasoning_effort is not None and args.reasoning_effort not in KNOWN_EFFORTS + CLIENT_EFFORTS + (NO_EFFORT,):
         print(f"[server] warning: --reasoning-effort {args.reasoning_effort!r} is not one of "
-              f"{', '.join(KNOWN_EFFORTS)}: the template renders it as medium", flush=True)
+              f"{', '.join(KNOWN_EFFORTS + CLIENT_EFFORTS + (NO_EFFORT,))}: the template renders it as medium",
+              flush=True)
     # the MTP head fine-tuned on the engine's own answers: +8% accepted drafts
     ft = os.path.join(args.model, "model_mtp_ft.safetensors")
     if getattr(args, "lsa", None):
@@ -3115,19 +3339,19 @@ def parse_args(argv=None):
     if args.mtp_file:
         os.environ["QE_MTP_FILE"] = args.mtp_file
     elif env_str("QE_MTP_FILE") is None and os.path.exists(ft):
-        os.environ["QE_MTP_FILE"] = ft
+        import assets  # 27B INT8 checkpoints keep their own head unless QE_INT8_MTP_FT=1 (Flash-Next's D2 has INT8 groups too: unchanged)
+        if args.profile.is_flash or assets.use_mtp_ft(args.model):
+            os.environ["QE_MTP_FILE"] = ft
     if args.disk_cache:  # (also the directory of the start-up cache, comm_cache.h: on Flash-Next too)
         os.environ["QE_DISK_CACHE"] = args.disk_cache
         os.environ["QE_DISK_CACHE_GB"] = str(args.disk_cache_gb)
-    return args
-
-
-def refuse_disk_cache_on_flash(args):
-    """Flash-Next has no disk tier (issue #15). A warning goes unread and the user believes conversations survive a
-    restart, so stop before the load. The start-up cache of the link probe has its own variable: QE_DISK_CACHE."""
+    # Flash-Next: its disk tier has its own variables. QE_DISK_CACHE alone only moves the start-up cache there (documented),
+    # so setting it never turns the tier on; without the flag it is off
+    os.environ.pop("FLASH_DISK_CACHE", None)
     if args.disk_cache and args.profile.is_flash:
-        sys.exit("error: --disk-cache is not supported on Flash-Next yet (only the 27B has it): remove the flag. "
-                 "Conversations do not survive a restart on Flash-Next. For the directory of the start-up cache, set QE_DISK_CACHE.")
+        os.environ["FLASH_DISK_CACHE"] = args.disk_cache
+        os.environ["FLASH_DISK_CACHE_GB"] = str(args.disk_cache_gb)
+    return args
 
 
 def start_log(args):
@@ -3141,10 +3365,13 @@ def start_log(args):
     version, build = version_info(args.engine_lib or env_str("QE_LIB"))
     env = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items())
                    if k.startswith(("QE_", "FLASH_", "CUDA_VISIBLE", "CUDA_MODULE")))
+    header = (f"==== qengine server start: QEngine {version}, pid {os.getpid()}, build {build} ({os.path.realpath(ROOT)}), log {path}\n"
+              f"argv: {' '.join(sys.argv)}\nenv: {env}")
     try:
-        logtee.install(path, args.log_mb, 3, f"==== qengine server start: QEngine {version}, pid {os.getpid()}, build {build} "
-                                             f"({os.path.realpath(ROOT)}), log {path}\n"
-                                             f"argv: {' '.join(sys.argv)}\nenv: {env}")
+        if env_str("FLASH_PAR_FALLBACK"):  # (the engine restarted itself in pp: the first start's tee is still running)
+            logtee.reattach(header)
+        else:
+            logtee.install(path, args.log_mb, 3, header)
     except Exception as ex:  # never keep the server from starting
         print(f"persistent log off: {ex}", flush=True)
 
@@ -3153,9 +3380,11 @@ def main():
     args = parse_args()
     start_log(args)
     print("QEngine %s (build %s)" % version_info(args.engine_lib or env_str("QE_LIB")), flush=True)
-    refuse_disk_cache_on_flash(args)
     if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
         import assets
+        why = assets.check_27b_format(args.model)
+        if why:
+            sys.exit(print(f"[server] {why}", flush=True) or 3)
         assets.ensure(args.model)
     try:  # kill -USR1 <pid>: Python stacks of every thread (the native ones: gdb -p <pid>)
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
@@ -3186,6 +3415,14 @@ def main():
     if args.disk_cache:
         t0 = time.time()
         gen.run_on_engine(gen.engine.persist)
+        # Flash-Next queues its files: wait for them (bounded: a hung disk must not hold the exit), then what a full archive
+        # could not take before those writes let go of their memory
+        flushed = gen.engine.disk_flush(DISK_FLUSH_S)
+        if flushed and "qe_disk_flush" in gen.engine.fns:
+            gen.run_on_engine(gen.engine.persist)
+            flushed = gen.engine.disk_flush(DISK_FLUSH_S)
+        if not flushed:
+            print(f"shutdown: disk cache writes still running after {DISK_FLUSH_S:.0f}s, not waiting (the unfinished file is dropped at the next start)", flush=True)
         print(f"shutdown: slots saved in {time.time() - t0:.1f}s", flush=True)
     gen.engine.set_exit_hook(None)
     # end here, as the re-raised signal did before: no interpreter / CUDA teardown while engine threads still run

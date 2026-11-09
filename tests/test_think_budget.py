@@ -215,7 +215,16 @@ def effort_units():
     assert tk({"output_config": {"effort": "low"}}, True, "xhigh", anthropic=True)["reasoning_effort"] == "low"
     assert tk({"output_config": {"format": {"type": "json_schema"}}}, True, "medium",
               anthropic=True)["reasoning_effort"] == "medium"  # no effort in output_config: the server default
-    print("  effort map: parsing (valid / malformed / start-up error), rules, precedence, output_config.effort ok")
+    # reasoning.effort (OpenAI Responses / OpenRouter): the effort the map resolves; none = off, no server budget;
+    # reasoning.max_tokens still wins as the request's budget
+    body = {"reasoning": {"effort": "low"}}
+    assert bs(body, tk(body, True, "xhigh"), m, Q) == (40, "effort:low")
+    body = {"reasoning": {"effort": "none"}}
+    assert bs(body, tk(body, True, "xhigh"), m, Q) == (None, "none")
+    body = {"reasoning": {"effort": "low", "max_tokens": 30}}
+    assert bs(body, tk(body, True), m, Q) == (30, "request")
+    print("  effort map: parsing (valid / malformed / start-up error), rules, precedence, output_config.effort, "
+          "reasoning.effort ok")
 
     # per template: the rules probed from the template, and for every effort a request can send, the budget's
     # level is the effort the rendered prompt carries
@@ -240,6 +249,11 @@ def effort_units():
         for e in tb.PROBE_EFFORTS + ("LOW", ""):
             for body, dflt in (({"reasoning_effort": e}, None), ({}, e), ({"output_config": {"effort": e}}, None)):
                 kw = rules.client_effort(tk(body, True, dflt, anthropic=True))
+                if e == "none":  # club-3090 #1966: thinking off before any template rule; no effort, no server budget
+                    assert kw == {"enable_thinking": False}, (label, body, kw)
+                    assert tb.budget_source({}, dict(kw), BM.parse("low:40,medium:50,xhigh:60,max:70,default:9"),
+                                            rules) == (None, "none")
+                    continue
                 try:
                     text = t.render([dict(x) for x in msgs], None, **kw)
                 except Exception:  # noqa: BLE001 (stock Qwen template: unknown efforts fail the request)
@@ -514,7 +528,6 @@ def main():
              ("chat", {"reasoning_effort": "low", "thinking_budget": 30}, (30, "request")),
              ("chat", {"reasoning_effort": "max"}, (60, "effort:xhigh")),              # client alias max = xhigh
              ("messages", {"output_config": {"effort": "max"}}, (60, "effort:xhigh")),
-             ("chat", {"reasoning_effort": "none"}, (50, "effort:medium")),            # the template's fallback
              ("chat", {"reasoning_effort": "low", "thinking_budget": -1}, (None, "off"))]
     for path, body, want in cases:
         rt, line = eff_run(path, body, want)
@@ -526,12 +539,27 @@ def main():
     assert not any(k[0] == "C" for k in klines()[nk:]), klines()[nk:]
     p = [l for l in open(log) if l.startswith("P ")][-1].split()
     assert tok.decode([int(x) for x in p[3:]], skip_special_tokens=False).endswith("<think>\n\n</think>\n\n")
+    # 26a. effort none (club-3090 #1966): thinking off as above, the same prompt, no budget from the map
+    for body in ({"reasoning_effort": "none"}, {"chat_template_kwargs": {"reasoning_effort": "None"}}):
+        nk = len(klines())
+        r = c.post("/v1/chat/completions", json={"model": name, "messages": msgs, **body}).json()
+        assert not any(k[0] == "C" for k in klines()[nk:]), (body, klines()[nk:])
+        assert [l for l in open(log) if l.startswith("P ")][-1].split()[3:] == p[3:], body
+        assert "completion_tokens_details" not in r["usage"], r["usage"]
+    # (a request's own budget still wins, as with enable_thinking=false: source "request", nothing forced)
+    kw = app.template_kwargs({"reasoning_effort": "none", "thinking_budget": 100}, True)
+    assert think_budget.budget_source({"thinking_budget": 100}, kw, gen.budget_map, gen.effort_rules) == (100, "request")
+    for body in ({"output_config": {"effort": "none"}}, {"reasoning_effort": "NONE"}):
+        nk = len(klines())
+        r = c.post("/v1/messages", json={"model": name, "max_tokens": 4000, "messages": msgs, **body}).json()
+        assert not any(k[0] == "C" for k in klines()[nk:]), (body, klines()[nk:])
+        assert not any(b["type"] == "thinking" for b in r["content"]), r["content"]
     # 27. plain integer default: unchanged meaning (one budget for every effort, source "default")
     gen.budget_map = think_budget.BudgetMap.parse("45")
     eff_run("chat", {"reasoning_effort": "low"}, (45, "default"))
     th = gen.metrics.snapshot()["thinking"]
     got = {k: v - st0.get(k, 0) for k, v in th["budget_from"].items() if v - st0.get(k, 0)}
-    assert got == {"effort:low": 3, "effort:xhigh": 4, "effort:medium": 1, "request": 1, "off": 1, "default": 1}, got
+    assert got == {"effort:low": 3, "effort:xhigh": 4, "request": 1, "off": 1, "default": 1}, got
     assert th["budget_default"] == 45 and th["effort_rules"].startswith("qwen3.8"), th
     print("  thinking off: no forced close; plain 45: default; /api/stats budget_from", got)
     # 26b. enable_thinking null / 0: the template opens <think> (its test is `is false`), so the reply starts in reasoning on both APIs

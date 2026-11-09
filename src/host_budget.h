@@ -12,6 +12,16 @@
 //      FLASH_NGRAM_PIN=0: a host thread copies a step's rows into a pinned buffer; no HMM needed). The page cache
 //      keeps a share of what is left (ngram_cache) for its hot rows;
 //   3. the KV archive + pinned prefixes get what is left, up to their defaults.
+// Flash-Next with FLASH_KV=ram (club-3090 #1966): the KV pool in host RAM is pinned at start as well (13,520 B per token,
+// 13.5 GB at the default 1M tokens). What is pinned at start (experts, the pinned n-gram table, the KV pool) must fit both
+// the room and what is free now above the runtime margin (MemAvailable - margin: these never shrink later, so a
+// short MemAvailable must not push the host into swap). Shrink order when it does not fit:
+//   a. the archive + prefixes (they get only what is left after the pool; no 8 GB archive floor before the n-gram
+//      table in this mode: the pool itself keeps conversations in RAM),
+//   b. the KV pool down to seats x window (FLASH_MAX_SEQS x the context: every seat still holds a full window),
+//   c. the KV pool down to one window (the smallest pool that serves the context),
+//   d. the n-gram table to the page cache (costs decode speed for every request, so last),
+//   e. the experts never (forced by the cards' VRAM): a warning, the start is never refused for this.
 // room = MemTotal - reserve - base - fixed: reserve for the OS and the desktop (max(8 GB, 8 % of MemTotal),
 // QE_HOST_RESERVE_GB), base for the server process (Python, torch, the vision encoder, CUDA; QE_HOST_BASE_GB, 6),
 // fixed = the engine's other pinned buffers it knows (embeddings, snapshot buffers). The machine's size decides the plan: a
@@ -54,6 +64,9 @@ struct In {
     bool prefix_needs_archive = true;  // Flash-Next: the pinned prefixes live in the archive's pool (27B: separate)
     const char* arch_env = "";   // env names, for the messages
     const char* pref_env = "";
+    // Flash-Next FLASH_KV=ram: the pool in host RAM (bytes; 0: KV in VRAM). want: the pool asked for (FLASH_KV_RAM_TOKENS,
+    // at least one window); seats: FLASH_MAX_SEQS x the window; one: one window (the floor). tok: bytes per token
+    double kv_want = 0, kv_seats = 0, kv_one = 0, kv_tok = 13520;
 };
 
 struct Out {
@@ -61,6 +74,8 @@ struct Out {
     bool ngram_pinned = false;
     double ngram_cache = 0;      // page-cache share kept for the mapped n-gram table
     double archive = 0, prefix = 0;
+    double kv = 0;               // the KV pool in host RAM (FLASH_KV=ram), bytes; 0 in VRAM mode
+    double pinned = 0;           // pinned at start: experts + the pinned n-gram table + the KV pool
     bool reduced = false;        // a default was lowered to fit
     std::vector<std::string> why;   // what was reduced and why
     std::vector<std::string> warn;  // explicit values that do not fit
@@ -123,8 +138,50 @@ inline Out plan(const In& in) {
         o.warn.push_back(fmt("the host-backed experts (%.1f GB) alone take more than the room (%.1f GB): add host RAM or "
                              "cards; the host may swap", in.experts / GB, o.room / GB));
     const bool arch_on = in.arch_user != 0 && (in.arch_user > 0 || in.arch_def > 0);
+    const bool kvr = in.qfn && in.kv_want > 0;
+    double kv = 0;
+    // 2'. FLASH_KV=ram: the n-gram table and the KV pool, both pinned at start, fit min(room, free now above the margin)
+    if (kvr) {
+        const double fb = std::min(r, rn);
+        const double kw = in.kv_want, k1 = std::min(kw, in.kv_one), ks = std::clamp(in.kv_seats, k1, kw);
+        const bool ng_auto = in.ngram_user < 0;
+        bool ngp = in.ngram > 0 && in.ngram_user != 0;
+        auto ngb = [&] { return ngp ? in.ngram : 0.0; };
+        auto tok = [&](double b) { return b / in.kv_tok / 1e6; };
+        kv = kw;
+        if (ngb() + kv > fb) kv = std::max(ks, std::floor((fb - ngb()) / in.kv_tok) * in.kv_tok);  // b. seats x window
+        if (ngb() + kv > fb) kv = std::max(k1, std::floor((fb - ngb()) / in.kv_tok) * in.kv_tok);  // c. one window
+        if (ngb() + kv > fb && ngp && ng_auto && in.ngram_can_map) {  // d. the n-gram table to the page cache
+            ngp = false;
+            o.reduced = true;
+            o.why.push_back(fmt("n-gram table not pinned: %.1f GB + a %.1f GB KV pool of one window > %.1f GB", in.ngram / GB, k1 / GB,
+                                std::max(0.0, fb) / GB) +
+                            " free after the experts (room and MemAvailable - margin); read from the page cache instead (staged rows)");
+            // the pool as large as fits again, next to the page cache's share for the table's hot rows (12 GB)
+            kv = std::clamp(std::floor((fb - 12 * GB) / in.kv_tok) * in.kv_tok, k1, kw);
+        }
+        if (kv < kw) {
+            o.reduced = true;
+            o.why.push_back(fmt("KV pool in RAM %.2fM -> %.2fM tokens", tok(kw), tok(kv)) +
+                            (kv <= k1 ? " (one window)" : kv < ks ? " (below seats x window)" : kv <= ks ? " (seats x window)" : "") +
+                            std::string(ngp ? ": the pool and the pinned n-gram table" : ": the pool") +
+                            fmt(" (%.1f GB pinned at start) fit", (ngb() + kv) / GB) +
+                            fmt(" the %.1f GB free after the experts (room and MemAvailable - margin)", std::max(0.0, fb) / GB));
+        }
+        if (ngb() + kv > fb) {
+            if (ngp && !in.ngram_can_map && ng_auto)
+                o.warn.push_back(fmt("the n-gram table (%.1f GB) does not fit next to the KV pool (%.1f GB) and only the INT8 table "
+                                     "can be read from the page cache: pinned anyway, the host may swap", in.ngram / GB, kv / GB));
+            else
+                o.warn.push_back(fmt("pinned at start %.1f GB (", (ngb() + kv) / GB) + (ngp ? "n-gram table + " : "") +
+                                 fmt("KV pool %.2fM tokens) > %.1f GB free after the experts (MemAvailable %.1f GB at start): "
+                                     "the host may swap; free host RAM, lower --max-ctx, or use FLASH_KV=vram", tok(kv), std::max(0.0, fb) / GB,
+                                     avail / GB));
+        }
+        o.ngram_pinned = ngp;
+    }
     // 2. the n-gram table
-    if (in.ngram > 0) {
+    if (in.ngram > 0 && !kvr) {
         const double fit = std::min(r, rn);
         if (in.ngram_user == 1) {
             o.ngram_pinned = true;
@@ -154,8 +211,12 @@ inline Out plan(const In& in) {
             }
         }
     }
-    o.avail_short = o.experts_short || (o.ngram_pinned && in.ngram > rn);
-    double left = r - (o.ngram_pinned ? in.ngram : 0.0);
+    o.avail_short = o.experts_short || (o.ngram_pinned && in.ngram > rn) ||
+                    (kvr && std::min((in.ngram_user != 0 ? in.ngram : 0.0) + in.kv_want, r) > rn);  // (plan_wait: a previous
+                    // server exiting; only when the machine's room would hold more than what is free now, review L4)
+    o.kv = kv;
+    o.pinned = in.experts + (o.ngram_pinned ? in.ngram : 0.0) + kv;
+    double left = r - (o.ngram_pinned ? in.ngram : 0.0) - kv;
     if (in.ngram > 0 && !o.ngram_pinned) {  // the mapped table's hot rows: half of what is left, at most 12 GB
         o.ngram_cache = floor01(std::min(12 * GB, std::max(0.0, left) / 2));
         left -= o.ngram_cache;
@@ -188,6 +249,7 @@ inline Out plan(const In& in) {
             o.reduced = true;
             o.why.back() += fmt(" (%.1f GB left after the server", left / GB) + (in.experts > 0 ? ", the experts" : "");
             if (in.ngram > 0) o.why.back() += o.ngram_pinned ? " and the pinned n-gram table" : " and the n-gram page cache";
+            if (kv > 0) o.why.back() += " and the KV pool";
             o.why.back() += ")";
         }
         if (user > left) {
@@ -243,6 +305,8 @@ inline std::string line(const In& in, const Out& o) {
         if (in.ngram > 0)
             s += o.ngram_pinned ? fmt(", n-gram table %.1f GB pinned", in.ngram / GB)
                                 : fmt(", n-gram table %.1f GB from the page cache (%.1f GB kept for it)", in.ngram / GB, o.ngram_cache / GB);
+        if (o.kv > 0) s += fmt(", KV pool in RAM %.1f GB (%.2fM tokens)", o.kv / GB, o.kv / in.kv_tok / 1e6);
+        s += fmt("; pinned at start %.1f GB, free above the margin at start %.1f GB", o.pinned / GB, std::max(0.0, o.room_now) / GB);
     }
     s += fmt("; KV archive %.1f GB", o.archive / GB) + (in.arch_user >= 0 ? std::string(" (") + in.arch_env + ")" : "");
     s += fmt(" + pinned prefixes %.1f GB", o.prefix / GB) + (in.pref_user >= 0 ? std::string(" (") + in.pref_env + ")" : "");
@@ -257,7 +321,7 @@ inline std::string json(const In& in_, const Out& o_, double experts_actual = -1
     In in = in_;
     Out o = o_;
     for (double* v : {&in.total, &in.avail, &in.base, &in.fixed, &in.experts, &in.ngram, &in.cg_limit}) *v = fin(*v);
-    for (double* v : {&o.reserve, &o.archive, &o.prefix, &o.ngram_cache}) *v = fin(*v);
+    for (double* v : {&o.reserve, &o.archive, &o.prefix, &o.ngram_cache, &o.kv, &o.pinned, &o.room_now}) *v = fin(*v);
     experts_actual = std::isfinite(experts_actual) ? experts_actual : -1;
     std::string s = fmt("{\"mem_total_gb\": %.2f, \"mem_available_gb\": %.2f, \"reserve_gb\": %.2f", in.total / GB, in.avail / GB, o.reserve / GB);
     if (in.cg_limit > 0) s += fmt(", \"cgroup_limit_gb\": %.2f", in.cg_limit / GB);
@@ -267,6 +331,8 @@ inline std::string json(const In& in_, const Out& o_, double experts_actual = -1
         if (experts_actual >= 0) s += fmt(", \"experts_gb\": %.2f", experts_actual / GB);
         s += fmt(", \"ngram_gb\": %.2f, \"ngram_page_cache_gb\": %.2f, \"ngram_pinned\": ", in.ngram / GB, o.ngram_cache / GB);
         s += o.ngram_pinned ? "true" : "false";
+        if (o.kv > 0) s += fmt(", \"kv_ram_gb\": %.2f, \"kv_ram_tokens\": %.0f", o.kv / GB, o.kv / in.kv_tok);
+        s += fmt(", \"pinned_at_start_gb\": %.2f, \"free_above_margin_gb\": %.2f", o.pinned / GB, std::max(0.0, o.room_now) / GB);
     }
     s += fmt(", \"archive_gb\": %.2f, \"prefix_gb\": %.2f, \"reduced\": ", o.archive / GB, o.prefix / GB);
     s += o.reduced ? "true" : "false";

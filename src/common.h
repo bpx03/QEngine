@@ -11,6 +11,11 @@
 // this GPU trap within milliseconds instead of spinning while the process ends; a collective timeout
 // (watchdog.cuh) is reported as such and exits with code 75 (restartable), other errors abort().
 [[noreturn]] void qe_fatal_cuda(int err, const char* file, int line);
+// out of device memory while the engine loads: the armed fallback runs first and, when it works, does not return
+// (FLASH_PAR=auto on 4 cards, #9); nullptr disarms. any_cuda_error: every CUDA error takes it (the peer check's window)
+void qe_set_load_oom_fallback(void (*fn)(), bool any_cuda_error = false);
+bool qe_load_oom_fallback_armed();
+void qe_load_oom_fallback();
 [[noreturn]] void qe_fatal_check();
 void qe_fatal_begin();
 

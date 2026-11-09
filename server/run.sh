@@ -48,7 +48,7 @@ if [ "$_uniq" -gt "$_avail" ] || [ "${_max:-0}" -ge "$_avail" ]; then
   exit 1
 fi
 if [ "${#_req[@]}" -lt 2 ] || [ "${#_req[@]}" -gt 3 ]; then
-  echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engines are tested on 2 and 3 GPUs (Flash-Next: 2 or 3 cards: tp; 4+ cards: pp, pipeline stages, untested on 4 cards; see the README)" >&2
+  echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engines are tested on 2 and 3 GPUs (Flash-Next: 2 or 3 cards: tp; 4 cards: tp with peer access between all of them, else pp; 5+ cards: pp, pipeline stages; see the README)" >&2
 fi
 # no core dumps unless QE_CORE_DUMP=1 (issue #3): a crashed engine holds 50+ GB of pinned host memory and the GPU
 # mappings; writing its core kept the GPUs busy for minutes (a restart failed meanwhile) and is rarely usable. The
