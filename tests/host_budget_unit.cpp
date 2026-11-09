@@ -254,6 +254,120 @@ int main() {
         k.arch_user = 0;
         o = plan(k);
         EXPECT(o.archive == 0 && o.prefix == 8 * GiB && o.warn.empty());
+        // club-3090 #1966 (FLASH_KV=ram): 125 GiB host (MemTotal 134.5 GB), 4x RTX 5080 16 GB at TP2 / TP3 / TP4, a 262K window,
+        // 3 seats, the default 1M-token pool. Before: the pool (13.5 GB) was not in the plan, so the archive took it too and the
+        // plan summed 13.5 GB past MemTotal - reserve. Now everything planned fits MemTotal - reserve, and what is pinned at
+        // start fits MemAvailable - margin
+        {
+            const double tot = 134.5e9, w = 262144, tb = 13520;
+            auto ram = [&](In x, double want_tok, int seats) {
+                x.kv_tok = tb;
+                x.kv_want = std::max(w, want_tok) * tb;
+                x.kv_seats = seats * w * tb;
+                x.kv_one = w * tb;
+                return x;
+            };
+            auto r5080 = [&](int n, double avail) {
+                In x = qfn(tot, avail, n);
+                x.experts = qfn_expert_host_est(n, std::vector<double>(n, 16303.0 * 1048576 - 0.45e9));
+                return x;
+            };
+            for (int n : {2, 3, 4})
+                for (double av : {127e9, 110e9, 95e9}) {
+                    const In x = ram(r5080(n, av), 1e6, 3);
+                    const Out ox = plan(x);
+                    if (table)
+                        printf("| #1966 TP%d | MemAvailable %.0f | experts %.1f | n-gram %s | KV %.1f GB (%.2fM) | archive %.1f + %.1f | "
+                               "pinned %.1f of %.1f free | %s |\n", n, av / GB, x.experts / GB, ox.ngram_pinned ? "pinned" : "page cache",
+                               ox.kv / GB, ox.kv / tb / 1e6, ox.archive / GB, ox.prefix / GB, ox.pinned / GB, ox.room_now / GB,
+                               ox.why.empty() ? "-" : ox.why[0].c_str());
+                    const double used = x.base + x.fixed + ox.pinned + (ox.ngram_pinned ? 0 : ox.ngram_cache) + ox.archive + ox.prefix;
+                    EXPECT(used <= tot - ox.reserve + 1e6);   // the plan inside MemTotal - reserve
+                    EXPECT(ox.pinned <= ox.room_now + 1e6 || !ox.warn.empty());  // pinned at start inside MemAvailable - margin
+                    EXPECT(ox.kv >= w * tb && ox.kv <= 1e6 * tb + 1);
+                    EXPECT(line(x, ox).find("KV pool in RAM") != std::string::npos);
+                    EXPECT(json(x, ox).find("\"kv_ram_gb\"") != std::string::npos);
+                    if (av == 127e9) EXPECT(ox.ngram_pinned && ox.warn.empty());  // a desktop's worth used: the table stays pinned
+                    if (av == 127e9 && n >= 3) EXPECT(ox.kv == 1e6 * tb);         // and the whole pool
+                }
+            // the order: the archive first (TP4, 127 GB free: the pool whole, the archive smaller than without the pool)
+            {
+                const In x = ram(r5080(4, 127e9), 1e6, 3);
+                const Out ox = plan(x), o0 = plan(r5080(4, 127e9));
+                EXPECT(ox.kv == 1e6 * tb && ox.ngram_pinned && ox.archive + ox.prefix <= o0.archive + o0.prefix - 13.5e9 + 0.3e9);
+            }
+            // then the pool to seats x window, then one window, then the n-gram table; the experts never
+            {
+                In x = ram(r5080(2, 120.5e9), 1e6, 3);  // TP2, a desktop using a few GB more
+                Out ox = plan(x);
+                EXPECT(ox.ngram_pinned && ox.kv < 1e6 * tb && ox.kv >= 3 * w * tb - 1 && ox.archive < 5e9);
+                x.avail = 116e9;
+                ox = plan(x);
+                EXPECT(ox.ngram_pinned && ox.kv < 3 * w * tb && ox.kv >= w * tb && ox.archive < 10e9);
+                x.avail = 95e9;
+                ox = plan(x);
+                EXPECT(!ox.ngram_pinned && ox.kv >= w * tb && ox.ngram_cache > 0 && ox.warn.empty());
+                EXPECT(line(x, ox).find("n-gram table not pinned") != std::string::npos);
+                x.ngram_user = 1;  // FLASH_NGRAM_PIN=1: pinned as set, the pool at one window, a warning
+                ox = plan(x);
+                EXPECT(ox.ngram_pinned && ox.kv == w * tb && !ox.warn.empty());
+                x.ngram_user = -1;
+                x.ngram_can_map = false;  // BF16 table only: pinned anyway, warned
+                ox = plan(x);
+                EXPECT(ox.ngram_pinned && ox.kv == w * tb && !ox.warn.empty());
+                // nothing fits: never refused, a warning; the pool never below one window
+                In y = ram(r5080(2, 55e9), 1e6, 3);
+                const Out oy = plan(y);
+                EXPECT(!oy.ngram_pinned && oy.kv == w * tb && !oy.warn.empty() && oy.experts_short);
+            }
+            // FLASH_NGRAM_PIN=0 with the pool: the table mapped, the pool whole where it fits (review L7)
+            {
+                In x = ram(r5080(2, 116e9), 1e6, 3);
+                x.ngram_user = 0;
+                const Out ox = plan(x);
+                EXPECT(!ox.ngram_pinned && ox.kv == 1e6 * tb && ox.warn.empty());
+                // FLASH_KV_RAM_TOKENS below one window: the pool is one window (the engine takes at least the context)
+                const Out os = plan(ram(r5080(3, 127e9), 1000, 3));
+                EXPECT(os.kv == w * tb);
+                // the re-plan after the load with the pool fixed: no reduction line for it, the archive from what is left
+                In f = ram(r5080(3, 127e9), 1e6, 3);
+                f.kv_want = f.kv_seats = f.kv_one = 1001472 * tb;
+                f.ngram_user = 1;
+                const Out of = plan(f);
+                EXPECT(of.kv == f.kv_want && of.warn.empty() && of.archive > 0);
+                for (auto& y : of.why) EXPECT(y.find("KV pool in RAM") == std::string::npos);
+                // a host where the room holds the plan but MemAvailable does not: plan_wait waits; where neither does, it
+                // does not wait for nothing (review L4)
+                EXPECT(plan(ram(r5080(3, 80e9), 1e6, 3)).avail_short);
+                In t = ram(qfn(64 * GiB, 68e9, 2), 1e6, 3);  // (room 33.4 GB < free above the margin 40 GB)
+                t.experts = 20e9;
+                EXPECT(!plan(t).avail_short);
+            }
+            // our host (251 GiB, 3 x 3090): FLASH_KV=ram keeps the old sizes exactly (pool 1M, archive 48 + 8, table pinned)
+            for (int n : {2, 3}) {
+                const In x = ram(qfn(kOurTotal, kOurTotal - 6e9, n), 1e6, 16);
+                const Out ox = plan(x);
+                EXPECT(ox.ngram_pinned && ox.kv == 1e6 * tb && ox.archive == 48e9 && ox.prefix == 8e9 && !ox.reduced && ox.warn.empty());
+                // next to another server (MemAvailable 111 GB): still the old sizes
+                const Out oz = plan(ram(qfn(kOurTotal, 111e9, n), 1e6, 16));
+                EXPECT(oz.ngram_pinned && oz.kv == 1e6 * tb && oz.archive == 48e9 && !oz.reduced);
+                // a 4M pool asked for fits as well
+                const Out o4 = plan(ram(qfn(kOurTotal, kOurTotal - 6e9, n), 4e6, 16));
+                EXPECT(o4.kv == 4e6 * tb && o4.ngram_pinned && o4.archive == 48e9);
+            }
+            // a cgroup of 134.5 GB on our host plans like the 125 GiB host
+            {
+                In g = ram(r5080(3, 200e9), 1e6, 3);
+                g.total = kOurTotal;
+                g.cg_limit = tot;
+                g.cg_anon = 7.5e9;
+                const Out og = plan(g), oh = plan(ram(r5080(3, tot - 7.5e9), 1e6, 3));
+                EXPECT(og.kv == oh.kv && og.archive == oh.archive && og.ngram_pinned == oh.ngram_pinned);
+            }
+            // KV in VRAM: the plan as before (the pool fields stay 0)
+            const Out ov = plan(r5080(3, 127e9));
+            EXPECT(ov.kv == 0 && line(r5080(3, 127e9), ov).find("KV pool in RAM") == std::string::npos);
+        }
         // review L3: a non-finite value keeps the JSON valid
         In n = qfn(kOurTotal, 200e9, 3);
         n.arch_user = HUGE_VAL;

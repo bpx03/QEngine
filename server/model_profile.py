@@ -24,17 +24,22 @@ FLASH_PRETOKENIZER = {
 }
 FLASH_DECODER = {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": False, "use_regex": False}
 
+# Sampling recommended by the Qwen3.8-27B and Qwen3.8-Flash-Next model cards (the same values on both), per mode
+CARD_SAMPLING = {
+    True: dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0),   # thinking
+    False: dict(temperature=0.7, top_p=0.80, top_k=20, min_p=0.0, presence_penalty=1.5),  # instruct (non-thinking)
+}
+
 FAMILIES = {
     # 27B defaults are the ones the server always had (unchanged)
     "qwen38-27b": dict(
-        served_name="qwen3.8-27b-qengine", temperature=0.6, mtp_k=7, split="",
+        served_name="qwen3.8-27b-qengine", mtp_k=7, split="",
         lib="build/libqengine.so", vision=True, prefill_chunk_idle=0,
         drop_empty_turns=False,   # HF #50 cleanup: off (would change 27B prompts)
         merge_system=False,       # server-side merge of leading system messages (syssafe does it)
     ),
     "qwen38-flash-next": dict(
         served_name="qwen3.8-flash-next-qengine",
-        temperature=None,         # None: generation_config.json (1.0)
         mtp_k=3,                  # best k 2..4 at c=1 (measured)
         split="176,160,176",      # expert groups per card (the middle card, often the desktop one, less)
         lib="build/libqflash.so", vision=True,
@@ -63,16 +68,14 @@ class Profile:
     def is_flash(self):
         return self.family == "qwen38-flash-next"
 
-    def sampling(self, temperature=None, top_p=None, top_k=None, min_p=None):
-        """Server defaults for requests without them: command line > family > generation_config."""
-        g = self.gen
-        t = temperature if temperature is not None else self.defaults["temperature"]
-        if t is None:
-            t = g.get("temperature", 1.0)
-        return {"temperature": float(t),
-                "top_p": float(top_p or g.get("top_p") or 0.95),
-                "top_k": int(top_k or g.get("top_k") or 20),
-                "min_p": float(min_p if min_p is not None else g.get("min_p", 0.0))}
+    def sampling(self, thinking, temperature=None, top_p=None, top_k=None, min_p=None, presence_penalty=None):
+        """Server defaults of one mode for requests without them: command line > the model card's for this mode."""
+        c = CARD_SAMPLING[bool(thinking)]
+        return {"temperature": float(temperature if temperature is not None else c["temperature"]),
+                "top_p": float(top_p or c["top_p"]),
+                "top_k": int(top_k or c["top_k"]),
+                "min_p": float(min_p if min_p is not None else c["min_p"]),
+                "presence_penalty": float(presence_penalty if presence_penalty is not None else c["presence_penalty"])}
 
     def tokenizer_json(self, override=None):
         """(tokenizer.json text, note): the model's file (or `override`), with the Flash-Next

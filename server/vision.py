@@ -67,7 +67,12 @@ class VisionEncoder:
         self.stream = self.dev.type == "cuda" and bool(
             env_int("QE_VISION_STREAM", int(cfg.get("model_type", "").startswith("qwen4_exp"))))
         self.hw = None
-        idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+        ip = os.path.join(model_dir, "model.safetensors.index.json")
+        if os.path.exists(ip):
+            idx = json.load(open(ip))["weight_map"]
+        else:  # single-file checkpoint (e.g. tools/quant_int8.py output): no index
+            with safe_open(os.path.join(model_dir, "model.safetensors"), "pt") as st:
+                idx = {k: "model.safetensors" for k in st.keys()}
         names = [k for k in idx if k.startswith("model.visual.")]
         w = {}
         for f in sorted({idx[k] for k in names}):

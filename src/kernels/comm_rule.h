@@ -98,3 +98,15 @@ inline DecodeRule comm_decode_rule(bool prefill_left_p2p, float t_p2p, float t_h
         return {0, "the prefill rule leaves P2P, but host memory is markedly slower in the decode microbench"};
     return {2, "the prefill rule leaves P2P"};
 }
+
+// Host-buffer NUMA placement (numa_place, comm_probe.cuh): the nodes a buffer's pages go to. `forced` (QE_NUMA, e.g.
+// 0,1,2,3) replaces what the caller asked for. Else the caller's nodes, the unknown ones (-1) dropped; when none is known
+// (sysfs numa_node -1, e.g. Threadripper Pro boards set to several nodes, PR #16) all of the machine's nodes, interleaved,
+// instead of first-touch placement. Empty: no placement.
+inline std::vector<int> numa_pick(const std::vector<int>& want, const std::vector<int>& forced, const std::vector<int>& all) {
+    if (want.empty()) return {};
+    std::vector<int> v;
+    for (int x : forced.empty() ? want : forced)
+        if (x >= 0 && std::find(v.begin(), v.end(), x) == v.end()) v.push_back(x);
+    return v.empty() && forced.empty() ? all : v;
+}

@@ -105,6 +105,8 @@ void Worker::alloc_slots() {
     sson_.assign(ns, 0);
     sson_d_ = (int*)dalloc((size_t)ns * 4);
     con_slot_.assign(ns, 0);
+    lp_slot_.assign(ns, 0);
+    lp_host_.assign(ns, nullptr);
     mask_d_ = (unsigned*)dalloc((size_t)MASK_ROWS * MASK_WORDS * 4);
     pen_ = (PenState*)dalloc((size_t)ns * pen_state_bytes(VOCAB));
     nolk_d_ = (int*)dalloc((size_t)ns * 4);
@@ -275,6 +277,7 @@ void Worker::use_slot(int s, int base) {
         }
         cur_slot_ = s;
         con_ = con_slot_.empty() ? false : con_slot_[s] != 0;
+        lp_h_ = lp_of(s);
         prev_m_ = sprev_[s];
         ws_ensure();
     }

@@ -29,7 +29,9 @@ The server default (BudgetMap) is either one number for every request or a budge
 effort its prompt is rendered with (kw["reasoning_effort"] after template_kwargs and the client aliases of
 EffortRules.client_effort: Qwen3.8 max = xhigh, minimal = low), normalised the way the served chat template renders
 it (EffortRules, probed from the template at start-up: Qwen3.8 high = xhigh, others = medium; GLM-5.3 low / high,
-others = max), else the `default:` / `*:` entry, else no budget.
+others = max), else the `default:` / `*:` entry, else no budget. Effort `none` never reaches the map: the server
+turns it into enable_thinking=false before rendering (app.template_kwargs), and a thinking-off request has no server
+budget (a request's own budget still wins, as with enable_thinking=false).
 """
 from qe_env import env_int, env_str
 from content_markers import OUT_MARK
@@ -390,7 +392,11 @@ class ThinkControl:
                     break
             if self.failed or self.fi >= len(self.fz):
                 self.fz = None
-                e.constrain(j.slot, False)
+                if j.lp is None:
+                    e.constrain(j.slot, False)
+                else:  # logprobs: stays constrained for its logits, every token allowed again
+                    e.mask_buffer(j.slot).fill(0xFFFFFFFF)
+                    e.constrain(j.slot, True)
                 return
             self._plan()
             return

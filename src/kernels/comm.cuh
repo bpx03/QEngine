@@ -82,15 +82,17 @@ struct Comm {
     unsigned long long* lbusy[4] = {nullptr, nullptr, nullptr, nullptr};
     float lemu = 0.f, lreal = 0.f;
     // decode collectives' path (comm_select_path, QE_DECODE_COMM): kXferP2P = the LL16 / all-gather words are SM stores
-    // into the peers' memory (pll / pag); kXferHost = the same protocol (same kernels, the reader clears what it read)
-    // with every rank's receive words in pinned host memory (hpll / hpag), so no SM store crosses a peer link. Boards
-    // with a severe P2P co-run tax (club-3090 #1926: SM stores 26-31x) decode faster through host memory.
+    // into the peers' memory (pll / pag); kXferHost = the no-peer host path (the QE_P2P=0 kernels: each rank writes its
+    // LL words once into pinned host memory, every peer reads them; all-gather through the host flag protocol) while
+    // peer access stays on for prefill. Boards with a severe P2P co-run tax (club-3090 #1926, bpx03#20 / #21: SM stores
+    // 24-31x) decode faster through host memory. (1.3.5 - 1.3.5.6 ran the P2P kernels over per-receiver host words
+    // instead: 3 cards 12.1 vs 8.3 ms per step, bpx03#21; removed)
     int dxfer = 0;
-    uint4* hpll[4] = {nullptr, nullptr, nullptr, nullptr};
-    uint2* hpag[4] = {nullptr, nullptr, nullptr, nullptr};
-    bool hview = false;      // this Comm is a comm_decode_view (its pll / pag are the host words)
-    bool hfence = false;     // host view: fence the reader's clears once per thread (comm_host_fence)
+    bool dhost = false;      // the host decode path is a candidate (forced, or auto with the calibration): scrub bound
+    bool hview = false;      // this Comm is a comm_decode_view (p2p off: the host path's kernels)
+    bool p2p_verified = false;  // comm_select_path: peer access on, the data check ran, nothing it found was left in use
     bool dcal_want = false;  // set by the engine before comm_select_path: it times real decode steps on both paths
+    bool pp_stages = false;  // log text only (engine, before comm_select_path): FLASH_PAR=pp, the stages do not use this path
     bool dcal = false;       // auto with both candidates allocated: the engine's start-up calibration picks (flash_capi)
     bool dcal_fresh = false; // QE_DECODE_COMM=remeasure: the calibration ignores its start-up cache (and rewrites it)
 };
@@ -98,19 +100,15 @@ struct Comm {
 void comm_link_emul(const Comm& c, int rank, size_t bytes, cudaStream_t st, int kind = 0);
 constexpr int kCeSlots = 16;
 constexpr int kXferP2P = 0, kXferCE = 1, kXferHost = 2;
-// whether the host view fences the reader's clears (one system fence per thread after its last consume):
-// QE_DECODE_HOST_FENCE, default 1 (a late clear could overtake the reader's later stores under PCIe relaxed ordering,
-// which user space cannot rule out); 0: off. The calibration's host legs run with it, so a host pick has paid for it
-bool comm_host_fence();
-// the Comm the decode collectives use: c itself, or (dxfer == kXferHost) a copy whose LL16 / all-gather receive words
-// are the host-memory ones (the kernels are the P2P ones: same arithmetic, bit-identical results)
+// the Comm the decode collectives use: c itself, or (dxfer == kXferHost with peer access on) a copy with p2p off, so
+// the decode all-reduce / all-gather run the no-peer host path (c.ll, c.data / c.flags: allocated in every Comm). Same
+// arithmetic as the P2P all-to-all (MODE 1); the P2P reduce-scatter (MODE 2) is bit-identical to it (QE_AR_RSUM)
 inline Comm comm_decode_view(const Comm& c) {
-    if (c.dxfer != kXferHost || !c.p2p || !c.hpll[0]) return c;
+    if (c.dxfer != kXferHost || !c.p2p || !c.dhost) return c;
     Comm v = c;
-    for (int i = 0; i < 4; i++) v.pll[i] = c.hpll[i], v.pag[i] = c.hpag[i];
+    v.p2p = false;
     v.dxfer = kXferP2P;  // (a view is never viewed again)
     v.hview = true;
-    v.hfence = comm_host_fence();
     return v;
 }
 // test only: QE_DECODE_TEST_STORE_US, a spin of that many us after every decode all-reduce that runs as SM stores into
@@ -121,7 +119,8 @@ void comm_test_spin(cudaStream_t st);  // the QE_DECODE_TEST_STORE_US spin (no-o
 // pointer, checked); comm_host_free undoes it
 void* comm_host_alloc(size_t bytes, int node);
 void comm_host_free(void* p);
-// free the host-memory decode words (after the calibration picked P2P for every mode); c.dxfer becomes P2P
+// drop the host decode candidate (after the calibration picked P2P for every mode); c.dxfer becomes P2P. Each worker
+// unbinds its scrub (comm_unbind_ll_scrub) with its graphs dropped on every rank first
 void comm_free_decode_host(Comm& c);
 
 // Owner-finished deferred prefill all-reduce: the owner of a row (reduce-scatter) also adds the
@@ -155,8 +154,12 @@ struct CommCounters {  // per GPU, device memory
 // So every rank clears its own words every 32 units, at a unit start, after a barrier
 // (no reader is left on any word). A peer that is ahead sees old words at most 32 units old, or zeros, or the new word.
 constexpr unsigned kLLScrubUnits = 32;  // a power of 2, < 64
-// Only without peer access and with QE_LL_NOCLEAR unset; a no-op otherwise. Call once per rank, before the first unit.
+// Only on the host path (no peer access, or the host decode candidate c.dhost) and with QE_LL_NOCLEAR unset; a no-op
+// otherwise. Call once per rank, before the first unit.
 void comm_bind_ll_scrub(CommCounters& ctr, const Comm& c, int rank);
+// the host decode candidate dropped (P2P everywhere): no scrub from the next unit on. Every rank's cached graphs must be
+// dropped before (a graph captured with the scrub barrier would wait for ranks that no longer run it)
+inline void comm_unbind_ll_scrub(CommCounters& ctr) { ctr.ll_host = nullptr; }
 
 Comm comm_create(int ngpu, int max_elems, int ll_hidden);
 // Enable peer access between all GPUs and allocate the P2P receive buffers (QE_P2P=0 or no peer

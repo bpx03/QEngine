@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "gemv.cuh"
+#include "q8_layout.h"
 
 namespace {
 
@@ -287,7 +288,9 @@ __global__ void x_to_h_kernel(const bf16* __restrict__ x, int ldx, int K, __half
     }
 }
 
-template <int WT, int TB>
+// Q8: INT8 weights in the Q8 layout (q8_layout.h) enter as w / 16 (byte_perm decode, exact; |w / 16| <= 8 as for
+// INT4, so the chunk bound above holds) and the flush scale carries the factor 16.
+template <int WT, int TB, bool Q8 = false>
 __global__ void __launch_bounds__(kThreads) gemm_h_kernel(const uint4* __restrict__ wq,
                                                          const bf16* __restrict__ ws, int N, int K,
                                                          const __half* __restrict__ x,
@@ -329,8 +332,9 @@ __global__ void __launch_bounds__(kThreads) gemm_h_kernel(const uint4* __restric
 
     const int rt0 = row0 / 16;
     const bool v0 = rt0 < N / 16, v1 = rt0 + 1 < N / 16;
-    const uint4* wp0 = wq + (size_t)rt0 * (K / 64) * 32 + lane;
-    const uint4* wp1 = wq + (size_t)(rt0 + 1) * (K / 64) * 32 + lane;
+    constexpr int UPC = Q8 ? 2 : 1;  // uint4 per lane per 64-k chunk
+    const uint4* wp0 = wq + (size_t)rt0 * (K / 64) * UPC * 32 + lane;
+    const uint4* wp1 = wq + (size_t)(rt0 + 1) * (K / 64) * UPC * 32 + lane;
 
 #pragma unroll
     for (int s = 0; s < STAGES - 1; s++) {
@@ -340,20 +344,33 @@ __global__ void __launch_bounds__(kThreads) gemm_h_kernel(const uint4* __restric
 
     for (int kc = 0; kc < nk; kc++) {
         uint32_t aw[2][4][4];
-        const uint4 z = make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u);
-        const uint4 q0 = v0 ? wp0[(size_t)(kb + kc) * 32] : z;
-        const uint4 q1 = v1 ? wp1[(size_t)(kb + kc) * 32] : z;
         const int gi = ((kb + kc) * BK) >> 7;
         const int groups = K >> 7;
         const bf16* s0 = ws + ((size_t)(v0 ? rt0 : 0) * groups + gi) * 16;
         const bf16* s1 = ws + ((size_t)(v1 ? rt0 + 1 : 0) * groups + gi) * 16;
-        const float sc[2][2] = {{__bfloat162float(s0[g]), __bfloat162float(s0[g + 8])},
-                                {__bfloat162float(s1[g]), __bfloat162float(s1[g + 8])}};
-        const uint32_t w0[4] = {q0.x, q0.y, q0.z, q0.w}, w1[4] = {q1.x, q1.y, q1.z, q1.w};
+        constexpr float kWs = Q8 ? 16.f : 1.f;  // Q8 weights enter as w / 16
+        const float sc[2][2] = {{__bfloat162float(s0[g]) * kWs, __bfloat162float(s0[g + 8]) * kWs},
+                                {__bfloat162float(s1[g]) * kWs, __bfloat162float(s1[g + 8]) * kWs}};
+        if constexpr (Q8) {
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            const size_t c0 = (size_t)(kb + kc) * 2;
+            const uint4 q00 = v0 ? wp0[c0 * 32] : z, q01 = v0 ? wp0[(c0 + 1) * 32] : z;
+            const uint4 q10 = v1 ? wp1[c0 * 32] : z, q11 = v1 ? wp1[(c0 + 1) * 32] : z;
 #pragma unroll
-        for (int s = 0; s < 4; s++) {
-            dequant_int_h(w0[s], aw[0][s]);
-            dequant_int_h(w1[s], aw[1][s]);
+            for (int s = 0; s < 4; s++) {
+                q8_frag_h(s < 2 ? q00 : q01, s & 1, aw[0][s]);
+                q8_frag_h(s < 2 ? q10 : q11, s & 1, aw[1][s]);
+            }
+        } else {
+            const uint4 z = make_uint4(0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u);
+            const uint4 q0 = v0 ? wp0[(size_t)(kb + kc) * 32] : z;
+            const uint4 q1 = v1 ? wp1[(size_t)(kb + kc) * 32] : z;
+            const uint32_t w0[4] = {q0.x, q0.y, q0.z, q0.w}, w1[4] = {q1.x, q1.y, q1.z, q1.w};
+#pragma unroll
+            for (int s = 0; s < 4; s++) {
+                dequant_int_h(w0[s], aw[0][s]);
+                dequant_int_h(w1[s], aw[1][s]);
+            }
         }
 
         cp_async_wait<STAGES - 2>();
@@ -632,7 +649,11 @@ __global__ void x_to_i8_old_kernel(const bf16* __restrict__ x, int ldx, int K, i
 // split into `parts` K-ranges each: every part stores its fp32 partial to the workspace
 // [tile][part][ROWS][TB] and sk_reduce_kernel sums the parts in a fixed order (deterministic)
 // and runs the epilogue. The work counter is zeroed by x_to_i8_kernel.
-template <int WT, int TB, int G, bool DIRECT>
+// Q8 (W8A8 of an INT8 checkpoint): the weights are already signed int8 in the s8 m16n8k32 A-fragment order with the
+// activation permutation of the pre-pass (q8_layout.h), so a stage stages 4 uint4 per 16-row tile (INT4: 2) and they
+// enter the MMA as loaded; the rest (s8 x s8 from the magic constant, {sx, -M sx} flush, stream-K) is unchanged.
+// |sum| per activation group <= 128 * 128 * 127 < 2^22 keeps the magic-constant accumulation exact for G <= 128.
+template <int WT, int TB, int G, bool DIRECT, bool Q8 = false>
 __global__ void __launch_bounds__(kThreads) gemm_i8_kernel(const uint4* __restrict__ wq,
                                                           const bf16* __restrict__ ws, int N, int K,
                                                           const int8_t* __restrict__ x,
@@ -646,9 +667,10 @@ __global__ void __launch_bounds__(kThreads) gemm_i8_kernel(const uint4* __restri
     constexpr int SUB = BKI / G;  // activation groups per stage
     constexpr int SP = SUB < 2 ? 2 : SUB;  // stored (sx, -M sx) pairs per token and stage
     float* ss = reinterpret_cast<float*>(dyn_smem + STAGES * TB * 8);  // [STAGES][TB][SP][sx, -M sx]
-    // weights of the next stage, staged by cp.async (double buffer): [2][4 chunks][thread]
+    // weights of the next stage, staged by cp.async (double buffer): [2][WU chunks][thread]
+    constexpr int WU = Q8 ? 8 : 4;  // uint4 per thread and stage (2 tiles x 2 64-k chunks; Q8: 2 x 4 32-k sub-chunks)
     uint4* wsm = dyn_smem + STAGES * TB * 8 + STAGES * TB * SP / 2;
-    uint4* ssm = wsm + 2 * 4 * kThreads;  // group scales of the stage: [buf][warp][4 x 16 B]
+    uint4* ssm = wsm + 2 * WU * kThreads;  // group scales of the stage: [buf][warp][4 x 16 B]
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     constexpr int WR = 8 / WT, NT8 = TB / 8 / WT, ROWS = block_rows<WT>();
     static_assert(NT8 >= 2 && NT8 % 2 == 0, "token tile");
@@ -711,18 +733,27 @@ __global__ void __launch_bounds__(kThreads) gemm_i8_kernel(const uint4* __restri
 
         const int rt0 = row0 / 16;
         const bool v0 = rt0 < N / 16, v1 = rt0 + 1 < N / 16;
-        const uint4* wp0 = wq + (size_t)(v0 ? rt0 : 0) * (K / 64) * 32 + lane;
-        const uint4* wp1 = wq + (size_t)(v1 ? rt0 + 1 : 0) * (K / 64) * 32 + lane;
-        // (rows past N: zero-filled -> w = -8; their results are never stored)
+        const uint4* wp0 = wq + (size_t)(v0 ? rt0 : 0) * (K / 64) * (Q8 ? 2 : 1) * 32 + lane;
+        const uint4* wp1 = wq + (size_t)(v1 ? rt0 + 1 : 0) * (K / 64) * (Q8 ? 2 : 1) * 32 + lane;
+        // (rows past N: zero-filled -> w = -8 (Q8: 0); their results are never stored)
         const bf16* sp0 = ws + (size_t)(v0 ? rt0 : 0) * groups * 16;
         const bf16* sp1 = ws + (size_t)(v1 ? rt0 + 1 : 0) * groups * 16;
         auto load_w = [&](int buf, int kc) {
-            const size_t ci = (size_t)(kb + kc) * 2;  // first 64-k chunk of the stage
-            uint4* d = wsm + (size_t)buf * 4 * kThreads + tid;  // [buf][chunk][thread]: conflict-free
-            cp_async16(d + 0 * kThreads, wp0 + ci * 32, v0);
-            cp_async16(d + 1 * kThreads, wp0 + (ci + 1) * 32, v0);
-            cp_async16(d + 2 * kThreads, wp1 + ci * 32, v1);
-            cp_async16(d + 3 * kThreads, wp1 + (ci + 1) * 32, v1);
+            uint4* d = wsm + (size_t)buf * WU * kThreads + tid;  // [buf][chunk][thread]: conflict-free
+            if constexpr (Q8) {
+                const size_t ci = (size_t)(kb + kc) * 4;  // first 32-k sub-chunk of the stage
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    cp_async16(d + j * kThreads, wp0 + (ci + j) * 32, v0);
+                    cp_async16(d + (4 + j) * kThreads, wp1 + (ci + j) * 32, v1);
+                }
+            } else {
+                const size_t ci = (size_t)(kb + kc) * 2;  // first 64-k chunk of the stage
+                cp_async16(d + 0 * kThreads, wp0 + ci * 32, v0);
+                cp_async16(d + 1 * kThreads, wp0 + (ci + 1) * 32, v0);
+                cp_async16(d + 2 * kThreads, wp1 + ci * 32, v1);
+                cp_async16(d + 3 * kThreads, wp1 + (ci + 1) * 32, v1);
+            }
             if (lane < 4)  // 2 m-tiles x 16 bf16 scales (always a valid address; row 0 for rows past N)
                 cp_async16(ssm + (buf * 8 + warp) * 4 + lane,
                            (lane < 2 ? sp0 : sp1) + ((size_t)(kb + kc) * 16) + (lane & 1) * 8, true);
@@ -746,7 +777,16 @@ __global__ void __launch_bounds__(kThreads) gemm_i8_kernel(const uint4* __restri
             cp_async_commit();
 
             uint32_t aw[2][4][4];  // [mtile][k32 step][reg]
-            {
+            if constexpr (Q8) {
+                const uint4* d = wsm + (size_t)(kc & 1) * WU * kThreads + tid;
+#pragma unroll
+                for (int i = 0; i < 2; i++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const uint4 v = d[(i * 4 + j) * kThreads];
+                        aw[i][j][0] = v.x; aw[i][j][1] = v.y; aw[i][j][2] = v.z; aw[i][j][3] = v.w;
+                    }
+            } else {
                 const uint4* d = wsm + (size_t)(kc & 1) * 4 * kThreads + tid;
                 const uint4 q00 = d[0], q01 = d[kThreads], q10 = d[2 * kThreads], q11 = d[3 * kThreads];
                 dequant_s8(q00.x, q00.y, aw[0][0]);
@@ -3627,6 +3667,71 @@ void gemm_i8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, 
                                                           VF >= 2 && VF <= 4 && tl_out16 && !w.glu);
     }
 }
+// W8A8 GEMM of a Q8 matrix (INT8 checkpoint): gemm_i8_kernel<..., Q8> after its own pre-pass (x_to_i8_old_kernel:
+// {sx, -M sx} records). Persistent stream-K as the W4A8 kernels; the weight double buffer is 2 x 32 KB, so TB <= 64.
+// The producers' W4A8 prequantization is off for Q8 models (gemm_q8_model), the GLU epilogue writes bf16 as usual.
+template <int TB, int WT, int G>
+void gemm_q8_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st) {
+    static_assert(TB <= 64, "Q8 W8A8 smem");
+    const int rb = (w.n + block_rows<WT>() - 1) / block_rows<WT>(), tb = (t + TB - 1) / TB;
+    const int nkt = w.k / BKI;
+    const SkPlan pl = sk_plan(rb * tb, nkt);
+    const size_t need = (size_t)t * w.k, needs = (size_t)t * i8_rec_floats(w.k, G);
+    if (need > tl_xq_buf.n) {
+        if (tl_xq_buf.p) tl_retire(tl_xq_buf.p);
+        tl_xq_buf.n = tl_alloc((void**)&tl_xq_buf.p, need, "tl_xq_buf");
+    }
+    if (needs > tl_xqs_buf.n) {
+        if (tl_xqs_buf.p) tl_retire(tl_xqs_buf.p);
+        tl_xqs_buf.n = tl_alloc((void**)&tl_xqs_buf.p, needs * 4, "tl_xqs_buf") / 4;
+    }
+    if (!tl_sk_ctr_buf.p) {
+        tl_alloc((void**)&tl_sk_ctr_buf.p, kSkCtrs * sizeof(int), "tl_sk_ctr_buf");
+        tl_sk_ctr_buf.n = kSkCtrs;
+    }
+    const size_t needw = (size_t)pl.rem * pl.parts * block_rows<WT>() * TB;
+    if (needw > tl_sk_ws_buf.n) {
+        if (tl_sk_ws_buf.p) tl_retire(tl_sk_ws_buf.p);
+        tl_sk_ws_buf.n = tl_alloc((void**)&tl_sk_ws_buf.p, needw * sizeof(float), "tl_sk_ws_buf") / sizeof(float);
+    }
+    tl_prequant.x = nullptr;  // (never registered for Q8 models; a stale entry must not reach a later W4 GEMM)
+    x_to_i8_old_kernel<G><<<t, 256, 0, st>>>(x, ldx, w.k, tl_xq_buf.p, tl_xqs_buf.p, tl_sk_ctr_buf.p, 1);
+    constexpr size_t smem = (size_t)STAGES * TB * (128 + 8 * (G == 128 ? 2 : 128 / G)) + 2 * kThreads * 128 + 2 * 8 * 64;
+    static_assert(smem <= 99 * 1024, "Q8 W8A8 smem");
+    static thread_local bool attr = false;  // per device (thread == device)
+    if (!attr) {
+        CUDA_CHECK(cudaFuncSetAttribute(gemm_i8_kernel<WT, TB, G, false, true>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        attr = true;
+    }
+    if (env_str("QE_GEMM_DEBUG"))
+        fprintf(stderr, "gemm q8a8 n=%d k=%d t=%d tb=%d wt=%d G=%d: tiles %d grid %d full %d rem %d parts %d\n", w.n, w.k,
+                t, TB, WT, G, rb * tb, pl.grid, pl.full, pl.rem, pl.parts);
+    gemm_i8_kernel<WT, TB, G, false, true><<<pl.grid, kThreads, smem, st>>>(
+        w.q, w.s, w.n, w.k, tl_xq_buf.p, tl_xqs_buf.p, t, c, ldc, w.glu, tl_sk_ctr_buf.p, tl_sk_ws_buf.p, pl.full,
+        pl.parts);
+    if (pl.rem) {
+        const size_t n = (size_t)pl.rem * (w.glu ? block_rows<WT>() / 2 : block_rows<WT>()) * TB;
+        sk_reduce_kernel<<<(n + 255) / 256, 256, 0, st>>>(tl_sk_ws_buf.p, pl.parts, pl.rem, pl.full, rb,
+                                                          block_rows<WT>(), TB, w.n, t, c, ldc, w.glu, false, g_i8_grp,
+                                                          false);
+    }
+}
+// candidates ci (gemm_run): 0 = 256 rows x 32 tokens, 1 = 256 x 64, 2 = 128 x 64, 3 = 128 x 32
+template <int G>
+void gemm_q8_run(int ci, const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st) {
+    switch (ci) {
+        case 0: gemm_q8_cfg<32, 1, G>(w, x, ldx, c, ldc, t, st); break;
+        case 1: gemm_q8_cfg<64, 1, G>(w, x, ldx, c, ldc, t, st); break;
+        case 2: gemm_q8_cfg<64, 2, G>(w, x, ldx, c, ldc, t, st); break;
+        default: gemm_q8_cfg<32, 2, G>(w, x, ldx, c, ldc, t, st); break;
+    }
+}
+void gemm_q8_dispatch(int ci, int G, const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st) {
+    if (G == 128) gemm_q8_run<128>(ci, w, x, ldx, c, ldc, t, st);
+    else if (G == 64) gemm_q8_run<64>(ci, w, x, ldx, c, ldc, t, st);
+    else gemm_q8_run<32>(ci, w, x, ldx, c, ldc, t, st);
+}
 // kernel variant: QE_PREFILL_INT8_KERNEL = 2 (gemm_i8v_kernel, default) | 1 (gemm_i8t_kernel) | 0 (gemm_i8_kernel)
 int g_i8_kernel = [] { return env_int("QE_PREFILL_INT8_KERNEL", 2); }();
 // bench variant (gemm_i8_dispatch) that QE_PREFILL_INT8_KERNEL=2 runs: 100 = gemm_i8v_kernel with the
@@ -3924,7 +4029,7 @@ template <int TB, int WT>
 void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int ks,
               cudaStream_t st) {
     const int rb = (w.n + block_rows<WT>() - 1) / block_rows<WT>(), tb = (t + TB - 1) / TB;
-    if (g_gemm_h16) {
+    if (g_gemm_h16 || w.bits == 8) {  // (Q8 has only the fp16-accumulate kernel among the non-W8A8 paths)
         // grow during the first prefills (never inside graph capture); the fp16 activations
         // need t * k elements, the token scales t: both checked (a call with more tokens but a
         // smaller k must still grow the scales)
@@ -3941,8 +4046,12 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
         }
         x_to_h_kernel<<<t, 256, 0, st>>>(x, ldx, w.k, tl_xh, tl_xs);
         if (ks == 1) {
-            gemm_h_kernel<WT, TB><<<dim3(rb, tb), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, tl_xh, tl_xs,
-                                                                    t, c, ldc, 0, w.glu);
+            if (w.bits == 8)
+                gemm_h_kernel<WT, TB, true><<<dim3(rb, tb), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, tl_xh, tl_xs,
+                                                                               t, c, ldc, 0, w.glu);
+            else
+                gemm_h_kernel<WT, TB><<<dim3(rb, tb), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, tl_xh, tl_xs,
+                                                                        t, c, ldc, 0, w.glu);
             return;
         }
         const size_t zs = (size_t)t * w.n, needp = zs * ks;
@@ -3951,8 +4060,12 @@ void gemm_cfg(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int
             tl_alloc((void**)&tl_splitk, needp * sizeof(float), "tl_splitk");
             tl_splitk_n = needp;
         }
-        gemm_h_kernel<WT, TB><<<dim3(rb, tb, ks), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, tl_xh, tl_xs,
-                                                                    t, tl_splitk, w.n, zs, false);
+        if (w.bits == 8)
+            gemm_h_kernel<WT, TB, true><<<dim3(rb, tb, ks), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, tl_xh, tl_xs,
+                                                                               t, tl_splitk, w.n, zs, false);
+        else
+            gemm_h_kernel<WT, TB><<<dim3(rb, tb, ks), kThreads, 0, st>>>(w.q, w.s, w.n, w.k, tl_xh, tl_xs,
+                                                                        t, tl_splitk, w.n, zs, false);
         splitk_reduce_kernel<<<(zs + 255) / 256, 256, 0, st>>>(tl_splitk, ks, t, w.n, zs, c, ldc,
                                                                w.glu);
         return;
@@ -3984,6 +4097,10 @@ double gemm_cost(int n, int k, int t, int tb_tokens, int rows, int ks, double ef
 
 void gemm_run(int ci, const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, int ks,
               cudaStream_t st) {
+    if (w.bits == 8 && i8_use(w)) {  // Q8: W8A8 (QE_PREFILL_INT8 classes), else the fp16-accumulate path below
+        gemm_q8_dispatch(ci, g_i8_group[i8_class(w)], w, x, ldx, c, ldc, t, st);
+        return;
+    }
     if (i8_use(w)) {
         gemm_i8_dispatch(g_i8_kernel >= 2 ? kI8vVar : g_i8_kernel, ci, g_i8_group[i8_class(w)], w, x, ldx, c, ldc, t, st);
         return;
@@ -4243,7 +4360,7 @@ void gemm_set_sk_maxparts(int n) { g_sk_maxparts_rt = n; }
 
 void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st) {
     CHECK(w.n % 16 == 0 && w.k % 128 == 0, "gemm_w4 %d %d", w.n, w.k);
-    if (tl_out16 && !w.glu && !(i8_use(w) && g_i8_kernel >= 2)) {  // path without a bf16 epilogue
+    if (tl_out16 && !w.glu && !(w.bits == 4 && i8_use(w) && g_i8_kernel >= 2)) {  // path without a bf16 epilogue
         const size_t need = (size_t)t * w.n;
         if (need > tl_o16_buf.n) {
             if (tl_o16_buf.p) tl_retire(tl_o16_buf.p);
@@ -4272,6 +4389,7 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
             if (cst < best) { best = cst; bi = ci; bks = ks; }
         }
     }
+    if (w.bits == 8 && i8_use(w)) { bi = t <= 64 ? 0 : 1; bks = 1; }  // Q8 W8A8 default tile (TB <= 64)
     if (const char* f = env_str("QE_GEMM_FORCE")) {  // "ci,ks" (experiments)
         int fc = 0, fk = 1;
         if (sscanf(f, "%d,%d", &fc, &fk) >= 1) { bi = fc; bks = std::max(1, fk); }
@@ -4281,7 +4399,9 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
         // ~25%); candidates are timed once, outside graph capture
         int bucket = 64;
         while (bucket < t) bucket *= 2;
-        const auto key = std::make_tuple(w.n, w.k, bucket, w.glu);
+        // (Q8 matrices: negative n, so a Q8 layer and an INT4 matrix of the same shape - the MTP layer's RTN weights -
+        // keep their own choices)
+        const auto key = std::make_tuple(w.bits == 8 ? -w.n : w.n, w.k, bucket, w.glu);
         TuneMap& tuned = tune_map();
         auto it = tuned.find(key);
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
@@ -4310,7 +4430,8 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
             // before the tuning-table fix); a runner-up within 3% gets a second A/B of the two
             std::vector<std::pair<int, int>> cl;
             for (int ci = 0; ci < 4; ci++) {
-                if (cands[ci].tb < 128 && t > 16 * cands[ci].tb) continue;  // (wider than the model)
+                // (wider than the model; the Q8 W8A8 candidates are all <= 64 tokens wide: all timed)
+                if (!(w.bits == 8 && i8_use(w)) && cands[ci].tb < 128 && t > 16 * cands[ci].tb) continue;
                 for (int ks : {1, 2, 4}) {
                     if (ks > 1 && (ks > nk / 4 || t >= 1024 || i8_use(w))) continue;
                     cl.emplace_back(ci, ks);
@@ -4392,14 +4513,21 @@ void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cuda
 void gemm_w4_i8(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st,
                 int G, int ci, int var) {
     CHECK(w.n % 16 == 0 && w.k % 128 == 0, "gemm_w4_i8 %d %d", w.n, w.k);
-    gemm_i8_dispatch(var, ci, G, w, x, ldx, c, ldc, t, st);
+    if (w.bits == 8) gemm_q8_dispatch(ci, G, w, x, ldx, c, ldc, t, st);
+    else gemm_i8_dispatch(var, ci, G, w, x, ldx, c, ldc, t, st);
 }
 
 int gemm_i8_variant() { return g_i8_kernel; }
 
+// INT8 checkpoint (all layer matrices Q8): the producers' W4A8 prequantization (AR tail, dn_out, the GLU epilogue of
+// gemm_i8v_kernel) writes INT4-kernel formats, so it is off and every Q8 W8A8 GEMM quantizes its own input
+bool g_q8_model = false;
+void gemm_q8_model(bool on) { g_q8_model = on; }
+
 // The int8 group the W4A8 GEMM uses for an input with k columns that feeds the MLP gate_up
 // (glu_next) or a mixer projection, 0 when that class does not run W4A8 / fusion is off.
 int gemm_i8_prequant_group(int k, bool glu_next) {
+    if (g_q8_model) return 0;
     if (!g_i8_fuse || k % 128 != 0 || (k / 4) % 32 != 0) return 0;
     const int cls = glu_next ? I8_GU : I8_IN;
     if (!(g_i8_mask & cls)) return 0;
@@ -4415,6 +4543,7 @@ void gemm_i8_prequant_ext(const bf16* x, int t, int k, int G, int8_t* xq, float*
 thread_local TlBuf<int8_t> tl_po_xq_buf;
 thread_local TlBuf<float> tl_po_xs_buf;
 bool gemm_i8_prequant_out(const bf16* x, int t, int k, int row0, int8_t** xq, float** xsc, int* G) {
+    if (g_q8_model) return false;
     if (!g_i8_fuse || g_i8_kernel < 1 || k != 2048 || !(g_i8_mask & I8_OUT) || !env_int("QE_DNO_I8", 0)) return false;
     const bool v2 = g_i8_kernel >= 2;
     const int g = g_i8_group[I8_OUT];
@@ -4446,6 +4575,7 @@ int* gemm_i8_sk_ctr() {
 // QE_I8_CTR_FUSE=0: the stream-K counter of a prequantized GEMM is zeroed by a memset again
 bool gemm_i8_prequant(const bf16* x, int t, int k, int row0, bool glu_next, int8_t** xq, float** xsc, int* G,
                       int** ctr) {
+    if (g_q8_model) return false;
     if (!g_i8_fuse || k % 128 != 0 || (k / 4) % 32 != 0) return false;
     const int cls = glu_next ? I8_GU : I8_IN;
     if (!(g_i8_mask & cls)) return false;

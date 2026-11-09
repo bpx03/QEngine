@@ -94,6 +94,7 @@ void qe_mem_guard(void* e);  // host memory pressure: the archive gives memory b
 void qe_persist(void* e);
 int qe_num_archives(void* e);
 int qe_num_disk_archives(void* e);
+int qe_disk_flush(void* e, double seconds);  // optional (Flash-Next): wait for the queued disk cache files; 1 = all written
 
 // ======================================================= TIER 6 "monitor" (all or none; dashboard)
 void qe_slot_info(void* e, int i, long long* out);  // {offset, capacity, cached tokens, active, last use, prio}
@@ -111,6 +112,13 @@ unsigned* qe_mask_buffer(void* e, int slot);  // pinned [8][(vocab + 31) / 32] a
 int* qe_spec_io(void* e, int slot);           // pinned int[32]: [0] model drafts n, [1..] drafts; [16] n to verify, [17..]
 void qe_constrain(void* e, int slot, int on);
 int qe_constrained(void* e, int slot);
+
+// ======================================================= TIER "logprobs" (both, + the grammar tier): OpenAI logprobs
+// A constrained slot (qe_constrain first; off with it) keeps the target head's raw logits, before the mask, in a per-slot
+// host buffer. qe_logits_read: row of the slot's last step in token order (row i: what emitted token i was chosen from;
+// after a start: row 0, the prompt end); returns the vocabulary size, 0: bad row.
+void qe_logits_capture(void* e, int slot, int on);
+int qe_logits_read(void* e, int slot, int row, float* out);
 
 // ======================================================= TIER 9 "vision" (+ qe_start_begin)
 int qe_start_mm(void* e, const int* ids, int n, int k, unsigned long long affinity, int hint,

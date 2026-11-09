@@ -126,6 +126,10 @@ public:
     int* spec_io(int slot);
     void constrain(int slot, bool on);
     bool constrained(int slot) const { return seqs_.at(slot).constrained; }
+    // logprobs: a constrained slot (constrain first; ends with it) keeps the target head's raw logits of its steps and its
+    // prompt end, before the mask. logits_read: row of the last step in token order; false: bad row
+    void logits_capture(int slot, bool on);
+    bool logits_read(int slot, int row, float* out);
     // temperature <= 0 selects greedy decoding
     // presence / frequency penalty of the current slot (after set_sampling, which turns it off): its counts
     // restart with the distinct seed tokens, then follow the reply. set_no_lookup: no lookup drafts for the slot's
@@ -397,6 +401,9 @@ private:
     std::vector<int> lkb_cool_;
     std::vector<int*> lkb_pin_;            // pinned upload buffer per slot (lazily allocated)            // steps left before a slot that left lookup mode (low acceptance) may return
     bool lkb_on_ = false;
+    // a history token as the cards' lookup sees it: an image row's content id -> <|image_pad|> (never drafted: a
+    // draft is embedded, and a content id would index the image table far past its end)
+    int lk_tok(int t) const { return t >= kImgToken ? cfg_.image_pad : t; }
     int lkb_rows_ = 32, lkb_hold_ = 2, lkb_min_ = 4;
   public:
     long long lkb_steps_ = 0, lkb_rows_sum_ = 0, lkb_tok_ = 0, lkb_bsteps_ = 0, lkb_slotsteps_ = 0;
@@ -585,13 +592,15 @@ private:
     int disk_busy_ = 0;
     std::thread disk_thread_;
     std::thread alloc_thread_;               // pre-pins snapshot buffers in the background
-    std::atomic<bool> snap_pause_{false}, snap_busy_{false};  // decode calibration: the snapshot pinning held
+    std::atomic<bool> snap_pause_{false}, snap_busy_{false};
+    std::atomic<int> snap_n_{0};  // snaps_.size() for the pinner thread (it pins past kSnapBase as the store fills)  // decode calibration: the snapshot pinning held
     std::mutex snap_mu_;
     std::vector<std::vector<void*>> free_bufs_;
     std::atomic<bool> stop_alloc_{false};
     std::vector<Seq> seqs_;
     int cur_ = 0;
-    int last_reused_ = 0, max_snaps_ = 32;
+    static constexpr int kSnapBase = 32;  // snapshot entries pinned without a host-room check (the store before q27_pressure_kv)
+    int last_reused_ = 0, max_snaps_ = kSnapBase;
     int snap_reserve0_ = 16;        // snapshot entries kept for checkpoints (QE_SNAP_CKPT_RESERVE)
     int ckpt_every_ = 8192;         // checkpoint spacing of a prefill (QE_CKPT)
     int end_cut_ = 4096;

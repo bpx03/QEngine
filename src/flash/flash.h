@@ -43,6 +43,10 @@ struct QpUnion {
 constexpr int H = 2560, HC = 4, RW = HC * H, LAYERS = 48, NE = 512, TOPK = 10, INTER = 640;
 constexpr int VOCAB = 248320, NQ = 24, NKV = 2, HD = 256, ROT = 64;
 constexpr int LNK = 16, LNV = 48, DK = 128, DV = 128;
+// row stride (floats) of the DeltaNet a / b projection rows [b: vl][a: vl][pad]: the GEMV writes its whole padded output
+// width (a multiple of 16), so the rows must be that wide. 2 vl is 32 / 48 on 3 / 2 cards (no pad) but 24 on 4 cards,
+// where a 24-float stride let row t's 8 pad outputs land on row t + 1's first 8 b values (race)
+__host__ __device__ constexpr int dn_ab_ld(int vl) { return (2 * vl + 15) / 16 * 16; }
 constexpr int LOWRANK = 320, HCD_ROWS = 336, HCU_K = 384;  // Wd + 4 inject rows (pad 16), Wu K padded to g128
 constexpr int IDX_NH = 4, IDX_HD = 128, IDX_BUDGET = 2048, IDX_R = 4, IDX_TOPB = IDX_BUDGET / IDX_R;
 // raw indexer keys by position mod IDX_TAIL: a verify forward writes up to MAXP rows past the accepted end, so with a
@@ -99,6 +103,11 @@ struct KvPool {
 constexpr bool kKvRamDefault = false;  // FLASH_KV default (ram | vram)
 bool kv_ram_mode();          // FLASH_KV / FLASH_KV_STREAM
 long long kv_ram_tokens();   // FLASH_KV_RAM_TOKENS
+// host RAM per token of the FLASH_KV=ram pool: 13 KV layers x 1,040 B (fp8 K / V + scales), for the whole machine
+constexpr double kKvRamTokBytes = 13.0 * (NKV * HD * 2 + NKV * 8);
+// the pool the host-RAM plan gives (tokens, host_budget.h; < 0: FLASH_KV_RAM_TOKENS as asked); set before the Workers are made
+void set_kv_ram_plan(long long tokens);
+long long kv_ram_plan();
 // YaRN RoPE scaling (opt-in; model card: rope_type yarn, factor 4.0, original_max_position_embeddings 262144):
 // FLASH_YARN=<factor> (0 / 1: off), else the factor the caller set for a context above the native one (context /
 // 262,144; set_yarn_factor before the Workers are made). Contexts above 262,144 need FLASH_KV=ram.
@@ -217,7 +226,7 @@ struct Layer {
     W4 dn_in, dn_out;      // in rows [q kl*128][k kl*128][v vl*128][z vl*128]
     W8 dn_in8, dn_out8;    // the same as INT8 g128 at load, used instead of W4 when the checkpoint carries the BF16
                            // tensors (in_proj_qkv + in_proj_z / out_proj ".weight", qfn-quant precision choice)
-    W16 dn_ab;             // rows [b vl][a vl] (32)
+    W16 dn_ab;             // rows [b vl][a vl], zero-padded to dn_ab_ld(vl) rows (the output row stride)
     bf16* conv_w = nullptr;  // [ch][4]
     float *A = nullptr, *dtb = nullptr;
     bf16* dn_norm = nullptr;
@@ -431,6 +440,10 @@ public:
     // grammar-constrained decoding: the bound slot verifies kv caller drafts (upload_drafts) with a mask per row
     // (upload_mask: [rows][MASK_WORDS] bits, row j = allowed after the pending token and drafts 1..j) and drafts kd
     void set_constrained(int slot, bool on);
+    // logprobs (constrained slots): the target head's raw logits of every step of the slot go to a per-slot host buffer,
+    // before the mask; lp_read: row of the slot's last step into out[token] (head ranks; the others do nothing)
+    void set_lp(int slot, bool on);
+    void lp_read(int slot, int row, float* out);
     bool constrained() const { return con_; }
     void upload_mask(const unsigned* host, int rows);
     void upload_drafts(const int* d, int n);
@@ -664,6 +677,7 @@ public:
     void selwin_report();  // FLASH_SELWIN: selected blocks vs recent-position windows / a recency cache (stderr)
     void kvs_report();  // KV streaming: block cache hits / misses / host fallbacks (stderr)
     bool kv_stream() const { return kvs_; }
+    long long kv_pool_positions() const { return kvs_ ? (long long)rows_ / p_.own * p_.period : 0; }  // FLASH_KV=ram: the pool
     bool ec_enabled() const { return ec_on_; }  // dynamic expert cache on (cold groups exist, FLASH_EC != 0)
     // the expert cache learns nothing while frozen (decode calibration: its dummy steps must not change which groups are
     // resident, the later steps' outputs depend on it): touches dropped, no scores, no admissions; unfreeze clears them
@@ -688,6 +702,16 @@ private:
     unsigned* mask_d_ = nullptr;       // constrained: masks of the bound slot's step (device)
     bool con_ = false;                 // the bound slot is grammar-constrained
     std::vector<char> con_slot_;
+    std::vector<float*> lp_host_;      // logprobs: per slot, pinned [MASK_ROWS][vocab slice]; kept once allocated
+    std::vector<char> lp_slot_;
+    std::vector<int> lp_map_;          // this card's row -> token
+    float* lp_h_ = nullptr;            // the bound slot's (a constrained batch of one: that slot's) buffer, null: off
+    float* lp_of(int s) const { return lp_slot_.empty() || !lp_slot_[s] ? nullptr : lp_host_[s]; }
+    void lp_copy(int m) {              // (stream order: after this head's gemv, before its mask; lp_on(): never in a graph)
+        if (lp_h_) CUDA_CHECK(cudaMemcpyAsync(lp_h_, logits_, (size_t)std::min(m, (int)MASK_ROWS) * (p_.voc1 - p_.voc0) * 4,
+                                              cudaMemcpyDeviceToHost, st_));
+    }
+    bool lp_on() const { return con_ && lp_h_; }
     std::map<long long, cudaGraphExec_t> cgraph_;  // constrained step graphs (sampling, selection, kv, kd)
     SampleParams* spslot_ = nullptr;  // per slot (device): the bound slot's live copy is sp_
     std::vector<char> sson_;          // per slot: sampling on (temperature > 0)
@@ -1246,6 +1270,11 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     unsigned *xflagsH_ = nullptr, *xqflagsH_ = nullptr, *xiflagsH_ = nullptr;
     float *xprH_[4] = {}, *xqprH_[4] = {}, *xiprH_[4] = {};
     unsigned *xpfH_[4] = {}, *xqpfH_[4] = {}, *xipfH_[4] = {};
+    // ... and the device pull slots of those host slots (bpx03#21): k_xpull copies the peers' rows once into device
+    // memory and raises device flags, as without peer access, so the attention blocks do not each poll host flags and
+    // read the rows over PCIe (plain cudaMalloc, freed in free_dhost; QE_HOST_XPULL=0: off)
+    float *xrecvdH_ = nullptr, *xqrecvdH_ = nullptr;
+    unsigned *xflagdH_ = nullptr, *xqflagdH_ = nullptr, *xiflagdH_ = nullptr, *xpcntH_ = nullptr;
     int *tok_h_ = nullptr, *pos_h_ = nullptr, *out_h_ = nullptr;  // pinned staging (graph inputs / outputs)
     bf16* ple_h_ = nullptr;
     cudaGraphExec_t graph_[2][2][MAXM + 1] = {};  // [sampling][selection][m]

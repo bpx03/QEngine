@@ -517,6 +517,8 @@ struct PickIn {
     double margin = 0.10;
     int rounds = 4;               // mode B decode rounds per server call (pipeline fill / drain once per call) when
     bool persist = true;          // the server's decode pipeline is not persistent (FLASH_PPB_PERSIST=0)
+    bool tp_fits = true;          // 4 cards: tp holds the requested context in the free VRAM (tp_fixed_need)
+    bool verified = true;         // 4 cards: the data check ran and left nothing corrupt in use (comm p2p_verified)
 };
 struct PickOut {
     Par par = Par::TP;
@@ -546,6 +548,38 @@ inline DecTab pp_dec_tab(int n) {
     if (n == 2) return {{1, 2, 4, 8, 16}, {120, 243, 291, 330, 324}};
     if (n >= 4) return {{1, 2, 4, 8, 16}, {220, 450, 610, 975, 1180}};  // B4: model
     return {{1, 2, 4, 8, 16}, {218, 450, 513, 800, 954}};
+}
+// The fixed part a TP rank needs per card, bytes: n cards, S slots, C tokens of context, KV in VRAM (dense weights, the
+// slots' recurrent state, the KV pool, buffers; the experts can all be host-backed). Fitted to 2- / 3-card loads,
+// 2026-11-03: 1.58 GB + 5.46 GB / n + (S - 1) x 206 MB / n + 24.8 KB x C / n + 0.9 GB (context,
+// workspaces, margin).
+inline double tp_fixed_need(int n, int S, long long c) {
+    return 1.58e9 + 5.46e9 / n + (S - 1) * 0.206e9 / n + 24.8e3 * (double)c / n + 0.9e9;
+}
+// The wiring around the pick (flash_capi.cpp), as pure functions for the unit test.
+// The card-wide comm: up to 3 cards as ever; 4 for tp asked for, and for auto where the driver reports peer access on all
+// pairs, so the data check can decide. Forced mode B on 4+ cards and PP x TP build none.
+inline bool comm_wanted(int n, Par par, bool pptp, bool driver_all) {
+    return !pptp && (n <= 3 || par == Par::TP || (n == 4 && par == Par::AUTO && driver_all));
+}
+// A pick mode B can replace: auto, exactly 4 cards, tp, KV in VRAM (FLASH_KV=ram has no mode B to go to).
+inline bool restart_armed(int n, bool forced, bool kv_ram, Par picked) {
+    return !forced && n == 4 && !kv_ram && picked == Par::TP;
+}
+// The same command in pp: the environment without FLASH_PAR, then FLASH_PAR=pp and the note for the log.
+inline std::vector<std::string> restart_env(const std::vector<std::string>& env) {
+    std::vector<std::string> out;
+    for (const std::string& v : env)
+        if (v.rfind("FLASH_PAR=", 0) != 0 && v.rfind("FLASH_PAR_FALLBACK=", 0) != 0) out.push_back(v);
+    out.push_back("FLASH_PAR=pp");
+    out.push_back("FLASH_PAR_FALLBACK=1");
+    return out;
+}
+// /proc/self/cmdline: NUL-terminated arguments
+inline std::vector<std::string> split_cmdline(const std::string& c) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < c.size(); i += out.back().size() + 1) out.push_back(c.c_str() + i);
+    return out;
 }
 inline PickOut pick_par(const PickIn& in) {
     PickOut o;
@@ -619,10 +653,15 @@ inline PickOut pick_par(const PickIn& in) {
     const bool all = !in.cs.empty() && mp * (1.0 + in.margin) < mt;
     // coordinator's rule (2026-11-01): with peer access TP always (also on slow links: its exchanges keep P2P); without
     // it mode B where the model says it wins
-    if (n == 4) {  // (user decision 2026-11-01: TP4 is opt-in until a 4-card run confirms the model)
-        o.par = Par::PP;
-        o.why = all ? "4 cards: mode B (also cheaper over the mix in the model)"
-                    : "4 cards: mode B";
+    if (n == 4) {  // (#12, 4 x RTX 5080: tp 310 vs pp 145 tok/s at c = 1; the model's 4-card numbers stay unfitted, so
+        // the rule does not use them.) Uneven cards keep mode B, whose split follows the card speeds: no 4-card run
+        // says otherwise. Not decided here: a tp load that fails anyway (#9): the engine restarts in pp (flash_capi.cpp)
+        o.par = in.p2p && in.verified && !o.uneven && in.tp_fits ? Par::TP : Par::PP;
+        o.why = !in.p2p     ? "4 cards, no peer access between all of them: mode B"
+                : !in.verified ? "4 cards, peer access not verified (QE_COMM_CHECK=0, or a forced FLASH_COMM on a transport that failed the check): mode B"
+                : o.uneven  ? "4 cards, uneven: mode B"
+                : !in.tp_fits ? "4 cards, TP does not hold the context in the free VRAM: mode B"
+                              : "4 cards, verified peer access between all of them: TP";
     } else if (in.p2p && !o.uneven) {
         o.par = Par::TP;
         o.why = "peer access between the cards: TP";

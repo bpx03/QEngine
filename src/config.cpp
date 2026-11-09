@@ -60,6 +60,8 @@ Config Config::load(const std::string& model_dir) {
         }
     }
     for (auto& lt : t["layer_types"].arr) c.is_full.push_back(lt.str == "full_attention");
+    c.image_pad = root.has("image_token_id") ? (int)root["image_token_id"].i() : c.eos;
+    if (c.image_pad < 0 || c.image_pad >= c.vocab) c.image_pad = c.eos;
 
     auto need = [](bool ok, const char* what) {
         if (!ok) throw std::runtime_error(std::string("unsupported config: ") + what);

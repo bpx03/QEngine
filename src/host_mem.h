@@ -61,6 +61,87 @@ inline const char* override_env() {
     return v;
 }
 
+// cgroup memory limit of this process (systemd-run -p MemoryMax, docker --memory): on every level from its cgroup up to the
+// root that has a limit, room = limit - (usage - reclaimable page cache); the level with the least room binds (review M3: a
+// parent slice shared with siblings can bind before a larger own limit). Usage counts anonymous, shmem (cudaHostAlloc'd
+// memory, the FLASH_KV=ram pool: measured as shmem in memory.stat) and kernel memory; only file pages that are not shmem are
+// reclaimable. limit = the binding level's limit, anon = limit - room (what is not available in it). {0, 0}: no limit.
+// v2 or v1 is chosen by the unified hierarchy's presence (review M2: docker's private cgroup namespace shows "0::/", the
+// container's own cgroup at /sys/fs/cgroup). The directories are found once; the files are read on each call. Read by the
+// host-RAM plan at boot (host_budget.h) and by available() below (the runtime guard sees the limit as the host)
+struct CgroupMem {
+    double limit = 0, anon = 0;
+};
+namespace detail {
+struct CgDirs {
+    bool v2 = false;
+    std::vector<std::string> dirs;  // own cgroup first, then the parents
+};
+inline const CgDirs& cg_dirs() {
+    static const CgDirs d = [] {
+        CgDirs r;
+        std::string v2path, v1path;
+        bool has0 = false;
+        if (FILE* f = fopen("/proc/self/cgroup", "r")) {
+            char line[1024];
+            while (fgets(line, sizeof line, f)) {
+                if (!strncmp(line, "0::", 3)) { has0 = true; v2path = line + 3; }
+                const char* c = strchr(line, ':');
+                if (c && !strncmp(c + 1, "memory:", 7)) v1path = c + 8;
+            }
+            fclose(f);
+        }
+        auto trim = [](std::string& p) { while (!p.empty() && (p.back() == '\n' || p.back() == '/')) p.pop_back(); };
+        trim(v2path);
+        trim(v1path);
+        r.v2 = has0 && v1path.empty() && access("/sys/fs/cgroup/cgroup.controllers", R_OK) == 0;
+        const std::string base = r.v2 ? "/sys/fs/cgroup" : "/sys/fs/cgroup/memory", path = r.v2 ? v2path : v1path;
+        for (std::string p = path;; p = p.rfind('/') == std::string::npos ? std::string() : p.substr(0, p.rfind('/'))) {
+            r.dirs.push_back(base + p);
+            if (p.empty()) break;
+        }
+        return r;
+    }();
+    return d;
+}
+inline bool read_num(const std::string& file, double* v) {
+    FILE* f = fopen(file.c_str(), "r");
+    if (!f) return false;
+    char b[64] = "";
+    const bool ok = fscanf(f, "%63s", b) == 1 && strcmp(b, "max");
+    fclose(f);
+    if (ok) *v = atof(b);
+    return ok;
+}
+}  // namespace detail
+inline CgroupMem cgroup_mem() {
+    CgroupMem r;
+    const detail::CgDirs& d = detail::cg_dirs();
+    double best = -1;
+    for (const std::string& dir : d.dirs) {
+        double lim = 0, use = 0;
+        if (!detail::read_num(dir + (d.v2 ? "/memory.max" : "/memory.limit_in_bytes"), &lim) || lim <= 0 || lim >= 1e18) continue;
+        if (!detail::read_num(dir + (d.v2 ? "/memory.current" : "/memory.usage_in_bytes"), &use)) continue;
+        double file = 0, shmem = 0;
+        if (FILE* s = fopen((dir + "/memory.stat").c_str(), "r")) {
+            char k[64];
+            double x;
+            while (fscanf(s, "%63s %lf", k, &x) == 2) {
+                if (!strcmp(k, d.v2 ? "file" : "cache")) file = x;
+                else if (!strcmp(k, "shmem")) shmem = x;
+            }
+            fclose(s);
+        }
+        const double room = std::max(0.0, lim - std::max(0.0, use - std::max(0.0, file - shmem)));
+        if (best < 0 || room < best) {
+            best = room;
+            r.limit = lim;
+            r.anon = lim - room;
+        }
+    }
+    return r;
+}
+
 // MemAvailable in bytes (cached for 100 ms unless `fresh`)
 inline size_t available(bool fresh = false) {
     const char* ov = override_env();
@@ -83,8 +164,14 @@ inline size_t available(bool fresh = false) {
             }
         } else {
             v = meminfo_kb("MemAvailable") << 10;
+            if (!v) v = (size_t)1 << 62;  // no /proc: no limit
+            // a cgroup memory limit (docker --memory, systemd-run -p MemoryMax) is the host for this process: past it the
+            // cgroup reclaims, swaps or OOM-kills inside it while the host's MemAvailable still looks fine. A full cgroup is
+            // 1 byte, never 0 (0 means "not read yet" here; review M1: it used to read as no limit)
+            const CgroupMem c = cgroup_mem();
+            if (c.limit > 0) v = std::max<size_t>(1, std::min(v, (size_t)std::max(0.0, c.limit - c.anon)));
         }
-        last = v ? v : (ov ? 1 : (size_t)1 << 62);  // no /proc: no limit
+        last = v ? v : 1;
         t = now;
     }
     if (ov) {  // the file is the host without the archive: its own bytes come off
@@ -122,90 +209,16 @@ inline bool pin_fits(size_t avail, size_t cap, size_t others) { return avail >= 
 inline size_t margin() {
     static const size_t m = [] {
         const double gb = env_double("QE_MEM_MARGIN_GB", -1.0);  // empty / unparsable: the default, not 0 GB
-        return gb >= 0 ? (size_t)(gb * 1e9) : std::max<size_t>((size_t)8e9, total() / 20);
+        if (gb >= 0) return (size_t)(gb * 1e9);
+        const CgroupMem c = override_env() ? CgroupMem{} : cgroup_mem();  // (a cgroup limit: 5 % of it, as the plan's margin)
+        const double t = c.limit > 0 ? std::min((double)total(), c.limit) : (double)total();
+        return std::max<size_t>((size_t)8e9, (size_t)(t / 20));
     }();
     return m;
 }
 
-// cgroup v2 memory limit of this process (systemd-run -p MemoryMax, docker --memory): the smallest memory.max on the
-// path from its cgroup up to the root, and that cgroup's anonymous bytes (memory.stat anon; page cache is reclaimable).
-// {0, 0}: no limit. Read by the host-RAM plan at boot (host_budget.h); the runtime guard above keeps MemAvailable.
-struct CgroupMem {
-    double limit = 0, anon = 0;
-};
-inline CgroupMem cgroup_mem() {
-    CgroupMem r;
-    std::string path;
-    if (FILE* f = fopen("/proc/self/cgroup", "r")) {
-        char line[1024];
-        while (fgets(line, sizeof line, f))
-            if (!strncmp(line, "0::", 3)) {
-                path = line + 3;
-                while (!path.empty() && (path.back() == '\n' || path.back() == '/')) path.pop_back();
-            }
-        fclose(f);
-    }
-    if (path.empty() || access("/sys/fs/cgroup/cgroup.controllers", R_OK) != 0) {  // cgroup v1 / hybrid: the memory controller
-        std::string v1;
-        if (FILE* f = fopen("/proc/self/cgroup", "r")) {
-            char line[1024];
-            while (fgets(line, sizeof line, f)) {
-                const char* c = strchr(line, ':');
-                if (c && !strncmp(c + 1, "memory:", 7)) { v1 = c + 8; break; }
-            }
-            fclose(f);
-        }
-        while (!v1.empty() && (v1.back() == '\n' || v1.back() == '/')) v1.pop_back();
-        for (const std::string& dir : {"/sys/fs/cgroup/memory" + v1, std::string("/sys/fs/cgroup/memory")})
-            if (FILE* f = fopen((dir + "/memory.limit_in_bytes").c_str(), "r")) {
-                double l = 0;
-                const bool ok = fscanf(f, "%lf", &l) == 1;
-                fclose(f);
-                if (ok && l > 0 && l < 1e18) {  // (no limit: ~9.2e18)
-                    r.limit = l;
-                    if (FILE* s = fopen((dir + "/memory.stat").c_str(), "r")) {
-                        char k[64];
-                        double x;
-                        while (fscanf(s, "%63s %lf", k, &x) == 2)
-                            if (!strcmp(k, "rss")) { r.anon = x; break; }
-                        fclose(s);
-                    }
-                }
-                break;
-            }
-        return r;
-    }
-    for (std::string p = path;; p = p.rfind('/') == std::string::npos ? std::string() : p.substr(0, p.rfind('/'))) {
-        const std::string dir = "/sys/fs/cgroup" + p;
-        if (FILE* f = fopen((dir + "/memory.max").c_str(), "r")) {
-            char v[64] = "";
-            if (fscanf(f, "%63s", v) == 1 && strcmp(v, "max")) {
-                const double l = atof(v);
-                if (l > 0 && (r.limit == 0 || l < r.limit)) {
-                    r.limit = l;
-                    r.anon = 0;
-                    if (FILE* s = fopen((dir + "/memory.stat").c_str(), "r")) {
-                        char k[64];
-                        double x;
-                        while (fscanf(s, "%63s %lf", k, &x) == 2)
-                            if (!strcmp(k, "anon")) { r.anon = x; break; }
-                        fclose(s);
-                    }
-                }
-            }
-            fclose(f);
-        }
-        if (p.empty()) break;
-    }
-    return r;
-}
-
 // what a pin may take now: MemAvailable, capped by this process's cgroup limit (past it the cgroup's OOM killer ends the load)
-inline size_t pin_available() {
-    const size_t a = available(true);
-    const CgroupMem c = cgroup_mem();
-    return c.limit > 0 ? std::min(a, (size_t)std::max(0.0, c.limit - c.anon)) : a;
-}
+inline size_t pin_available() { return available(true); }  // (available() includes the cgroup limit)
 
 // bytes the archive may still take from the host (0 at or below the margin)
 inline size_t headroom(bool fresh = false) {

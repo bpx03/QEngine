@@ -88,6 +88,7 @@ char* pin_host_file(const std::string& path, size_t off, size_t n, const void* s
                 "other load threads), %.1f GB available. Free host RAM, add RAM, or use more cards (they keep more experts in "
                 "VRAM). Largest processes: %s\n", cap / 1e9, charge.others() / 1e9, av / 1e9, qe_hostmem::top_rss(4).c_str());
         fflush(stderr);
+        qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp)
         _exit(3);
     }
     CHECK(posix_memalign((void**)&p, PG, cap) == 0 && p, "pin_host_file: out of host memory (%.1f GB)", cap / 1e9);
@@ -167,11 +168,14 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
     // killer would end the process: a clear stop instead (host_mem.h: MemAvailable; of the other load threads' pins in
     // flight only the part they have not touched yet counts, MemAvailable already lacks the rest: L9, review H1)
     qe_hostmem::PinCharge charge(cap);
-    if (const size_t av = qe_hostmem::pin_available(); !qe_hostmem::pin_fits(av, cap, charge.others())) {
+    // (FLASH_TEST_TP_RAM_STOP=1, test only: this stop with the auto fallback armed)
+    static const bool test_ram_stop = env_int("FLASH_TEST_TP_RAM_STOP", 0) != 0;
+    if (const size_t av = qe_hostmem::pin_available(); !qe_hostmem::pin_fits(av, cap, charge.others()) || (test_ram_stop && qe_load_oom_fallback_armed())) {
         fprintf(stderr, "qflash: not enough host RAM: %.1f GB of pinned host memory needed now (+ %.1f GB still to come from "
                 "other load threads), %.1f GB available. Free host RAM, add RAM, or use more cards (they keep more experts in "
                 "VRAM). Largest processes: %s\n", cap / 1e9, charge.others() / 1e9, av / 1e9, qe_hostmem::top_rss(4).c_str());
         fflush(stderr);
+        qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp)
         _exit(3);
     }
     CHECK(posix_memalign((void**)&p, PG, cap) == 0 && p, "pin_host: out of host memory (%.1f GB)", cap / 1e9);
@@ -586,6 +590,9 @@ void* Worker::dalloc_try(size_t bytes) {
 
 void* Worker::dalloc(size_t bytes) {
     void* p = dalloc_try(bytes);
+    // (FLASH_TEST_TP_LOAD_OOM=<GB>, test only: the armed auto fallback, #9, with that much on this card already)
+    static const int test_oom_gb = env_int("FLASH_TEST_TP_LOAD_OOM", 0);
+    if (test_oom_gb && !vready_ && wbytes_ >= test_oom_gb * 1e9 && qe_load_oom_fallback_armed()) { if (p) cudaFree(p); p = nullptr; }
     // serving (lazily sized buffers): the cached graphs first, then resident expert groups to host memory (in steps) until
     // the buffer fits or nothing more moves
     if (!p && vready_ && drop_all_graphs(nullptr) > 0) p = dalloc_try(bytes);
@@ -602,6 +609,7 @@ void* Worker::dalloc(size_t bytes) {
                 env_int("FLASH_MAX_SEQS", 16));
         if (!vready_) {  // at load: a clear stop (no abort, no core dump); the context fit before the load makes it rare
             fflush(stderr);
+            qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp, #9)
             _exit(3);
         }
         CHECK(false, "flash: out of device memory at load (see above)");
@@ -1115,7 +1123,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
                                     this, A, st_);
             else
             L.dn_out = load_w4(st, {{d + "out_proj", 0, H}}, p_.v0 * DV, p_.v1 * DV, false, this, A, st_);
-            L.dn_ab = load_w16((2 * vl + 15) / 16 * 16, H, {{B(st, d + "in_proj_b.weight") + (size_t)p_.v0 * H, H, vl, H, 0, 0},
+            L.dn_ab = load_w16(dn_ab_ld(vl), H, {{B(st, d + "in_proj_b.weight") + (size_t)p_.v0 * H, H, vl, H, 0, 0},
                                        {B(st, d + "in_proj_a.weight") + (size_t)p_.v0 * H, H, vl, H, vl, 0}},
                                this, A, st_);
             const int ch = 2 * kl * DK + vl * DV;
@@ -1502,8 +1510,10 @@ bool kv_ram_mode() {
 // size of the RAM pool, all conversations together: FLASH_KV_RAM_TOKENS (10000000, 10M, 1.5M, 500k; default
 // kKvRamDefaultTokens). Host RAM per token: 13 KV layers x 1,040 B (fp8 K / V + scales) = 13,520 B for the whole
 // machine (2 or 3 cards alike: each card holds its share of the positions), ~74K tokens per GB.
-constexpr double kKvRamTokBytes = 13.0 * (NKV * HD * 2 + NKV * 8);
 constexpr long long kKvRamDefaultTokens = 1000000;
+static long long g_kv_ram_plan = -1;
+void set_kv_ram_plan(long long tokens) { g_kv_ram_plan = tokens; }
+long long kv_ram_plan() { return g_kv_ram_plan; }
 long long kv_ram_tokens() {
     // empty = unset (src/env.h); a value that does not parse (no number, junk after the k/M/G suffix): warning + default
     auto num = [](const char* v, double* x) {
@@ -1547,8 +1557,11 @@ void Worker::alloc_full(Layer& L) {
                 return h;
             }
             void* h = nullptr;
+            // (charged while it is touched: pins of other load threads starting next to it see it, review M4)
+            qe_hostmem::PinCharge charge(n);
             CUDA_CHECK(cudaHostAlloc(&h, n, cudaHostAllocMapped | cudaHostAllocPortable));
             memset(h, 0, n);
+            charge.touched(n);
             void* d = nullptr;
             CUDA_CHECK(cudaHostGetDevicePointer(&d, h, 0));
             kvs_host_ += n;
@@ -1689,11 +1702,18 @@ void Worker::alloc_state() {
     // holds a few of them: not validated yet)
     CHECK(!(kvs_ && p_.pp()), "flash: FLASH_KV=ram is not supported with pipeline stages (FLASH_PAR=pp / pp_prefill) yet; use FLASH_KV=vram");
     if (kvs_) {
-        // the pool (all conversations together) in host RAM: FLASH_KV_RAM_TOKENS (e.g. 10M), at most what the host can
-        // pin next to the margin (host_mem.h; shared by the cards, 3/4 of the headroom at start: the archive keeps room)
-        const long long want = std::max<long long>(max_ctx_, kv_ram_tokens());
+        // the pool (all conversations together) in host RAM: FLASH_KV_RAM_TOKENS (e.g. 10M) as the host-RAM plan fits it
+        // (host_budget.h: next to the experts and the n-gram table, within MemAvailable - margin at start), and as a last
+        // guard at most what the host can pin next to the margin now (host_mem.h; shared by the cards, 3/4 of the headroom)
+        const long long asked = std::max<long long>(max_ctx_, kv_ram_tokens());
+        const long long want = g_kv_ram_plan >= 0 ? std::max<long long>(max_ctx_, std::min(asked, g_kv_ram_plan)) : asked;
+        if (want < asked && p_.rank == 0)
+            fprintf(stderr, "[flash] KV in RAM: %.2fM tokens asked, %.2fM tokens planned (host RAM plan: next to the experts and the "
+                    "n-gram table within MemAvailable - margin)\n", asked / 1e6, want / 1e6);
         const double per_tok = 13.0 * (NKV * HD * 2 + NKV * 8) * p_.own / p_.period;  // host bytes per position on a card
-        static const long long cap_tok = (long long)(0.75 * (double)qe_hostmem::headroom(true) / p_.ngpu / per_tok);
+        // (less what the other load threads' pins in flight have not touched yet: MemAvailable does not lack it yet)
+        static const long long cap_tok = (long long)(0.75 * std::max(0.0, (double)qe_hostmem::headroom(true) -
+                                                                       (double)qe_hostmem::pin_untouched().load()) / p_.ngpu / per_tok);
         long long pc = std::max<long long>(max_ctx_, std::min(want, cap_tok));
         // 16384 (was 8192): a lone 262K prompt on 2 GPUs 111-139 s -> 57 s (VRAM mode 58 s); entries beyond the active
         // contexts stay with the expert cache (set_kv_active), so the size costs VRAM only while long contexts run
@@ -2148,7 +2168,7 @@ void Worker::alloc_state() {
     xqdone_ = (unsigned*)dalloc(4);
     xirecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * IDX_TOPB * 4);
     xiflags_ = (unsigned*)palloc(4 * 4);
-    if (comm_.p2p && comm_.hpll[0] && p_.ngpu > 1) {  // decode exchanges through host memory (QE_DECODE_COMM / calibration)
+    if (comm_.p2p && comm_.dhost && p_.ngpu > 1) {  // decode exchanges through host memory (QE_DECODE_COMM / calibration)
         // on this card's NUMA node (it polls them), host pointer = device pointer (checked in comm_host_alloc)
         auto halloc = [&](size_t bytes) -> void* { return comm_host_alloc(bytes, gpu_numa_node(dev_)); };
         xrecvH_ = (float*)halloc((size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
@@ -2157,6 +2177,25 @@ void Worker::alloc_state() {
         xflagsH_ = (unsigned*)halloc(4 * 4);
         xqflagsH_ = (unsigned*)halloc(4 * 4);
         xiflagsH_ = (unsigned*)halloc(4 * 4);
+        if (env_int("QE_HOST_XPULL", 1)) {  // their device pull slots (xpull, bpx03#21), outside allocs_: free_dhost frees them
+            // (an allocation failure only costs speed: the consumers then read the host slots, as before)
+            const size_t bx = (size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4, bq = (size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4;
+            void* q[6] = {};
+            const size_t b[6] = {bx, bq, 16, 16, 16, 48};
+            bool ok = true;
+            for (int i = 0; i < 6 && ok; i++)
+                if (cudaMalloc(&q[i], b[i]) != cudaSuccess) (void)cudaGetLastError(), q[i] = nullptr, ok = false;
+                else CUDA_CHECK(cudaMemsetAsync(q[i], 0, b[i], st_));
+            if (ok) {
+                CUDA_CHECK(cudaStreamSynchronize(st_));
+                xrecvdH_ = (float*)q[0], xqrecvdH_ = (float*)q[1];
+                xflagdH_ = (unsigned*)q[2], xqflagdH_ = (unsigned*)q[3], xiflagdH_ = (unsigned*)q[4], xpcntH_ = (unsigned*)q[5];
+            } else {
+                for (void* v : q) if (v) cudaFree(v);
+                fprintf(stderr, "[flash] GPU%d: no VRAM for the device pull slots of the host decode path (%.0f MB): "
+                                "its attention exchanges read host memory (slower)\n", dev_, (bx + bq) / 1048576.0);
+            }
+        }
         dhs_ = true;
         dpath_[0] = dpath_[1] = comm_.dxfer;
         dhx_ = comm_.dxfer == kXferHost;
@@ -3723,7 +3762,7 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
         if (L.dn_in8.q) rows8(L.dn_in8, x_, H, proj_, ld, m, st_);
         else gemm_w4(L.dn_in, x_, H, proj_, ld, m, st_);
         KCHK("dn pf in");
-        gemv_w16_rows(L.dn_ab, x_, H, proj2_, 2 * vl, m, st_);
+        gemv_w16_rows(L.dn_ab, x_, H, proj2_, dn_ab_ld(vl), m, st_);
         KCHK("dn pf ab");
         float* cv = qbuf_;
         if (m >= 16) {  // rows in parallel, then the new history
@@ -3744,6 +3783,8 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
             s.nk = kl;
             s.nv = vl;
             for (int h = 0; h < vl; h++) s.v2k[h] = (p_.v0 + h) / (LNV / LNK) - p_.k0;
+            // ab_pad = vl matches the a/b rows only while dn_ab_ld(vl) == 2 * vl (TP1-3): at TP4 the rows are
+            // [b vl][a vl][8 zero pad], not [b ab_pad][a ab_pad]; this fused path is not taken by Flash-Next today
             s.ab_pad = vl;
             s.ab_splits = 1;
             s.ab_rows = m;
@@ -3766,12 +3807,12 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
     if (abp) {  // the small a/b GEMV (2 blocks) on a side branch next to the in-projection
         CUDA_CHECK(cudaEventRecord(pfe0_, st_));
         CUDA_CHECK(cudaStreamWaitEvent(pfs_, pfe0_, 0));
-        gemv_w16(L.dn_ab, x_, H, proj2_, 2 * vl, m, pfs_);
+        gemv_w16(L.dn_ab, x_, H, proj2_, dn_ab_ld(vl), m, pfs_);
         CUDA_CHECK(cudaEventRecord(pfe1_, pfs_));
     }
     if (L.dn_in8.q) gemv_w8_rows(L.dn_in8, x_, H, proj_, ld, m, st_);
     else gemv_w4h(L.dn_in, xh_, H, proj_, ld, m, st_);
-    if (!abp) gemv_w16(L.dn_ab, x_, H, proj2_, 2 * vl, m, st_);
+    if (!abp) gemv_w16(L.dn_ab, x_, H, proj2_, dn_ab_ld(vl), m, st_);
     float* cv = qbuf_;
     k_dn_conv_d<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend, posd_ + 1, cv, m);
     KCHK("k_dn_conv_d");
@@ -4193,17 +4234,25 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
 
 void Worker::xpull(Xchg& x, int kind, int mr, size_t rowb, size_t per) {
     static const bool on = env_int("QE_HOST_XPULL", 1);
-    if (!on || !xpcnt_ || comm_.p2p || p_.ngpu < 2 || mr <= 0) return;
+    if (!on || p_.ngpu < 2 || mr <= 0) return;
+    // peer access on, decode exchange on this card's host-memory slots (dhx_, QE_DECODE_COMM=host or a host pick): the
+    // same pull into this card's device slots (bpx03#21: without it every attention block polled the host flags and read
+    // the rows over PCIe, 3 cards 12.1 vs 8.3 ms per decode step)
+    const bool hv = comm_.p2p && xpcntH_ &&
+                    x.recv[p_.rank] == (kind == 0 ? xqrecvH_ : kind == 1 ? xrecvH_ : xirecvH_);
+    if (!hv && (!xpcnt_ || comm_.p2p)) return;
     // kind 2 (indexer keys): flags only. Each row block of k_idx_select reads its peers' rows once (no redundant
     // host reads to save), but every block polled the host flag words: one serialized PCIe read per block and peer
     // (~0.64 ms per 512-row chunk, 3 cards without P2P); the rows stay in the host-mapped slot
     if (static const bool io = env_int("QE_HOST_XPULL_IDX", 1); kind == 2 && !io) return;
-    float* const d = kind == 0 ? xqrecvd_ : kind == 1 ? xrecvd_ : nullptr;
-    unsigned* const f = kind == 0 ? xqflagd_ : kind == 1 ? xflagd_ : xiflagd_;
+    float* const d = hv ? (kind == 0 ? xqrecvdH_ : kind == 1 ? xrecvdH_ : nullptr)
+                        : (kind == 0 ? xqrecvd_ : kind == 1 ? xrecvd_ : nullptr);
+    unsigned* const f = hv ? (kind == 0 ? xqflagdH_ : kind == 1 ? xflagdH_ : xiflagdH_)
+                           : (kind == 0 ? xqflagd_ : kind == 1 ? xflagd_ : xiflagd_);
     if (!f) return;
     const int bytes = kind == 2 ? 0 : (int)((size_t)mr * rowb);
     const int gy = std::max(1, std::min(8, bytes / 16384));
-    k_xpull<<<dim3(p_.ngpu - 1, gy), 256, 0, st_>>>(x.recv[p_.rank], d, x.flags[p_.rank], f, x.seq, xpcnt_ + 4 * kind, p_.rank,
+    k_xpull<<<dim3(p_.ngpu - 1, gy), 256, 0, st_>>>(x.recv[p_.rank], d, x.flags[p_.rank], f, x.seq, (hv ? xpcntH_ : xpcnt_) + 4 * kind, p_.rank,
                                                     p_.ngpu, (size_t)XROWS * per, bytes);
     KCHK("k_xpull");
     if (d) x.recv[p_.rank] = d;
@@ -4541,6 +4590,7 @@ void Worker::head_sample(int m, int* dst) {  // full lm_head, local top-64 -> ga
     const int nv = p_.voc1 - p_.voc0;
     if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard, as in head()
     gemv_w8(lm_, x_, H, logits_, nv, m, st_);
+    if (con_) lp_copy(m);
     if (con_) k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, nv, lmap_, mask_d_, MASK_WORDS);
     topk_local(logits_, nv, m, 0, cand_, st_);
     k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_);
@@ -4602,6 +4652,7 @@ void Worker::head_sample_b(int m, int* dst, const int* rs) {  // as head_sample,
     const int nv = p_.voc1 - p_.voc0;
     if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard, as in head()
     gemv_w8(lm_, x_, H, logits_, nv, m, st_);
+    if (con_) lp_copy(m);
     if (con_) k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, nv, lmap_, mask_d_, MASK_WORDS);  // (a constrained batch of one)
     topk_local(logits_, nv, m, 0, cand_, st_);
     k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_);
@@ -4688,6 +4739,28 @@ void Worker::start_ngram_stage(const HostTables* ht) {
 void Worker::set_constrained(int slot, bool on) {
     con_slot_.at(slot) = on;
     if (slot == cur_slot_) con_ = on;
+    if (!on) set_lp(slot, false);
+}
+void Worker::set_lp(int slot, bool on) {
+    const size_t nv = p_.voc1 - p_.voc0;
+    if (on && p_.last() && !lp_host_.at(slot)) {
+        CUDA_CHECK(cudaSetDevice(dev_));
+        CUDA_CHECK(cudaMallocHost((void**)&lp_host_[slot], (size_t)MASK_ROWS * nv * 4));
+        if (lp_map_.empty()) {
+            lp_map_.resize(nv);
+            copy_lmap(lp_map_.data());
+        }
+    }
+    lp_slot_.at(slot) = on && p_.last();
+    if (slot == cur_slot_) lp_h_ = lp_of(slot);
+}
+void Worker::lp_read(int slot, int row, float* out) {
+    if (!p_.last() || !lp_host_.at(slot)) return;
+    // (no sync: every path that returns a token synced this stream first; in pp this stream is a stage thread's)
+    const int nv = p_.voc1 - p_.voc0;
+    const float* l = lp_host_[slot] + (size_t)row * nv;
+    for (int i = 0; i < nv; i++)
+        if (lp_map_[i] >= 0 && lp_map_[i] < VOCAB) out[lp_map_[i]] = l[i];
 }
 void Worker::upload_mask(const unsigned* host, int rows) {
     CUDA_CHECK(cudaSetDevice(dev_));
@@ -4707,6 +4780,7 @@ void Worker::head(int m, int* dst, bool draft) {  // lm_head (vocab slice) + dis
     else if (draft) w.n = ndraft_;  // draft vocabulary: the leading rows of the permuted head
     else if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard (FLASH_GUARD=0 off): nf_check
     gemv_w8(w, x_, H, logits_, w.n, m, st_);
+    if (con_ && !draft) lp_copy(m);  // (the target head only: a draft head's logits are never read)
     if (con_ && !draft) k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, w.n, map, mask_d_, MASK_WORDS);
     argmax_local(logits_, w.n, m, 0, pairs_, st_, map);
     allgather_small(pairs_, 2 * m, pairs_all_, comm_, p_.rank, ctr_, st_);
@@ -4796,6 +4870,7 @@ void Worker::run_cached(std::map<long long, cudaGraphExec_t>& cache, long long k
         xb_key_[xk] = d;
         if (undo) memcpy(xb_, xb0, sizeof(xb0));
     };
+    if (lp_on()) { fn(); xb_keep(false); return; }  // logprobs: the prompt of such a slot runs eagerly (its buffer is per slot)
     // a key whose graph is larger than the whole graph budget (inst_graph, review F2) is not captured again
     if (graphs && !gbig_keys_.empty() && gbig_keys_.count(xk)) { fn(); xb_keep(false); return; }
     // prefill-side caches (prompt-shaped keys): every call is counted and stamps its key; a key is captured only when
@@ -4943,10 +5018,16 @@ void Worker::free_dhost() {
         comm_host_free(q);
     xrecvH_ = xqrecvH_ = xirecvH_ = nullptr;
     xflagsH_ = xqflagsH_ = xiflagsH_ = nullptr;
+    for (void* q : {(void*)xrecvdH_, (void*)xqrecvdH_, (void*)xflagdH_, (void*)xqflagdH_, (void*)xiflagdH_, (void*)xpcntH_})
+        if (q) CUDA_CHECK(cudaFree(q));
+    xrecvdH_ = xqrecvdH_ = nullptr;
+    xflagdH_ = xqflagdH_ = xiflagdH_ = xpcntH_ = nullptr;
     dhs_ = dhx_ = false;
     dpath_[0] = dpath_[1] = kXferP2P;
     comm_.dxfer = kXferP2P;
-    for (int i = 0; i < 4; i++) comm_.hpll[i] = nullptr, comm_.hpag[i] = nullptr;  // (freed by the engine's Comm)
+    comm_.dhost = false;
+    drop_graphs(nullptr, 1.0);  // (every rank drops its graphs before the scrub goes: a graph holds the scrub barrier)
+    comm_unbind_ll_scrub(ctr_);
 }
 
 void Worker::set_agpeer(int g, const Worker* w) {
@@ -6781,11 +6862,11 @@ void Worker::spec_launch_con(int kv, int kd) {
     CUDA_CHECK(cudaSetDevice(dev_));
     ec_tick(spos_ + 2 * std::max(kv, kd) + 2, 0);
     static const bool graphs = env_int("FLASH_GRAPH", 1);
-    if (!graphs) {
+    sel_on_ = spos_ + 2 * std::max(kv, kd) + 2 > IDX_BUDGET + IDX_R - 1;
+    if (!graphs || lp_on()) {  // (logprobs: the copy's host buffer is per slot, the graphs are not)
         spec_body(kv, false, kd);
         return;
     }
-    sel_on_ = spos_ + 2 * std::max(kv, kd) + 2 > IDX_BUDGET + IDX_R - 1;
     const long long key = ((long long)sampling_ << 20) | ((long long)sel_on_ << 16) | ((long long)kv << 8) | kd;
     cudaGraphExec_t& ge = cgraph_[key];
     if (!ge && !graph_skip()) {

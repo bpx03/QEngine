@@ -1,6 +1,7 @@
 #include "../env.h"
 #include "gemv.cuh"
 #include "gemv_h16.cuh"
+#include "q8_layout.h"
 #include "ar_fused.cuh"
 
 namespace {
@@ -730,6 +731,180 @@ __global__ void gemv_w8p_kernel(const uint4* __restrict__ q, const bf16* __restr
     reduce_store_nt<NT>(acc, nwarps, y, ldy, m, r * 16, false);
 }
 
+// ---------------------------------------------------------------- Q8 decode GEMV (INT8 layer weights, q8_layout.h)
+// (q8_h2 / q8_frag_h: q8_layout.h)
+// group scale of rows g / g + 8 for the H16 flush of Q8: weights enter as w / 16 and x as x / 16 (exact powers of two)
+__device__ __forceinline__ float q8h_scale(bf16 s) { return __bfloat162float(s) * (kXhScale * 16.f); }
+
+// H16 math with Q8 weights: same XH activations, same fp16 partial per 64-k chunk and fp32 flush as gemv_w4h_kernel
+// (|w / 16| <= 8 as for INT4, so the chunk bound of gemv_h16.cuh holds), same K slices (pick_warps on the group
+// count) and reduction order: every row's result is independent of m (batch == alone). A 64-k chunk is two uint4
+// per lane (INT4: one), so NT == 1 prefetches one chunk ahead (the INT4 kernel one group = two chunks: the same
+// bytes and registers in flight).
+template <int NT, int MAXW, bool PF>
+__device__ __forceinline__ void q8h_body(const uint4* __restrict__ q, const bf16* __restrict__ s, int K,
+                                         const __half* __restrict__ xh, int ldx, float* __restrict__ y, int ldy,
+                                         int m, bool glu, __half* __restrict__ yh, int ldyh) {
+    const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nwarps = blockDim.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int groups = K >> 7;
+    const int gb = warp * groups / nwarps, ge = (warp + 1) * groups / nwarps;
+    const int cb = 2 * gb, ce = 2 * ge;  // 64-k chunks of this K slice
+    const uint4* qp = q + (size_t)r * (K >> 5) * 32 + lane;
+    const bf16* sp = s + (size_t)r * groups * 16;
+    const uint4* xr[NT];
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+        const int tok = 8 * j + g < m ? 8 * j + g : 0;  // padding rows read row 0 (results discarded)
+        xr[j] = reinterpret_cast<const uint4*>(xh + (size_t)tok * ldx + t * 16);
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    uint4 w0 = make_uint4(0, 0, 0, 0), w1 = w0;
+    bf16 s0 = __float2bfloat16(0.f), s8 = s0;
+    if (PF && cb < ce) {
+        w0 = ldg_stream(qp + (size_t)(2 * cb) * 32);
+        w1 = ldg_stream(qp + (size_t)(2 * cb + 1) * 32);
+        s0 = sp[gb * 16 + g];
+        s8 = sp[gb * 16 + g + 8];
+    }
+    float sg = 0.f, sg8 = 0.f;
+    for (int ch = cb; ch < ce; ch++) {
+        uint4 c0, c1;
+        if (PF) {
+            c0 = w0; c1 = w1;
+            if (!(ch & 1)) { sg = q8h_scale(s0); sg8 = q8h_scale(s8); }
+            if (ch + 1 < ce) {
+                w0 = ldg_stream(qp + (size_t)(2 * ch + 2) * 32);
+                w1 = ldg_stream(qp + (size_t)(2 * ch + 3) * 32);
+                if (ch & 1) {  // the next chunk opens a new group
+                    s0 = sp[((ch + 1) >> 1) * 16 + g];
+                    s8 = sp[((ch + 1) >> 1) * 16 + g + 8];
+                }
+            }
+        } else {
+            if (!(ch & 1)) { sg = q8h_scale(sp[(ch >> 1) * 16 + g]); sg8 = q8h_scale(sp[(ch >> 1) * 16 + g + 8]); }
+            c0 = ldg_stream(qp + (size_t)(2 * ch) * 32);
+            c1 = ldg_stream(qp + (size_t)(2 * ch + 1) * 32);
+        }
+        uint4 b[NT][2];
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+            b[nt][0] = xr[nt][(size_t)ch * 8];
+            b[nt][1] = xr[nt][(size_t)ch * 8 + 1];
+        }
+        uint32_t h[NT][2];
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) h[nt][0] = h[nt][1] = 0u;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {  // k-steps of the chunk: uint4 j / 2, step j % 2
+            uint32_t a[4];
+            q8_frag_h(j < 2 ? c0 : c1, j & 1, a);
+#pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+                const uint4& bb = b[nt][j >> 1];
+                xh_mma(h[nt], a, (j & 1) ? bb.z : bb.x, (j & 1) ? bb.w : bb.y);
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) xh_flush(acc[nt], h[nt], sg, sg8);
+    }
+    reduce_store_nt<NT, MAXW>(acc, nwarps, y, ldy, m, r * 16, glu, yh, ldyh);
+}
+__global__ void __launch_bounds__(256, 4) gemv_q8h_kernel1(const uint4* __restrict__ q, const bf16* __restrict__ s, int K,
+        const __half* __restrict__ xh, int ldx, float* __restrict__ y, int ldy, int m, bool glu, __half* __restrict__ yh,
+        int ldyh) {
+    q8h_body<1, kMaxWarps, true>(q, s, K, xh, ldx, y, ldy, m, glu, yh, ldyh);
+}
+#define QE_Q8H_KERNEL(NT_, ATTR_)                                                                                    \
+    __global__ void ATTR_ gemv_q8h_kernel##NT_(const uint4* __restrict__ q, const bf16* __restrict__ s, int K,      \
+                                              const __half* __restrict__ xh, int ldx, float* __restrict__ y,      \
+                                              int ldy, int m, bool glu, __half* __restrict__ yh, int ldyh) {      \
+        q8h_body<NT_, kW4hwMaxWarps, false>(q, s, K, xh, ldx, y, ldy, m, glu, yh, ldyh);                           \
+    }
+QE_Q8H_KERNEL(2, )
+QE_Q8H_KERNEL(3, __launch_bounds__(kW4hwMaxWarps * 32, 4))
+QE_Q8H_KERNEL(4, __launch_bounds__(kW4hwMaxWarps * 32, 4))
+#undef QE_Q8H_KERNEL
+
+// Q8 GEMV on bf16 activations (QE_GEMV_H16=0 off-switch path): exact integer weights in fp16 (byte_perm into
+// 1024 + u, minus 1152), x converted to fp16, fp32-accumulate MMA over a 128-k group, then acc += c * scale - the
+// numerics of the INT8 lm_head (gemv_w8_kernel). Per-row arithmetic does not depend on m (batch == alone).
+__device__ __forceinline__ uint32_t q8_i2(uint32_t wx, uint32_t sel) {
+    uint32_t v = __byte_perm(wx, 0x64u, sel);
+    const __half2 h = __hsub2(*reinterpret_cast<__half2*>(&v), __float2half2_rn(1152.f));
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+template <int NT>
+__global__ void gemv_q8_kernel(const uint4* __restrict__ q, const bf16* __restrict__ s, int K,
+                               const bf16* __restrict__ x, int ldx, float* __restrict__ y, int ldy, int m, bool glu) {
+    const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nwarps = blockDim.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int groups = K >> 7;
+    const int gb = warp * groups / nwarps, ge = (warp + 1) * groups / nwarps;
+    const uint4* qp = q + (size_t)r * (K >> 5) * 32 + lane;
+    const bf16* sp = s + (size_t)r * groups * 16;
+    bool act[NT];
+    const bf16* xr[NT];
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+        act[j] = 8 * j + g < m;
+        xr[j] = x + (size_t)(act[j] ? 8 * j + g : 0) * ldx + 2 * t;
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    for (int gi = gb; gi < ge; gi++) {
+        uint4 w[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) w[i] = ldg_stream(qp + (size_t)(gi * 4 + i) * 32);
+        const float sg = __bfloat162float(sp[gi * 16 + g]), sg8 = __bfloat162float(sp[gi * 16 + g + 8]);
+        float c[NT][4];
+#pragma unroll
+        for (int j = 0; j < NT; j++) c[j][0] = c[j][1] = c[j][2] = c[j][3] = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int st = 0; st < 2; st++) {
+                const int k0 = gi * 128 + (2 * i + st) * 16;
+                const uint32_t wa = (st ? w[i].z : w[i].x) ^ 0x80808080u, wb = (st ? w[i].w : w[i].y) ^ 0x80808080u;
+                const uint32_t a[4] = {q8_i2(wa, kQ8SelLo), q8_i2(wb, kQ8SelLo), q8_i2(wa, kQ8SelHi), q8_i2(wb, kQ8SelHi)};
+#pragma unroll
+                for (int nt = 0; nt < NT; nt++)
+                    mma_f16(c[nt], a, load_x2_f16(xr[nt] + k0, act[nt]), load_x2_f16(xr[nt] + k0 + 8, act[nt]));
+            }
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+            acc[nt][0] += c[nt][0] * sg; acc[nt][1] += c[nt][1] * sg;
+            acc[nt][2] += c[nt][2] * sg8; acc[nt][3] += c[nt][3] * sg8;
+        }
+    }
+    reduce_store_nt<NT>(acc, nwarps, y, ldy, m, r * 16, glu);
+}
+
+// compressed-tensors 8-bit (int32 [N][K/4], u = w + 128 LSB-first) -> Q8; one thread per destination word
+__global__ void repack_q8_kernel(const int32_t* __restrict__ src, int N, int K, uint32_t* __restrict__ dst) {
+    const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (idx >= (size_t)N * K / 4) return;
+    const int word = idx & 3, lane = (idx >> 2) & 31;
+    const size_t rc = idx >> 7;  // r * (K / 32) + c
+    const int r = rc / (K >> 5), c = rc % (K >> 5);
+    const int g = lane >> 2, t = lane & 3;
+    const int row = r * 16 + g + (word & 1) * 8;
+    const int kb = c * 32 + (word >> 1) * 16 + 2 * t;
+    uint32_t v = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int k = kb + q8_koff(i);
+        const uint32_t u = ((uint32_t)src[(size_t)row * (K >> 2) + (k >> 2)] >> (8 * (k & 3))) & 0xFFu;
+        v |= (u ^ 0x80u) << (8 * i);
+    }
+    dst[idx] = v;
+}
+
 // INT8 lm_head for 17..32 tokens (one K slice per tile, i.e. pick_warps == 1 as for the 5174-tile vocab
 // shard): the per-tile kernel above re-reads the packed activations for every tile (NT x 2 KB per group:
 // 1.7 GB per call at m = 32, L2-bound at ~50 % of DRAM). Here a block of WB warps owns WB x TW consecutive
@@ -923,12 +1098,13 @@ __global__ void quantize_rtn_kernel(const bf16* __restrict__ src, int N, int K,
 }
 
 // one block per destination row
+// (wpr: int32 words per row, K / 8 for INT4, K / 4 for INT8)
 __global__ void glu_rows_kernel(const int32_t* __restrict__ sq, const bf16* __restrict__ ss, int N,
-                                int K, int32_t* __restrict__ dq, bf16* __restrict__ ds) {
+                                int K, int32_t* __restrict__ dq, bf16* __restrict__ ds, int wpr) {
     const int dr = blockIdx.x, I = N / 2;
     const int tile = dr / 16, j = dr % 16;
     const int sr = j < 8 ? tile * 8 + j : I + tile * 8 + (j - 8);
-    for (int i = threadIdx.x; i < K / 8; i += blockDim.x) dq[(size_t)dr * (K / 8) + i] = sq[(size_t)sr * (K / 8) + i];
+    for (int i = threadIdx.x; i < wpr; i += blockDim.x) dq[(size_t)dr * wpr + i] = sq[(size_t)sr * wpr + i];
     for (int i = threadIdx.x; i < K / 128; i += blockDim.x) ds[(size_t)dr * (K / 128) + i] = ss[(size_t)sr * (K / 128) + i];
 }
 
@@ -1083,6 +1259,7 @@ __global__ void flag_kernel(unsigned* flag, unsigned v, unsigned long long ns, c
 void gemv_w4h_early(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, int depth,
                     const unsigned* flag, int nw_override, cudaStream_t st, const unsigned* epoch, int idx,
                     __half* yh, int ldyh, const FusedAR* far) {
+    CHECK(w.bits == 4, "gemv_w4h_early: INT4 weights only");  // the engine never launches it for Q8 (allreduce_early)
     const FusedAR fa = far ? *far : FusedAR{};
     CHECK(w.n % 16 == 0 && w.k % 128 == 0 && m >= 1 && m <= 8 && ldx % 64 == 0, "gemv_w4h_early %d %d %d", w.n, w.k, m);
     const int tiles = w.n / 16;
@@ -1128,9 +1305,36 @@ int pick_warps(int tiles, int units, bool w4) {
 }
 
 void glu_interleave_rows(const int32_t* src_q, const bf16* src_s, int n, int k, int32_t* dst_q,
-                         bf16* dst_s, cudaStream_t st) {
-    CHECK(n % 16 == 0, "glu rows %d", n);
-    glu_rows_kernel<<<n, 256, 0, st>>>(src_q, src_s, n, k, dst_q, dst_s);
+                         bf16* dst_s, cudaStream_t st, int bits) {
+    CHECK(n % 16 == 0 && (bits == 4 || bits == 8), "glu rows %d bits %d", n, bits);
+    glu_rows_kernel<<<n, 256, 0, st>>>(src_q, src_s, n, k, dst_q, dst_s, k * bits / 32);
+}
+
+void repack_q8(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st) {
+    CHECK(n % 16 == 0 && k % 128 == 0, "repack_q8 %d %d", n, k);
+    const size_t words = (size_t)n * k / 4;
+    repack_q8_kernel<<<(words + 255) / 256, 256, 0, st>>>(src_q, n, k, reinterpret_cast<uint32_t*>(dst_q));
+    const size_t ns = (size_t)n * (k / 128);
+    repack_scales_kernel<<<(ns + 255) / 256, 256, 0, st>>>(src_s, n, k, dst_s);
+}
+
+// Q8 decode GEMV on XH activations (the H16 path of an INT8 checkpoint): <= 32 rows per launch (more: row blocks of
+// 32, every row's result is independent of the others), NT = 1 prefetching kernel / NT = 2..4 per-chunk kernels
+static void gemv_q8h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, cudaStream_t st, __half* yh,
+                     int ldyh) {
+    for (int r0 = 0; r0 < m; r0 += kMaxGemvW4Tokens) {
+        const int mm = std::min(kMaxGemvW4Tokens, m - r0);
+        const __half* x0 = xh + (size_t)r0 * ldx;
+        __half* yh0 = yh ? yh + (size_t)r0 * ldyh : nullptr;
+        // GLU: y is the bf16 activation buffer [m][ldy]
+        float* y0 = w.glu ? reinterpret_cast<float*>(reinterpret_cast<bf16*>(y) + (size_t)r0 * ldy) : y + (size_t)r0 * ldy;
+        const int tiles = w.n / 16, nw = pick_warps(tiles, w.k / 128, true), ntt = (mm + 7) / 8;
+        CHECK(ntt == 1 || nw <= kW4hwMaxWarps, "gemv_q8h slices %d", nw);
+        if (ntt == 1) gemv_q8h_kernel1<<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu, yh0, ldyh);
+        else if (ntt == 2) gemv_q8h_kernel2<<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu, yh0, ldyh);
+        else if (ntt == 3) gemv_q8h_kernel3<<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu, yh0, ldyh);
+        else gemv_q8h_kernel4<<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu, yh0, ldyh);
+    }
 }
 
 void prefetch_l2(const void* p, size_t bytes, cudaStream_t st) {
@@ -1268,6 +1472,13 @@ void xh_pack(const bf16* x, int ldx, int K, int m, __half* xh, int ldxh, cudaStr
 
 void gemv_w4h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, cudaStream_t st,
               __half* yh, int ldyh) {
+    if (w.bits == 8) {
+        CHECK(w.n % 16 == 0 && w.k % 128 == 0 && m >= 1 && m <= kMaxBatchRows && ldx % 64 == 0 &&
+              (reinterpret_cast<uintptr_t>(xh) & 127) == 0 && (!yh || ldyh % 64 == 0),
+              "gemv_q8h %d %d %d %d", w.n, w.k, m, ldx);
+        gemv_q8h(w, xh, ldx, y, ldy, m, st, yh, ldyh);
+        return;
+    }
     if (m > kMaxGemvW4Tokens) {  // 33..64 rows: the wide kernel (same numerics)
         CHECK(gemv_w4hx(w, xh, ldx, y, ldy, m, st, yh, ldyh), "gemv_w4hx %d %d %d", w.n, w.k, m);
         return;
@@ -1297,6 +1508,20 @@ void gemv_w4h(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m, 
 }
 
 void gemv_w4(const W4& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
+    if (w.bits == 8) {  // Q8 on bf16 activations (QE_GEMV_H16=0): row blocks of <= 32
+        CHECK(w.n % 16 == 0 && w.k % 128 == 0 && m >= 1 && m <= kMaxBatchRows, "gemv_q8 %d %d %d", w.n, w.k, m);
+        const int tiles = w.n / 16, nw = pick_warps(tiles, w.k / 128, true);
+        for (int r0 = 0; r0 < m; r0 += kMaxGemvW4Tokens) {
+            const int mm = std::min(kMaxGemvW4Tokens, m - r0), ntt = (mm + 7) / 8;
+            const bf16* x0 = x + (size_t)r0 * ldx;
+            float* y0 = w.glu ? reinterpret_cast<float*>(reinterpret_cast<bf16*>(y) + (size_t)r0 * ldy) : y + (size_t)r0 * ldy;
+            if (ntt == 1) gemv_q8_kernel<1><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu);
+            else if (ntt == 2) gemv_q8_kernel<2><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu);
+            else if (ntt == 3) gemv_q8_kernel<3><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu);
+            else gemv_q8_kernel<4><<<tiles, nw * 32, 0, st>>>(w.q, w.s, w.k, x0, ldx, y0, ldy, mm, w.glu);
+        }
+        return;
+    }
     if (m > kMaxGemvW4Tokens && m <= kMaxBatchRows) {  // 33..64 rows (draft head of a wide step): two calls
         gemv_w4(w, x, ldx, y, ldy, 32, st);
         gemv_w4(w, x + (size_t)32 * ldx, ldx, y + (size_t)32 * ldy, ldy, m - 32, st);

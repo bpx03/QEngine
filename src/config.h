@@ -22,6 +22,10 @@ struct Config {
     std::vector<bool> is_full;  // per layer: full attention (true) or gated delta net
     int eos = 0;
     int eos2 = -1;  // second end-of-turn id (generation_config.json), e.g. <|im_end|>
+    // <|image_pad|> (config.json image_token_id; eos without one): what the lookup history holds for an image row, as
+    // Flash-Next's dev_tok. The host keeps the rows' content-derived ids (>= kImgToken) for prefix matching; a lookup
+    // draft copied from them read the image table at that id (Xid 13)
+    int image_pad = -1;
 
     int n_full() const;
     int n_lin() const { return layers - n_full(); }
