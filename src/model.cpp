@@ -1148,7 +1148,15 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     const int kd = c_.lin_nk * 128;  // global key dim of in_proj_qkv sections
 
     layers_.resize(c_.layers);
+    if (g_load_drop27.on()) {  // every card reads (a slice of) every layer: its pages go once all cards are past it
+        for (int i = 0; i < c_.layers; i++) g_load_drop27.expect(&st, lp(i));
+    }
+    g_load_drop27.ready();
     for (int i = 0; i < c_.layers; i++) {
+        if (i > 0 && g_load_drop27.on()) {  // layer i - 1 read: its copies out of the mapping are done
+            CUDA_CHECK(cudaDeviceSynchronize());  // (plain cudaMemcpy from pageable memory too)
+            g_load_drop27.done(&st, lp(i - 1));
+        }
         Layer& L = layers_[i];
         const std::string pre = lp(i);
         L.full = c_.is_full[i];
@@ -1232,6 +1240,10 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
                              {pre + "mlp.up_proj", p_.inter.b, p_.inter.e}},
                             -1, -1, glu_);
         L.down = load_w4(st, {{pre + "mlp.down_proj", 0, H}}, p_.inter.b, p_.inter.e);
+    }
+    if (g_load_drop27.on() && c_.layers > 0) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        g_load_drop27.done(&st, lp(c_.layers - 1));
     }
     final_norm_ = load_bf16(st, "model.language_model.norm.weight", -1, -1);
     if (has_q8_) {  // INT8 checkpoint: the producers' W4A8 prequantization is off (gemm.cu gemm_q8_model)

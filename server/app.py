@@ -850,6 +850,11 @@ class Generator:
         self.gen_turns = collections.OrderedDict()  # see remember_turn
         self.gen_turn_tokens = 0
         self.im_start = self.tok.token_to_id("<|im_start|>")
+        # image rows in the grammar lookup history (grammar.TokenLookup): the pad, as in the engines' own lookup;
+        # a tokenizer without it has no image prompts, eos is then only a valid placeholder
+        self.image_pad = self.tok.token_to_id("<|image_pad|>")
+        if self.image_pad is None:
+            self.image_pad = min(prof.eos_ids) if prof.eos_ids else 0
         self.im_end_nl = self.tok.encode("<|im_end|>\n", add_special_tokens=False).ids
         # loop guard (server/loop_guard.py): the repeated reply's tokens seed the penalty, without special tokens
         # (ids from <|endoftext|> on) and whitespace-only pieces
@@ -1331,8 +1336,9 @@ class Generator:
         if gpus:
             facts += f", free VRAM {gpus}"
         if cur < start and n + k + 2 <= min(start, e.max_t):
-            return (f"no room in the KV pool: another process took the GPU memory and this request can't be finished ({facts}). "
-                    "Free the GPU memory and send it again.")
+            mem = "host RAM" if getattr(e, "kv_in_ram", False) else "GPU memory"  # FLASH_KV=ram (lazy pinning) shrinks with host RAM
+            return (f"no room in the KV pool: another process took the {mem} and this request can't be finished ({facts}). "
+                    f"Free the {mem} and send it again.")
         return f"no room in the KV pool: this request doesn't fit ({facts}). No sign of another process taking memory."
 
     def stop_requests(self):
@@ -2055,7 +2061,7 @@ class Job:
             pending = ok
             self.gsteps += 1
             if self.glk is None:  # token history for lookup drafts (prompt + emitted so far)
-                self.glk = TokenLookup(list(self.ids) + list(self.det.ids))
+                self.glk = TokenLookup(list(self.ids) + list(self.det.ids), g.image_pad)
             self.glk.append(ok)
             if not gdone:
                 # drafts for the next step: forced tokens / lookup / the grammar-valid model drafts
@@ -2523,20 +2529,36 @@ def template_kwargs(body, default_think, default_effort=None, anthropic=False):
     sends (any of the fields above) wins over its own enable_thinking: true, as enable_thinking: false wins over an
     effort (any "off" wins). The server default `none` (--reasoning-effort) only sets the default: a request that
     turns thinking on itself (chat_template_kwargs.enable_thinking: true, thinking.type enabled / adaptive) thinks with
-    the template's own default effort, one that names an effort thinks at that effort."""
+    the template's own default effort, one that names an effort thinks at that effort.
+
+    reasoning.enabled (OpenRouter; true / false only) has the lowest precedence. false (= effort none) applies only when
+    the request sends none of the fields above (no effort, no enable_thinking, no thinking.type); true turns thinking on
+    over the server default (--think 0, --reasoning-effort none) unless the request turns it off itself, at the effort
+    the request names, else the server's, else the template's own default."""
     kw = dict(body.get("chat_template_kwargs") or {})
     th = body.get("thinking")
     th_type = th.get("type") if isinstance(th, dict) else None
+    rs = body.get("reasoning")  # OpenAI Responses / OpenRouter: reasoning: {"effort": ..., "enabled": ...}
+    rs = rs if isinstance(rs, dict) else {}
+    oc = body.get("output_config")
+    # OpenRouter reasoning.enabled (a real bool only), the lowest-precedence switch: false only when the request sends no
+    # other thinking switch or effort (fields above); true unless the request turns thinking off itself (enable_thinking
+    # false, thinking.type disabled, an effort none), with the effort the request names (OpenRouter clients send both)
+    en = rs.get("enabled")
+    efforts = [kw.get("reasoning_effort"), body.get("reasoning_effort"), rs.get("effort")]
+    if anthropic and isinstance(oc, dict):
+        efforts.append(oc.get("effort"))
+    sent = kw.get("enable_thinking") is not None or th_type is not None or any(x is not None for x in efforts)
+    asked_off = kw.get("enable_thinking") is False or th_type == "disabled" or any(is_no_effort(x) for x in efforts)
+    en = en if isinstance(en, bool) and not (sent if en is False else asked_off) else None
     if th_type == "disabled":
         kw.setdefault("enable_thinking", False)
     from_request = True
     if kw.get("reasoning_effort") is None:
         kw.pop("reasoning_effort", None)
         eff = body.get("reasoning_effort")
-        rs = body.get("reasoning")  # OpenAI Responses / OpenRouter: reasoning: {"effort": ...}
-        if eff is None and isinstance(rs, dict):
+        if eff is None:
             eff = rs.get("effort")
-        oc = body.get("output_config")
         if eff is None and anthropic and isinstance(oc, dict):
             eff = oc.get("effort")
         if eff is None:
@@ -2549,8 +2571,20 @@ def template_kwargs(body, default_think, default_effort=None, anthropic=False):
         asked_on = kw.get("enable_thinking") is True or th_type in ("enabled", "adaptive")
         if from_request or not asked_on:
             kw["enable_thinking"] = False
+    if en is False:  # as effort none: the prompt of enable_thinking=false
+        kw.pop("reasoning_effort", None)
+        kw["enable_thinking"] = False
+    elif en is True:  # on even under --think 0 / --reasoning-effort none (then at the template's own default effort)
+        kw["enable_thinking"] = True
     kw.setdefault("enable_thinking", default_think)
     return kw
+
+
+def reasoning_excluded(body):
+    """OpenRouter reasoning.exclude: true: the model reasons as usual (same prompt, same budget, reasoning tokens in
+    usage), the reply carries no reasoning_content (/v1/chat/completions; streamed reasoning deltas are dropped)."""
+    rs = body.get("reasoning")
+    return isinstance(rs, dict) and rs.get("exclude") is True
 
 
 def structured(gen, body, kw):
@@ -2854,6 +2888,7 @@ def build_app(gen: Generator, args):
             params["logprobs"] = logprobs
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
         parser = Parser(reply_thinking(gen, ids, kw))
+        hide_rs = reasoning_excluded(body)  # reasoning.exclude: generated, not returned
 
         def tool_calls_out(calls):
             return [{"index": i, "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
@@ -2901,6 +2936,8 @@ def build_app(gen: Generator, args):
                     if isinstance(item, dict):
                         st = item
                         for kind, t in parser.feed("", final=True, promote=st.get("promote_call", False)):
+                            if kind == "reasoning" and hide_rs:
+                                continue
                             yield chunk({"reasoning_content" if kind == "reasoning" else "content": t})
                         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
                         if calls:
@@ -2922,6 +2959,8 @@ def build_app(gen: Generator, args):
                     if type(item) is LpText:
                         lp_buf.extend(item.lp)
                     for kind, t in parser.feed(item):
+                        if kind == "reasoning" and hide_rs:
+                            continue
                         c = chunk({"reasoning_content" if kind == "reasoning" else "content": t})
                         if STEP_PROF:
                             sse_s[0] += _pc() - a0
@@ -2941,7 +2980,7 @@ def build_app(gen: Generator, args):
         msg = {"role": "assistant", "content": parts["content"].strip() or (None if calls else "")}
         if logprobs is not None and msg["content"]:  # as streamed: the entries join to exactly this text
             msg["content"] = parts["content"]
-        if parts["reasoning"]:
+        if parts["reasoning"] and not hide_rs:
             msg["reasoning_content"] = parts["reasoning"].strip()
         if calls:
             msg["tool_calls"] = [{k: v for k, v in c.items() if k != "index"} for c in tool_calls_out(calls)]
@@ -3177,11 +3216,14 @@ def parse_args(argv=None):
                     help="MTP head weights for the engine (sets $QE_MTP_FILE; default: the engine's own choice, "
                          "for 27B model_mtp_ft.safetensors when present, else downloaded once from the latest "
                          "release into ~/.cache/qengine/assets; QE_FETCH_ASSETS=0: no download)")
-    ap.add_argument("--lsa", default=None, metavar="MAP",
-                    help="27B: Latent Sparse Attention for long contexts (opt-in, lossy): the D-LSA index map as "
-                         "safetensors (tools/lsa/convert_map.py from the released .pt); sets $QE_LSA ($QE_LSA_MODE block / dlsa: "
-                         "default block below --max-ctx 1M, dlsa from 1M on). Rows at "
-                         "positions >= $QE_LSA_PF_MIN (prefill) / $QE_LSA_DEC_MIN (decode) attend sparsely")
+    ap.add_argument("--lsa", nargs="?", const="auto", default=None, metavar="MAP",
+                    help="27B: Latent Sparse Attention for long contexts (opt-in, lossy). --lsa (or QE_LSA=auto): "
+                         "the released D-LSA index map, downloaded once (pinned URL + sha256), converted and "
+                         "cached in $QE_LSA_DIR / $QE_DISK_CACHE/lsa / ~/.cache/qengine/lsa; offline without a cached "
+                         "map the server starts with full attention. --lsa MAP (or QE_LSA=MAP): a safetensors map, or "
+                         "the released .pt (converted into the cache). Sets $QE_LSA ($QE_LSA_MODE block / dlsa: default block below "
+                         "--max-ctx 1M, dlsa from 1M on). Rows at positions >= $QE_LSA_PF_MIN (prefill) / "
+                         "$QE_LSA_DEC_MIN (decode) attend sparsely")
     ap.add_argument("--think", type=int, default=1, help="default enable_thinking")
     ap.add_argument("--reasoning-effort", default=env_str("QE_REASONING_EFFORT"),
                     help="default reasoning effort for requests that send none (xhigh, high = xhigh, max = xhigh, "
@@ -3190,7 +3232,7 @@ def parse_args(argv=None):
                          "a request's reasoning_effort, chat_template_kwargs.reasoning_effort or reasoning.effort "
                          "wins, and a "
                          "request's none turns thinking off (as enable_thinking=false, also over its own "
-                         "enable_thinking=true); other values "
+                         "enable_thinking=true); OpenRouter reasoning.enabled false / true is read last; other values "
                          "render as medium); env QE_REASONING_EFFORT; default: unset = the template's own (xhigh)")
     ap.add_argument("--thinking-budget", default=env_str("QE_THINKING_BUDGET"),
                     help="default thinking budget in tokens for requests that send none (0 = off): at the budget the "
@@ -3326,16 +3368,39 @@ def parse_args(argv=None):
               flush=True)
     # the MTP head fine-tuned on the engine's own answers: +8% accepted drafts
     ft = os.path.join(args.model, "model_mtp_ft.safetensors")
-    if getattr(args, "lsa", None):
-        if not os.path.isfile(args.lsa):
-            sys.exit(f"--lsa: no such file {args.lsa}")
-        with open(args.lsa, "rb") as f:
-            head = f.read(9)
-        n = int.from_bytes(head[:8], "little") if len(head) == 9 else 0
-        if head[:2] == b"PK" or len(head) < 9 or head[8:9] != b"{" or n > os.path.getsize(args.lsa) - 8:
-            sys.exit(f"--lsa: {args.lsa} is not a safetensors file (a released .pt map must be converted first: "
-                     f"python3 -I tools/lsa/convert_map.py <map.pt> <out.safetensors>)")
-        os.environ["QE_LSA"] = os.path.abspath(args.lsa)
+    # --lsa wins over $QE_LSA (the engine reads $QE_LSA as the map path); auto / a .pt resolve in main() (lsa_map.py)
+    from_env = args.lsa is None
+    if from_env:
+        args.lsa = os.environ.get("QE_LSA")
+    if args.lsa is not None:
+        import lsa_map
+        spec = args.lsa.strip()
+        if spec.lower() in lsa_map.OFF:
+            os.environ.pop("QE_LSA", None)
+            args.lsa = None
+        elif spec.lower() in lsa_map.AUTO:
+            os.environ.pop("QE_LSA", None)
+            args.lsa = "auto"
+        elif args.profile.is_flash:  # (Flash-Next ignores the map; an explicit missing / wrong file stops as before)
+            if not from_env and not os.path.isfile(spec):
+                sys.exit(f"--lsa: no such file {spec}")
+            if not from_env and not lsa_map.is_safetensors(spec):
+                sys.exit(f"--lsa: {spec} is not a safetensors file")
+            print("[server] LSA: --lsa is for the 27B only; Flash-Next has its own sparse indexer (ignored)", flush=True)
+            os.environ["QE_LSA"] = os.path.abspath(spec)
+        elif from_env and not lsa_map.is_pt(spec):
+            pass  # $QE_LSA=<path> as before: the engine checks it (a bad map: `LSA off: map ...`, full attention)
+        else:
+            try:  # --lsa PATH: checked now, SystemExit as before; a released .pt is converted into the cache
+                args.lsa = lsa_map.resolve(spec, args.model)
+            except SystemExit as ex:
+                if not from_env:
+                    raise
+                print(f"[server] LSA: off: $QE_LSA {ex}; the server starts with full attention", flush=True)
+                args.lsa = None
+                os.environ.pop("QE_LSA", None)
+            else:
+                os.environ["QE_LSA"] = args.lsa
     if args.mtp_file:
         os.environ["QE_MTP_FILE"] = args.mtp_file
     elif env_str("QE_MTP_FILE") is None and os.path.exists(ft):
@@ -3386,6 +3451,13 @@ def main():
         if why:
             sys.exit(print(f"[server] {why}", flush=True) or 3)
         assets.ensure(args.model)
+        if args.lsa == "auto":  # find / fetch / convert the released map; any failure: full attention, never a stop
+            import lsa_map
+            path = lsa_map.resolve("auto", args.model)
+            if path:
+                os.environ["QE_LSA"] = path
+    elif getattr(args, "lsa", None) == "auto":
+        print("[server] LSA: --lsa is for the 27B only; Flash-Next has its own sparse indexer (ignored)", flush=True)
     try:  # kill -USR1 <pid>: Python stacks of every thread (the native ones: gdb -p <pid>)
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     except Exception:

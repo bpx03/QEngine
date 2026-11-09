@@ -20,12 +20,18 @@ LK_GRAMMAR = env_str("QE_LK_GRAMMAR", "0") != "0"  # JSON copy bench: no gain (s
 LK_MIN = env_int("QE_LK_MIN", 24)
 
 
-class TokenLookup:
-    """Prompt + emitted tokens of one request, append-only, with the engine's lookup policy (vectorized)."""
+IMG_TOKEN = 1 << 30  # server ids >= this are image rows (vision.py, engine kImgToken)
 
-    def __init__(self, ids):
+
+class TokenLookup:
+    """Prompt + emitted tokens of one request, append-only, with the engine's lookup policy (vectorized).
+    Image rows (ids >= IMG_TOKEN, content-derived) are held as `image_pad` (the in-vocab <|image_pad|> id), as the
+    engines' own lookup histories do: a draft is always a vocab id (plan() indexes the masks with it)."""
+
+    def __init__(self, ids, image_pad=0):
         self.h = np.zeros(max(1024, 2 * len(ids)), np.int32)
         self.n = 0
+        self.image_pad = int(image_pad)
         self.append(ids)
         self.n_drafts = 0
 
@@ -33,7 +39,8 @@ class TokenLookup:
         k = len(toks)
         if self.n + k > len(self.h):
             self.h = np.concatenate([self.h, np.zeros(max(len(self.h), k), np.int32)])
-        self.h[self.n:self.n + k] = toks
+        a = np.asarray(toks, np.int64)
+        self.h[self.n:self.n + k] = np.where(a >= IMG_TOKEN, self.image_pad, a) if k else a
         self.n += k
 
     def find(self, lmax, mmin=LK_MIN):

@@ -259,7 +259,7 @@ def run_job(chunks, max_new=10000, stops=(), guard=0, eos=(), sink=None, room=10
     tok.token_to_id = {v: k for k, v in tok.SPECIAL.items()}.get
     got = [] if sink is None else sink
     LAST.clear()
-    g = types.SimpleNamespace(eos=set(eos), im_start=305, tok=tok, args=types.SimpleNamespace(loop_guard_tokens=guard, mtp_k=3),
+    g = types.SimpleNamespace(eos=set(eos), im_start=305, image_pad=306, tok=tok, args=types.SimpleNamespace(loop_guard_tokens=guard, mtp_k=3),
                               engine=types.SimpleNamespace(slots={0: room}, spec_io=lambda s: None, mask_buffer=lambda s: None), marks=None,
                               think_ids=types.SimpleNamespace(ok=True, open_at_end=lambda ids, im: True))
     j = app.Job.__new__(app.Job)

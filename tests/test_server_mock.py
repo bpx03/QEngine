@@ -399,6 +399,24 @@ def check_effort_none():
                                              "reasoning": {"effort": "none"}}).text
     ev = [e["choices"][0]["delta"] for e in sse_events(t) if e.get("choices")]
     assert last_prompt() == p_off and not any(d.get("reasoning_content") for d in ev), t[:400]
+    # OpenRouter reasoning.enabled false = off (lowest precedence); reasoning.exclude: thinks, returns no reasoning
+    p, rs, txt, _ = chat(c, reasoning={"enabled": False})
+    assert p == p_off and rs is None and txt == "Hello there.", (rs, txt)
+    p, rs, _, _ = chat(c, reasoning={"enabled": False}, reasoning_effort="low")
+    assert p == p_low and rs == "Hello there.", rs
+    p, rs, txt, _ = chat(c, reasoning={"exclude": True})
+    assert p == p_on and rs is None and not txt, (rs, txt)
+    t = c.post("/v1/chat/completions", json={"model": "x", "messages": msgs, "max_tokens": 50, "stream": True,
+                                             "reasoning": {"exclude": True}}).text
+    ev = [e["choices"][0]["delta"] for e in sse_events(t) if e.get("choices")]
+    assert last_prompt() == p_on and not any(d.get("reasoning_content") for d in ev), t[:400]
+    assert ev and ev[0].get("role") == "assistant" and "[DONE]" in t, t[:400]
+    p, rs, txt, _ = chat(c, reasoning={"exclude": True}, **off)  # the content stays
+    assert p == p_off and rs is None and txt == "Hello there.", (rs, txt)
+    t = c.post("/v1/chat/completions", json=dict({"model": "x", "messages": msgs, "max_tokens": 50, "stream": True,
+                                                  "reasoning": {"exclude": True}}, **off)).text
+    ev = [e["choices"][0]["delta"] for e in sse_events(t) if e.get("choices")]
+    assert "".join(d.get("content") or "" for d in ev) == "Hello there.", t[:400]
     # Anthropic: the same prompt as enable_thinking=false, a text block only
     pa_off, types_, _ = anth(c, **off)
     assert pa_off == p_off and types_ == ["text"], types_
@@ -430,6 +448,8 @@ def check_effort_none():
     assert p == p_low and rs == "Hello there.", rs
     p, types_, _ = anth(c, thinking={"type": "adaptive"})
     assert p == p_on and types_[0] == "thinking", types_
+    p, rs, _, _ = chat(c, reasoning={"enabled": True})  # on over the server default (template default effort)
+    assert p == p_on and rs == "Hello there.", rs
     p, rs, _, _ = chat(c, chat_template_kwargs={"enable_thinking": 0})  # (not a bool: not a switch)
     assert p == p_off and rs is None, rs
     c = server(["--think", "0"])

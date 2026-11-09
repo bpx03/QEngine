@@ -26,6 +26,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+LoadDrop g_load_drop27;  // load-time page cache of the layer tensors (model.h; set up before the load)
+
 extern std::atomic<bool> g_qe_loaded;
 static double vnow_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 size_t qe_release_load_scratch();  // model.cpp
@@ -303,7 +305,29 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         if (!why.empty())
             for (auto& w : workers_) w->lsa_refuse(why);
     }
+    {  // load-time page cache (QE_LOAD_DROP: 1 on, 0 off, unset / auto: auto): a layer's file pages go once every card has
+        // read its slice, so the files do not fill the page cache next to the pins. Auto: only when the host could not keep
+        // the files cached next to what the engine pins (the archive and pinned prefixes as set, else their defaults of
+        // 32 + 8 GiB, + 8 GiB for its buffers): on a large host the files stay cached as before (a restart reads them
+        // from memory)
+        const double GiB = (double)(1ull << 30), files = (double)st_.mapped_bytes(), avail = (double)qe_hostmem::available(true);
+        const double pins = (std::max(0.0, env_double("QE_KV_ARCHIVE_GB", 32.0)) + std::max(0.0, env_double("QE_PREFIX_GB", 8.0)) + 8.0) * GiB;
+        const double need = files + pins + (double)qe_hostmem::margin();
+        const char* v = env_str("QE_LOAD_DROP");
+        const bool forced = v && strcmp(v, "auto") != 0;
+        const bool on = forced ? env_int("QE_LOAD_DROP", 0) != 0 : avail < need;
+        g_load_drop27.begin((int)workers_.size(), on);
+        if (forced)
+            printf("load: model file pages %s (QE_LOAD_DROP=%s)\n", on ? "dropped layer by layer" : "kept in the page cache", v);
+        else
+            printf("load: model file pages %s (auto: MemAvailable %.1f GB %s %.1f GB of files + pinned archive and prefixes + "
+                   "margin; QE_LOAD_DROP=0/1 sets it)\n", on ? "dropped layer by layer" : "kept in the page cache", avail / 1e9,
+                   on ? "<" : ">=", need / 1e9);
+        fflush(stdout);
+    }
     pool_->run([&](int r) { workers_[r]->load(st_, mtp_st_.get(), embed_); });
+    if (g_load_drop27.on()) printf("load: page cache of each layer dropped once loaded (%.1f GB of file ranges)\n", g_load_drop27.dropped() / 1e9), fflush(stdout);
+    g_load_drop27.begin(0, false);
     // the load's staging buffers (their room goes to the slots / the pool); QE_VRAM_ADAPT=0: kept, as before (review L3)
     vram_adapt_ = env_int("QE_VRAM_ADAPT", 1) != 0;
     scratch_freed_.assign(workers_.size(), 0);
@@ -413,7 +437,11 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         in.base = std::max(0.0, env_double("QE_HOST_BASE_GB", 6.0)) * 1e9;
         double snap = 0;
         for (size_t sz : sizes) snap += (double)sz;
-        in.fixed = (double)emb_bytes_ + snap * max_snaps_;
+        // snapshot entries pinned at start: the first kSnapBase (background, no room check); the rest are pinned only as
+        // the store fills and only while MemAvailable - margin holds two more (alloc_thread_, take_snapshot; a failed pin
+        // keeps the store at its size), and unused pre-pinned ones go back under the margin (mem_guard; entries in use
+        // stay): the plan does not take them from the archive, which restores whole conversations
+        in.fixed = (double)emb_bytes_ + snap * std::min(max_snaps_, kSnapBase);
         const double GiB = (double)(1ull << 30);
         in.arch_def = 32 * GiB;
         in.pref_def = 8 * GiB;
@@ -2652,6 +2680,8 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
                 if (max_snaps_ > (int)snaps_.size())
                     printf("snapshots: host memory short, the store stays at %zu of %d entries\n", snaps_.size(), max_snaps_), fflush(stdout);
                 max_snaps_ = (int)snaps_.size();
+                // (checkpoints keep at most half of the store that is left: prompt-end states still get entries)
+                snap_reserve0_ = std::min(snap_reserve0_, max_snaps_ / 2);
             }
         }
         if (!b.empty()) {
@@ -3165,26 +3195,51 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         if (div > from + 512 && div < n) marks.push_back(div);
     }
     std::sort(marks.begin(), marks.end());
-    // image rows: the device-side ids index the image table (rows [from, n) filled from img)
+    // image rows: the device-side ids index the image table (rows [from, n) filled from img). Each prefill in flight
+    // has its own range (kMaxPrefills: two image prompts may prefill at once): the first gap of the table that the
+    // others' ranges leave, which a grown table keeps (their rows copied before the old table is freed)
     std::vector<int> dev_ids;
+    size_t img_base = 0;
     if (img_rows > 0) {
-        if ((size_t)img_rows > img_cap_) {
-            if (img_table_) CUDA_CHECK(cudaFreeHost(img_table_));
-            img_cap_ = std::max<size_t>(img_rows, 2 * img_cap_);
-            CUDA_CHECK(cudaHostAlloc(&img_table_, img_cap_ * cfg_.hidden * 2,
-                                     cudaHostAllocMapped | cudaHostAllocPortable));
+        std::vector<std::pair<size_t, size_t>> used;
+        for (auto& o : pfs_)
+            if (o.img_n > 0) used.push_back({(size_t)o.img_base, (size_t)o.img_base + o.img_n});
+        std::sort(used.begin(), used.end());
+        size_t keep = 0;  // rows of the table in use by the others
+        for (auto& [a, b] : used) {
+            if (img_base + img_rows <= a) break;
+            img_base = std::max(img_base, b);
+        }
+        for (auto& u : used) keep = std::max(keep, u.second);
+        if (img_base + img_rows > img_cap_) {
+            const size_t cap = std::max<size_t>(img_base + img_rows, 2 * img_cap_);
+            bf16* t = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&t, cap * cfg_.hidden * 2, cudaHostAllocMapped | cudaHostAllocPortable));
+            if (img_table_ && keep) memcpy(t, img_table_, keep * cfg_.hidden * 2);
+            bf16* old = img_table_;
+            img_table_ = t;
+            img_cap_ = cap;
             pool_->run([&](int r) {
                 CUDA_CHECK(cudaSetDevice(workers_[r]->device));
                 set_image_table(img_table_);
                 set_image_table_spec(img_table_);
             });
+            // (after the switch, and once nothing queued on the cards can still read the old table: chunks of the other
+            // prefill read the copy; only when the table grows)
+            if (old) {
+                pool_->run([&](int r) {
+                    CUDA_CHECK(cudaSetDevice(workers_[r]->device));
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                });
+                CUDA_CHECK(cudaFreeHost(old));
+            }
         }
         dev_ids.assign(ids, ids + n);
         for (int i = 0, j = 0; i < n; i++)
             if (ids[i] >= kImgToken) {
                 if (i >= from)
-                    memcpy(img_table_ + (size_t)j * cfg_.hidden, img + (size_t)j * cfg_.hidden, (size_t)cfg_.hidden * 2);
-                dev_ids[i] = kImgToken + j++;
+                    memcpy(img_table_ + (img_base + j) * cfg_.hidden, img + (size_t)j * cfg_.hidden, (size_t)cfg_.hidden * 2);
+                dev_ids[i] = kImgToken + (int)img_base + j++;
             }
     }
     pf.slot = slot;
@@ -3197,6 +3252,8 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     pf.from_archive = last_from_archive_;
     pf.ids.assign(ids, ids + n);
     pf.dev_ids = std::move(dev_ids);
+    pf.img_base = (int)img_base;
+    pf.img_n = img_rows;
     if (img_rows) pf.rope3.assign(rope3, rope3 + 3 * (size_t)n);
     pf.marks = std::move(marks);
     pfs_.push_back(std::move(pf));

@@ -19,6 +19,7 @@
 #include "kernels/spec.cuh"
 #include "kernels/lsa.cuh"
 #include "safetensors.h"
+extern LoadDrop g_load_drop27;  // load-time page cache of the layer tensors (model.cpp; Engine sets it up)
 
 struct FullAttnLayer {
     W4 qkv, o;

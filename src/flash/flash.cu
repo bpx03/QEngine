@@ -570,6 +570,7 @@ struct RowSel {
     int r0, r1;
 };
 }  // namespace
+LoadDrop g_load_drop;  // load-time page cache of the layer files (flash.h)
 
 void* Worker::dalloc_try(size_t bytes) {
     void* p;
@@ -2598,6 +2599,11 @@ void Worker::pfs_alloc_fit(int cap, int cap0, long long keep_b) {
 // card's routed groups stay on the device; the coldest (static cold list first, then by router-trace prior, then by
 // index) are host-backed (pinned, full copy) and cached dynamically in the KV tail. The shared expert stays on device.
 void Worker::load_deferred_groups() {
+    {  // the layers this worker reads from the files (shared expert views read none): their pages go once every rank is done
+        for (auto& d : ec_defer_l_)
+            if (!views()) g_load_drop.expect(d.st, d.pre);
+        g_load_drop.ready();
+    }
     // lazily grown GEMM workspaces (gemm.cu tl_alloc): reserved here per device, before the budget, for the largest
     // prefill chunk; a later growth that runs out of memory drops this card's cached graphs and retries (not while
     // capturing). Both are per device: this runs on the loader thread, the card is served from another one
@@ -2756,6 +2762,7 @@ void Worker::load_deferred_groups() {
         auto& d = ec_defer_l_[i];
         if (i + 1 < ec_defer_l_.size()) prefetch_experts(*ec_defer_l_[i + 1].st, ec_defer_l_[i + 1].pre, false);
         load_groups(*d.st, L_[d.li], d.pre, isc[d.li]);
+        g_load_drop.done(d.st, d.pre);  // (load_groups read the mapping synchronously)
     }
     ec_defer_l_.clear();
     g_hs.release();

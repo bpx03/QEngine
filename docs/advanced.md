@@ -40,14 +40,14 @@ and uses the default too. In Docker pass them with `-e`.
 | `FLASH_MAIN_STALE_S` | `300` | A conversation holding a main agent thread's turn counts as an active main for this many seconds after its last use. One order frees memory everywhere (archive room, host RAM, VRAM slots, idle reclaim): least recently used whole conversation first, active mains after all the others. This is an order, not a guarantee: an active main goes when nothing else is left, and the loss is logged with its tokens and bytes. An idle main never makes a request wait: it moves to the archive, or is lost with a log line if nothing fits. A generating conversation never leaves VRAM; its archive copy may be dropped, since its slot holds the state. | A larger value keeps old sessions' main threads longer. |
 | `FLASH_SLOT_LOG` | `0` | `1` logs KV cache events on stderr: each request's start (tokens reused and from where), archive writes, slot moves, evictions, pauses and resumes. | Set it to see why a conversation left VRAM or was recomputed, or to attach to a bug report. |
 | `--burst-wait` (server) | `5` | ms: on an idle server the first request waits until none has arrived for this long (at most 30 ms), so a burst of requests shares one prefill batch. | `0` starts at once. |
-| `FLASH_KV_RAM_LAZY` | `0` | With `FLASH_KV=ram`: `0` pins the whole host-RAM pool at start; `1` pins it in 443 MB slabs per card as the conversations grow (only on GPUs that can use registered host memory directly; otherwise the pool is pinned at start). | `1` if the pinned RAM should grow only with use. |
+| `FLASH_KV_RAM_LAZY` | `0` | With `FLASH_KV=ram`: `0` pins the whole host-RAM pool at start; `1` pins it in 443 MB slabs per card as the conversations grow (only on GPUs that can use registered host memory directly; otherwise the pool is pinned at start). | `1` if the pinned RAM should grow only with use. With `1` one full conversation window is pinned from the start and never given back, so a conversation of the full `--max-ctx` always fits; more conversations get room while the host can still pin it (otherwise they wait, or idle ones leave the pool, as with a full pool). The server's "KV pool" (start-up `context:` line, the no-room error) then means what is pinned plus what the host can still pin. |
 | `FLASH_MAX_PREFILLS` | `8` | Prompts that may be in the prefill at the same time. While several are waiting, they share prefill batches (the expert weights are read once for all of them). | Rarely; lower it to limit how many requests start prefilling together. |
 | `FLASH_PF_MULTI` | `1` | Several waiting prompts share one prefill batch. `0`: one prompt per prefill batch, as before 1.3.1. | `0` only to rule the feature out while debugging. |
 | `FLASH_PF_STAGE_XMB` | `1024` (`2048` on `FLASH_PAR=pp` stages) | Size cap (MB per card) of the ring that stages host-backed expert groups for large prefill batches. The part above 512 MB is lent to the expert cache between large prefill batches and taken back for each one. It matters on 2 cards, where about half of the expert groups live in host RAM; on 3 cards 512 MB already hold a layer. | `0` restores the fixed 512 MB ring (to rule it out while debugging); otherwise leave it. |
 | `FLASH_NGRAM` | auto | n-gram embedding table: `int8` when `ngram_int8.safetensors` exists in the model directory, else `bf16`. | Set `bf16` to force the BF16 table (needs the original shard and 102 GB of pinned RAM). |
 | `FLASH_NGRAM_PIN` | set by the host-RAM plan (`1` when the table fits) | `0`: disk mode, the INT8 n-gram table is read through the file mapping instead of being pinned; `1`: pinned even if the plan says it does not fit (see [Host memory](../README.md#host-memory-flash-next) in the README; measurements under [Disk mode](#disk-mode-for-the-n-gram-table)). | Leave unset: the start-up picks it from the RAM. |
 | `QE_NUMA` | unset | Machines with several NUMA nodes (both models): the nodes of the pinned host buffers (n-gram table, host-backed experts, staging buffers), e.g. `0,1,2,3`; several nodes interleave the pages, one prefers it. Unset: each card's node from sysfs, and when sysfs does not know it (`numa_node` -1, `GPU NUMA ID: N/A` in `nvidia-smi topo -m`, seen on Threadripper Pro boards set to several nodes) the pages are interleaved over all nodes, logged once at start. No effect on a single-node machine. | Set it to keep the buffers on chosen nodes. |
-| `FLASH_WEIGHTS_COLD` | `1` | After the load, the engine drops the page cache of the model files it no longer reads: every weight file, and the n-gram table file too when the table is pinned. In disk mode the table's file is kept, so the weights' page cache (about 70 GB, read last) no longer pushes the table out. The mappings stay valid; nothing reads them during serving. | `0` keeps the page cache (only to rule it out). |
+| `FLASH_WEIGHTS_COLD` | `1` | After the load, the engine drops the page cache of the model files it no longer reads: every weight file, and the n-gram table file too when the table is pinned. In disk mode the table's file is kept, so the weights' page cache (about 70 GB, read last) no longer pushes the table out. The mappings stay valid; nothing reads them during serving. | `0` keeps the page cache (only to rule it out); it also turns off the load-time drop (`QE_LOAD_DROP`). |
 | `FLASH_TP_SPIN_US` | `5000` | Tensor parallel: µs a helper thread (one per card after the first) spins after its last job before it sleeps until the next one. The jobs of a decode step and consecutive steps come within this window, so serving speed is unchanged, and an idle server uses no CPU (1.3.4.2 and earlier: one core per helper). | `-1` spins all the time (the old behaviour). |
 | `FLASH_NGRAM_SPIN_MS` | `50` | Disk mode: ms the row-copy thread of each card spins after the last request; then it only polls, every 50 µs during the first second and every 1 ms after, so an idle server costs almost no CPU (1.3.4.2 and earlier: about a third of a core per card). The first decode step after a pause waits at most one poll. | `-1` spins all the time; `0` polls at every step (slower). |
 | `FLASH_LOOKUP` | `1` | Lookup drafts: when the recent tokens repeat an earlier part of the conversation, drafts are copied from there. | `0` turns them off (with `FLASH_DETERMINISTIC=1` for reproducible runs). |
@@ -306,13 +306,33 @@ first 4 tokens, with one list for all heads. The selection runs on the GPUs. Two
 - `QE_LSA_MODE=block` or `dlsa` picks one (for example `block` on a 1M server whose prompts stay near 512K).
 
 ```bash
-# the distilled index map released with the paper (GitHub release d-lsa-weights-v1 of
-# Prefrontal-AI/latent-sparse-attention, Apache-2.0, 6.3 MB): convert it once to safetensors. The converter loads
-# only tensors (torch.load with weights_only, which runs no pickled code from torch 2.6 on; it refuses older torch)
-# (-I ignores the user site: run it in an environment where torch is installed, e.g. a venv)
-python3 -I tools/lsa/convert_map.py qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt models/lsa-27b.safetensors
-server/run.sh 8080 --model models/Qwen3.8-27B-INT4 --max-ctx 1M --lsa models/lsa-27b.safetensors
+server/run.sh 8080 --model models/Qwen3.8-27B-INT4 --max-ctx 1M --lsa
+# Docker: -e QE_EXTRA_ARGS="--max-ctx 1M --lsa" (or -e QE_LSA=auto), with the qengine-cache volume mounted
 ```
+
+The index map is the distilled one released with the paper: file
+`qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt` (6.3 MB) of the GitHub release `d-lsa-weights-v1` of
+[Prefrontal-AI/latent-sparse-attention](https://github.com/Prefrontal-AI/latent-sparse-attention/releases/tag/d-lsa-weights-v1),
+a repository under the Apache-2.0 license. QEngine does not ship it. On the first start with `--lsa` the server
+downloads it from that pinned URL, checks its sha256, converts it to safetensors (in plain Python: the file's
+pickle is read by a restricted reader that accepts only the names a tensor dictionary needs, so nothing in the file
+runs, and torch is not needed), checks the result's sha256 too, and keeps it in `~/.cache/qengine/lsa`. Later starts
+use the cached file without network. The start-up log names the map, its source and the cache path:
+`LSA: map qwen38_27b_d2048.safetensors (...) from the cache /root/.cache/qengine/lsa/qwen38_27b_d2048.safetensors`.
+
+- In Docker the file goes into the `qengine-cache` volume (`/root/.cache/qengine`), so only the first start of a
+  new volume downloads it; the image itself does not contain it.
+- Where it is kept: `QE_LSA_DIR`, else `$QE_DISK_CACHE/lsa` (also set by `--disk-cache`), else
+  `~/.cache/qengine/lsa`.
+- The first start waits at most `QE_FETCH_WAIT_S` (120 s) for the download; if it takes longer, that start runs
+  with the full attention and the map is used from the next start.
+- Without network (or with `QE_FETCH_ASSETS=0`) and no cached map, the server starts with the full attention and
+  logs `LSA: off: ...` with a `curl` line: put the `.pt` into the cache directory and start again, and it is
+  converted there without network. `QE_LSA_URL` points the download at a mirror (the sha256 check stays).
+- `--lsa MAP` (or `QE_LSA=MAP`) still takes a converted safetensors map; a `.pt` path is converted into the cache.
+  `tools/lsa/convert_map.py` (torch) writes the same file byte for byte.
+- A checkpoint other than Qwen3.8-27B (INT4 or INT8) has no released map: `--lsa` logs that and the server runs
+  with the full attention. Flash-Next ignores `--lsa`; it has its own sparse indexer.
 
 Measured on 3 RTX 3090 cards (November 3, 2026), same prompts as above, `--max-ctx 1M`:
 
@@ -353,9 +373,11 @@ the block mode, which uses the same index map without the paper's training for b
 | variable | default | what it does |
 |---|---|---|
 | `QE_YARN` | auto | YaRN RoPE factor: unset = `--max-ctx` / 262,144 above 262,144 (else native RoPE, or the factor of a `rope_type: yarn` config.json); `<factor>` sets it (also at 262,144); `0` = native RoPE. See [Context up to 1M tokens](#context-up-to-1m-tokens-yarn-opt-in). |
-| `QE_LSA` | off | Path of a D-LSA index map (safetensors): sparse attention in the 16 attention layers for long contexts (`--lsa` sets it). See [Sparse attention for long prompts](#sparse-attention-for-long-prompts-opt-in). |
+| `QE_LSA` | off | `auto`: the released index map, downloaded once and cached (as `--lsa`); or the path of a D-LSA index map (safetensors, or the released `.pt`): sparse attention in the 16 attention layers for long contexts (`--lsa` wins). See [Sparse attention for long prompts](#sparse-attention-for-long-prompts-opt-in). |
 | `QE_LSA_PF_MIN` | `65536` | With `QE_LSA`: prompt rows from this position on attend sparsely; before it the full attention runs (faster there, exact). |
 | `QE_LSA_DEC_MIN` | `196608` | With `QE_LSA`: decode steps from this context length on attend sparsely. |
+| `QE_LSA_DIR` | `$QE_DISK_CACHE/lsa`, else `~/.cache/qengine/lsa` | Where `--lsa` keeps the downloaded, converted index map. |
+| `QE_LSA_URL` | the pinned release URL | Download the index map from a mirror instead (the sha256 check stays). |
 | `QE_LSA_MODE` | auto | With `QE_LSA`: `block` (4-key blocks, 2,048 keys per token; default below `--max-ctx 1M`) or `dlsa` (content buckets, 4,096 keys; default from 1M). |
 | `QE_LSA_STATS` | `0` | `1`: with `QE_LSA`, print how many rows took the exact fallback since the last report. | To see whether a workload leaves the sparse path. |
 | `QE_LSA_TC`, `QE_LSA_FASTSEL`, `QE_LSA_FB_SPLIT` | `1` | With `QE_LSA`: the tensor-core attention kernel, the fast selection and the split fallback in decode. `0` uses the slower variant of each. | `0` only to rule one out while debugging. |
@@ -464,6 +486,7 @@ graphs keep the room); a fast-growing `budget_evictions` under steady traffic me
 | `QE_MEM_MARGIN_GB` | max(8, 5 % of RAM) | while serving: free RAM (`MemAvailable`) the archives keep; below it they stop growing and give memory back |
 | `QE_HOST_RESERVE_GB` | max(8, 8 % of RAM) | at start only, host-RAM plan (both models): RAM left to the system and the desktop when the n-gram table, the archive and the pinned prompts are sized ([Host memory](../README.md#host-memory-flash-next)) |
 | `QE_HOST_BASE_GB` | `6` | host-RAM plan: RAM counted for the server process (Python, vision encoder, CUDA) |
+| `QE_LOAD_DROP` | Flash-Next `1`, 27B auto | during the load, a layer's model-file pages leave the page cache once every card has read that layer, so the files do not fill RAM next to the memory being pinned (in a memory-limited container this took the kernel's direct reclaim to its limit). Flash-Next: on (its n-gram table keeps its pages; `FLASH_WEIGHTS_COLD=0` turns it off too). 27B auto: on only when free RAM is short of the files plus the default archive and pinned prompts; otherwise the files stay cached for a quick restart. `0` = off, `1` = on |
 
 **Host RAM safety.** The archives (`QE_KV_ARCHIVE_GB`, `FLASH_KV_ARCHIVE_GB`) never take the machine below
 `MemAvailable` minus `QE_MEM_MARGIN_GB`: pinning stops there and the archive's budget shrinks, with a log line

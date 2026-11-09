@@ -195,3 +195,29 @@ for q in (0.0, 0.7, 1.0):
 steps, _ = simulate(UNION, json.dumps({"language": "pl", "ok": True, "score": -1.5e-3, "title": None, "page": "xii", "conf": 100}), 0.8)
 print("spec plan with null unions ok")
 print("ok (stage 2)")
+
+# ---- stage 3: grammar lookup on an image prompt (QE_LK_GRAMMAR=1): image rows (ids >= 1 << 30) are the pad in the
+# lookup history, so a draft that runs into an image is a vocab id the masks can index (was: IndexError, request failed)
+import grammar
+from grammar import IMG_TOKEN, TokenLookup
+PAD = tok.token_to_id("<|image_pad|>")
+gids = tok.encode(good, add_special_tokens=False).ids
+k = 40
+assert len(gids) > k
+prompt = gids[:k] + [IMG_TOKEN | (12345 + j) for j in range(16)] + tok.encode(" describe it", add_special_tokens=False).ids
+c = G.matcher(BATCH)
+for t in gids[:k]:
+    assert c.consume(t), c.error
+lk = TokenLookup(prompt + gids[:k], PAD)
+assert int(lk.h[:lk.n].max()) < V, "image ids left in the lookup history"
+assert lk.find(7) == [PAD] * 7, lk.find(7)
+old_lk, grammar.LK_GRAMMAR = grammar.LK_GRAMMAR, True
+try:
+    io[:] = 0
+    n = c.plan(io, masks, 7, lk)  # lookup draft = 7 pads: the JSON grammar rejects the first one
+finally:
+    grammar.LK_GRAMMAR = old_lk
+assert n == 0 and lk.n_drafts == 1, (n, lk.n_drafts)
+lk.append([])  # empty appends stay valid
+print("grammar lookup with image rows ok")
+print("ok (stage 3)")

@@ -3216,6 +3216,12 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                       (pptp ? ", \"pptp\": \"" + flash_pp::stage_map_str(groups) + "\"" : std::string()) + "}";
     } else {
         set_card_ranks(e->devs);  // (a card listed twice: SM partitions)
+        // load-time page cache (QE_LOAD_DROP=0 off; also off with FLASH_WEIGHTS_COLD=0, which keeps the files' cache): a
+        // layer file's pages go once every rank has loaded that layer's expert groups (Worker::load_deferred_groups),
+        // instead of the whole files filling the page cache next to the pins until the page-out after the load
+        // (the n-gram table's tensors, under layer 1's prefix, keep their pages: the table is pinned from the file in
+        // parallel, or read from the mapping while serving in disk mode; the page-out after the load decides for it)
+        g_load_drop.begin(e->ng, env_int("QE_LOAD_DROP", 1) != 0 && env_int("FLASH_WEIGHTS_COLD", 1) != 0, {"ple_embedding"});
         // one thread per card; ranks sharing a card (a TP4 test on 3 cards: devices 0,1,2,2) load one after the other,
         // each sizing its expert cache to its share of what is free then
         std::vector<std::thread> th;
@@ -3245,6 +3251,10 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                 }
             });
         for (auto& t : th) t.join();
+        if (g_load_drop.on())
+            fprintf(stderr, "[qflash %.0fs] model files: page cache of each layer dropped once loaded (%.1f GB of file ranges; QE_LOAD_DROP=0 keeps it)\n",
+                    secs(), g_load_drop.dropped() / 1e9);
+        g_load_drop.begin(0, false);  // (workers made later, e.g. pipeline stages, keep the plain load)
     }
     fprintf(stderr, "[qflash %.0fs] weights loaded\n", secs());
     if (box) fputs(layout_report(e->W).c_str(), stderr);
@@ -5096,7 +5106,12 @@ int qe_num_slots(void* p) { FE* e = (FE*)p; return e->batch_api ? (int)e->sl.siz
 // FLASH_KV_RAM_TOKENS as far as the host could pin it)
 long long qe_pool_tokens(void* p) {
     FE* e = (FE*)p;
-    return std::max<long long>(e->ctx, (long long)e->W[0]->periods() * e->period);
+    // the pool that can hold conversations now: the reserved pool, or with FLASH_KV_RAM_LAZY=1 what is pinned plus
+    // what the host can still pin (as refresh_np, without writing np; never below one window: one max_ctx sequence
+    // stays pinned from the start)
+    int v = e->W[0]->periods();
+    for (int r = 0; r < e->ng; r++) v = std::min(v, e->W[r]->kv_ram_periods());
+    return std::max<long long>(e->ctx, (long long)v * e->period);
 }
 int qe_kv_in_ram(void* p) { return ((FE*)p)->W[0]->kv_stream() ? 1 : 0; }  // FLASH_KV=ram
 int qe_can_admit(void* p, int n) {

@@ -107,6 +107,7 @@ long long kv_ram_tokens();   // FLASH_KV_RAM_TOKENS
 constexpr double kKvRamTokBytes = 13.0 * (NKV * HD * 2 + NKV * 8);
 // the pool the host-RAM plan gives (tokens, host_budget.h; < 0: FLASH_KV_RAM_TOKENS as asked); set before the Workers are made
 void set_kv_ram_plan(long long tokens);
+extern LoadDrop g_load_drop;  // load-time page cache of the layer files (safetensors.h), set up by qe_create
 long long kv_ram_plan();
 // YaRN RoPE scaling (opt-in; model card: rope_type yarn, factor 4.0, original_max_position_embeddings 262144):
 // FLASH_YARN=<factor> (0 / 1: off), else the factor the caller set for a context above the native one (context /

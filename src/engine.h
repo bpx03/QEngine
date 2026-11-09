@@ -429,6 +429,7 @@ private:
         int reused = 0, copied = 0;       // prompt-cache statistics (last_reused() after start_finish)
         bool from_archive = false;
         std::vector<int> ids, dev_ids, rope3, marks;
+        int img_base = 0, img_n = 0;      // this prompt's rows in img_table_: [img_base, img_base + img_n)
     };
     static constexpr int kMaxPrefills = 2;
     std::vector<PrefillState> pfs_;       // in flight, the newest last
@@ -438,7 +439,7 @@ private:
     }
     const PrefillState* pf_of(int slot) const { return const_cast<Engine*>(this)->pf_of(slot); }
     bool lookahead_ = true;
-    bf16* img_table_ = nullptr;     // image embedding rows of the prompt being prefilled (mapped)
+    bf16* img_table_ = nullptr;     // image embedding rows of the prompts being prefilled (mapped; one range per prefill)
     size_t img_cap_ = 0;            // rows
     void take_snapshot(const int* ids, int pos, int kind = 0, int replace = 0);
     std::vector<Snapshot> snaps_;

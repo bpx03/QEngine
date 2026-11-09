@@ -102,6 +102,36 @@ def test_template_kwargs():
     assert template_kwargs({"reasoning": {"effort": "low"}}, True, "none") == {"enable_thinking": True, "reasoning_effort": "low"}
     for rs in ({"effort": None}, {"max_tokens": 100}, "none", ["none"], None):
         assert template_kwargs({"reasoning": rs}, True, "low")["reasoning_effort"] == "low", rs
+    # reasoning.enabled (OpenRouter): lowest precedence, only a real bool; false = off, true = on over the server default
+    assert template_kwargs({"reasoning": {"enabled": False}}, True) == off
+    assert template_kwargs({"reasoning": {"enabled": False}}, True, "low") == off
+    assert template_kwargs({"reasoning": {"enabled": False}}, True, "low", anthropic=True) == off
+    assert template_kwargs({"reasoning": {"enabled": True}}, True, "none") == {"enable_thinking": True}
+    assert template_kwargs({"reasoning": {"enabled": True}}, False) == {"enable_thinking": True}
+    assert template_kwargs({"reasoning": {"enabled": True}}, True, "low") == {"enable_thinking": True, "reasoning_effort": "low"}
+    for body in ({"reasoning": {"enabled": False, "effort": "low"}}, {"reasoning": {"enabled": False}, "reasoning_effort": "low"},
+                 {"reasoning": {"enabled": False}, "chat_template_kwargs": {"reasoning_effort": "low"}}):
+        assert template_kwargs(body, True) == {"enable_thinking": True, "reasoning_effort": "low"}, body
+    assert template_kwargs({"reasoning": {"enabled": False}, "chat_template_kwargs": {"enable_thinking": True}}, True,
+                           "low") == {"enable_thinking": True, "reasoning_effort": "low"}
+    assert template_kwargs({"reasoning": {"enabled": False}, "thinking": {"type": "enabled"}}, True)["enable_thinking"] is True
+    assert template_kwargs({"reasoning": {"enabled": True}, "reasoning_effort": "none"}, True) == off
+    # true with an effort (OpenRouter clients send both): on at that effort, also over --think 0 / --reasoning-effort none
+    for d_think, d_eff in ((False, None), (True, "none"), (False, "none")):
+        assert template_kwargs({"reasoning": {"enabled": True, "effort": "high"}}, d_think, d_eff) == \
+            {"enable_thinking": True, "reasoning_effort": "high"}, (d_think, d_eff)
+        assert template_kwargs({"reasoning": {"enabled": True}, "thinking": {"type": "enabled"}}, d_think, d_eff)["enable_thinking"] is True
+        assert template_kwargs({"reasoning": {"enabled": True}, "chat_template_kwargs": {"enable_thinking": False}}, d_think, d_eff) == off
+        assert template_kwargs({"reasoning": {"enabled": True, "effort": "none"}}, d_think, d_eff) == off
+    assert template_kwargs({"reasoning": {"enabled": True}, "thinking": {"type": "disabled"}}, True) == off
+    assert template_kwargs({"reasoning": {"enabled": False}, "output_config": {"effort": "low"}}, True, None,
+                           anthropic=True)["reasoning_effort"] == "low"
+    assert template_kwargs({"reasoning": {"enabled": False}, "output_config": {"effort": "low"}}, True) == off  # not read on chat
+    for v in (0, 1, "false", None):  # not a bool: not sent
+        assert template_kwargs({"reasoning": {"enabled": v}}, True, "low")["reasoning_effort"] == "low", v
+    assert app.reasoning_excluded({"reasoning": {"exclude": True}})
+    for b in ({}, {"reasoning": {"exclude": 1}}, {"reasoning": {"exclude": False}}, {"reasoning": "exclude"}):
+        assert not app.reasoning_excluded(b), b
     # values that are not none stay as before (non-strings too)
     for v in (0, 1, ["none"], {"x": 1}, "nonee", "no ne"):
         assert template_kwargs({"reasoning_effort": v}, True)["reasoning_effort"] == v, v
@@ -134,7 +164,7 @@ def test_render(path, safe):
     want = render(t, {"chat_template_kwargs": {"enable_thinking": False}}, None)
     for body, flag in (({"reasoning_effort": "none"}, None), ({"reasoning_effort": "NONE"}, "low"),
                        ({"chat_template_kwargs": {"reasoning_effort": "none"}}, "xhigh"), ({}, "none"),
-                       ({"reasoning": {"effort": "none"}}, "low")):
+                       ({"reasoning": {"effort": "none"}}, "low"), ({"reasoning": {"enabled": False}}, "low")):
         assert render(t, body, flag) == want, (path, body, flag)
     assert render(t, {"chat_template_kwargs": {"enable_thinking": False}}, "low") == want
     # efforts the template does not know

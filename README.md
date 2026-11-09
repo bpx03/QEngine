@@ -32,7 +32,9 @@ the default settings:
 
 (1.3.5, November 6, 2026; method under [Benchmarks](#benchmarks).)
 
-**What is new in 1.3.5.6 (stable, `latest`; it also holds everything from 1.3.5.1 to 1.3.5.5 below):** a fix for a 27B crash (`illegal memory access`, Xid 13) when the n-gram lookup drafted tokens from a conversation with images; 27B agent conversations under load keep their prompt-cache states between turns, so they no longer re-prefill from the system prompt (the snapshot store now scales with the sequence slots, see [Host memory](#host-memory-flash-next)); decode through host memory is fast again on boards where P2P stores are expensive ([#20](https://github.com/bpx03/QEngine/issues/20), [#21](https://github.com/bpx03/QEngine/issues/21)): the host path is now the no-peer path of 1.3.4.3, with peer access kept for prefill, and `QE_DECODE_COMM=auto` picks P2P or that path (see [Link probe](#link-probe-and-flash_comm--qe_comm)). Checked with smoke tests and speed comparisons against 1.3.5.5; the full stress and quality runs and the numbers above are from 1.3.5.
+**What is new in 1.3.5.7 (stable, `latest`; it also holds everything from 1.3.5.1 to 1.3.5.6 below):** `--lsa` works with no manual steps: the 27B downloads the released index map once (pinned URL and sha256), converts it without torch and caches it (Docker: the `qengine-cache` volume), so `--max-ctx 1M --lsa` is all it takes; a 262K prompt took 57 s instead of 79 s here, 512K 117 s instead of 232 s (see [Long documents](#long-documents-27b-opt-in)). During the load each layer's model-file pages leave the page cache once every card has read them (`QE_LOAD_DROP`), so a host or container short of RAM no longer reclaims hard while the server starts. Small fixes: a grammar-constrained image prompt no longer fails with the opt-in grammar lookup (`QE_LK_GRAMMAR=1`), two 27B image prompts prefilling at once no longer share one image table, the 27B host-RAM plan counts only the snapshots it pins at start, and the OpenRouter `reasoning.enabled` / `reasoning.exclude` fields are read (see [API](#api)). Checked with smoke tests against 1.3.5.6; the full stress and quality runs and the numbers above are from 1.3.5.
+
+**What is new in 1.3.5.6:** a fix for a 27B crash (`illegal memory access`, Xid 13) when the n-gram lookup drafted tokens from a conversation with images; 27B agent conversations under load keep their prompt-cache states between turns, so they no longer re-prefill from the system prompt (the snapshot store now scales with the sequence slots, see [Host memory](#host-memory-flash-next)); decode through host memory is fast again on boards where P2P stores are expensive ([#20](https://github.com/bpx03/QEngine/issues/20), [#21](https://github.com/bpx03/QEngine/issues/21)): the host path is now the no-peer path of 1.3.4.3, with peer access kept for prefill, and `QE_DECODE_COMM=auto` picks P2P or that path (see [Link probe](#link-probe-and-flash_comm--qe_comm)). Checked with smoke tests and speed comparisons against 1.3.5.5; the full stress and quality runs and the numbers above are from 1.3.5.
 
 **What is new in 1.3.5.5 (experimental, not `latest`):** a fix for Flash-Next on 4 cards, which could lose details in long prompts; `reasoning_effort: "none"` (also `reasoning: {"effort": "none"}`) turns thinking off (see [API](#api)); the served context is never larger than the KV pool, with a `context:` start-up line (see [context and the KV archive](#both-models-context-and-the-kv-archive)); with `FLASH_KV=ram` the host-RAM plan counts the KV pool, so a host that is short of RAM no longer pages to swap (see [Host memory](#host-memory-flash-next)). Lightly tested.
 
@@ -147,7 +149,7 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 ```
 
 - Without `QE_MODEL` the container serves `/app/models/Qwen3.8-27B-INT4`.
-- Images: `latest` / `1.3.5.6` (text only, ~0.4 GB download) and `vision` / `1.3.5.6-vision` (with the image encoder, ~3.2 GB download). Earlier: `1.3.5` and `1.3.5-vision`; experimental `1.3.5.5`, `1.3.5.5-vision`, `1.3.5.4`, `1.3.5.4-vision`, `1.3.5.3`, `1.3.5.3-vision`, `1.3.5.2`, `1.3.5.2-vision`, `1.3.5.1`, `1.3.5.1-vision`.
+- Images: `latest` / `1.3.5.7` (text only, ~0.4 GB download) and `vision` / `1.3.5.7-vision` (with the image encoder, ~3.2 GB download). Earlier: `1.3.5.6`, `1.3.5.6-vision`, `1.3.5` and `1.3.5-vision`; experimental `1.3.5.5`, `1.3.5.5-vision`, `1.3.5.4`, `1.3.5.4-vision`, `1.3.5.3`, `1.3.5.3-vision`, `1.3.5.2`, `1.3.5.2-vision`, `1.3.5.1`, `1.3.5.1-vision`.
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`; `QE_DEVICES`, if set, wins over `QE_GPUS`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -648,7 +650,7 @@ checkpoints use their own `model_mtp.safetensors`, not the fine-tuned head (`QE_
 #### Long documents (27B, opt-in)
 
 Above 262K tokens the 27B needs YaRN (`--max-ctx 512K` or `1M`), and for prompts that long most of the time goes to
-attention; `--lsa MAP` makes that attention sparse. Both are off by default. YaRN is static: it applies to every
+attention; `--lsa` makes that attention sparse (the index map is downloaded once and cached, see the docs). Both are off by default. YaRN is static: it applies to every
 request of that server, short ones too, so run a separate server for long documents. What `--lsa` changes
 (3× RTX 3090, measured November 3, 2026; details in [docs/advanced.md](docs/advanced.md#sparse-attention-for-long-prompts-opt-in)):
 
@@ -730,6 +732,11 @@ is read too, on both paths, after `chat_template_kwargs.reasoning_effort` and th
 the same as `enable_thinking: false`, also when the same request sets `enable_thinking: true` (an "off" always wins).
 `QE_REASONING_EFFORT=none` makes thinking off the default; a request that names another effort, sets
 `enable_thinking: true` or the Anthropic `thinking.type` `enabled` / `adaptive` still thinks.
+The OpenRouter switches are read last: `reasoning: {"enabled": false}` is thinking off when the request sends no other
+thinking setting or effort; `"enabled": true` turns thinking on over the server default (`--think 0`,
+`--reasoning-effort none`) at the effort the request names, unless the same request turns thinking off.
+`reasoning: {"exclude": true}` on `/v1/chat/completions`: the model reasons as usual (the reasoning tokens are in
+`usage`), but the reply carries no `reasoning_content`, streamed or not.
 
 ### Thinking budget and the answer tail
 
@@ -918,7 +925,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `--model <dir>` (Docker `QE_MODEL`) | `models/Qwen3.8-27B-INT4` | the model directory; the engine is picked from its `config.json` |
 | `QE_DEVICES` (Docker: `QE_DEVICES`, else `QE_GPUS`) | all visible GPUs (Docker `0,1,2`) | physical GPU ids, e.g. `0,2` |
 | `--max-ctx` | `262144` | context per conversation (`256K`, `512K`, `1M` accepted); above 262,144 turns on YaRN RoPE scaling (factor context / 262,144; Flash-Next also needs `FLASH_KV=ram`; 27B: up to what the VRAM pool holds, about 1.2M on 3 cards, 580K on 2) |
-| `--lsa MAP` | off | 27B: sparse attention for long prompts (opt-in, lossy): 512K prompts about 2x faster, 1M about 3x, decode at 1M 2x; MAP is the converted index map ([docs](docs/advanced.md#sparse-attention-for-long-prompts-opt-in)) |
+| `--lsa` / `QE_LSA=auto` | off | 27B: sparse attention for long prompts (opt-in, lossy): 512K prompts about 2x faster, 1M about 3x, decode at 1M 2x. The released index map (Prefrontal AI, Apache-2.0) is downloaded on the first start into `~/.cache/qengine/lsa` (Docker: the `qengine-cache` volume); offline without it the server runs with full attention. `--lsa MAP` / `QE_LSA=MAP` takes a map file ([docs](docs/advanced.md#sparse-attention-for-long-prompts-opt-in)) |
 | `--think` | `1` | thinking on by default (a request's `enable_thinking` wins) |
 | `--reasoning-effort` / `QE_REASONING_EFFORT` | the template's (`xhigh`) | default effort: `xhigh`, `high` / `max` (= `xhigh`), `medium`, `low`, `minimal` (= `low`), `none` (thinking off) |
 | `--thinking-budget` / `QE_THINKING_BUDGET` | `0` (off) | default thinking budget in tokens, or one per effort (`low:4096,medium:16384,xhigh:32768[,default:N]`) |
@@ -953,7 +960,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `FLASH_KV_ARCHIVE_GB` | `48` (less on smaller machines) | host-RAM archive of conversations; `0` = off; a set value wins over the [host-RAM plan](#host-memory-flash-next) |
 | `FLASH_PREFIX_GB` | `8` (less on smaller machines) | host RAM for pinned system prompts; `0` = off |
 | `FLASH_NGRAM_PIN` | set by the host-RAM plan (`1` when it fits) | `1`: pin the n-gram table; `0`: read it through the page cache |
-| `FLASH_WEIGHTS_COLD` | `1` | after the load, drop the page cache of the model files the engine no longer reads (all but the n-gram table in page-cache mode); `0` = keep it |
+| `FLASH_WEIGHTS_COLD` | `1` | after the load, drop the page cache of the model files the engine no longer reads (all but the n-gram table in page-cache mode); `0` = keep it, and also turns off the load-time drop (`QE_LOAD_DROP`) |
 | `FLASH_TP_SPIN_US` | `5000` | µs a tensor-parallel helper thread spins after its last job before it sleeps (an idle server then uses no CPU); `-1` = always spin |
 | `FLASH_VRAM_ADAPT` | `1` | Flash-Next: when another process takes GPU memory while serving, move resident expert groups to host memory and back later; `0` off |
 | `FLASH_VRAM_LOW_MB` / `FLASH_VRAM_TARGET_MB` | `128` / `256` | free memory per card below which groups move to host memory / up to which they move; they come back as soon as the other processes give the memory back (keeping 16 MB above the low mark free) |

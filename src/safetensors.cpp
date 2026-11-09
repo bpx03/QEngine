@@ -126,6 +126,120 @@ PageOut SafeTensors::page_out(const std::function<bool(const void* base, size_t 
     return o;
 }
 
+int SafeTensors::map_of(const void* p) const {
+    for (size_t i = 0; i < maps_.size(); i++) {
+        const char* b = (const char*)maps_[i].first;
+        if ((const char*)p >= b && (const char*)p < b + maps_[i].second) return (int)i;
+    }
+    return -1;
+}
+
+size_t SafeTensors::mapped_bytes() const {
+    size_t n = 0;
+    for (auto& m : maps_) n += m.second;
+    return n;
+}
+
+size_t SafeTensors::drop_prefix(const std::string& prefix, const std::vector<std::string>& keep) const {
+    const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    std::vector<std::vector<std::pair<uintptr_t, uintptr_t>>> rs(maps_.size());  // per mapping: page ranges
+    for (auto it = tensors_.lower_bound(prefix); it != tensors_.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it) {
+        const int m = map_of(it->second.data);
+        if (m < 0 || !it->second.nbytes) continue;
+        bool kept = false;
+        for (auto& k : keep) kept |= it->first.find(k) != std::string::npos;
+        if (kept) continue;
+        const uintptr_t a = ((uintptr_t)it->second.data + pg - 1) / pg * pg, e = ((uintptr_t)it->second.data + it->second.nbytes) / pg * pg;
+        if (e > a) rs[m].push_back({a, e});
+    }
+    size_t asked = 0;
+    for (size_t m = 0; m < maps_.size(); m++) {
+        if (rs[m].empty()) continue;
+        auto& v = rs[m];
+        std::sort(v.begin(), v.end());
+        std::vector<std::pair<uintptr_t, uintptr_t>> mg;  // merged (a layer's tensors are mostly adjacent)
+        for (auto& r : v)
+            if (!mg.empty() && r.first <= mg.back().second) mg.back().second = std::max(mg.back().second, r.second);
+            else mg.push_back(r);
+        const int fd = ::open(paths_[m].c_str(), O_RDONLY);
+        const uintptr_t base = (uintptr_t)maps_[m].first;
+        for (auto& [a, e] : mg) {
+            madvise((void*)a, e - a, MADV_DONTNEED);  // (clean read-only shared mapping: no data lost)
+            if (fd >= 0) posix_fadvise(fd, (off_t)(a - base), (off_t)(e - a), POSIX_FADV_DONTNEED);
+            asked += e - a;
+        }
+        if (fd >= 0) ::close(fd);
+    }
+    return asked;
+}
+
+void LoadDrop::begin(int loaders, bool on, std::vector<std::string> keep) {
+    std::lock_guard<std::mutex> lk(mu_);
+    on_ = on;
+    keep_ = std::move(keep);
+    loaders_ = loaders;
+    ready_ = 0;
+    g_.clear();
+    bytes_ = 0;
+}
+
+void LoadDrop::expect(const SafeTensors* st, const std::string& prefix) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (on_) g_[{st, prefix}].first++;
+}
+
+void LoadDrop::ready() {
+    std::vector<std::pair<const SafeTensors*, std::string>> go;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ready_++;
+        sweep(&go);
+    }
+    drop(go);
+}
+
+void LoadDrop::done(const SafeTensors* st, const std::string& prefix) {
+    std::vector<std::pair<const SafeTensors*, std::string>> go;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = g_.find({st, prefix});
+        if (it == g_.end()) return;
+        it->second.second++;
+        sweep(&go);
+    }
+    drop(go);
+}
+
+void LoadDrop::sweep(std::vector<std::pair<const SafeTensors*, std::string>>* go) {
+    if (!on_ || ready_ < loaders_) return;
+    for (auto it = g_.begin(); it != g_.end();)
+        if (it->second.second >= it->second.first) {
+            go->push_back(it->first);
+            it = g_.erase(it);
+        } else {
+            ++it;
+        }
+}
+
+void LoadDrop::drop(const std::vector<std::pair<const SafeTensors*, std::string>>& go) {
+    // (outside the lock: the other loaders' done() calls do not wait for the madvise / fadvise work)
+    if (go.empty()) return;
+    std::vector<std::string> keep;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        keep = keep_;
+    }
+    size_t n = 0;
+    for (auto& [st, prefix] : go) n += st->drop_prefix(prefix, keep);
+    std::lock_guard<std::mutex> lk(mu_);
+    bytes_ += n;
+}
+
+size_t LoadDrop::dropped() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return bytes_;
+}
+
 SafeTensors::~SafeTensors() {
     for (auto& [p, n] : maps_) munmap(p, n);
 }
