@@ -170,7 +170,7 @@ def load_gptq(d, fn):
 def conv_layer(args):
     L, src_dir, dst_dir, nverify, dense_dir, exp_dir, keep16, int8 = args
     t0 = time.time()
-    torch.set_num_threads(6)
+    torch.set_num_threads(int(os.environ.get("QE_CONV_THREADS", "6")))
     S = Src(src_dir)
     pre = f"{P}layers.{L}."
     out, stats = {}, {}
@@ -255,6 +255,35 @@ def conv_layer(args):
         if rest.startswith("mlp.experts.") or rest.startswith("mlp.shared_expert.") or "ngram_embedding" in rest:
             continue
         base = rest[:-len(".weight")] if rest.endswith(".weight") else None
+        if base is None:
+            # W4A16 exports (ukisai etc.): some dense tensors arrive already INT4 (.qweight) while the
+            # engine expects BF16 (.weight) on these paths (-> INT8 g128 at load). Dequantise them; the
+            # matching .qzeros/.scales are consumed here and dropped. Other non-.weight tensors
+            # (A_log, dt_bias, ...) are copied as-is.
+            pk = None
+            for d in ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
+                      "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"):
+                if rest == d + ".qweight":
+                    pk = pre + d
+                    break
+            if pk:
+                w = dequant_gptq(S.get(pk + ".qweight"), S.get(pk + ".qzeros"), S.get(pk + ".scales"))
+                if ".linear_attn." in pk:      # DeltaNet: engine stores these INT8 g128 in the files
+                    N, K = w.shape
+                    g = w.reshape(N, K // 128, 128)
+                    s = (g.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1e-30)
+                    q = torch.clamp(torch.round(g / s), -127, 127).to(torch.int8).reshape(N, K)
+                    out[pk + ".weight"] = q.contiguous()
+                    out[pk + ".weight_scale"] = s.reshape(N, K // 128).to(torch.bfloat16).contiguous()
+                    stats[pk[len(pre):]] = "int8 g128 (dequant from int4)"
+                else:                          # self_attn q/k/v/o: BF16 in the files -> INT8 at load
+                    out[pk + ".weight"] = w.to(torch.bfloat16).contiguous()
+                    stats[pk[len(pre):]] = "bf16 (dequant from int4)"
+            elif rest.endswith(".qzeros") or rest.endswith(".scales"):
+                pass  # consumed by the dequant above
+            else:
+                out[k] = S.get(k).contiguous()
+            continue
         if base in keep and base.split(".")[-1] in int8:  # stored INT8 g128: the values the engine computes at load
             q, sc = int8_engine(S.get(k))
             out[pre + base + ".weight"] = q
@@ -283,7 +312,20 @@ def conv_mtp_bf16(args):
     src_dir, dst_dir = args
     t0 = time.time()
     S = Src(src_dir)
-    out = {k: S.get(k).contiguous() for k in S.keys("mtp.")}
+    pre = "mtp.layers.0."
+    out = {}
+    for k in S.keys("mtp."):
+        if k == pre + "mlp.experts.gate_up_proj":     # fuse -> per-expert (QEngine reads per-expert)
+            gu = S.get(k).reshape(NE, 2 * I, H)
+            for e in range(NE):
+                out[f"{pre}mlp.experts.{e}.gate_proj.weight"] = gu[e, :I].contiguous()
+                out[f"{pre}mlp.experts.{e}.up_proj.weight"] = gu[e, I:].contiguous()
+        elif k == pre + "mlp.experts.down_proj":
+            dn = S.get(k).reshape(NE, H, I)
+            for e in range(NE):
+                out[f"{pre}mlp.experts.{e}.down_proj.weight"] = dn[e].contiguous()
+        else:
+            out[k] = S.get(k).contiguous()
     save_file(out, os.path.join(dst_dir, "mtp.safetensors"))
     return "mtp.safetensors", list(out.keys()), {"mtp": "bf16 passthrough"}, time.time() - t0
 
@@ -301,15 +343,27 @@ def conv_mtp(args):
     dn_s = torch.empty(NE, H, I // 128, dtype=torch.float16)
     errs = {"gate_proj": [], "up_proj": [], "down_proj": []}
     errs0 = {"gate_proj": [], "up_proj": [], "down_proj": []}
-    for e in range(NE):
-        b = f"{pre}mlp.experts.{e}."
-        for nm, qd, sd, r0 in (("gate_proj", gu_q, gu_s, 0), ("up_proj", gu_q, gu_s, I), ("down_proj", dn_q, dn_s, 0)):
-            q, s, st = rtn_int4(S.get(b + nm + ".weight"), torch.float16)
-            qd[e, r0:r0 + q.shape[0]] = q
-            sd[e, r0:r0 + q.shape[0]] = s
-            errs[nm].append(st["rel_err"])
-            errs0[nm].append(st["rel_err_absmax"])
+    fused = pre + "mlp.experts.gate_up_proj" in S.where
+    if fused:   # fused MTP experts (ukisai and other W4A16 exports): [NE,2I,H] / [NE,H,I] bf16
+        gu = S.get(pre + "mlp.experts.gate_up_proj").reshape(NE * 2 * I, H)
+        q, s, st = rtn_int4(gu, torch.float16)
+        gu_q = q.reshape(NE, 2 * I, H // 8); gu_s = s.reshape(NE, 2 * I, H // 128)
+        dn = S.get(pre + "mlp.experts.down_proj").reshape(NE * H, I)
+        q, s, st = rtn_int4(dn, torch.float16)
+        dn_q = q.reshape(NE, H, I // 8); dn_s = s.reshape(NE, H, I // 128)
+        stats["mtp.experts"] = "fused rtn_int4"
+    else:
+        for e in range(NE):
+            b = f"{pre}mlp.experts.{e}."
+            for nm, qd, sd, r0 in (("gate_proj", gu_q, gu_s, 0), ("up_proj", gu_q, gu_s, I), ("down_proj", dn_q, dn_s, 0)):
+                q, s, st = rtn_int4(S.get(b + nm + ".weight"), torch.float16)
+                qd[e, r0:r0 + q.shape[0]] = q
+                sd[e, r0:r0 + q.shape[0]] = s
+                errs[nm].append(st["rel_err"])
+                errs0[nm].append(st["rel_err_absmax"])
     for nm in errs:
+        if not errs[nm]:
+            continue
         v = torch.tensor(errs[nm]); v0 = torch.tensor(errs0[nm])
         stats[f"mtp.experts.{nm}"] = {"rel_err_mean": v.mean().item(), "rel_err_max": v.max().item(),
                                       "rel_err_absmax_mean": v0.mean().item()}
@@ -466,12 +520,19 @@ def main():
     idx_path = os.path.join(a.dst, "model.safetensors.index.json")
     if os.path.exists(idx_path):
         wmap = json.load(open(idx_path))["weight_map"]
-    for f in ngram_files:  # n-gram table: symlink
-        dst = os.path.join(a.dst, os.path.basename(f))
-        if not os.path.exists(dst):
-            os.symlink(f, dst)
-        for k in header(f):
-            wmap[k] = os.path.basename(f)
+    NG_PRE = "model.language_model.layers.1.ple.ple_embedding."
+    if os.environ.get("QE_NGRAM_EXTERNAL") == "1":
+        # n-gram provided as ngram_int8.safetensors (built by tools/convert_ngram_fp8.py):
+        # index it here; do NOT symlink the source shards the FP8 table lives in.
+        for i in range(128):
+            wmap[f"{NG_PRE}ngram_q8.shard_{i}"] = "ngram_int8.safetensors"
+    else:
+        for f in ngram_files:  # n-gram table: symlink
+            dst = os.path.join(a.dst, os.path.basename(f))
+            if not os.path.exists(dst):
+                os.symlink(f, dst)
+            for k in header(f):
+                wmap[k] = os.path.basename(f)
     for fn in ("config.json", "generation_config.json", "chat_template.jinja", "tokenizer.json",
                "tokenizer_config.json", "preprocessor_config.json", "processor_config.json"):
         if os.path.exists(os.path.join(a.src, fn)):
