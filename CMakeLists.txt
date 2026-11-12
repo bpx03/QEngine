@@ -92,7 +92,7 @@ add_compile_definitions(QE_CUDA_ARCHS="${QE_ARCH_STR}")
 find_package(CUDAToolkit REQUIRED)
 
 file(GLOB KERNELS CONFIGURE_DEPENDS src/kernels/*.cu)
-add_library(qengine SHARED ${KERNELS} src/capi.cpp src/config.cpp src/safetensors.cpp src/model.cpp src/engine.cpp src/build_id.cpp)
+add_library(qengine SHARED ${KERNELS} src/capi.cpp src/config.cpp src/safetensors.cpp src/model.cpp src/dflash.cpp src/engine.cpp src/build_id.cpp)
 target_include_directories(qengine PUBLIC src)
 target_include_directories(qengine PRIVATE ${CMAKE_BINARY_DIR}/gen)
 target_link_libraries(qengine PUBLIC CUDA::cudart CUDA::cuda_driver)

@@ -859,6 +859,11 @@ void Worker::ce_loop() {
 }
 
 Worker::~Worker() {
+    if (dfl_) {  // the drafter's own allocations (dflash.cpp)
+        cudaSetDevice(device);
+        cudaDeviceSynchronize();
+        dfl_unload();
+    }
     if (ready_) {  // QE_EARLY_GEMV guard timeouts (each = a consumer that gave up waiting: wrong results)
         std::vector<unsigned> h(1024);
         if (cudaSetDevice(device) == cudaSuccess &&
@@ -1803,10 +1808,11 @@ void Worker::forward(int m, bool logits, bool spec) {
         if (i + 1 < c_.layers) nxt = layers_[i + 1].full ? &layers_[i + 1].fa.qkv : &layers_[i + 1].dn.in;
         // the layer output: its steering (fused into the all-reduce; the early-GEMV all-reduce has no hook)
         const SteerArg sa = steer_arg(i, cur_slot_);
-        early_in = nxt && !debug_hidden && sa.li < 0 && !cap_ &&
+        early_in = nxt && !debug_hidden && sa.li < 0 && !cap_ && !(dfl_cap_ && dfl_is_tap(i)) &&
                    allreduce_early(m, next_norm, *nxt, proj_, proj_ld_, nullptr, 0, layers_[i + 1].full,
                                    layers_[i + 1].full ? 2 : 4);
         if (!early_in) allreduce_pf(resid_, m, next_norm, xn_, nxt, sa.li >= 0 ? &sa : nullptr);
+        if (dfl_cap_) dfl_tap_layer(i, m, 0);  // DFlash2 drafter taps (residual after layer i, rows of this pass)
         if (cap_) capture_rows(i, m);
         if (debug_hidden) {
             CUDA_CHECK(cudaMemcpyAsync(debug_hidden + (size_t)i * m * H, resid_,
@@ -3025,10 +3031,15 @@ void Worker::forward_prefill(int m, bool logits) {
             pending[b] = nullptr;
         }
     };
+    // DFlash2 taps: the residual rows of b after layer i - 1 are complete after wait(b) (not with the owner-finished
+    // all-reduce, whose residual is valid on the owned rows only: no taps then, the drafter context stays short)
+    const bool dtap = dfl_cap_ && !of_on;
+    dfl_tapped_ = dtap;  // (prefill_chunk writes the ring only from taps this pass made, review L2)
     for (int i = 0; i < c_.layers; i++) {
         Layer& L = layers_[i];
         for (int b = 0; b < 2; b++) {
             wait(b);
+            if (dtap && i > 0) dfl_tap_layer(i - 1, mbs[b], r0s[b]);
             xbf_cur_ = xbf_[b];  // bf16 input rows of the ab projection (owner-finished AR), else xn_
             mixer_rows(i, r0s[b], mbs[b], poss[b], b == 0 ? 0 : m0, pb[b]);
             xbf_cur_ = nullptr;
@@ -3352,13 +3363,20 @@ void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const in
     // every new prompt captured and instantiated a whole-model graph for a single launch): launch
     // it directly; a repeated key is captured as before (QE_PF_EAGER=0: always a graph)
     const auto gkey = std::make_tuple(m | (in_pf_ ? 1 << 30 : 0), last, mode(), cur_slot_);  // (run_'s key: S4)
-    if (cap_) forward(m, last);  // activation capture: eager, every layer output seen (capture_rows)
+    // DFlash2 drafter (dfl_pf_): the taps of the rows in the window of the prompt's first block (positions >= n - 2048)
+    const int dwin = n - kDflWin, dlo = std::max(0, dwin - i0);
+    const bool dtap = dfl_pf_ && dfl_ && i0 + m > dwin;
+    dfl_cap_ = dtap;
+    dfl_tapped_ = dtap;  // (forward taps every row; forward_prefill may not: owner-finished all-reduce)
+    if (cap_ || (dtap && m <= kMaxGemvTokens)) forward(m, last);  // activation capture / taps: eager, every layer output seen
     else if (m <= kMaxGemvTokens && env_int("QE_PF_EAGER", 1) && !debug_hidden && !graphs_.m.count(gkey) &&
         eager_seen_.insert(gkey).second)
         forward(m, last);
     else if (m <= kMaxGemvTokens) run(m, last);
     else if (overlap && m >= overlap_min() && !debug_hidden) forward_prefill(m, last);
     else forward(m, last);  // big chunks: launch overhead is negligible, no graph
+    dfl_cap_ = false;
+    if (dtap && dfl_tapped_) dfl_ctx_rows(dlo, m - dlo, pos_);  // positions i0 + row (pos_ = i0 here)
     if (dump_hidden && rank == 0)  // training data for the MTP head (needs k > 0: all rows normed)
         CUDA_CHECK(cudaMemcpyAsync(dump_hidden + (size_t)i0 * c_.hidden, xn_, (size_t)m * c_.hidden * 2,
                                    cudaMemcpyDeviceToHost, stream));
@@ -3377,12 +3395,13 @@ void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const in
             mtp_forward(m, pos_, spec_.mtp_tok, xn_, nullptr, last);
         if (last) {
             spec_prefill_select(spec_, m, n, stream);
-            for (int r = 1; r < k; r++) {
+            for (int r = 1; r < k && !(dfl_pf_ && dfl_); r++) {  // (block steps: the drafter makes the first drafts)
                 mtp_forward(1, spec_.mtp_pos, spec_.mtp_tok, mtp_h_, spec_.hrow, true, mtp_draft_win());
                 spec_append(spec_, r, stream);
             }
             spec_finish_prefill(spec_, k, stream);
             CUDA_CHECK(cudaMemcpyAsync(pos_, &n, 4, cudaMemcpyHostToDevice, stream));
+            if (dfl_pf_ && dfl_) dfl_block();  // anchor = the first token at n: 7 drafts for the first step
         }
     }
     if (rope3) CUDA_CHECK(cudaMemsetAsync(rope3_, 0, 4, stream));  // later passes: text positions
@@ -3491,9 +3510,11 @@ void Worker::lk_set_history(const int* ids, int n) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void Worker::run_spec(int kv, int kd, bool launch, bool lookup) {
+void Worker::run_spec(int kv, int kd, bool launch, bool lookup, bool block, bool ring) {
     dpath_use(0);
-    auto key = std::make_tuple(kv, kd | (lookup ? 256 : 0), mode(), cur_slot_);
+    block = block && dfl_;
+    ring = ring && dfl_ && !block;
+    auto key = std::make_tuple(kv, kd | (lookup ? 256 : 0) | (block ? 512 : 0) | (ring ? 1024 : 0), mode(), cur_slot_);
     cudaGraphExec_t sge = spec_graphs_.get(key);
     if (!sge) {
         cudaGraph_t g;
@@ -3506,7 +3527,9 @@ void Worker::run_spec(int kv, int kd, bool launch, bool lookup) {
             copy_int(dn_save_, dn_cur_, stream);
         }
         if (lookup) lookup_to_tokens(lk_dev_, spec_.tokens, kv, stream);  // the previous step's lookup drafts
+        dfl_cap_ = block || ring;  // DFlash2: the tap rows of the verification
         forward(kv + 1, true, true);
+        dfl_cap_ = false;
         if (sampling) spec_accept_sampled(topk_all_, ngpu_, kv, sp_, spec_, stream);
         else spec_accept(spec_, kv, stream);
         if (defer) {  // accepted rows -> stash (committed by the next step)
@@ -3542,6 +3565,53 @@ void Worker::run_spec(int kv, int kd, bool launch, bool lookup) {
             rp.n = li;
             dn_replay(rp, dn_ch_, dsh_, dn_slot_floats_, dn_cur_, spec_.acc, stream);
             dn_commit(dn_cur_, nullptr, 1, stream);
+        }
+        // an IF node around fn: it runs only when the step's lookup found no drafts (the history scan ran before)
+        auto if_no_lookup = [&](const std::function<void()>& fn) {
+            cudaStreamCaptureStatus cs;
+            cudaGraph_t cg;
+            const cudaGraphNode_t* deps;
+            size_t nd;
+            CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &cs, nullptr, &cg, nullptr, nullptr, nullptr));
+            cudaGraphConditionalHandle h;
+            CUDA_CHECK(cudaGraphConditionalHandleCreate(&h, cg, 0, 0));
+            lookup_cond(lk_dev_, h, stream);
+            CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &cs, nullptr, &cg, &deps, nullptr, &nd));
+            cudaGraphNodeParams cp = {};
+            cp.type = cudaGraphNodeTypeConditional;
+            cp.conditional.handle = h;
+            cp.conditional.type = cudaGraphCondTypeIf;
+            cp.conditional.size = 1;
+            cudaGraphNode_t node;
+            CUDA_CHECK(cudaGraphAddNode(&node, cg, deps, nullptr, nd, &cp));
+            CUDA_CHECK(cudaStreamUpdateCaptureDependencies(stream, &node, nullptr, 1, cudaStreamSetCaptureDependencies));
+            cudaGraph_t body = cp.conditional.phGraph_out[0];
+            cudaStream_t s0 = stream;
+            stream = lk_cst_;
+            CUDA_CHECK(cudaStreamBeginCaptureToGraph(stream, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal));
+            fn();
+            CUDA_CHECK(cudaStreamEndCapture(stream, &body));
+            stream = s0;
+        };
+        if (block || ring) dfl_ctx_rows(0, kv + 1, spec_.pos);  // DFlash2 context: positions *pos + row (before the advance)
+        if (block) {
+            // DFlash2 block step: the MTP pass only keeps its KV cache (batched steps of this slot draft with it),
+            // the verified rows' taps go to the drafter's context, the drafter makes the next step's 7 drafts
+            static const bool mtpkv = env_int("QE_DF_MTPKV", 1) != 0;
+            if (mtpkv) mtp_forward(kv + 1, spec_.mtp_pos, spec_.mtp_tok, xn_, spec_.hrow, false);
+            if (lk_on()) {
+                lookup_append(lk_dev_, spec_.emit, stream);
+                lookup_scan_emit(lk_dev_, stream, spec_.emit + 31);
+            }
+            spec_finish(spec_, kd, stream);  // tokens[0] = the anchor, pos = its position (drafts follow)
+            if (lk_on()) if_no_lookup([&] { dfl_block(); });
+            else dfl_block();
+            CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+            CHECK(instantiate(&sge, g), "out of VRAM for a speculative-step graph");
+            CUDA_CHECK(cudaGraphDestroy(g));
+            spec_graphs_.put(key, sge);
+            if (launch) CUDA_CHECK(cudaGraphLaunch(sge, stream));
+            return;
         }
         // kd == 0: the MTP pass only fills its KV cache, no draft head
         mtp_forward(kv + 1, spec_.mtp_pos, spec_.mtp_tok, xn_, spec_.hrow, kd > 0);

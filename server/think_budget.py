@@ -392,6 +392,10 @@ class ThinkControl:
                     break
             if self.failed or self.fi >= len(self.fz):
                 self.fz = None
+                if getattr(j, "grammar", None) is not None:
+                    # a tool_choice constraint (server/tool_choice.py) under the close: it stays, and its masks /
+                    # drafts for the next step are the ones Job.feed planned just before this call
+                    return
                 if j.lp is None:
                     e.constrain(j.slot, False)
                 else:  # logprobs: stays constrained for its logits, every token allowed again

@@ -22,8 +22,22 @@ Output (row-major "compressed-tensors pack-quantized" layout, the one repack_w4 
   A_log / dt_bias, vision. The n-gram table shard is symlinked, not copied.
 Files: base.safetensors (embed, lm_head, final mixer, vision), layer-LL.safetensors, mtp.safetensors, n-gram
 symlink, model.safetensors.index.json, config/tokenizer copies, convert_report.json (RTN error stats).
+
+Other W4A16 exports (auto_gptq v1 packing, 4 bit, no act-order g_idx; checked, anything else is refused):
+* dense GDN / QSA projections shipped as .qweight: GDN in/out with sym g128 INT4 are repacked onto their own grid
+  (bf16 scales), otherwise dequantised and RTN-requantised (warning: prefer --int8); with --int8 / --keep-bf16 and for
+  QSA q/k/v/o they are dequantised to BF16 and take the BF16 path.
+* fused MTP experts (mtp.layers.0.mlp.experts.gate_up_proj [NE, 2I, H] / down_proj [NE, H, I]) are split per expert.
+* an FP8 n-gram table: convert it first with tools/convert_ngram_fp8.py --out DST/ngram_int8.safetensors, then run
+  this converter with QE_NGRAM_EXTERNAL=1 (see the environment variables below).
+
+Environment:
+  QE_NGRAM_EXTERNAL=1  the n-gram table is DST/ngram_int8.safetensors (written beforehand by tools/convert_ngram_fp8.py
+                       or tools/convert_ngram_int8.py; checked: 128 shards U8 [2500012, 162]); it is indexed, the source
+                       shards are not linked. Needed for a non-BF16 (e.g. FP8) n-gram source.
+  QE_CONV_THREADS=N    torch threads per layer worker (default 6)
 """
-import argparse, glob, json, os, shutil, struct, sys, time
+import argparse, glob, json, os, re, shutil, struct, sys, time
 from concurrent.futures import ProcessPoolExecutor
 
 import torch
@@ -34,6 +48,8 @@ SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "
 DST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "Qwen3.8-Flash-Next-QE-INT4")
 P = "model.language_model."
 NE, H, I = 512, 2560, 640
+GPTQ_DENSE = {"linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
+              "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"}
 
 # QSA q/k/v/o stay BF16 (engine: INT8 at load): RTN INT4 of them lengthened reasoning ~2.9x in a community
 # W4A16 (community report); MTP stays BF16 (fp8 MTP halved acceptance, HF #47)
@@ -96,17 +112,71 @@ def dequant_ours(q, s):
     return u * sc
 
 
-def dequant_gptq(qweight, qzeros, scales):
-    """auto_gptq v1 (zero stored minus 1) -> fp32 [N, K] (nn.Linear orientation)"""
+def gptq_group(qweight, qzeros, scales):
+    """4-bit auto_gptq shapes (qweight [K/8, N], qzeros [K/gs, N/8], scales [K/gs, N]) -> (K, group size)"""
     Kp, N = qweight.shape
+    K, G = Kp * 8, scales.shape[0]
+    assert qweight.dtype == torch.int32 and qzeros.dtype == torch.int32 and K % G == 0 and (K // G) % 8 == 0 \
+        and tuple(scales.shape) == (G, N) and tuple(qzeros.shape) == (G, N // 8), \
+        f"not 4-bit auto_gptq shapes: qweight {tuple(qweight.shape)} qzeros {tuple(qzeros.shape)} scales {tuple(scales.shape)}"
+    return K, K // G
+
+
+def check_gidx(S, base, K, gs):
+    """refuse act-order (desc_act) exports: a .g_idx that is not k // gs (the dequant / repack assume it)"""
+    if base + ".g_idx" in S.where and not torch.equal(S.get(base + ".g_idx").to(torch.int64), torch.arange(K) // gs):
+        raise SystemExit(f"{base}.g_idx: act-order (desc_act) GPTQ is not supported; export without desc_act / "
+                         "with static groups, or convert from the BF16 checkpoint")
+
+
+def dequant_gptq(qweight, qzeros, scales):
+    """auto_gptq v1 (zero stored minus 1) -> fp32 [N, K] (nn.Linear orientation); group size from the shapes"""
+    Kp, N = qweight.shape
+    _, gs = gptq_group(qweight, qzeros, scales)
     q = qweight.to(torch.int64) & 0xFFFFFFFF
     sh = torch.arange(8, dtype=torch.int64) * 4
     u = ((q.unsqueeze(1) >> sh.view(1, 8, 1)) & 15).reshape(Kp * 8, N)  # [K, N], k = 8r + j
     z = qzeros.to(torch.int64) & 0xFFFFFFFF
-    zu = ((z.unsqueeze(-1) >> sh) & 15).reshape(z.shape[0], z.shape[1] * 8) + 1  # [K/128, N]
-    zz = zu.repeat_interleave(128, dim=0)
-    sc = scales.float().repeat_interleave(128, dim=0)
+    zu = ((z.unsqueeze(-1) >> sh) & 15).reshape(z.shape[0], z.shape[1] * 8) + 1  # [K/gs, N]
+    zz = zu.repeat_interleave(gs, dim=0)
+    sc = scales.float().repeat_interleave(gs, dim=0)
     return ((u - zz).float() * sc).t().contiguous()
+
+
+def gptq_v1_format(qc, names):
+    """refuse a W4A16 dense source the dequant would read wrong: only 4-bit auto_gptq v1 packing (zero stored minus 1).
+    qc: the source quantization_config; names: the dense tensors that arrive as .qweight"""
+    meth = str(qc.get("quant_method", "")).lower().replace("_", "-")
+    fmt = str(qc.get("packing_format") or qc.get("checkpoint_format") or qc.get("format") or "").lower()
+    if not ((meth == "gptq" and fmt in ("", "gptq")) or (meth == "auto-round" and fmt.endswith("auto_gptq"))):
+        raise SystemExit(f"dense .qweight tensors in a {meth or '?'} / {fmt or '?'} export: only auto_gptq v1 packing "
+                         "(quant_method gptq + checkpoint_format gptq, or auto-round + packing_format auto_round:auto_gptq) "
+                         "is supported")
+    bits = {qc.get("bits")}
+    for key in ("extra_config", "dynamic"):  # per-layer overrides (auto-round extra_config, gptqmodel dynamic)
+        for pat, o in (qc.get(key) or {}).items():
+            if pat.startswith("-:") or not isinstance(o, dict) or "bits" not in o:
+                continue
+            pat = pat[2:] if pat.startswith("+:") else pat
+            if any(re.search(pat, n) for n in names):
+                bits.add(o["bits"])
+    if bits != {4}:
+        raise SystemExit(f"dense .qweight tensors with bits {sorted(map(str, bits))} in quantization_config: only 4-bit")
+
+
+def repack_gptq_sym(qweight, qzeros, scales):
+    """sym g128 auto_gptq v1 -> our layout on the source grid (qweight.T, bf16 scales: the engine's GDN scales are bf16),
+    or None when the source is not sym g128"""
+    K, gs = gptq_group(qweight, qzeros, scales)
+    if gs != 128 or not bool((qzeros == 0x77777777).all()):
+        return None
+    return qweight.t().contiguous(), scales.t().to(torch.bfloat16).contiguous()
+
+
+def assert_no_gptq(out, fn):
+    left = [k for k in out if k.endswith((".qweight", ".qzeros", ".g_idx"))]
+    if left:
+        raise SystemExit(f"{fn}: W4A16 tensors this converter does not handle: {left[:8]}{' ...' if len(left) > 8 else ''}")
 
 
 def rtn_int4(w, scale_dtype, search=True):
@@ -170,7 +240,7 @@ def load_gptq(d, fn):
 def conv_layer(args):
     L, src_dir, dst_dir, nverify, dense_dir, exp_dir, keep16, int8 = args
     t0 = time.time()
-    torch.set_num_threads(6)
+    torch.set_num_threads(int(os.environ.get("QE_CONV_THREADS", "6")))
     S = Src(src_dir)
     pre = f"{P}layers.{L}."
     out, stats = {}, {}
@@ -204,6 +274,8 @@ def conv_layer(args):
             qw, qz, sc = S.get(b + nm + ".qweight"), S.get(b + nm + ".qzeros"), S.get(b + nm + ".scales")
             assert sc.dtype == torch.float16
             assert bool((qz == 0x77777777).all()), f"non-symmetric zero point in {b}{nm}"
+            if b + nm + ".g_idx" in S.where:
+                check_gidx(S, b + nm, *gptq_group(qw, qz, sc))
             n = qw.shape[1]
             qd[e, r0:r0 + n] = qw.t()
             sd[e, r0:r0 + n] = sc.t()
@@ -241,7 +313,11 @@ def conv_layer(args):
             assert out[k].shape == v.shape and out[k].dtype == v.dtype, (k, out[k].shape, v.shape, out[k].dtype, v.dtype)
         else:  # GDN / PLE: shape from the BF16 source, bf16 scales, int32 packs
             assert base in RTN_BF16, k
-            N, K = S.get(pre + base + ".weight").shape
+            if pre + base + ".weight" in S.where:
+                N, K = S.get(pre + base + ".weight").shape
+            else:  # W4A16 source: auto_gptq qweight [K/8, N]
+                qw = S.get(pre + base + ".qweight")
+                N, K = qw.shape[1], qw.shape[0] * 8
             if k.endswith(".weight_packed"):
                 assert tuple(v.shape) == (N, K // 8) and v.dtype == torch.int32, (k, v.shape, v.dtype)
             else:
@@ -252,29 +328,58 @@ def conv_layer(args):
     # everything else of the layer
     for k in S.keys(pre):
         rest = k[len(pre):]
-        if rest.startswith("mlp.experts.") or rest.startswith("mlp.shared_expert.") or "ngram_embedding" in rest:
+        if rest.startswith("mlp.experts.") or rest.startswith("mlp.shared_expert.") or "ngram_embedding" in rest \
+                or "ngram_q8" in rest:  # an INT8 n-gram table in the source dir is not copied (51.8 GB)
             continue
         base = rest[:-len(".weight")] if rest.endswith(".weight") else None
+        w = None
+        if base is None and rest.endswith(".qweight") and rest[:-len(".qweight")] in GPTQ_DENSE:
+            # W4A16 exports (ukisai etc.): some dense projections arrive already INT4 (auto_gptq .qweight). Dequantise
+            # to BF16 and take the same path as a BF16 source (INT8 g128 via the engine kernel, or BF16 kept).
+            base = rest[:-len(".qweight")]
+            qw, qz, sc = S.get(k), S.get(pre + base + ".qzeros"), S.get(pre + base + ".scales")
+            check_gidx(S, pre + base, *gptq_group(qw, qz, sc))
+            k = pre + base + ".weight"
+            if base in RTN_BF16 and base not in keep:
+                if pre + base + ".weight_packed" in dense:
+                    continue  # calibrated GPTQ tensors replace it
+                rp = repack_gptq_sym(qw, qz, sc)
+                if rp is not None:  # sym g128: the source INT4 grid as is (only the scales round to bf16)
+                    out[pre + base + ".weight_packed"], out[pre + base + ".weight_scale"] = rp
+                    stats[base] = "int4 repack of the source grid (bf16 scales)"
+                    continue
+                print(f"warning: {pre}{base}: source INT4 is not sym g128, RTN-requantising the dequantised weights "
+                      "(a second rounding); --int8 in_proj_qkv,in_proj_z,out_proj avoids it", flush=True)
+            w = dequant_gptq(qw, qz, sc).to(torch.bfloat16)
+        elif base is None and (rest.endswith(".qzeros") or rest.endswith(".scales") or rest.endswith(".g_idx")) \
+                and rest.rsplit(".", 1)[0] in GPTQ_DENSE:
+            continue  # consumed with the .qweight above
+        if base is None:  # A_log, dt_bias, norms, ...
+            out[k] = S.get(k).contiguous()
+            continue
+        if w is None:
+            w = S.get(k)
         if base in keep and base.split(".")[-1] in int8:  # stored INT8 g128: the values the engine computes at load
-            q, sc = int8_engine(S.get(k))
+            q, sc = int8_engine(w)
             out[pre + base + ".weight"] = q
             out[pre + base + ".weight_scale"] = sc
             stats[base] = "int8 g128 (engine quantize_w8)"
             continue
         if base in keep:
-            out[k] = S.get(k).contiguous()
+            out[k] = w.contiguous()
             stats[base] = "bf16 (INT8 at load)"
             continue
         if base in RTN_BF16 and pre + base + ".weight_packed" in dense:
             continue
         if base in RTN_BF16:
-            q, s, st = rtn_int4(S.get(k), torch.bfloat16)
+            q, s, st = rtn_int4(w, torch.bfloat16)
             out[pre + base + ".weight_packed"] = q
             out[pre + base + ".weight_scale"] = s
             stats[base] = st
         else:
-            out[k] = S.get(k).contiguous()
+            out[k] = w.contiguous()
     fn = f"layer-{L:02d}.safetensors"
+    assert_no_gptq(out, fn)
     save_file(out, os.path.join(dst_dir, fn))
     return L, fn, list(out.keys()), stats, time.time() - t0
 
@@ -283,7 +388,23 @@ def conv_mtp_bf16(args):
     src_dir, dst_dir = args
     t0 = time.time()
     S = Src(src_dir)
-    out = {k: S.get(k).contiguous() for k in S.keys("mtp.")}
+    pre = "mtp.layers.0."
+    out = {}
+    for k in S.keys("mtp."):
+        if k == pre + "mlp.experts.gate_up_proj":     # fuse -> per-expert (QEngine reads per-expert)
+            gu = S.get(k)
+            assert tuple(gu.shape) == (NE, 2 * I, H), (k, tuple(gu.shape), "expected [NE, 2I, H]")
+            for e in range(NE):
+                out[f"{pre}mlp.experts.{e}.gate_proj.weight"] = gu[e, :I].contiguous()
+                out[f"{pre}mlp.experts.{e}.up_proj.weight"] = gu[e, I:].contiguous()
+        elif k == pre + "mlp.experts.down_proj":
+            dn = S.get(k)
+            assert tuple(dn.shape) == (NE, H, I), (k, tuple(dn.shape), "expected [NE, H, I]")
+            for e in range(NE):
+                out[f"{pre}mlp.experts.{e}.down_proj.weight"] = dn[e].contiguous()
+        else:
+            out[k] = S.get(k).contiguous()
+    assert_no_gptq(out, "mtp.safetensors")
     save_file(out, os.path.join(dst_dir, "mtp.safetensors"))
     return "mtp.safetensors", list(out.keys()), {"mtp": "bf16 passthrough"}, time.time() - t0
 
@@ -301,10 +422,17 @@ def conv_mtp(args):
     dn_s = torch.empty(NE, H, I // 128, dtype=torch.float16)
     errs = {"gate_proj": [], "up_proj": [], "down_proj": []}
     errs0 = {"gate_proj": [], "up_proj": [], "down_proj": []}
+    fused = pre + "mlp.experts.gate_up_proj" in S.where
+    if fused:   # fused MTP experts (W4A16 exports): [NE,2I,H] / [NE,H,I] bf16, RTN per expert on slices
+        gu, dn = S.get(pre + "mlp.experts.gate_up_proj"), S.get(pre + "mlp.experts.down_proj")
+        assert tuple(gu.shape) == (NE, 2 * I, H) and tuple(dn.shape) == (NE, H, I), \
+            ("fused MTP experts: expected gate_up_proj [NE, 2I, H] and down_proj [NE, H, I]", tuple(gu.shape), tuple(dn.shape))
+        part = {"gate_proj": lambda e: gu[e, :I], "up_proj": lambda e: gu[e, I:], "down_proj": lambda e: dn[e]}
+        stats["mtp.experts_source"] = "fused gate_up_proj / down_proj"
     for e in range(NE):
         b = f"{pre}mlp.experts.{e}."
         for nm, qd, sd, r0 in (("gate_proj", gu_q, gu_s, 0), ("up_proj", gu_q, gu_s, I), ("down_proj", dn_q, dn_s, 0)):
-            q, s, st = rtn_int4(S.get(b + nm + ".weight"), torch.float16)
+            q, s, st = rtn_int4(part[nm](e) if fused else S.get(b + nm + ".weight"), torch.float16)
             qd[e, r0:r0 + q.shape[0]] = q
             sd[e, r0:r0 + q.shape[0]] = s
             errs[nm].append(st["rel_err"])
@@ -340,6 +468,7 @@ def conv_mtp(args):
             stats[base] = st
         else:
             out[k] = S.get(k).contiguous()
+    assert_no_gptq(out, "mtp-int4.safetensors")
     save_file(out, os.path.join(dst_dir, "mtp-int4.safetensors"))
     return "mtp-int4.safetensors", list(out.keys()), stats, time.time() - t0
 
@@ -353,6 +482,7 @@ def conv_base(args):
         if k.startswith(P + "layers.") or k.startswith("mtp."):
             continue
         out[k] = S.get(k).contiguous()
+    assert_no_gptq(out, "base.safetensors")
     save_file(out, os.path.join(dst_dir, "base.safetensors"))
     return "base.safetensors", list(out.keys()), time.time() - t0
 
@@ -423,7 +553,8 @@ def qengine_config(cfg, a, keep16, int8):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=__doc__[__doc__.index("Environment:"):],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src", default=SRC)
     ap.add_argument("--dst", default=DST)
     ap.add_argument("--workers", type=int, default=8)
@@ -459,6 +590,18 @@ def main():
     os.makedirs(a.dst, exist_ok=True)
     S = Src(a.src)
     ngram_files = sorted({f for k, f in S.where.items() if "ngram_embedding" in k})
+    ng_ext = os.environ.get("QE_NGRAM_EXTERNAL") == "1"
+    if not ng_ext:  # the engine reads the linked shards as BF16 without a dtype check
+        bad = sorted({h[k]["dtype"] for f in ngram_files for h in [header(f)] for k in h
+                      if "ngram_embedding.shard_" in k and h[k]["dtype"] != "BF16"})
+        if bad:
+            raise SystemExit(f"n-gram table in {'/'.join(bad)}, the engine links only BF16 shards: convert it with "
+                             "tools/convert_ngram_fp8.py --model SRC --out DST/ngram_int8.safetensors, then rerun with "
+                             "QE_NGRAM_EXTERNAL=1")
+    dense_q = sorted(k[:-len(".qweight")] for k in S.where if k.startswith(P + "layers.") and k.endswith(".qweight")
+                     and k.split(".", 4)[-1][:-len(".qweight")] in GPTQ_DENSE)
+    if dense_q:
+        gptq_v1_format(json.load(open(os.path.join(a.src, "config.json"))).get("quantization_config") or {}, dense_q)
     layers = [int(x) for x in a.layers.split(",")] if a.layers else list(range(48))
     rep_path = os.path.join(a.dst, "convert_report.json")
     report = json.load(open(rep_path)) if os.path.exists(rep_path) else {"layers": {}}
@@ -466,12 +609,32 @@ def main():
     idx_path = os.path.join(a.dst, "model.safetensors.index.json")
     if os.path.exists(idx_path):
         wmap = json.load(open(idx_path))["weight_map"]
-    for f in ngram_files:  # n-gram table: symlink
-        dst = os.path.join(a.dst, os.path.basename(f))
-        if not os.path.exists(dst):
-            os.symlink(f, dst)
-        for k in header(f):
-            wmap[k] = os.path.basename(f)
+    NG_PRE = "model.language_model.layers.1.ple.ple_embedding."
+    if ng_ext:
+        # n-gram provided as ngram_int8.safetensors (built by tools/convert_ngram_fp8.py):
+        # index it here; do NOT symlink the source shards the FP8 table lives in.
+        ng = os.path.join(a.dst, "ngram_int8.safetensors")
+        if not os.path.exists(ng):
+            raise SystemExit(f"QE_NGRAM_EXTERNAL=1: {ng} missing (tools/convert_ngram_fp8.py --out {ng})")
+        h = header(ng)
+        bad = [i for i in range(128) if h.get(f"{NG_PRE}ngram_q8.shard_{i}", {}).get("shape") != [2500012, 162]
+               or h[f"{NG_PRE}ngram_q8.shard_{i}"]["dtype"] != "U8"]
+        if bad:
+            raise SystemExit(f"{ng}: expected 128 tensors {NG_PRE}ngram_q8.shard_<i> U8 [2500012, 162]; wrong / missing "
+                             f"shards {bad[:8]}")
+        for k in [k for k in wmap if "ngram_embedding" in k]:  # a rerun into a DST of a linked-shard conversion
+            f = os.path.join(a.dst, wmap.pop(k))
+            if os.path.islink(f):
+                os.remove(f)
+        for i in range(128):
+            wmap[f"{NG_PRE}ngram_q8.shard_{i}"] = "ngram_int8.safetensors"
+    else:
+        for f in ngram_files:  # n-gram table: symlink
+            dst = os.path.join(a.dst, os.path.basename(f))
+            if not os.path.exists(dst):
+                os.symlink(f, dst)
+            for k in header(f):
+                wmap[k] = os.path.basename(f)
     for fn in ("config.json", "generation_config.json", "chat_template.jinja", "tokenizer.json",
                "tokenizer_config.json", "preprocessor_config.json", "processor_config.json"):
         if os.path.exists(os.path.join(a.src, fn)):

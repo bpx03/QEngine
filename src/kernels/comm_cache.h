@@ -2,13 +2,13 @@
 // Start-up cache of the communication measurements (club-3090 #1926): the link probe's bandwidth / co-run tax per GPU
 // pair (comm_select_path, ~0.7-1.2 s per boot) and the decode collectives' calibration (real decode steps on P2P stores
 // vs host memory, both engines). Reused while everything that can change the answer is unchanged: the key holds the
-// engine build and this file's format version, the engine / model / mode / card count, per card (in device order)
-// its UUID, PCI address, maximum link speed and negotiated width, NUMA node, the peer-access matrix, the kernel
-// driver and CUDA versions, and the env knobs of the collectives. Any mismatch, a missing or corrupt file: measured
-// again and rewritten. Files: $QE_DISK_CACHE or ~/.cache/qengine (Docker: the /root/.cache/qengine volume; without
-// one the container just measures each start), comm_<what>_<key hash>.txt. Written to a temporary name and renamed
-// (atomic): two servers starting at once both measure and the last rename wins, a reader never sees half a file.
-// QE_COMM_CACHE=0: no reads or writes; QE_COMM_CACHE=refresh (or QE_DECODE_COMM=remeasure for the decode part):
+// engine build and this file's format version, the engine / model / mode / card count, per card (in device order) its
+// UUID, PCI address, maximum link speed and negotiated width, NUMA node, active NVLink links, the peer-access matrix,
+// the kernel driver and CUDA versions, and the env knobs of the collectives. Any mismatch, a missing or corrupt file:
+// measured again and rewritten. Files: $QE_DISK_CACHE or ~/.cache/qengine (Docker: the /root/.cache/qengine volume;
+// without one the container just measures each start), comm_<what>_<key hash>.txt. Written to a temporary name and
+// renamed (atomic): two servers starting at once both measure and the last rename wins, a reader never sees half a
+// file. QE_COMM_CACHE=0: no reads or writes; QE_COMM_CACHE=refresh (or QE_DECODE_COMM=remeasure for the decode part):
 // measure and rewrite. Entries expire after QE_COMM_CACHE_DAYS (30). Nothing is written when another compute process
 // runs on one of the cards while measuring (NVML), or when the decode rounds disagree: such a boot measures again next
 // time instead of fixing a noisy answer.
@@ -82,6 +82,8 @@ struct CommNvml {
     int (*max_width)(void*, unsigned*) = nullptr;
     int (*gpc_off)(void*, int*) = nullptr;
     int (*putil)(void*, void*, unsigned*, unsigned long long) = nullptr;  // per-process utilization samples
+    int (*nvl_state)(void*, unsigned, int*) = nullptr;  // NVLink link active (nvmlEnableState_t)
+    int (*nvl_remote)(void*, unsigned, void*) = nullptr;  // the PCI address at the link's other end (nvmlPciInfo_t)
     bool ok = false;
     static CommNvml& get() {
         static CommNvml n = [] {
@@ -102,6 +104,8 @@ struct CommNvml {
             x.max_width = (int (*)(void*, unsigned*))f("nvmlDeviceGetMaxPcieLinkWidth");
             x.gpc_off = (int (*)(void*, int*))f("nvmlDeviceGetGpcClkVfOffset");
             x.putil = (int (*)(void*, void*, unsigned*, unsigned long long))f("nvmlDeviceGetProcessUtilization");
+            x.nvl_state = (int (*)(void*, unsigned, int*))f("nvmlDeviceGetNvLinkState");
+            x.nvl_remote = (int (*)(void*, unsigned, void*))f("nvmlDeviceGetNvLinkRemotePciInfo_v2");
             x.ok = x.init && x.by_bus && x.init() == 0;
             return x;
         }();
@@ -395,7 +399,8 @@ inline std::string comm_trained_link(int device) {
     return bs + " x" + wd;
 }
 // the card's settings that change compute vs transfer time: power limit, application / max clocks, clock offset,
-// BAR1 size (ReBAR), the PCIe generation / width the card and slot allow (the trained link: comm_trained_link)
+// BAR1 size (ReBAR), the PCIe generation / width the card and slot allow (the trained link: comm_trained_link), the
+// active NVLink links and their peers
 inline std::string comm_nvml_key(int device) {
     const CommNvml& n = CommNvml::get();
     void* h = n.dev(comm_bus_id(device).c_str());
@@ -413,6 +418,20 @@ inline std::string comm_nvml_key(int device) {
     k << " bar1 " << (n.bar1 && n.bar1(h, b) == 0 ? (long long)(b[0] >> 20) : -1LL) << "M";
     k << " gen " << (n.max_gen && n.max_gen(h, &v) == 0 ? (long)v : -1L) << " x"
       << (n.max_width && n.max_width(h, &w) == 0 ? (long)w : -1L);
+    // NVLink: the active links and the card at each one's other end (club-3090 #2000: a bridge installed after the
+    // first boot left the PCIe-era probe in force, peer 26 instead of 49 GB/s). No bridge / no NVLink: "nvl -"
+    k << " nvl";
+    int nl = 0;
+    for (unsigned l = 0; n.nvl_state && l < 18; l++) {  // NVML_NVLINK_MAX_LINKS
+        int on = 0;
+        if (n.nvl_state(h, l, &on) != 0 || !on) continue;
+        // nvmlPciInfo_t: busIdLegacy[16], domain, bus, device, pciDeviceId, pciSubSystemId, busId[32]
+        unsigned pci[32] = {};
+        k << " " << l;
+        if (n.nvl_remote && n.nvl_remote(h, l, pci) == 0) k << ":" << pci[4] << "." << pci[5] << "." << pci[6];
+        nl++;
+    }
+    if (!nl) k << " -";
     // (locked clocks, nvidia-smi -lgc, are not readable: NVML and nvidia-smi report the VBIOS range; review round 3 R2.
     // After a clock change: QE_COMM_CACHE=refresh)
     return k.str();

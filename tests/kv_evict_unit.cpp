@@ -229,6 +229,19 @@ static void test_reclaim_order() {
     // ordinary ones first, oldest first, by their own time
     EXPECT(kve::reclaim_order({o(0, 5, 60, 9), m(1, 87, 60, 1), o(2, 5, 60, 3), o(3, 5, 1, 2)}, true, 2, 30, np) == V({2, 0, 1}));
     EXPECT(kve::reclaim_order({o(0, 5, 20, 9), o(1, 5, 31, 3)}, false, 30, 30, np) == V({1}));
+    // qfn-kv-vram-place: an ordinary one above every generating region leaves before Tord under pressure (kve::at_once)
+    auto a = [](int s, int cap, double idle, bool main, bool above) { return S{s, cap, idle, kve::Rank{main, 1}, above}; };
+    EXPECT(kve::at_once(a(0, 9, 0.1, false, true), true, 0, false, np));
+    EXPECT(!kve::at_once(a(0, 9, 0.1, false, true), false, 0, false, np));   // no pressure
+    EXPECT(!kve::at_once(a(0, 9, 0.1, false, false), true, 0, false, np));   // not above the generating ones
+    EXPECT(!kve::at_once(a(0, 9, 0.1, true, true), true, 0, false, np));     // an active main never
+    EXPECT(!kve::at_once(a(0, 9, 0.1, false, true), true, -1, false, np));   // off
+    EXPECT(!kve::at_once(a(0, 9, 0.1, false, true), true, 0.5, false, np));  // inside its wait
+    EXPECT(kve::at_once(a(0, 9, 0.6, false, true), true, 0.5, false, np));
+    EXPECT(!kve::at_once(a(0, 15, 0.1, false, true), true, 0, true, np));    // min size: < 1/16 of the pool stays
+    EXPECT(kve::at_once(a(0, 16, 0.1, false, true), true, 0, true, np));
+    EXPECT(kve::reclaim_order({a(0, 9, 0.1, false, true), a(1, 9, 0.1, false, false)}, true, 2, 30, np, 0) == V({0}));
+    EXPECT(kve::reclaim_order({a(0, 9, 0.1, false, true)}, true, 2, 30, np).empty());  // default: the rule is off
 }
 // one pass of FE::reclaim_idle on the model: each one in the order writes under ROOM_OLDER (without pressure: nothing may go) and
 // leaves; a refused one follows kve::RefusedWrite. out: who left with a copy, who left lost.

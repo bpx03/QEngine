@@ -887,6 +887,58 @@ struct FE {
             at = sl[i].base + sl[i].cap;
         }
     }
+    // s grows in place to `need` periods by moving the idle regions in its way (not generating, not `protect`) to the
+    // lowest gaps outside [s.base, s.base + need) and outside every current region, when that leaves the pool top no
+    // higher than moving s to the first gap that fits. KV in VRAM: the expert cache only uses the pool above the top, and a growing main moved to the first gap
+    // lands above every subagent region (top 238 of 256 periods for a 75-period main, until the
+    // reclaim). Targets are free rows, so no copy lands on rows in use. false: nothing moved
+    bool displace_above(int s, int need, const std::vector<int>& protect) {
+        if (W[0]->kv_stream()) return false;  // KV in RAM: the top holds no expert cache; moving s is the smaller host copy
+        const Slot& q = sl[s];
+        if (q.base + need > np) return false;
+        std::vector<int> blk;
+        std::vector<std::pair<int, int>> used{{q.base, q.base + need}};
+        int top_s = 0;  // the top when s moves instead
+        for (int i = 0; i < (int)sl.size(); i++) {
+            if (i == s || !sl[i].cap) continue;
+            top_s = std::max(top_s, sl[i].base + sl[i].cap);
+            if (sl[i].base < q.base + need && sl[i].base + sl[i].cap > q.base + q.cap) {
+                if (sl[i].active || sl[i].paused || std::find(protect.begin(), protect.end(), i) != protect.end()) return false;
+                blk.push_back(i);
+            }
+            used.push_back({sl[i].base, sl[i].base + sl[i].cap});  // (blockers too: no target overlaps current rows)
+        }
+        if (blk.empty()) return false;
+        const int at_s = find_gap(need, s);
+        top_s = at_s < 0 ? np : std::max(top_s, at_s + need);
+        std::sort(blk.begin(), blk.end(), [&](int a, int b) { return sl[a].base < sl[b].base; });
+        std::vector<int> to;
+        int top = 0;
+        for (int i : blk) {  // plan: the lowest gap for each, in order
+            std::sort(used.begin(), used.end());
+            int at = 0, g = -1;
+            for (auto& [a, b] : used) {
+                if (a - at >= sl[i].cap) { g = at; break; }
+                at = std::max(at, b);
+            }
+            if (g < 0 && np - at >= sl[i].cap) g = at;
+            if (g < 0) return false;
+            to.push_back(g);
+            used.push_back({g, g + sl[i].cap});
+        }
+        int after = q.base + need;  // the top once they moved (their old rows free)
+        for (int i = 0; i < (int)sl.size(); i++)
+            if (i != s && sl[i].cap && std::find(blk.begin(), blk.end(), i) == blk.end()) after = std::max(after, sl[i].base + sl[i].cap);
+        for (size_t k = 0; k < blk.size(); k++) after = std::max(after, to[k] + sl[blk[k]].cap);
+        if (after > top_s) return false;
+        for (auto& [a, b] : used) top = std::max(top, b);
+        job = [&](int r) { W[r]->set_kv_top(top); W[r]->kv_claim(0); };  // the target rows leave the expert cache first
+        run("displace_above");
+        for (size_t k = 0; k < blk.size(); k++) move_region(blk[k], to[k]);
+        if (log) fprintf(stderr, "[qflash] pool: slot %d grows in place, %zu idle region%s moved out of its way (top %d, %d if it moved)\n", s,
+                         blk.size(), blk.size() > 1 ? "s" : "", after, top_s);
+        return true;
+    }
     // region of slot s holds `tokens` positions (+ reserve): grows in place, moves to a gap, packs the others or
     // evicts idle slots (not `protect`); the slot bound to the single-sequence path is re-bound after any move
     bool ensure_region(int s, int tokens, const std::vector<int>& protect = {}) {
@@ -910,6 +962,8 @@ struct FE {
             return true;
         };
         if (q.cap && free_above()) {
+            n_grow++;
+        } else if (q.cap && displace_above(s, need, protect)) {
             n_grow++;
         } else if (q.cap) {
             // s holds rows: packing the others from the bottom (compact) would copy them over s's region before s
@@ -962,8 +1016,8 @@ struct FE {
             q.base = at;
         }
         q.cap = need;
+        rebind();  // (before update_top: its ec_tick reads the bound slot's offset, review L4)
         update_top();
-        rebind();
         if (log) fprintf(stderr, "[qflash] pool: slot %d region [%d, %d) periods for %d tokens (%.1f ms)\n", s, q.base, q.base + q.cap, tokens,
                          now_ms() - t0);
         return true;
@@ -1129,16 +1183,32 @@ struct FE {
         }
         const bool pressure = cap > 0 && live * 10 < cap * 9 && decoding && (top0 - keep_p) * 16 >= np;
         const double T = fixed ? Tfix : pressure ? Tfast : 30.0;
+        // under pressure an idle ordinary conversation above every generating one leaves before T (kve::at_once): its rows keep
+        // the pool top, and with it the expert cache, above the sequences decoding now (a finished subagent above the main,
+        //). FLASH_EC_RECLAIM_ABOVE_S: its wait (default 0.5, < 0: off), FLASH_EC_RECLAIM_ABOVE_MIN=1: only
+        // regions of >= 1/16 of the pool
+        static const double Tabove = env_double("FLASH_EC_RECLAIM_ABOVE_S", 0.5);  // 0.5 s: best turn time of 0 / 0.5 / min size
+        static const bool above_min = env_int("FLASH_EC_RECLAIM_ABOVE_MIN", 0) != 0;
+        int act_hi = -1;  // the end of the highest generating region (none: nothing is above one)
+        for (auto& q : sl)
+            if (q.cap && q.active && !q.paused) act_hi = std::max(act_hi, q.base + q.cap);
+        if (act_hi < 0) act_hi = np + 1;
+        std::vector<char> now1(sl.size(), 0);
         std::vector<kve::IdleSlot> idle;
         for (int i = 0; i < (int)sl.size(); i++)
-            if (idle_slot(sl[i])) idle.push_back(kve::IdleSlot{i, sl[i].cap, (t - sl[i].idle_ms) / 1000.0, rank_of(*sl[i].conv)});
-        const std::vector<int> ord = kve::reclaim_order(idle, pressure, T, Tmain, np);
-        int n = 0, toks = 0, mains = 0;
+            if (idle_slot(sl[i])) {
+                kve::IdleSlot x{i, sl[i].cap, (t - sl[i].idle_ms) / 1000.0, rank_of(*sl[i].conv), !fixed && sl[i].base >= act_hi};
+                now1[i] = x.idle_s < T && kve::at_once(x, pressure, Tabove, above_min, np);
+                idle.push_back(x);
+            }
+        const std::vector<int> ord = kve::reclaim_order(idle, pressure, T, Tmain, np, fixed ? -1.0 : Tabove, above_min);
+        int n = 0, toks = 0, mains = 0, at_once = 0;
         kve::RefusedWrite refused;
         for (int i : ord) {  // each one leaves right after its write: a later writer may then evict it as older, not the other way round
             Slot& q = sl[i];
             bool written = q.synced || sync(i, 1 << 30, true, pressure ? ROOM_OLDER : ROOM_NONE);
             if (!q.conv) continue;
+            if (!written && now1[i]) continue;  // taken before its wait: it leaves only with its archive copy (review M1)
             if (!written) {  // it does not fit: it stays in VRAM, or it is the one that leaves anyway
                 const bool main = rank_of(*q.conv).main;
                 if (!refused.leaves(pressure, main)) {
@@ -1155,6 +1225,7 @@ struct FE {
             if (!n) drain();  // (the single-step path may have a step launched ahead: the compaction below can move its region)
             toks += (int)q.hist.size();
             mains += rank_of(*q.conv).main;
+            at_once += now1[i];
             evict_slot(i, written);
             n++;
         }
@@ -1167,6 +1238,7 @@ struct FE {
         for (auto& q : sl) if (q.cap) top1 = std::max(top1, q.base + q.cap);
         char main_wait[48] = "";
         if (mains) snprintf(main_wait, sizeof main_wait, "; %d active main, idle >= %.0f s", mains, std::max(T, Tmain));
+        else if (at_once) snprintf(main_wait, sizeof main_wait, "; %d above a generating one at once", at_once);
         fprintf(stderr, "[qflash] pool: %d idle conversation%s (%d tokens, idle >= %.0f s%s) left VRAM for the expert cache "
                 "(%s), pool top %d -> %d of %d periods (%.1f ms)\n", n, n > 1 ? "s" : "", toks, T, main_wait,
                 !refused.used ? "archived" : n > 1 ? "archived, one not: logged above" : "not archived: logged above", top0, top1, np, now_ms() - t);

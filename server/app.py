@@ -43,7 +43,8 @@ from content_markers import OUT_MARK, SENT, Markers, escape_out, mark, out_marks
 from engine import Engine, EngineRefused, SequenceFault, StartRefused
 import engine_stats
 from steering import DEFAULT as STEER_DEFAULT, resolve_steering
-from grammar import GrammarError, Grammars, TokenLookup, schema_of
+from grammar import Constraint, GrammarError, Grammars, TokenLookup, schema_of
+import tool_choice
 from think_budget import (BudgetError, BudgetMap, ThinkControl, ThinkIds, budget_banner, budget_source, empty_reply,
                           probe_rules, request_budget)
 from model_profile import DroppedTurnLog, Profile, drop_empty_turns, merge_leading_system
@@ -907,6 +908,7 @@ class Generator:
             self.grammars.prepare()
         # thinking budget (server/think_budget.py): the forced close of <think> goes through the grammar tier
         self.think_ids = ThinkIds(self.tok)
+        self.tool_tier_call = self.tok.token_to_id("<tool_call>")
         self.can_force = self.engine.has("grammar") and self.think_ids.ok
         self.think = {"requests_with_budget": 0, "forced_budget": 0, "forced_max_tokens": 0, "forced_failed": 0,
                       "empty_replies": 0, "empty_stop": 0, "empty_length": 0, "empty_after_forced_close": 0,
@@ -914,6 +916,17 @@ class Generator:
                       "budget_from": {}}
         self.think_mu = threading.Lock()  # (counted from the scheduler thread and the event loop: review server F9)
         self.drop_log = DroppedTurnLog()  # --drop-empty-turns (HF #50): logged once per conversation
+        # tool_choice (server/tool_choice.py): masks through the same grammar tier
+        self.tool_tier = tool_choice.Tier(self.tok, self.think_ids, self.eos, self.im_start) \
+            if self.engine.has("grammar") else None
+        if self.tool_tier is not None and not self.tool_tier.ok:
+            self.tool_tier = None
+        self.tool_choice_noted = False  # the first request whose required / named tool_choice is not enforced
+        if self.tool_tier is None:
+            print("tool_choice: not enforced through masks (the engine has no grammar C API"
+                  f"{': ' + self.engine.refused['grammar'] if getattr(self.engine, 'refused', {}).get('grammar') else ''}"
+                  "): none ends a reply at its first tool call, required / any / a named tool decode as auto",
+                  flush=True)
         if not self.can_force:
             print("thinking budget: not enforced (the engine has no grammar C API or the tokenizer no <think> "
                   "tokens): budgets are ignored and max_tokens may end inside <think>", flush=True)
@@ -1921,6 +1934,12 @@ class Job:
             g.guard_note(dict(guard, seed=len(seed)))
         e.set_prio(self.slot, self.prio)
         self.grammar = self.p.get("grammar")
+        tcs = self.p.get("tool_choice")
+        if self.grammar is None and tcs and not tcs.get("cut") and g.tool_tier is not None:
+            # tool_choice none / required / named (server/tool_choice.py): a fresh automaton per start, through the
+            # grammar path; it knows from the prompt whether the reply opens inside <think>
+            opens = g.think_ids.ok and g.think_ids.open_at_end(self.ids, g.im_start)
+            self.grammar = Constraint(g.tool_tier.matcher(tcs, opens), sorted(g.eos))
         self.grammar_s = 0.0
         if self.grammar is not None:  # constrained from the first token on (prompt's last chunk)
             tg = time.perf_counter()
@@ -2063,12 +2082,29 @@ class Job:
             if self.glk is None:  # token history for lookup drafts (prompt + emitted so far)
                 self.glk = TokenLookup(list(self.ids) + list(self.det.ids), g.image_pad)
             self.glk.append(ok)
-            if not gdone:
+            if not gdone and getattr(c, "released", None) is not None and c.released():
+                # tool_choice: the forced call header is complete, the arguments decode freely (as after a forced
+                # close of <think>: unconstrained, or with logprobs constrained with every token allowed)
+                self.grammar_s += time.perf_counter() - tg
+                self.release_grammar()
+            elif not gdone:
                 # drafts for the next step: forced tokens / lookup / the grammar-valid model drafts
                 e = g.engine
                 c.plan(e.spec_io(self.slot), e.mask_buffer(self.slot), g.args.mtp_k, self.glk)
-            self.grammar_s += time.perf_counter() - tg
+            if self.grammar is not None:
+                self.grammar_s += time.perf_counter() - tg
+        cut_call = (self.p.get("tool_choice") or {}).get("cut") and not self.p.get("ignore_eos")
+        think_open = cut_call and self.tc is not None and self.tc.open
         for i, t in enumerate(pending):
+            if cut_call:  # tool_choice none without the grammar tier: the reply ends at a call in the answer
+                if think_open:
+                    think_open = t != g.think_ids.end
+                elif t == g.tool_tier_call:
+                    print(f"tool_choice none: the reply ends at the tool call the model began after {self.n + i} "
+                          f"tokens (no grammar tier to mask it)", flush=True)
+                    self.finish, stop_now = "stop", True
+                    pending = pending[:i]
+                    break
             if t in g.eos and not self.p.get("ignore_eos"):
                 self.finish, stop_now = "stop", True
                 self.eos_end = True
@@ -2136,9 +2172,11 @@ class Job:
                 c.done() or (self.finish == "stop" and c.accepting()))):
             # structured output ended before its grammar was complete (loop guard, rejected token):
             # the JSON is cut off, so say "length" (clients retry / raise) and never "stop"
-            why = c.error.splitlines()[0] if c.error else "loop guard"
-            print(f"structured output: incomplete after {self.n} tokens ({why}), finish_reason length",
-                  flush=True)
+            why = c.error.splitlines()[0] if c.error else "loop guard" if self.finish == "stop" else self.finish
+            what = "tool_choice: the required call was not made" if isinstance(getattr(c, "m", None),
+                                                                               tool_choice.ToolMatcher) \
+                else "structured output: incomplete"
+            print(f"{what} after {self.n} tokens ({why}), finish_reason length", flush=True)
             self.finish = "length"
         if (stop_now or self.n >= self.max_new or
                 len(self.ids) + self.n + 8 >= g.engine.slots[self.slot]):
@@ -2146,11 +2184,24 @@ class Job:
         elif self.tc is not None:
             self.tc.after(pending)  # a forced close of <think> in flight, or one due now (budget / answer tail)
 
+    def release_grammar(self):
+        """Drop a tool_choice constraint whose forced part is done (Constraint.released): the slot decodes freely again;
+        a logprobs reply stays constrained for its logits with every token allowed (as ThinkControl after its close)."""
+        e = self.gen.engine
+        self.grammar = None
+        if self.lp is None:
+            e.constrain(self.slot, False)
+        else:
+            e.mask_buffer(self.slot).fill(0xFFFFFFFF)
+            e.constrain(self.slot, True)
+
     def call_in_block(self):
         """The model ended the reply itself with complete tool calls inside an open <think>: they are its calls. Not after a
         stop string, max_tokens, the context limit or the loop guard: such a cut can land right after a quoted call. The
-        call's tokens are then not thinking tokens."""
+        call's tokens are then not thinking tokens. Never under tool_choice none."""
         g = self.gen
+        if (self.p.get("tool_choice") or {}).get("mode") == tool_choice.NONE:
+            return False
         if not self.eos_end or self.cut or mark("<tool_call>") not in self.text_mk or not g.think_ids.ok:
             return False
         p = Parser(g.think_ids.open_at_end(self.ids, g.im_start))
@@ -2302,6 +2353,9 @@ class Job:
                     g.think_add("empty_after_forced_close", bool(er["forced"]))
                     self.stats["empty"] = {k: v for k, v in er.items() if k != "line"}
                     print(er["line"], flush=True)
+            if self.p.get("tool_choice"):
+                self.stats["tool_choice"] = self.p["tool_choice"]["mode"] + (" (cut)" if self.p["tool_choice"].get("cut")
+                                                                             else "")
             if self.grammar is not None:
                 self.stats["grammar_s"] = self.grammar_s
                 self.stats["grammar_steps"] = self.gsteps
@@ -2396,7 +2450,7 @@ async def fault_events(it):
         yield ex
 
 
-async def complete(gen, ids, params, aff, thinking, tools):
+async def complete(gen, ids, params, aff, thinking, tools, tchoice=None):
     """A non-streamed reply: (parser, parts, stats, tool calls), or the SequenceFault of an engine error. A sampled
     reply that ends by itself (finish stop) with no text and no tool call -- reasoning only (EOS inside or right after
     <think>, HF Qwen3.8-Flash-Next #50) or a tool call that does not parse -- is sampled again, up to --empty-retry
@@ -2404,7 +2458,9 @@ async def complete(gen, ids, params, aff, thinking, tools):
     costs the whole task. The prompt is cached, so a retry costs only its decode. Off for greedy (temperature 0) and
     seeded requests (a resample would repeat the output or break reproducibility), structured output (single-use
     grammar), ignore_eos and client stop sequences (the stop may have cut the text). Streams are never retried: their
-    bytes are already sent. usage.completion_tokens counts the tokens of every try; finish_reason is the last try's."""
+    bytes are already sent. usage.completion_tokens counts the tokens of every try; finish_reason is the last try's.
+    tchoice (the request's tool_choice, tool_choice_of): the calls it allows (tool_choice.filter_calls; under none they
+    are not parsed: none are left, masked or cut without the grammar tier)."""
     tries = max(0, getattr(gen.args, "empty_retry", 0))
     temp = params.get("temperature")
     temp = gen.sampling_defaults[bool(thinking)]["temperature"] if temp is None else temp
@@ -2432,7 +2488,9 @@ async def complete(gen, ids, params, aff, thinking, tools):
                     parts["logprobs"] += item.lp
         if first is None:
             first = st
-        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+        no_calls = tchoice is not None and tchoice["mode"] == tool_choice.NONE
+        calls = tool_choice.filter_calls(tchoice, parse_tool_calls(parser.tool_text, tools)) \
+            if parser.tool_text and not no_calls else []
         empty = not calls and not parts["content"].strip() and st["finish"] == "stop"
         if not empty:
             if attempt:
@@ -2483,7 +2541,8 @@ def log_stats(kind, st):
           f"{st['grammar_forced']} forced drafts" if "grammar_s" in st else "")
     print(f"[{kind}] slot {st['slot']} prompt {st['prompt_tokens']} (cached {st['cached_tokens']}{src}, prefill "
           f"{pps:.0f} tok/s) | gen {st['completion_tokens']} @ {tps:.1f} tok/s | {st['finish']}{gr}"
-          f"{' | stop trim ' + ('ok' if st['stop_trim'] else 'missed') if 'stop_trim' in st else ''}{think_note(st)}",
+          f"{' | stop trim ' + ('ok' if st['stop_trim'] else 'missed') if 'stop_trim' in st else ''}{think_note(st)}"
+          f"{' | tool_choice ' + st['tool_choice'] if st.get('tool_choice') else ''}",
           flush=True)
     engine_stats.log(st, st.get("drafts"))  # [stats] lines for benchmark log parsers (QE_STATS_LOG=0: off)
 
@@ -2598,6 +2657,31 @@ def structured(gen, body, kw):
         raise GrammarError(why or "structured output is not supported by this engine (no grammar C API)")
     kw["enable_thinking"] = False
     return gen.grammars.matcher(schema)
+
+
+def tool_choice_of(gen, body, tools, grammar):
+    """The tool_choice of a request for its job (params["tool_choice"]; None: auto, nothing to enforce). Raises
+    tool_choice.ToolChoiceError (HTTP 400). With the grammar tier the job masks the reply (server/tool_choice.py);
+    without it `none` ends the reply at its first tool call ("cut") and a required / named choice is not enforced
+    (one log line at the first such request). A structured-output request (response_format) cannot also force a call;
+    its JSON grammar already allows no tool call, so `none` needs nothing more."""
+    spec = tool_choice.parse(body.get("tool_choice"), tools)
+    if spec is None:
+        return None
+    if grammar is not None:
+        if spec["mode"] == tool_choice.REQUIRED:
+            raise tool_choice.ToolChoiceError("a tool_choice that forces a call cannot be combined with structured "
+                                              "output (response_format / output_format)")
+        return None
+    if gen.tool_tier is not None:
+        return spec
+    if spec["mode"] == tool_choice.NONE:
+        return dict(spec, cut=True)
+    if not gen.tool_choice_noted:
+        gen.tool_choice_noted = True
+        print(f"tool_choice {spec['mode']}: not enforced (the engine has no grammar C API); the model decides as with "
+              f"auto (logged once)", flush=True)
+    return None
 
 
 class InputError(ValueError):
@@ -2853,6 +2937,12 @@ def build_app(gen: Generator, args):
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "response_format"}}, status_code=400)
         try:
+            tchoice = tool_choice_of(gen, body, tools, grammar)
+        except tool_choice.ToolChoiceError as ex:
+            return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
+                                           "param": "tool_choice"}}, status_code=400)
+        no_calls = tchoice is not None and tchoice["mode"] == tool_choice.NONE
+        try:
             steer = resolve_steering(gen.steer, body)
         except ValueError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
@@ -2880,7 +2970,7 @@ def build_app(gen: Generator, args):
                   "max_tokens": body.get("max_completion_tokens") or body.get("max_tokens"),
                   "stop": [stop] if isinstance(stop, str) else stop,
                   "ignore_eos": bool(body.get("ignore_eos")),  # benchmarks (vllm bench serve --ignore-eos)
-                  "grammar": grammar, "steering_sel": steer, "think_budget": budget,
+                  "grammar": grammar, "tool_choice": tchoice, "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
                   "thinking": reply_thinking(gen, ids, kw)}
@@ -2939,7 +3029,8 @@ def build_app(gen: Generator, args):
                             if kind == "reasoning" and hide_rs:
                                 continue
                             yield chunk({"reasoning_content" if kind == "reasoning" else "content": t})
-                        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+                        calls = tool_choice.filter_calls(tchoice, parse_tool_calls(parser.tool_text, tools)) \
+                            if parser.tool_text and not no_calls else []
                         if calls:
                             yield chunk({"tool_calls": tool_calls_out(calls)})
                         finish = "tool_calls" if calls else st["finish"]
@@ -2970,7 +3061,7 @@ def build_app(gen: Generator, args):
                             a0 = _pc()
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice)
         if isinstance(r, SequenceFault):
             if bad_input(r):
                 return JSONResponse({"error": {"message": str(r), "type": "invalid_request_error"}}, status_code=400)
@@ -3028,6 +3119,12 @@ def build_app(gen: Generator, args):
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
                                 status_code=400)
         try:
+            tchoice = tool_choice_of(gen, body, tools, grammar)
+        except tool_choice.ToolChoiceError as ex:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
+                                status_code=400)
+        no_calls = tchoice is not None and tchoice["mode"] == tool_choice.NONE
+        try:
             steer = resolve_steering(gen.steer, body)
         except ValueError as ex:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(ex)}},
@@ -3049,7 +3146,8 @@ def build_app(gen: Generator, args):
         stop = body.get("stop_sequences")
         params = {"temperature": body.get("temperature"), "top_p": body.get("top_p"),
                   "top_k": body.get("top_k"), "max_tokens": body.get("max_tokens"),
-                  "stop": [stop] if isinstance(stop, str) else stop, "grammar": grammar, "steering_sel": steer, "think_budget": budget,
+                  "stop": [stop] if isinstance(stop, str) else stop, "grammar": grammar, "tool_choice": tchoice,
+                  "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
                   "thinking": reply_thinking(gen, ids, kw)}
@@ -3107,7 +3205,8 @@ def build_app(gen: Generator, args):
                                 yield x
                         if state["kind"] is not None:
                             yield ev("content_block_stop", {"type": "content_block_stop", "index": state["idx"]})
-                        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+                        calls = tool_choice.filter_calls(tchoice, parse_tool_calls(parser.tool_text, tools)) \
+                            if parser.tool_text and not no_calls else []
                         ids_out = ["toolu_" + uuid.uuid4().hex[:24] for _ in calls]
                         REASONING.put(prev, seen["content"], ids_out, seen["reasoning"])
                         for c, tid in zip(calls, ids_out):
@@ -3131,7 +3230,7 @@ def build_app(gen: Generator, args):
                             yield x
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice)
         if isinstance(r, SequenceFault):
             if bad_input(r):
                 return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(r)}},
@@ -3451,6 +3550,8 @@ def main():
         if why:
             sys.exit(print(f"[server] {why}", flush=True) or 3)
         assets.ensure(args.model)
+        import dflash_fetch  # DFlash2 drafter checkpoint: found or fetched once (pinned revision + sha256); never a stop
+        dflash_fetch.resolve(args.model)
         if args.lsa == "auto":  # find / fetch / convert the released map; any failure: full attention, never a stop
             import lsa_map
             path = lsa_map.resolve("auto", args.model)

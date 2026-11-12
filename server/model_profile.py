@@ -78,19 +78,25 @@ class Profile:
                 "presence_penalty": float(presence_penalty if presence_penalty is not None else c["presence_penalty"])}
 
     def tokenizer_json(self, override=None):
-        """(tokenizer.json text, note): the model's file (or `override`), with the Flash-Next
-        pre-tokenizer when the file has the 27B one."""
+        """(tokenizer.json text, note): the model's file (or `override`) without truncation / padding, with the
+        Flash-Next pre-tokenizer when the file has the 27B one. (Some finetunes ship `"truncation": {"max_length":
+        4096}` (Swift-1.5 27B): every longer prompt would be cut silently.)"""
         path = override or os.path.join(self.model_dir, "tokenizer.json")
         with open(path, encoding="utf-8") as f:
             text = f.read()
-        if not self.is_flash or override:
-            return text, path
         tj = json.loads(text)
-        if tj.get("pre_tokenizer") == FLASH_PRETOKENIZER and tj.get("decoder") == FLASH_DECODER:
+        notes = []
+        if tj.get("truncation") or tj.get("padding"):
+            tj["truncation"] = tj["padding"] = None
+            notes.append("truncation / padding off")
+        if self.is_flash and not override and (tj.get("pre_tokenizer") != FLASH_PRETOKENIZER
+                                                or tj.get("decoder") != FLASH_DECODER):
+            tj["pre_tokenizer"] = FLASH_PRETOKENIZER
+            tj["decoder"] = FLASH_DECODER
+            notes.append("pre-tokenizer patched to Qwen3.8-Flash-Next")
+        if not notes:
             return text, path
-        tj["pre_tokenizer"] = FLASH_PRETOKENIZER
-        tj["decoder"] = FLASH_DECODER
-        return json.dumps(tj, ensure_ascii=False), path + " (pre-tokenizer patched to Qwen3.8-Flash-Next)"
+        return json.dumps(tj, ensure_ascii=False), path + " (" + ", ".join(notes) + ")"
 
     def tokenizer(self, override=None):
         from tokenizers import Tokenizer

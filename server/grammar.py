@@ -240,3 +240,8 @@ class Constraint:
 
     def accepting(self):
         return self.m.is_accepting()
+
+    def released(self):
+        """The constraint may be dropped now (tool_choice: the forced call header is complete); a JSON schema never."""
+        r = getattr(self.m, "released", None)
+        return bool(r is not None and r())

@@ -18,6 +18,7 @@
 #include "kernels/sample.cuh"
 #include "kernels/spec.cuh"
 #include "kernels/lsa.cuh"
+#include "kernels/dflash.cuh"
 #include "safetensors.h"
 extern LoadDrop g_load_drop27;  // load-time page cache of the layer tensors (model.cpp; Engine sets it up)
 
@@ -242,9 +243,10 @@ public:
     // kv: drafts verified this step (made by the previous step); kd: drafts made for the next.
     // lookup = true: the kv drafts are the device lookup drafts (lk_dev_), the MTP draft chain (drafts 2..kd) runs
     // only when the step's own lookup finds none (conditional graph node)
-    void run_spec(int kv, int kd, bool launch = true, bool lookup = false);  // launch = false: only build the graph
-    bool has_spec_graph(int kv, int kd, bool lookup = false) {
-        return spec_graphs_.m.count(std::make_tuple(kv, kd | (lookup ? 256 : 0), mode(), cur_slot_)) != 0;
+    void run_spec(int kv, int kd, bool launch = true, bool lookup = false, bool block = false, bool ring = false);  // launch = false: only build the graph
+    // ring: an MTP step that still writes the DFlash2 context ring (the slot's later block steps keep their window)
+    bool has_spec_graph(int kv, int kd, bool lookup = false, bool block = false, bool ring = false) {
+        return spec_graphs_.m.count(std::make_tuple(kv, kd | (lookup ? 256 : 0) | (block ? 512 : 0) | (ring ? 1024 : 0), mode(), cur_slot_)) != 0;
     }
     // Lookup drafts on the GPU (QE_LOOKUP): the current sequence's token history on the device, appended and scanned
     // at the end of every single-sequence step graph; lk_dev_.lk = drafts for the next step.
@@ -360,6 +362,25 @@ public:
     void cap_end(float* host);
     bool capturing() const { return cap_ != nullptr; }
 
+    // DFlash2 block drafter (dflash.cpp): weights replicated on every card, residual taps of the
+    // verification / prefill rows, context rings (one per sequence slot that runs block steps, chosen by the Engine)
+    // read through a device descriptor (graphs stay valid when a slot's ring changes)
+    bool dfl_load(const SafeTensors& st, const bf16* pred_cb, const bf16* succ_cb, int rings, bool full_head, int cb_rows);
+    static size_t dfl_weight_bytes(const SafeTensors& st, int ngpu);  // VRAM of the drafter per card (estimate before loading)
+    // "" when the file holds every tensor dfl_load reads with the expected dtype / shape, else the first problem
+    static std::string dfl_schema(const SafeTensors& st, int vocab);
+    void dfl_unload();  // frees everything dfl_load allocated (another card's load failed)
+    size_t dfl_ring_bytes() const;                          // per ring
+    bool dfl_on() const { return dfl_ != nullptr; }
+    void dfl_ring_select(int ring);                         // stream-ordered: the ring the next passes use
+    void dfl_ring_inval(int from);                          // its rows of positions >= from (0: all) dropped
+    // taps rows [row0, row0 + m) -> ring at positions *pos + row (fc, norm, every layer's K / V)
+    void dfl_ctx_rows(int row0, int m, const int* pos);
+    // drafter block: anchor spec_.tokens[0] at *spec_.pos -> drafts in spec_.tokens[1 .. 7]
+    void dfl_block();
+    bool dfl_cap_ = false;  // forward / forward_prefill: copy the tap layers' residual rows (rows of the pass)
+    bool dfl_pf_ = false;   // prefill_chunk: the prompt runs block steps (taps of the window rows, drafter at its end)
+    double dfl_bench(int iters);  // ms per drafter block (eager timing of the graph-free sequence; dev check)
     // optional per-layer residual dump (host pointer, [layers][m][hidden] floats), debug only
     float* debug_hidden = nullptr;
     uint16_t* dump_hidden = nullptr;  // host: final normed hidden (MTP input) of every prompt row
@@ -621,6 +642,11 @@ private:
     bool h16_ = false;
     __half *xh_xn_ = nullptr, *xh_act_ = nullptr, *xh_tmp_ = nullptr;
     int xh_act_ld_ = 0;
+    struct Dfl;
+    Dfl* dfl_ = nullptr;
+    void dfl_tap_layer(int i, int m, int r0);
+    static bool dfl_is_tap(int i) { return i == 5 || i == 19 || i == 33 || i == 47 || i == 61; }
+    bool dfl_tapped_ = false;
     // INT4 matmul of a decode input: the fp16-accumulate kernel on the XH copy (packed here when xh is
     // null) when enabled and m fits, else the bf16/fp32 path
     bf16* xn_bf16(bf16* xn, int m, const W4* next);

@@ -87,8 +87,15 @@ struct IdleSlot {
     int slot = 0, cap = 0;  // cap: periods of its region
     double idle_s = 0;
     Rank rank;
+    bool above = false;     // its region starts at or above the end of every generating one (KV in VRAM: it alone holds the top up)
 };
-inline std::vector<int> reclaim_order(std::vector<IdleSlot> v, bool pressure, double Tord, double Tmain, int np) {
+// Under pressure an idle ordinary conversation above every generating region leaves before Tord: after Tabove (< 0: never) and,
+// with min_size, only when it holds >= 1/16 of the pool (a finished subagent above the main)
+inline bool at_once(const IdleSlot& q, bool pressure, double Tabove, bool min_size, int np) {
+    return pressure && q.above && !q.rank.main && Tabove >= 0 && q.idle_s >= Tabove && (!min_size || (long long)q.cap * 16 >= np);
+}
+inline std::vector<int> reclaim_order(std::vector<IdleSlot> v, bool pressure, double Tord, double Tmain, int np, double Tabove = -1,
+                                      bool min_size = false) {
     std::sort(v.begin(), v.end(), [](const IdleSlot& a, const IdleSlot& b) { return goes_first(a.rank, b.rank); });
     const auto main_ok = [&](const IdleSlot& q) { return pressure && Tmain > 0 && q.idle_s >= std::max(Tord, Tmain); };
     long long mains = 0;
@@ -97,7 +104,7 @@ inline std::vector<int> reclaim_order(std::vector<IdleSlot> v, bool pressure, do
     std::vector<int> out;
     for (const auto& q : v) {
         if (!q.rank.main) {
-            if (q.idle_s >= Tord) out.push_back(q.slot);
+            if (q.idle_s >= Tord || at_once(q, pressure, Tabove, min_size, np)) out.push_back(q.slot);
         } else if (main_ok(q) && mains * 16 >= np) {
             out.push_back(q.slot);
             mains -= q.cap;

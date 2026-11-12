@@ -8,6 +8,9 @@
 // -DMOCK_GRAMMAR adds the grammar tier (TIER 8) the forced close of <think> uses (tests/test_think_budget.py): a
 // constrained step emits, per row, the one token its mask allows (else the script's), verifying the caller's drafts;
 // after an emitted </think> (248069) the script goes on after its own </think> (the model moves on to its answer).
+// QE_MOCK_MASK=<end token id> (tests/test_tool_choice.py) makes the constrained steps mask-aware: a forced token equal to
+// the script's next one moves the script on, and a script token outside its row's mask ends the reply with that end
+// token (or, if the mask does not allow it either, emits the row's lowest allowed token).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +72,9 @@ void qe_set_sampling(void* e, float t, float p, int k, float mp, unsigned long l
     (void)mp, (void)seed;
     if (m->log) fprintf(m->log, "S %.3f %.3f %d\n", t, p, k), fflush(m->log);
 }
+#ifdef MOCK_GRAMMAR
+static int mask_pick(Mock* m, int row);
+#endif
 int qe_start3(void* e, const int* ids, int n, int k, unsigned long long affinity, int hint) {
     Mock* m = e;
     (void)affinity, (void)hint;
@@ -87,11 +93,17 @@ int qe_start3(void* e, const int* ids, int n, int k, unsigned long long affinity
     m->k = k;
     m->limit = 0;
     m->cur = m->next++ % m->nrep;
-    m->rpos = 1;
-    push(m, m->replies[m->cur][0]);
 #ifdef MOCK_GRAMMAR
     m->stepc = 1;
+    if (m->con && getenv("QE_MOCK_MASK") && *getenv("QE_MOCK_MASK")) {  // (constrained before the start: row 0 applies)
+        m->rpos = 0;
+        int t = mask_pick(m, 0);
+        push(m, t);
+        return t;
+    }
 #endif
+    m->rpos = 1;
+    push(m, m->replies[m->cur][0]);
     return m->replies[m->cur][0];
 }
 #ifdef MOCK_GRAMMAR
@@ -105,6 +117,23 @@ static int one_bit(const unsigned* row) {  // the only allowed token of a mask r
         }
     return t;
 }
+static int allowed_bit(const unsigned* row, int t) { return t >= 0 && t < 32 * MOCK_WORDS && ((row[t >> 5] >> (t & 31)) & 1); }
+static int mask_pick(Mock* m, int row) {  // the token a constrained row emits (see QE_MOCK_MASK above)
+    const int* r = m->replies[m->cur];
+    const char* mk = getenv("QE_MOCK_MASK");
+    const int mask_eos = mk && *mk ? atoi(mk) : -1;
+    const unsigned* mrow = m->mask + (size_t)row * MOCK_WORDS;
+    int t = one_bit(mrow);
+    if (t >= 0 && mask_eos >= 0 && m->rpos < m->rlen[m->cur] && r[m->rpos] == t) m->rpos++;
+    if (t < 0) {
+        t = m->rpos < m->rlen[m->cur] ? r[m->rpos++] : r[m->rlen[m->cur] - 1];
+        if (mask_eos >= 0 && !allowed_bit(mrow, t)) {
+            if (allowed_bit(mrow, mask_eos)) t = mask_eos;
+            else for (t = 0; t < 32 * MOCK_WORDS && !allowed_bit(mrow, t); t++) {}
+        }
+    }
+    return t;
+}
 static int con_step(Mock* m, int* out) {
     const int* r = m->replies[m->cur];
     int kv = m->io[16] < 0 ? 0 : m->io[16] > 7 ? 7 : m->io[16];
@@ -112,8 +141,7 @@ static int con_step(Mock* m, int* out) {
     if (m->limit > 0 && kv + 1 > m->limit) kv = m->limit - 1;
     int c = 0;
     for (int row = 0; row <= kv; row++) {
-        int t = one_bit(m->mask + (size_t)row * MOCK_WORDS);
-        if (t < 0) t = m->rpos < m->rlen[m->cur] ? r[m->rpos++] : r[m->rlen[m->cur] - 1];
+        int t = mask_pick(m, row);
         out[c++] = t;
         push(m, t);
         if (t == 248069)  // forced </think>: the scripted reply continues after its own

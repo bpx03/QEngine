@@ -332,6 +332,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     vram_adapt_ = env_int("QE_VRAM_ADAPT", 1) != 0;
     scratch_freed_.assign(workers_.size(), 0);
     if (vram_adapt_) pool_->run([&](int r) { scratch_freed_[r] = qe_release_load_scratch(); });
+    dfl_init(model_dir, max_t);  // DFlash2 drafter: after the load scratch went (its memory check sees what the pool would get)
     // the stats exchange of a position-split head: each card writes into its peer's rows / flags
     for (size_t r = 0; r < workers_.size(); r++)
         for (int j = 0; j < plan_[r].kv_heads.size(); j++)
@@ -539,6 +540,7 @@ Engine::~Engine() {
     if (batch_host_) cudaFreeHost(batch_host_);
     if (img_table_) cudaFreeHost(img_table_);
     if (emit_host_) cudaFreeHost(emit_host_);
+    dfl_free_host();  // (after the workers: their graphs read the mapped codebooks)
 }
 
 // Main slot: as much context as fits up to main_cap (the model maximum by default); the rest
@@ -757,6 +759,18 @@ void Engine::plan_slots(int main_cap) {
         lkb_ema_.assign(nslots, 6.f);
         lkb_cool_.assign(nslots, 0);
     }
+    if (dfl_on_ && dfl_req_ > 0) {  // auto (review M5): the drafter only if the requested context still fits after every term
+        const size_t f = std::min(pool_fit(), cap_tokens) / 1024 * 1024;
+        const int ctx = (int)std::min<size_t>(std::min<size_t>(main_cap, cfg_.max_pos), f > slack_ ? f - slack_ : 0);
+        if (ctx < dfl_req_) {
+            pool_->run([&](int r) { workers_[r]->dfl_unload(); });
+            dfl_free_host();
+            dfl_on_ = false;
+            printf("DFlash2 drafter unloaded (QE_DRAFTER=auto): with it the context would be %d tokens, below the requested %d: "
+                   "MTP drafts (QE_DRAFTER=dflash2 keeps it)\n", ctx, dfl_req_);
+            fflush(stdout);
+        }
+    }
     const size_t fit = pool_fit();
     reserve_min_ = *std::min_element(reserve.begin(), reserve.end());
     pool_tokens_ = std::min(fit, cap_tokens) / 1024 * 1024;
@@ -781,6 +795,9 @@ void Engine::plan_slots(int main_cap) {
                     pool_tokens_ - slack_, fmin / 1e9, nslots);
     }
     max_ctx_ = (int)std::min<size_t>(std::min<size_t>(main_cap, cfg_.max_pos), pool_tokens_ - slack_);
+    if (dfl_on_ && dfl_req_ > 0 && max_ctx_ < dfl_req_)  // auto's estimate missed (review M5): say so, with the way back
+        printf("qengine: WARNING: with the DFlash2 drafter the context is %d tokens, below the requested %d: QE_DRAFTER=mtp "
+               "serves the requested context\n", max_ctx_, dfl_req_);
     pool_->run([&](int r) { workers_[r]->alloc_pool(pool_tokens_); });
     pool_tokens0_ = pool_tokens_;
     if (vram_adapt_) {
@@ -1460,6 +1477,8 @@ double Engine::warmup(int modes) {
             pool_->run([&](int r) {
                 for (int kv = 0; kv <= kMaxSpecK; kv++)
                     for (int kd = 1; kd <= kMaxSpecK; kd++) workers_[r]->run_spec(kv, kd, false);
+                if (dfl_on_ && drafter_ != 0)  // DFlash2 block steps (7 drafts; after a resync 0)
+                    for (int kv : {kDflDrafts, 0}) workers_[r]->run_spec(kv, kDflDrafts, false, false, true);
             });
         }
         for (auto& w : workers_) w->set_sampling(samp_, false);
@@ -3246,6 +3265,9 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     pf.n = n;
     pf.i = from;
     pf.kstart = kstart;
+    pf.dfl = kstart > 0 && use_block(slot);
+    if (pf.dfl) dfl_bind(slot, mode == LIVE || mode == SNAP, from);  // (ring selected with the first chunk)
+    else if (dfl_on_) dfl_gap(slot, mode == LIVE || mode == SNAP ? from : 0);  // no block steps: its ring rows go stale (review M1)
     pf.affinity = affinity;
     pf.reused = last_reused_;
     pf.copied = last_copied_;
@@ -3292,7 +3314,19 @@ bool Engine::prefill_more_slot(int slot, int budget) {
         static const int prof_at = env_int("QE_PROF_AT", -1);  // debug: nsys --capture-range=cudaProfilerApi on one chunk
         const bool prof = prof_at >= i && prof_at < i + m;
         if (prof) CUDA_CHECK(cudaProfilerStart());
-        pool_->run([&](int r) { workers_[r]->prefill_chunk(pids, i, m, n, pf.kstart, r3); });
+        const bool dfl = pf.dfl && !seqs_[pf.slot].constrained;  // (a grammar set after start_begin: MTP drafts)
+        const int dsel = dfl ? dring_of_[pf.slot] : -1, dinv = dsel >= 0 ? drings_[dsel].pinv : -1;
+        if (dsel >= 0) drings_[dsel].pinv = -1, drings_[dsel].used = ++tick_;  // (a prompt in flight keeps its ring: review L8)
+        pool_->run([&](int r) {
+            Worker& w = *workers_[r];
+            w.dfl_pf_ = dfl && dsel >= 0;
+            if (w.dfl_pf_) {
+                w.dfl_ring_select(dsel);
+                if (dinv >= 0) w.dfl_ring_inval(dinv);
+            }
+            w.prefill_chunk(pids, i, m, n, pf.kstart, r3);
+            w.dfl_pf_ = false;
+        });
         if (prof) CUDA_CHECK(cudaProfilerStop());
         pf.i += m;
         done += m;
@@ -3337,7 +3371,9 @@ int Engine::start_finish_slot(int slot) {
     CUDA_CHECK(cudaMemcpy(&tok, workers_[0]->out_tok_ + last_m - 1, 4, cudaMemcpyDeviceToHost));
     q.last_tok = q.pending = tok;
     if (q.pen) pool_->run([&](int r) { workers_[r]->pen_host(&tok, 1, n); });  // the first token sits at n
-    q.k_avail = pf.kstart;
+    if (pf.slot < (int)dcopy_.size()) dcopy_[pf.slot] = 0.f;
+    q.k_avail = pf.dfl && !q.constrained && dring_of_[pf.slot] >= 0 ? kDflDrafts : pf.kstart;
+    if (pf.dfl && q.constrained) dfl_gap(pf.slot, n);
     lk_slot_ = -1;
     lkb_inval(pf.slot);
     if (q.constrained) {  // the drafts made at the prompt end, for the caller to check
@@ -3358,7 +3394,20 @@ void Engine::launch_step(int buf, int base, int lk) {
     // a grammar-constrained sequence verifies the caller's drafts (spec_io) with per-row masks;
     // the drafts the step makes go back to the caller. lk > 0: a lookup step verifying lk device lookup drafts.
     const bool con = seqs_[cur_].constrained;
-    const int kv0 = con ? con_kv(cur_, k_) : lk > 0 ? lk : seqs_[cur_].k_avail, kd = next_k();
+    const bool want_blk = !con && use_block(cur_);
+    const bool blk = want_blk && !(lk == 0 && dfl_copy(cur_));  // DFlash2 block step: 7 drafts from the block drafter
+    const int kv0 = con ? con_kv(cur_, k_) : lk > 0 ? lk : seqs_[cur_].k_avail, kd = blk ? kDflDrafts : next_k();
+    // an MTP step of a slot with a drafter ring still writes the ring (no gap in the window of its next block steps)
+    const bool ring = !blk && dfl_on_ && cur_ < (int)dring_of_.size() && dring_of_[cur_] >= 0;
+    int dsel = -1, dinv = -1;
+    if (blk || ring) {
+        dfl_bind(cur_, true, INT_MAX);
+        dsel = dring_of_[cur_], dinv = drings_[dsel].pinv;
+        drings_[dsel].pinv = -1;
+    } else if (dfl_on_) {
+        dfl_gap(cur_, seqs_[cur_].pos);
+    }
+    buf_blk_[buf] = blk;
     int kv = clamp_kv(seqs_[cur_], kv0, base);
     const bool look = lk > 0 && kv > 0;
     if (lk > 0 && !look) kv = 0;
@@ -3379,7 +3428,7 @@ void Engine::launch_step(int buf, int base, int lk) {
     // stay in the ~38-split region
     const bool rs = seqs_[cur_].pos + 2 * (kMaxSpecK + 1) + 8 <= dec38_max();
     for (auto& wp : workers_) wp->attn_rs_ = rs;
-    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look);
+    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look, blk, ring);
     pool_->run([&](int r) {
         Worker& w = *workers_[r];
         if (io) {
@@ -3388,7 +3437,11 @@ void Engine::launch_step(int buf, int base, int lk) {
         }
         if (r == 0) CUDA_CHECK(cudaEventRecord(tstart_[buf], w.stream));
         w.lsa_step(cur_, seqs_[cur_].pos);  // LSA: blocks before the committed position (eager, before the graph)
-        w.run_spec(kv, kd, true, look);
+        if (dsel >= 0) {
+            w.dfl_ring_select(dsel);
+            if (dinv >= 0) w.dfl_ring_inval(dinv);
+        }
+        w.run_spec(kv, kd, true, look, blk, ring);
         if (r == 0) {
             CUDA_CHECK(cudaMemcpyAsync(emit_host_ + buf * 64, w.spec_.emit, (w.lk_on() ? 32 : kv + 2) * 4,
                                        cudaMemcpyDeviceToHost, w.stream));
@@ -3707,6 +3760,8 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
     vram_tick();
     CHECK(n >= 1 && n <= kMaxBatch && k_ > 0, "step_batch n=%d k=%d", n, k_);
     finish_single();  // the single-sequence step queued ahead, if any
+    if (dfl_on_)  // batched steps draft with MTP: the slots' drafter rings fall behind from here
+        for (int i = 0; i < n; i++) dfl_gap(slots[i], seqs_[slots[i]].pos);
     if (!batch_host_) {
         CUDA_CHECK(cudaSetDevice(workers_[0]->device));
         CUDA_CHECK(cudaMallocHost(&batch_host_, 2 * kMaxBatch * 64 * 4));
@@ -3954,14 +4009,15 @@ int Engine::spec_step(int* out) {
         q.count_step(false, 0, 1);
         return 1;
     }
+    const int kr = std::max(k_, use_block(cur_) ? kDflDrafts : 0);  // drafts a step may verify (room)
     if (binflight_) {  // switching from batched steps: undo the queued one
         finish_batch();
         resync(q, cur_);
     }
-    if (!inflight_ && q.pos + 2 * (k_ + 1) + 1 > q.max_t &&  // room for this step and the next
-        !room_or_pause(cur_, std::min(q.pos + 2 * (k_ + 1) + 1, max_ctx_))) {
+    if (!inflight_ && q.pos + 2 * (kr + 1) + 1 > q.max_t &&  // room for this step and the next
+        !room_or_pause(cur_, std::min(q.pos + 2 * (kr + 1) + 1, max_ctx_))) {
         if (q.paused) return 0;  // paused for a sequence worth more: no tokens until it resumes
-        const int need = std::min(q.pos + 2 * (k_ + 1) + 1, max_ctx_);
+        const int need = std::min(q.pos + 2 * (kr + 1) + 1, max_ctx_);
         if (pool_tokens_ < pool_tokens0_) {  // shrunk under VRAM pressure: never an early end (review H2)
             if (!(pool_regrow_now(total_for(cur_, need)) && room_or_pause(cur_, need))) {
                 q.vwait = true;
@@ -3978,7 +4034,7 @@ int Engine::spec_step(int* out) {
         }
     }
     q.vwait = false;
-    CHECK(q.pos + k_ + 1 <= q.max_t, "context full");
+    CHECK(q.pos + kr + 1 <= q.max_t, "context full");
     // lookup drafts (QE_LOOKUP): the device history must be this sequence's; a lookup step is launched once the
     // previous step's result is known (no step queued ahead while the text is being copied)
     const bool lk_ok = lk_on_ && !q.constrained && !q.want_drafts && !q.no_lookup;
@@ -3995,9 +4051,9 @@ int Engine::spec_step(int* out) {
     if (!inflight_) {
         int L = lk_live ? lk_next_ : 0;
         if (L > 0) {  // room for the lookup rows and a following MTP step
-            const int need = q.pos + L + 2 * (k_ + 1) + 1;
+            const int need = q.pos + L + 2 * (kr + 1) + 1;
             if (need > q.max_t) ensure_cap(cur_, std::min(need, max_ctx_));
-            L = std::min(L, std::max(0, q.max_t - q.pos - 2 * (k_ + 1) - 1));
+            L = std::min(L, std::max(0, q.max_t - q.pos - 2 * (kr + 1) - 1));
         }
         launch_step(buf_, q.pos, L);
         inflight_ = true;
@@ -4005,7 +4061,7 @@ int Engine::spec_step(int* out) {
     // queue the next step before waiting for this one (if two steps still fit the slot, and the
     // reply's limit leaves room for a token even if every draft of this one is accepted)
     const int worst = q.pos + buf_kv_[buf_] + 1;  // the slot's position after this step, at most
-    ahead_ = lookahead_ && !q.constrained && !q.no_ahead && q.pos + 2 * (k_ + 1) <= q.max_t &&
+    ahead_ = lookahead_ && !q.constrained && !q.no_ahead && q.pos + 2 * (kr + 1) <= q.max_t &&
              (q.end == 0 || worst < q.end) && !(lk_live && (lk_next_ > 0 || buf_lk_[buf_]));
     if (ahead_) launch_step(buf_ ^ 1, worst, 0);
     CUDA_CHECK(cudaSetDevice(workers_[0]->device));
@@ -4014,7 +4070,12 @@ int Engine::spec_step(int* out) {
     const int cnt = em[0];
     for (int i = 0; i < cnt; i++) out[i] = em[1 + i];
     q.count_step(buf_lk_[buf_] != 0, buf_kv_[buf_], cnt);
-    if (!q.constrained && !buf_lk_[buf_]) {  // kd = 0 / lookup steps would skew the draft statistics / step-time model
+    if (buf_blk_[buf_]) df_steps_++, df_tok_ += cnt;
+    if (dfl_on_) {  // the slot's copy signal
+        if ((int)dcopy_.size() < (int)seqs_.size()) dcopy_.resize(seqs_.size(), 0.f);
+        dcopy_[cur_] = 0.8f * dcopy_[cur_] + (buf_lk_[buf_] ? 0.2f : 0.f);
+    }
+    if (!q.constrained && !buf_lk_[buf_] && !buf_blk_[buf_]) {  // kd = 0 / lookup / block steps would skew the MTP statistics / step-time model
         if (!buf_clamped_[buf_]) observe(buf_kv_[buf_], cnt - 1);  // capped drafts: biased
         observe_time(buf_);
     }
@@ -4521,4 +4582,188 @@ void Engine::decode_calibrate() {
     else
         fprintf(stderr, "[comm] decode collectives (QE_DECODE_COMM=auto): calibration could not run a decode step, P2P SM stores "
                         "(%.0f ms)\n", ms);
+}
+
+// ---------------------------------------------------------------- DFlash2 block drafter
+
+void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
+    std::string d = env_str("QE_DRAFTER") ? env_str("QE_DRAFTER") : "auto";
+    for (auto& c : d) c = (char)tolower((unsigned char)c);  // (review L6: as the server reads it)
+    drafter_ = d == "mtp" ? 0 : d == "dflash2" ? 1 : 2;
+    if (d != "mtp" && d != "dflash2" && d != "auto")
+        fprintf(stderr, "qengine: QE_DRAFTER=%s unknown (mtp, dflash2, auto): auto\n", d.c_str());
+    if (drafter_ == 0 || !has_mtp()) return;
+    // the drafter checkpoint: QE_DFLASH (directory or file), else <model>/dflash2, else a sibling Qwen3.8-27B-DFlash2
+    std::vector<std::string> cand;
+    if (const char* e = env_str("QE_DFLASH")) cand.push_back(e);
+    std::string md = model_dir;
+    while (!md.empty() && md.back() == '/') md.pop_back();
+    const std::string parent = md.substr(0, md.find_last_of('/') + 1);
+    cand.push_back(md + "/dflash2");
+    cand.push_back(parent + "Qwen3.8-27B-DFlash2");
+    std::string file;
+    for (const auto& c : cand) {
+        for (const std::string& f : {c, c + "/model.safetensors"}) {
+            struct stat sb;
+            if (stat(f.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) { file = f; break; }
+        }
+        if (!file.empty()) break;
+    }
+    if (file.empty()) {
+        printf("DFlash2 drafter: no checkpoint (QE_DFLASH, %s/dflash2 or %sQwen3.8-27B-DFlash2): MTP drafts\n", md.c_str(), parent.c_str());
+        return;
+    }
+    const int rings = std::max(1, env_int("QE_DF_RINGS", 2));
+    size_t need = 0;
+    dfl_st_.reset(new SafeTensors);
+    try {  // any checkpoint the loader does not expect: MTP, one line, never a stop (review M3)
+        dfl_st_->open(file);
+        const std::string why = Worker::dfl_schema(*dfl_st_, cfg_.vocab);
+        if (!why.empty()) throw std::runtime_error("not the W4A16 DFlash2 drafter of the 27B (" + why + ")");
+        need = Worker::dfl_weight_bytes(*dfl_st_, (int)workers_.size()) + rings * workers_[0]->dfl_ring_bytes();
+    } catch (const std::exception& e) {
+        printf("DFlash2 drafter %s: %s: MTP drafts\n", file.c_str(), e.what());
+        fflush(stdout);
+        dfl_st_.reset();
+        return;
+    }
+    // memory (user 2026-11-12): auto loads the drafter next to MTP only when the requested context (one conversation)
+    // and the requested slots still fit every card with it, counted as plan_slots counts them (review M5: slots from
+    // QE_MAX_SEQS / QE_SLOTS, the region slack, the per-position buffers of a context past the native one); otherwise
+    // MTP only, one line with the numbers and the --max-ctx that fits. dflash2 loads it whenever a 16K-token pool stays.
+    int nslots = env_int("QE_MAX_SEQS", 16);
+    if (const char* e = env_str("QE_MAX_SEQS")) {
+        std::string v(e);
+        if (v.find(',') != std::string::npos) nslots = (int)std::count(v.begin(), v.end(), ',') + 1;
+    }
+    if (const char* e = env_str("QE_SLOTS")) {
+        std::string v(e);
+        nslots = (int)std::count(v.begin(), v.end(), ',') + 1;
+    }
+    nslots = std::max(1, nslots);
+    std::vector<double> res(workers_.size(), 1.5);
+    if (const char* e = env_str("QE_RESERVE_GB")) {
+        std::stringstream ss(e);
+        size_t r = 0;
+        double last = 1.5;
+        for (std::string x; std::getline(ss, x, ',') && r < res.size();) res[r++] = last = atof(x.c_str());
+        for (; r < res.size(); r++) res[r] = last;
+    }
+    const long long req = std::min<long long>(req_ctx > 0 ? req_ctx : cfg_.max_pos, cfg_.max_pos);
+    const bool yarn = req > cfg_.native_ctx;
+    long long fit_ctx = LLONG_MAX;  // the context that would fit next to the drafter at these slots (every card)
+    int bad = -1;
+    size_t bad_fr = 0, bad_keep = 0;
+    for (size_t r = 0; r < workers_.size(); r++) {
+        Worker& w = *workers_[r];
+        const size_t fr = w.free_bytes(), slack = w.region_slack();
+        const size_t per = w.slot_token_bytes() + (yarn ? w.ctx_bytes_per_pos((int)req) : 0) + (has_mtp() ? 4 * (size_t)(nslots + 1) : 0);
+        const size_t base = (size_t)(res[r] * 1e9) +
+                            (drafter_ == 1 ? 0 : (size_t)(nslots * (double)w.slot_fixed_bytes() * 1.05) + (yarn ? w.ctx_fixed_bytes((int)req) : 0));
+        const size_t keep = base + (size_t)((drafter_ == 1 ? 16384 : req + 1024) + slack) * per;
+        const long long room = fr > need + base ? (long long)((fr - need - base) / per) - 1024 - (long long)slack : 0;
+        fit_ctx = std::min(fit_ctx, room);
+        if (fr < need + keep && bad < 0) bad = (int)r, bad_fr = fr, bad_keep = keep;
+    }
+    if (bad >= 0) {
+        const long long k = std::max(0LL, fit_ctx) / 1024;
+        char how[160];
+        if (drafter_ != 1 && k >= 8) snprintf(how, sizeof how, "--max-ctx <= %lldK or QE_DRAFTER=dflash2", k);
+        else snprintf(how, sizeof how, "fewer slots (QE_MAX_SEQS) or QE_DRAFTER=dflash2");
+        printf("DFlash2 drafter not loaded (QE_DRAFTER=%s): GPU%d has %.2f GB free after the weights; the drafter needs %.2f GB and "
+               "%s %.2f GB (%d slots, %lld-token context, %.1f GB reserve): MTP drafts. For DFlash2: %s\n",
+               drafter_ == 1 ? "dflash2" : "auto", workers_[bad]->device, bad_fr / 1e9, need / 1e9,
+               drafter_ == 1 ? "a 16K-token pool" : "the requested context and slots", bad_keep / 1e9, drafter_ == 1 ? 1 : nslots,
+               drafter_ == 1 ? 16384LL : req, res[bad], drafter_ == 1 ? "more free GPU memory" : how);
+        fflush(stdout);
+        dfl_st_.reset();
+        return;
+    }
+    dfl_req_ = drafter_ == 2 ? (int)req : 0;
+    const TensorInfo& pc = dfl_st_->get("candidate_selector.predecessor_codebook");
+    const TensorInfo& sc = dfl_st_->get("candidate_selector.successor_codebook");
+    dfl_cb_rows_ = (int)pc.shape[0];
+    // pinned codebooks (2 x 127 MB): a host-RAM shortage is MTP, not a stop (review L4)
+    if (cudaHostAlloc(&dfl_pred_, pc.nbytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc(&dfl_succ_, sc.nbytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void)cudaGetLastError();
+        printf("DFlash2 drafter not loaded: no pinned host memory for its codebooks (%.2f GB): MTP drafts\n", 2.0 * pc.nbytes / 1e9);
+        fflush(stdout);
+        dfl_free_host();
+        dfl_st_.reset();
+        return;
+    }
+    memcpy(dfl_pred_, pc.data, pc.nbytes);
+    memcpy(dfl_succ_, sc.data, sc.nbytes);
+    std::string head = env_str("QE_DF_HEAD") ? env_str("QE_DF_HEAD") : "";
+    const bool full = head == "full";
+    std::vector<char> ok(workers_.size(), 0);
+    pool_->run([&](int r) { ok[r] = workers_[r]->dfl_load(*dfl_st_, dfl_pred_, dfl_succ_, rings, full, dfl_cb_rows_); });
+    dfl_st_.reset();  // weights uploaded, codebooks copied: the file mapping is not needed (review L4)
+    if (std::count(ok.begin(), ok.end(), 1) != (long)ok.size()) {  // a card ran out of memory: every card drops it (review M4)
+        pool_->run([&](int r) { workers_[r]->dfl_unload(); });
+        dfl_free_host();
+        printf("DFlash2 drafter not loaded: a card ran out of memory while loading it: MTP drafts\n");
+        fflush(stdout);
+        return;
+    }
+    drings_.assign(rings, DRing{});
+    dfl_on_ = true;
+    printf("DFlash2 drafter: %s, %s (codebooks %.2f GB pinned host memory)\n", file.c_str(),
+           drafter_ == 1 ? "every single-sequence step (QE_DRAFTER=dflash2)" : "single-sequence steps, MTP in batched steps (QE_DRAFTER=auto)",
+           2.0 * pc.nbytes / 1e9);
+    fflush(stdout);
+}
+
+void Engine::dfl_free_host() {
+    if (dfl_pred_) cudaFreeHost(dfl_pred_);
+    if (dfl_succ_) cudaFreeHost(dfl_succ_);
+    dfl_pred_ = dfl_succ_ = nullptr;
+}
+
+bool Engine::use_block(int slot) const {
+    return dfl_on_ && drafter_ != 0 && k_ > 0 && !seqs_.at(slot).constrained;
+}
+
+void Engine::dfl_bind(int slot, bool keep, int from) {
+    if ((int)dring_of_.size() < (int)seqs_.size()) dring_of_.resize(seqs_.size(), -1);
+    int r = dring_of_[slot];
+    bool fresh = false;
+    if (r < 0) {
+        // free ring first, then the least recently used one whose owner has no prompt in flight (review L8), then any
+        auto rank = [&](int i) { const int o = drings_[i].owner; return o < 0 ? 0 : pf_of(o) ? 2 : 1; };
+        r = 0;
+        for (int i = 1; i < (int)drings_.size(); i++)
+            if (rank(i) != rank(r) ? rank(i) < rank(r) : drings_[i].used < drings_[r].used) r = i;
+        if (drings_[r].owner >= 0) dring_of_[drings_[r].owner] = -1;
+        drings_[r].owner = slot;
+        dring_of_[slot] = r;
+        fresh = true;
+    }
+    DRing& g = drings_[r];
+    g.used = ++tick_;
+    int inv = -1;
+    if (fresh || !keep) inv = 0;
+    else if (std::min(from, g.gap) < INT_MAX) inv = std::min(from, g.gap);
+    g.gap = INT_MAX;
+    if (inv >= 0) g.pinv = g.pinv < 0 ? inv : std::min(g.pinv, inv);
+}
+
+void Engine::dfl_gap(int slot, int pos) {
+    if (slot < 0 || slot >= (int)dring_of_.size() || dring_of_[slot] < 0) return;
+    DRing& g = drings_[dring_of_[slot]];
+    g.gap = std::min(g.gap, pos);
+}
+
+double Engine::dfl_bench(int iters) {
+    if (!dfl_on_) return -1;
+    finish();
+    std::vector<double> ms(workers_.size());
+    pool_->run([&](int r) { ms[r] = workers_[r]->dfl_bench(iters); });
+    return *std::max_element(ms.begin(), ms.end());
+}
+
+bool Engine::dfl_copy(int slot) {
+    static const double th = env_double("QE_DF_COPY", 1.0);
+    return th < 1.0 && slot < (int)dcopy_.size() && dcopy_[slot] > th;
 }

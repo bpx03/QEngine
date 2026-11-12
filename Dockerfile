@@ -169,6 +169,6 @@ ARG REVISION=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
       org.opencontainers.image.description="QEngine: Qwen3.8-27B INT4 (and Qwen3.8-Flash-Next preview) inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in, not tuned), OpenAI/Anthropic-compatible API; model not included" \
-      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0" \
+      org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"

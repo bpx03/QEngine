@@ -4,6 +4,7 @@
 #include <mutex>
 #include "host_mem.h"
 #include <atomic>
+#include <climits>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -430,6 +431,7 @@ private:
         bool from_archive = false;
         std::vector<int> ids, dev_ids, rope3, marks;
         int img_base = 0, img_n = 0;      // this prompt's rows in img_table_: [img_base, img_base + img_n)
+        bool dfl = false;                 // the reply runs DFlash2 block steps (drafter context from the prompt)
     };
     static constexpr int kMaxPrefills = 2;
     std::vector<PrefillState> pfs_;       // in flight, the newest last
@@ -635,6 +637,32 @@ private:
     int buf_kv_[2] = {0, 0};               // drafts verified by the step in each buffer
     bool buf_clamped_[2] = {false, false};
     bool buf_lk_[2] = {false, false};      // the step in each buffer was a lookup step
+    bool buf_blk_[2] = {false, false};     // ... a DFlash2 block step (drafts from the block drafter)
+    // DFlash2 block drafter (QE_DRAFTER=auto|dflash2|mtp): single-sequence steps draft with it, batched
+    // steps keep MTP. Context rings: a few per card, LRU over the slots that run block steps; gap: the slot advanced
+    // without writing its ring from this position on (batched / MTP steps): rows past it dropped at its next block step
+    int drafter_ = 2;                      // 0 mtp, 1 dflash2, 2 auto
+    bool dfl_on_ = false;
+    std::unique_ptr<SafeTensors> dfl_st_;
+    bf16 *dfl_pred_ = nullptr, *dfl_succ_ = nullptr;  // selector codebooks (pinned, mapped; read rows per step)
+    struct DRing { int owner = -1; unsigned long long used = 0; int gap = INT_MAX; int pinv = -1; };  // pinv: rows from it on to drop at the next selection
+    std::vector<DRing> drings_;
+    std::vector<int> dring_of_;            // slot -> ring (-1: none)
+    // copy signal per slot (EMA of single steps that were lookup steps): above QE_DF_COPY the steps that are not lookup
+    // steps draft with MTP, which reads the whole context (the block drafter sees the last 2,048 positions)
+    std::vector<float> dcopy_;
+    bool dfl_copy(int slot);
+    bool use_block(int slot) const;
+    void dfl_bind(int slot, bool keep, int from);  // the slot's ring selected on every card (keep: its rows below from)
+    void dfl_gap(int slot, int pos);               // the slot advanced from pos without writing its ring
+    void dfl_init(const std::string& model_dir, int req_ctx);
+    void dfl_free_host();
+    int dfl_cb_rows_ = 0;   // codebook rows (candidate ids are clamped below it)
+    int dfl_req_ = 0;       // auto: the requested context it was loaded for (checked after the pool plan)  // req_ctx: the requested context (max_t)
+  public:
+    long long df_steps_ = 0, df_tok_ = 0;  // block steps, their tokens (statistics)
+    double dfl_bench(int iters);           // ms per drafter block on every card (development check)
+  private:
     bool lk_on_ = false;                   // QE_LOOKUP: lookup drafts on the GPU (single-sequence steps)
     int lk_slot_ = -1;                     // slot whose history the cards hold (-1: none / stale)
     int lk_next_ = 0;                      // lookup drafts found by the last finished step

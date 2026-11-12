@@ -266,6 +266,9 @@ void qe_archive_info(void* e, double* out) { ((Engine*)e)->archive_info(out); }
 void qe_pool_counters(void* e, long long* out) { ((Engine*)e)->pool_counters(out); }
 int qe_spec_step(void* e, int* out) { return ((Engine*)e)->spec_step(out); }
 void qe_draft_stats(void* e, int slot, long long* out) { ((Engine*)e)->draft_stats(slot, out); }
+// DFlash2 block drafter: {block steps, their tokens}; ms per drafter block (development check, -1: no drafter)
+void qe_dfl_stats(void* e, long long* out) { out[0] = ((Engine*)e)->df_steps_, out[1] = ((Engine*)e)->df_tok_; }
+double qe_dfl_bench(void* e, int iters) { return ((Engine*)e)->dfl_bench(iters); }
 void qe_finish(void* e) { ((Engine*)e)->finish(); }
 double qe_warmup(void* e, int modes) { return ((Engine*)e)->warmup(modes); }
 int qe_last_copied(void* e) { return ((Engine*)e)->last_copied(); }
