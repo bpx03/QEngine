@@ -179,7 +179,11 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
         _exit(3);
     }
     CHECK(posix_memalign((void**)&p, PG, cap) == 0 && p, "pin_host: out of host memory (%.1f GB)", cap / 1e9);
-    madvise(p, cap, MADV_HUGEPAGE);
+    // 4 KB pages by default, as in pin_host_file: with 2 MB pages (FLASH_PIN_THP=1) a host whose RAM is fragmented by
+    // page cache and other pinned buffers runs direct compaction on every fault and falls back to 4K anyway; the
+    // host-backed expert pin then crawled at ~17 MB/s (a 4M / 6M FLASH_KV=ram start looked hung for 25+ min)
+    static const bool thp = env_int("FLASH_PIN_THP", 0);
+    if (thp) madvise(p, cap, MADV_HUGEPAGE);
     numa_place(p, cap, numa);  // before the first touch
     threads = (int)std::max<size_t>(1, std::min<size_t>(threads, cap / PG));
     std::vector<std::thread> th;
