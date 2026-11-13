@@ -288,7 +288,8 @@ a card in use stops at start with the first one's pid and command line (`QE_ALLO
 ### With and without GPU P2P
 
 GeForce cards have no GPU-to-GPU P2P with the stock NVIDIA driver. A community patch of the open kernel modules
-([tinygrad/open-gpu-kernel-modules](https://github.com/tinygrad/open-gpu-kernel-modules), with Resizable BAR on)
+([aikitoria/open-gpu-kernel-modules](https://github.com/aikitoria/open-gpu-kernel-modules), a fork of tinygrad's patch
+that tracks current driver versions, with Resizable BAR on)
 enables it. QEngine detects which one you have and needs no setting.
 
 Since 1.3.4 both engines are fast without P2P: their tensor-parallel exchanges copy through pinned host memory by
