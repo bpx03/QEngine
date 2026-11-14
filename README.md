@@ -8,7 +8,7 @@
   <sub>Built and tested on one home machine. If QEngine helps you, a coffee keeps it going.</sub>
 </p>
 
-QEngine is a source-available inference engine for two models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
+QEngine is an open-source (MIT) inference engine for two models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
 nothing extra to install or set for any of them (tuned on the RTX 3090):
 
 - **Qwen3.8-Flash-Next** (routed experts INT4 from Intel's AutoRound checkpoint, the parts every token passes through
