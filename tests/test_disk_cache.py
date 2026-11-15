@@ -3,6 +3,8 @@ recreated (as after a server restart) and
   1. the conversation continues from the disk archive (output must match a fresh computation),
   2. a new conversation with the same system prompt resumes from the archived checkpoint at the
      end of the system prompt (hint).
+  3. a file with a corrupted payload (one byte in the KV rows, one in a delta-net state) is dropped at load
+     (checksum mismatch, open_findings DK-L6) and both replies equal a run with the cache on and no files.
 Phases run in separate processes. Usage: python3 test_disk_cache.py [cache_dir]"""
 import os, shutil, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
@@ -12,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 # differently. Even with one shared tuning table (bit-identical across processes) a
 # near-tie flips: new B 46/60 for one table, 12/60 for another; 60/60 with the cost model alone
 os.environ.setdefault("QE_GEMM_TUNE", "0")
-MODEL = os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.8-27B-INT4")
+MODEL = os.environ.get("QE_MODEL", os.path.join(os.path.dirname(__file__), "..", "models", "Qwen3.8-27B-INT4"))
 N = 60
 
 
@@ -86,6 +88,38 @@ if __name__ == "__main__":
                 print(p.stdout[-2000:], p.stderr[-2000:])
                 sys.exit("FAIL")
             res[ph] = r[0][7:].split("|")
+    # reference for 3: the same load with the disk cache on but no files. With the cache on, B's prefill is split at the
+    # system prompt (its checkpoint), so B differs from the fresh run at a near-tie (12/60 here) without any file read
+    empty = cache.rstrip("/") + "-empty"
+    shutil.rmtree(empty, ignore_errors=True)
+    os.makedirs(empty)
+    shutil.copy(os.path.join(cache, "outA.txt"), empty)
+    p = run("load", empty)
+    re_ = [l for l in p.stdout.splitlines() if l.startswith("RESULT")]
+    shutil.rmtree(empty, ignore_errors=True)
+    if not re_:
+        print(p.stdout[-2000:], p.stderr[-2000:])
+        sys.exit("FAIL")
+    res["empty"] = re_[0][7:].split("|")
+    # 3. corrupt every file's payload (the header stays valid), load again: no reuse from the files, replies = the
+    # empty-cache run's (same splits)
+    for nm in os.listdir(cache):
+        if nm.endswith(".qkv"):
+            fp = os.path.join(cache, nm)
+            sz = os.path.getsize(fp)
+            with open(fp, "r+b") as f:
+                for off in (sz // 2, sz - 1000):
+                    f.seek(off)
+                    b = f.read(1)
+                    f.seek(off)
+                    f.write(bytes([b[0] ^ 0x5A]))
+    p = run("load", cache)
+    rc = [l for l in p.stdout.splitlines() if l.startswith("RESULT")]
+    if not rc:
+        print(p.stdout[-2000:], p.stderr[-2000:])
+        sys.exit("FAIL")
+    res["corrupt"] = rc[0][7:].split("|")
+    nbad = p.stderr.count("checksum mismatch")
     load, fresh = res["load"], res["fresh"]
     agree = lambda x, y: next((i for i, (a, b) in enumerate(zip(x.split(), y.split())) if a != b), N)
     r2, rB, nA, nsys = map(int, load[2].split())  # nA: A + its whole reply (the archived live end)
@@ -95,5 +129,13 @@ if __name__ == "__main__":
     # which was never fed (it is the next input); before the reply was saved in full (MTP accepts
     # past N) only the prompt-end checkpoint matched, which sits at len(A) - 1 since ce7443b
     ok = r2 >= nA - 1 and rB >= nsys and dA >= 20 and dB >= 20
+    cor = res["corrupt"]
+    cr2, crB = map(int, cor[2].split()[:2])
+    emp = res["empty"]
+    cA, cB = agree(cor[0], emp[0]), agree(cor[1], emp[1])
+    er2, erB = map(int, emp[2].split()[:2])  # (what a run with the cache on and no files reuses in the process itself)
+    print(f"corrupted files: {nbad} checksum mismatches, reused A {cr2} B {crB} (no files {er2} {erB}), agreement with the "
+          f"no-file run A {cA}/{N} B {cB}/{N}")
+    ok = ok and nbad >= 1 and cr2 <= er2 and crB <= erB and cA == N and cB == N
     shutil.rmtree(cache, ignore_errors=True)
     print("PASS" if ok else "FAIL")

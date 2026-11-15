@@ -55,6 +55,9 @@ inline bool is_qsa(int li) { return li % kQsaEvery == kQsaEvery - 1; }
 // Bytes of the INT4 checkpoint as the engine lays it out (sizes from the loader: GRP_BYTES = 506,880 per 128-wide
 // expert group, 513 experts x 5 groups per layer; dense parts from the per-card numbers of the PP=2 gate,
 // scaled to the whole layer).
+// bytes of one QSA layer's K / V + scales per token: 1,040 (FP8) or 576 (4-bit, FLASH_KV_BITS=4); the engine sets it
+// when it resolves the KV format (flash.cu kv4_mode), before any plan (the unit tests keep FP8)
+inline double& kv_layer_bytes() { static double b = 1040.0; return b; }
 struct ModelBytes {
     double expert_layer = 2565.0 * 506880.0;  // 1.300 GB: all expert groups of one layer (routed + shared)
     double gdn_dense = 30.5e6;                // DeltaNet in / out projections, a / b, conv, norms (one whole layer)
@@ -66,7 +69,7 @@ struct ModelBytes {
     double draft_head = 0.168e9;              // balanced draft head (65,536 rows)
     double mtp_dense = 0.07e9;                // MTP block: its QSA layer, fc_embedding / fc_hidden, HC, router
     double mtp_experts = 1.300e9;             // its expert groups
-    double kv_tok_layer = 1040.0 + 64.0;      // one QSA layer, one token: fp8 K / V + scales (1,040 B) + pooled indexer key
+    double kv_tok_layer = kv_layer_bytes() + 64.0;  // one QSA layer, one token: K / V + scales (1,040 B fp8, 576 B 4-bit) + pooled indexer key
     double dn_state_layer = 48.0 * 128 * 128 * 4 + 3.0 * (2 * 16 * 128 + 48 * 128) * 4;  // DeltaNet S + conv history, one sequence
     double row_buf = 72.0 * 1024;             // prefill batch buffers per row (R, HC sums, x / xh, part, y, router, n-gram rows, MoE slots)
     double ctx_overhead = 0.9e9;              // CUDA context, cuBLAS / graph workspaces, small tables per card
@@ -553,8 +556,10 @@ inline DecTab pp_dec_tab(int n) {
 // slots' recurrent state, the KV pool, buffers; the experts can all be host-backed). Fitted to 2- / 3-card loads,
 // 2026-11-03: 1.58 GB + 5.46 GB / n + (S - 1) x 206 MB / n + 24.8 KB x C / n + 0.9 GB (context,
 // workspaces, margin).
+// (24.8 KB per token was fitted with the FP8 cache: 13 KV layers x 1,040 B of it; the 4-bit cache takes 13 x 576 B)
+inline double tp_ctx_tok_bytes() { return 24.8e3 - 13.0 * (1040.0 - kv_layer_bytes()); }
 inline double tp_fixed_need(int n, int S, long long c) {
-    return 1.58e9 + 5.46e9 / n + (S - 1) * 0.206e9 / n + 24.8e3 * (double)c / n + 0.9e9;
+    return 1.58e9 + 5.46e9 / n + (S - 1) * 0.206e9 / n + tp_ctx_tok_bytes() * (double)c / n + 0.9e9;
 }
 // The wiring around the pick (flash_capi.cpp), as pure functions for the unit test.
 // The card-wide comm: up to 3 cards as ever; 4 for tp asked for, and for auto where the driver reports peer access on all

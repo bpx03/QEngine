@@ -9,6 +9,7 @@
 
 #include <sys/mman.h>
 #include "snap_policy.h"
+#include "pool_order.h"
 #include "kernels/comm_cache.h"
 
 #include <array>
@@ -32,6 +33,12 @@ extern std::atomic<bool> g_qe_loaded;
 static double vnow_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 size_t qe_release_load_scratch();  // model.cpp
 extern std::function<bool(Worker*, size_t)> g_pool_emergency;  // model.cpp
+// [q27-plain] block steps that verify drafter drafts take the graph without the IF node (QE_DF_PLAIN=0: off). Only with
+// the lookup on: without it the block graph has no conditional node, so a plain copy would be the same graph (review L4)
+static bool df_plain(Worker& w) {
+    static const bool on = env_int("QE_DF_PLAIN", 1) != 0;
+    return on && w.lk_on();
+}
 
 GpuPool::GpuPool(const std::vector<int>& devices) : devices_(devices) {
     for (size_t i = 0; i < devices.size(); i++) threads_.emplace_back([this, i] { loop(i); });
@@ -248,7 +255,13 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
     // across GPUs; QE_DRAFT_VOCAB=0 uses the full vocabulary; QE_TOKEN_RANK_FILE: the ranking file
     // (default <model_dir>/token_rank.bin; the server sets it to its cached download)
     {
-        int nd = env_int("QE_DRAFT_VOCAB", 65536);
+        // [q27-acc-head] 98,304 (was 65,536): the DFlash2 block drafter reaches the full vocabulary's acceptance
+        // (1 card Swift: sb3 3.080 -> 3.209 tok/step, 30-prompt mix 3.834 -> 3.909) for +0.04 ms per step.
+        // [q27-vocab-mtp] (review q27_1card3 M2) the MTP draft head keeps the 65,536 most frequent (QE_MTP_VOCAB): with
+        // 98,304 batched decode lost 1.4 % at c=8 (1 card, 537.0 -> 529.5 tok/s). Rows are kept in frequency order
+        // (dealt round-robin to the cards), so the MTP head is the first rows of the same matrix: no second copy
+        int nd = env_int("QE_DRAFT_VOCAB", 98304);
+        int nm = env_int("QE_MTP_VOCAB", 65536);
         const std::string rank_file = env_str("QE_TOKEN_RANK_FILE") ? env_str("QE_TOKEN_RANK_FILE")
                                                                     : model_dir + "/token_rank.bin";
         FILE* f = fopen(rank_file.c_str(), "rb");
@@ -256,11 +269,15 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             nd = std::min(nd, cfg_.vocab) / (16 * (int)devices.size()) * 16 * devices.size();
             std::vector<int> rank(nd);
             CHECK(fread(rank.data(), 4, nd, f) == (size_t)nd, "token_rank.bin");
-            std::sort(rank.begin(), rank.end());
-            const int per = nd / devices.size();
-            for (size_t r = 0; r < devices.size(); r++)
-                workers_[r]->draft_ids.assign(rank.begin() + r * per, rank.begin() + (r + 1) * per);
-            printf("MTP draft vocabulary: %d most frequent tokens\n", nd);
+            const int ng = devices.size();
+            nm = nm <= 0 ? nd : std::min(nm, nd) / (16 * ng) * 16 * ng;
+            for (int r = 0; r < ng; r++) {
+                auto& ids = workers_[r]->draft_ids;
+                ids.clear();
+                for (int i = r; i < nd; i += ng) ids.push_back(rank[i]);  // frequency order: a prefix = the most frequent
+                workers_[r]->draft_mtp_n = nm / ng;
+            }
+            printf("draft vocabulary: %d most frequent tokens (DFlash2 head), MTP drafts the first %d\n", nd, nm);
         }
         if (f) fclose(f);
     }
@@ -324,6 +341,31 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
                    "margin; QE_LOAD_DROP=0/1 sets it)\n", on ? "dropped layer by layer" : "kept in the page cache", avail / 1e9,
                    on ? "<" : ">=", need / 1e9);
         fflush(stdout);
+    }
+    {  // [q27-head4r] the verify head's bf16 rows (mapped pinned host memory, each card its vocabulary shard): every card or
+        // none (review M5: a split would mix exact and INT8 values across the shards), and only when MemAvailable holds them
+        // with the other pins in flight + 2 GB (review L5); else the INT8 head on every card, one line
+        const int R = std::min(env_int("QE_HEAD4R", 16), kH4MaxR);
+        if (R > 0) {
+            size_t tot = 0;
+            for (auto& w : workers_) tot += w->h4_pin_bytes();
+            const char* why = nullptr;
+            if (!qe_hostmem::pin_fits(qe_hostmem::available(true), tot, qe_hostmem::pin_untouched().load()))
+                why = "MemAvailable does not hold";
+            else
+                for (auto& w : workers_)
+                    if (!w->h4_pin()) {
+                        why = "no pinned host memory for";
+                        break;
+                    }
+            if (why) {
+                for (auto& w : workers_) w->h4_unpin();
+                printf("verify head: INT8 head on every card (%s the %.2f GB of bf16 rows the INT4 screen + exact rescore needs)\n",
+                       why, tot / 1e9);
+                fflush(stdout);
+            }
+            for (auto& w : workers_) w->h4_set(why ? 0 : R);
+        }
     }
     pool_->run([&](int r) { workers_[r]->load(st_, mtp_st_.get(), embed_); });
     if (g_load_drop27.on()) printf("load: page cache of each layer dropped once loaded (%.1f GB of file ranges)\n", g_load_drop27.dropped() / 1e9), fflush(stdout);
@@ -443,6 +485,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         // keeps the store at its size), and unused pre-pinned ones go back under the margin (mem_guard; entries in use
         // stay): the plan does not take them from the archive, which restores whole conversations
         in.fixed = (double)emb_bytes_ + snap * std::min(max_snaps_, kSnapBase);
+        for (auto& w : workers_) in.fixed += (double)w->h4_host_bytes_;  // [q27-head4r] bf16 head rows (pinned)
         const double GiB = (double)(1ull << 30);
         in.arch_def = 32 * GiB;
         in.pref_def = 8 * GiB;
@@ -469,7 +512,6 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         prefix_budget_ = o.prefix == kp ? (size_t)((env_double("QE_PREFIX_GB", 8.0)) * (1ull << 30)) : (size_t)o.prefix;
     }
     if (env_set("QE_ARCHIVE_MIN")) archive_min_ = env_int("QE_ARCHIVE_MIN", archive_min_);
-    main_stale_s_ = env_double("FLASH_MAIN_STALE_S", main_stale_s_);
     if (env_set("QE_SHARE_PREFIX")) share_prefix_ = env_int("QE_SHARE_PREFIX", share_prefix_) != 0;
     pool_log_ = env_int("QE_POOL_LOG", 0);
     disk_init();
@@ -527,6 +569,7 @@ Engine::~Engine() {
     }
     stop_alloc_ = true;
     if (alloc_thread_.joinable()) alloc_thread_.join();
+    snap_host_wait();  // [q27-snapasync] (no copy into a buffer freed below)
     for (auto& b : free_bufs_)
         for (void* p : b) cudaFreeHost(p);
     pool_.reset();
@@ -562,6 +605,9 @@ void Engine::plan_slots(int main_cap) {
     // the slots' recurrent state (~110 / 164 MB per slot and card on 3 / 2 cards) before the pool: on a small card the
     // count is lowered to what leaves a 32K-token pool and a 0.5 GB reserve (a smaller card starts with fewer
     // concurrent conversations instead of stopping); measured on the first slot
+    // [q27-snapasync] the staged conv rings of the snapshot copy (n_lin x 16 x channels bf16 per card): before the slot
+    // measurement (review L5), only when the copy runs asynchronously
+    if (env_int("QE_SNAP_ASYNC", 1) != 0) pool_->run([&](int r) { workers_[r]->snap_init(); });
     std::vector<size_t> c0(workers_.size()), f0(workers_.size());
     for (size_t r = 0; r < workers_.size(); r++) c0[r] = workers_[r]->cache_bytes, f0[r] = workers_[r]->free_bytes();
     pool_->run([&](int r) { workers_[r]->add_slot(); });
@@ -573,7 +619,11 @@ void Engine::plan_slots(int main_cap) {
             // (the device's cost: the free memory a slot takes, allocation rounding of its small buffers included)
             const size_t fr = workers_[r]->free_bytes();
             const size_t per = std::max<size_t>({1, workers_[r]->cache_bytes - c0[r], f0[r] > fr ? f0[r] - fr : 0});
-            const size_t keep = (size_t)0.5e9 + (size_t)(32768 + 4096) * workers_[r]->slot_token_bytes();
+            // (the 4-bit cache: the slot count the fp8 cache would get, so its smaller rows become context, not slots)
+            const size_t keep = (size_t)0.5e9 + (size_t)(32768 + 4096) *
+                                (workers_[r]->kv4() ? std::max(workers_[r]->fp8_token_bytes(),
+                                                               workers_[r]->slot_token_bytes() + workers_[r]->kv4_stage_bytes_per_key())
+                                                    : workers_[r]->slot_token_bytes());
             fit_n = std::min<long long>(fit_n, 1 + (long long)((fr > keep ? fr - keep : 0) / per));
             slot_each = std::max(slot_each, per);
             if (env_int("QE_SLOT_FIT_LOG", 0))
@@ -699,10 +749,27 @@ void Engine::plan_slots(int main_cap) {
     // holds a 32K context (the runtime buffers then grow into less room; VRAM pressure: vram_tick). QE_RESERVE_GB set or
     // QE_VRAM_ADAPT=0: kept as given. Before the YaRN reach, which sizes with the reserve too (review L6)
     for (auto& w : workers_) slack_ = std::max(slack_, w->region_slack());
-    if (vram_adapt_ && !env_set("QE_RESERVE_GB") && pool_fit() < 32768 + slack_) {
+    // 4-bit cache (QE_KV_BITS=4): the prefill's fp8 staging takes ~sb bytes per key of the context one conversation
+    // reaches, beside the pool's tb per token: per card P tb + C sb <= F with C = min(want, P - slack - 2048). kv4_fit(want)
+    // = that C (the served context with the staging counted); every context decision below uses it (review M2)
+    const bool kv4 = workers_[0]->kv4();
+    auto kv4_fit = [&](size_t want) {
+        size_t c = want;
+        for (size_t r = 0; r < workers_.size(); r++) {
+            const size_t fr = workers_[r]->free_bytes(), res = reserve[r];
+            const double F = fr > res ? (double)(fr - res) : 0.0, tb = (double)workers_[r]->slot_token_bytes(),
+                         sb = (double)workers_[r]->kv4_stage_bytes_per_key() + 1.0;
+            if ((double)want * sb + (double)(want + slack_ + 2048) * tb <= F) continue;
+            const double pt = (F + (double)(slack_ + 2048) * sb) / (tb + sb);  // P with C = P - slack - 2048
+            c = std::min(c, pt > (double)(slack_ + 4096) ? (size_t)(pt - slack_ - 2048) : (size_t)2048);
+        }
+        return c;
+    };
+    auto small_pool = [&]() { return kv4 ? kv4_fit(32768) < 32768 : pool_fit() < 32768 + slack_; };
+    if (vram_adapt_ && !env_set("QE_RESERVE_GB") && small_pool()) {
         for (double gb : {1.0, 0.5}) {
             for (auto& r : reserve) r = std::min(r, (size_t)(gb * 1e9));
-            if (pool_fit() >= 32768 + slack_) break;
+            if (!small_pool()) break;
         }
         printf("KV pool: the cards' memory past the 1.5 GB reserve held fewer than 32K tokens: reserve lowered to %.1f GB per card "
                "(QE_RESERVE_GB sets it)\n", reserve[0] / 1e9);
@@ -724,7 +791,9 @@ void Engine::plan_slots(int main_cap) {
                 slack = std::max(slack, workers_[r]->region_slack());
             }
             reach = std::min(reach, cap_tokens);
-            return reach > slack + 1024 ? (reach - slack) / 1024 * 1024 : 0;
+            // (4-bit cache: kv4_fit keeps 2048 tokens past the slack, re-review N3)
+            const size_t mg = slack + (kv4 ? 2048 : 0);
+            return reach > mg + 1024 ? (reach - mg) / 1024 * 1024 : 0;
         };
         size_t reach = reach_of(cfg_.max_pos);
         if (reach < (size_t)cfg_.max_pos && reach > (size_t)cfg_.native_ctx) reach = std::min(reach, reach_of((int)reach));
@@ -761,7 +830,11 @@ void Engine::plan_slots(int main_cap) {
     }
     if (dfl_on_ && dfl_req_ > 0) {  // auto (review M5): the drafter only if the requested context still fits after every term
         const size_t f = std::min(pool_fit(), cap_tokens) / 1024 * 1024;
-        const int ctx = (int)std::min<size_t>(std::min<size_t>(main_cap, cfg_.max_pos), f > slack_ ? f - slack_ : 0);
+        int ctx = (int)std::min<size_t>(std::min<size_t>(main_cap, cfg_.max_pos), f > slack_ ? f - slack_ : 0);
+        if (kv4) {  // with the staging and the pool cap as the staging sizes them (re-review N3)
+            ctx = (int)std::min<size_t>((size_t)ctx, kv4_fit((size_t)ctx));
+            ctx = (int)std::min<size_t>((size_t)ctx, cap_tokens > slack_ + 2048 ? cap_tokens - slack_ - 2048 : 2048);
+        }
         if (ctx < dfl_req_) {
             pool_->run([&](int r) { workers_[r]->dfl_unload(); });
             dfl_free_host();
@@ -770,6 +843,19 @@ void Engine::plan_slots(int main_cap) {
                    "MTP drafts (QE_DRAFTER=dflash2 keeps it)\n", ctx, dfl_req_);
             fflush(stdout);
         }
+    }
+    // 4-bit cache (QE_KV_BITS=4): the prefill's fp8 staging of the keys is sized to the context one conversation can
+    // reach: per card the pool P and the staging C keys share what is free, P tb + C sb <= F, C = min(want, P - slack)
+    int kv4_cap = 0;
+    if (kv4) {
+        // (QE_POOL_TOKENS / QE_SLOTS cap the pool: no staging past what it can hold, review L8)
+        const size_t want = std::min<size_t>((size_t)std::min<int>(main_cap, cfg_.max_pos),
+                                             cap_tokens > slack_ + 2048 ? cap_tokens - slack_ - 2048 : 2048);
+        const size_t c = kv4_fit(want);
+        kv4_cap = (int)((c + 1023) / 1024 * 1024 + 1024);  // (a prefill chunk never reaches past the served context)
+        pool_->run([&](int r) { workers_[r]->kv4_stage_alloc(kv4_cap); });
+        printf("KV cache 4 bits: prefill staging for %d keys (%.0f MB per card)\n", kv4_cap,
+               (double)workers_[0]->kv4_stage_bytes_per_key() * kv4_cap / 1048576.0);
     }
     const size_t fit = pool_fit();
     reserve_min_ = *std::min_element(reserve.begin(), reserve.end());
@@ -795,6 +881,7 @@ void Engine::plan_slots(int main_cap) {
                     pool_tokens_ - slack_, fmin / 1e9, nslots);
     }
     max_ctx_ = (int)std::min<size_t>(std::min<size_t>(main_cap, cfg_.max_pos), pool_tokens_ - slack_);
+    if (kv4_cap > 0) max_ctx_ = std::min(max_ctx_, kv4_cap - 1024);
     if (dfl_on_ && dfl_req_ > 0 && max_ctx_ < dfl_req_)  // auto's estimate missed (review M5): say so, with the way back
         printf("qengine: WARNING: with the DFlash2 drafter the context is %d tokens, below the requested %d: QE_DRAFTER=mtp "
                "serves the requested context\n", max_ctx_, dfl_req_);
@@ -1027,8 +1114,8 @@ bool Engine::ensure_cap(int s, int need, const std::vector<int>& protect, Room m
     if (mode != FREE) trim_active(false);
     // shared prefix regions nobody reads go first (cheap: they come back from their host copy;
     // evicting a conversation detaches it, so they are retried after every eviction); then
-    // inactive conversations: finished ones first, the main thread last (prio), least recently
-    // used within a class (the evicted context goes to the archive). They go before s grows by
+    // inactive conversations, least recently used first, every conversation alike (user decision
+    // 2026-11-12; the evicted context goes to the archive). They go before s grows by
     // less than the floor: a region squeezed to exactly need is re-placed on every step.
     while (true) {
         if (try_grow(s, want) || try_grow(s, floor)) return true;
@@ -1052,14 +1139,14 @@ bool Engine::ensure_cap(int s, int need, const std::vector<int>& protect, Room m
     return false;
 }
 
-// Archive and drop the idle conversation worth least (see ensure_cap); false: none left.
+// Archive and drop the least recently used idle conversation (see ensure_cap); false: none left.
 bool Engine::evict_one(int keep_slot, const std::vector<int>& protect) {
     int v = -1;
     for (size_t j = 0; j < seqs_.size(); j++) {
         const Seq& x = seqs_[j];
         if ((int)j == keep_slot || x.active || x.max_t == 0) continue;
         if (std::find(protect.begin(), protect.end(), (int)j) != protect.end()) continue;
-        if (v < 0 || x.prio < seqs_[v].prio || (x.prio == seqs_[v].prio && x.used < seqs_[v].used)) v = j;
+        if (v < 0 || x.used < seqs_[v].used) v = j;
     }
     if (v < 0) return false;
     const int keep_cur = cur_;
@@ -1094,7 +1181,7 @@ bool Engine::room_or_pause(int s, int need) {
             const Seq& x = seqs_[j];
             if (!x.active || x.paused || x.max_t <= 0 || pf_of(j)) continue;
             if ((int)j != s) others++;
-            if (v < 0 || x.prio < seqs_[v].prio || (x.prio == seqs_[v].prio && x.admit > seqs_[v].admit)) v = j;
+            if (v < 0 || qe_pool::pauses_first(x.admit, seqs_[v].admit)) v = j;  // the most recently admitted, no prio order
         }
         if (others == 0 || v < 0 || !pause_slot(v)) break;  // alone (or not archivable): squeeze
         if (v == s) return false;
@@ -1343,7 +1430,7 @@ static size_t admit_headroom() {
     return ah;
 }
 
-bool Engine::pause_for(int n, int prio) {
+bool Engine::pause_for(int n, int /*prio: ignored, user decision 2026-11-12*/) {
     const size_t ah = admit_headroom();
     if (n > max_ctx_) return false;
     bool slot = false;
@@ -1357,23 +1444,21 @@ bool Engine::pause_for(int n, int prio) {
         else if (!q.paused) {
             const size_t u = units(std::min<size_t>((size_t)q.pos - q.split + ah, max_ctx_));
             used += u;
-            if (q.prio < prio && q.max_t > 0 && q.pos > q.split) vs.push_back({(int)i, u});
+            if (q.max_t > 0 && q.pos > q.split) vs.push_back({(int)i, u});
         }
     }
     for (auto& p : pres_) used += units(p.n);
     const size_t need = units(std::min<size_t>((size_t)n + ah, max_ctx_));
     if (!slot) return false;  // every slot is taken: pausing frees no slot
     if (used + need <= pool_tokens_) return true;
-    std::stable_sort(vs.begin(), vs.end(), [&](const V& a, const V& b) {
-        const Seq &x = seqs_[a.j], &y = seqs_[b.j];
-        return x.prio != y.prio ? x.prio < y.prio : x.admit > y.admit;
-    });
+    // the pool's own preemption order (room_or_pause): the most recently admitted first, every conversation alike
+    std::stable_sort(vs.begin(), vs.end(), [&](const V& a, const V& b) { return qe_pool::pauses_first(seqs_[a.j].admit, seqs_[b.j].admit); });
     size_t k = 0, left = used;
     while (k < vs.size() && left + need > pool_tokens_) left -= vs[k++].u;
     if (left + need > pool_tokens_) return false;  // pausing all of them would not make it fit: pause none
     for (size_t i = 0; i < k; i++) {
         if (pool_log_)
-            printf("pool: pausing slot %d (prio %d) for a %d-token start of prio %d\n", vs[i].j, seqs_[vs[i].j].prio, n, prio),
+            printf("pool: pausing slot %d for a %d-token start\n", vs[i].j, n),
                 fflush(stdout);
         if (!pause_slot(vs[i].j)) return false;
     }
@@ -1447,6 +1532,25 @@ void Engine::constrain(int slot, bool on) {
     pool_->run([&](int r) { workers_[r]->set_constrained(slot, on); });
 }
 
+void Engine::ban(int slot, const int* ids, int n) {
+    Seq& q = seqs_.at(slot);
+    std::vector<unsigned> m;
+    bool any = false;
+    if (n > 0) {
+        m.assign(((size_t)cfg_.vocab + 31) / 32, 0xFFFFFFFFu);
+        for (int i = 0; i < n; i++)
+            if (ids[i] >= 0 && ids[i] < cfg_.vocab) {
+                m[ids[i] >> 5] &= ~(1u << (ids[i] & 31));
+                any = true;
+            }
+    }
+    if (!any && !q.banned) return;
+    finish_for(slot);  // nothing of this slot queued ahead under the old setting
+    q.banned = any;
+    const unsigned* h = any ? m.data() : nullptr;
+    pool_->run([&](int r) { workers_[r]->set_ban(slot, h); });
+}
+
 void Engine::logits_capture(int slot, bool on) {
     pool_->run([&](int r) { workers_[r]->set_lp(slot, on); });
 }
@@ -1458,6 +1562,7 @@ bool Engine::logits_read(int slot, int row, float* out) {
 }
 
 void Engine::use_slot(int i) {
+    if (mkv_slot_ >= 0 && i != mkv_slot_) mkv_catch_up();  // [q27-mtpkv-defer] (while its slot is still bound)
     lk_slot_ = -1;  // the device lookup history is the current sequence's
     cur_ = i;
     pool_->run([&](int r) { workers_[r]->select_slot(i); });
@@ -1477,8 +1582,9 @@ double Engine::warmup(int modes) {
             pool_->run([&](int r) {
                 for (int kv = 0; kv <= kMaxSpecK; kv++)
                     for (int kd = 1; kd <= kMaxSpecK; kd++) workers_[r]->run_spec(kv, kd, false);
-                if (dfl_on_ && drafter_ != 0)  // DFlash2 block steps (7 drafts; after a resync 0)
-                    for (int kv : {kDflDrafts, 0}) workers_[r]->run_spec(kv, kDflDrafts, false, false, true);
+                if (dfl_on_ && drafter_ != 0)  // DFlash2 block steps (7 drafts; after a resync 0), with and without the IF node
+                    for (int pl = 0; pl < (df_plain(*workers_[r]) ? 2 : 1); pl++)  // (no plain graphs when unused: review L4)
+                        for (int kv : {kDflDrafts, 0}) workers_[r]->run_spec(kv, kDflDrafts, false, false, true, false, pl != 0);
             });
         }
         for (auto& w : workers_) w->set_sampling(samp_, false);
@@ -1512,6 +1618,7 @@ void Engine::reset() {  // forget every cached prefix (slots and snapshots)
     }
     paused_.clear();
     pres_.clear();
+    snap_host_wait();  // [q27-snapasync]
     std::lock_guard<std::mutex> lk(snap_mu_);
     for (auto& sn : snaps_) free_bufs_.push_back(std::move(sn.bufs));
     snaps_.clear();
@@ -1540,11 +1647,72 @@ uint64_t fnv64(const int* p, int n) {
     }
     return h;
 }
-constexpr char kArchMagic[8] = {'Q', 'K', 'V', 'A', '0', '0', '0', '2'};
+// 0003: the header holds a payload checksum per GPU section part (open_findings DK-L6); 0002 files (no checksums) still load
+constexpr char kArchMagic[8] = {'Q', 'K', 'V', 'A', '0', '0', '0', '3'};
+constexpr char kArchMagicV2[8] = {'Q', 'K', 'V', 'A', '0', '0', '0', '2'};
+// 64-bit payload checksum (4 independent multiply-rotate lanes over 8-byte words, then the tail): catches a file of the right
+// size with wrong contents (a write cut by power loss), not an adversary
+// streaming form of arch_hash for read-and-hash in pieces (review L4): update() takes multiples of 32 bytes, the last piece
+// of a region goes to final(); the result equals arch_hash over the whole region
+struct ArchHash {
+    uint64_t h[4] = {0x9E3779B185EBCA87ull + 0xC2B2AE3D27D4EB4Full, 0xC2B2AE3D27D4EB4Full, 0, 0 - 0x9E3779B185EBCA87ull};
+    size_t n = 0;
+    void update(const char* p, size_t len) {  // len % 32 == 0
+        constexpr uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
+        auto rot = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+        for (size_t i = 0; i + 32 <= len; i += 32)
+            for (int k = 0; k < 4; k++) {
+                uint64_t w;
+                memcpy(&w, p + i + 8 * k, 8);
+                h[k] = rot(h[k] + w * P2, 31) * P1;
+            }
+        n += len;
+    }
+    uint64_t final(const char* p, size_t len) {
+        constexpr uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
+        auto rot = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+        const size_t full = len / 32 * 32;
+        update(p, full);
+        n += len - full;
+        uint64_t t = (uint64_t)n;
+        for (int k = 0; k < 4; k++) t = rot(t ^ h[k], 27) * P1 + P2;
+        for (size_t i = full; i < len; i++) t = rot(t ^ (uint64_t)(uint8_t)p[i] * P1, 11) * P2;
+        t ^= t >> 29;
+        t *= P2;
+        return t ^ (t >> 32);
+    }
+};
+uint64_t arch_hash(const void* data, size_t n) {
+    constexpr uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
+    auto rot = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+    uint64_t h[4] = {P1 + P2, P2, 0, 0 - P1};
+    const char* p = (const char*)data;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (int k = 0; k < 4; k++) {
+            uint64_t w;
+            memcpy(&w, p + i + 8 * k, 8);
+            h[k] = rot(h[k] + w * P2, 31) * P1;
+        }
+    uint64_t t = (uint64_t)n;
+    for (int k = 0; k < 4; k++) t = rot(t ^ h[k], 27) * P1 + P2;
+    for (; i < n; i++) t = rot(t ^ (uint64_t)(uint8_t)p[i] * P1, 11) * P2;
+    t ^= t >> 29;
+    t *= P2;
+    return t ^ (t >> 32);
+}
 template <typename T>
 void put(std::vector<char>& b, const T& v) {
     const char* p = (const char*)&v;
     b.insert(b.end(), p, p + sizeof(T));
+}
+// (review L5) checksum of what indexes an archive: its length, checkpoint positions and token ids
+uint64_t arch_hdr_hash(int32_t n, const std::vector<int>& subs, const int* toks) {
+    std::vector<char> b;
+    put(b, n);
+    for (int p : subs) put(b, (int32_t)p);
+    b.insert(b.end(), (const char*)toks, (const char*)toks + (size_t)n * 4);
+    return arch_hash(b.data(), b.size());
 }
 bool read_all(int fd, void* dst, size_t n, size_t off) {
     char* d = (char*)dst;
@@ -1754,6 +1922,20 @@ void Engine::drop_archive(std::list<KvArchive>::iterator it) {
     archives_.erase(it);
 }
 
+// A copy of the archive exists: in memory, or a file written or being written (a failed write is not one)
+bool Engine::arch_present(const KvArchive& a) {
+    if (a.ram) return true;
+    if (a.path.empty() || !a.disk) return false;
+    std::lock_guard<std::mutex> l(a.disk->mu);
+    return !(a.disk->done && !a.disk->ok);
+}
+// Its file is written (readable now without waiting for the writer)
+bool Engine::arch_file_ready(const KvArchive& a) {
+    if (a.path.empty() || !a.disk) return false;
+    std::lock_guard<std::mutex> l(a.disk->mu);
+    return a.disk->done && a.disk->ok;
+}
+
 // Delete the archive's file (or cancel its pending write); the memory copy stays.
 void Engine::disk_forget(KvArchive& a) {
     if (a.path.empty()) return;
@@ -1814,31 +1996,24 @@ void Engine::mem_guard() {
            u0 / 1e9, archive_used_ / 1e9, p0 / 1e9, hpool_.pinned_bytes() / 1e9), fflush(stdout);
 }
 
-qe_arch::Rank Engine::arch_rank(const KvArchive& a, double now) const {
-    return {qe_arch::active_main(a.prio, a.last_s, now, main_stale_s_), a.last_s, a.used};
-}
+qe_arch::Rank Engine::arch_rank(const KvArchive& a) const { return {a.last_s, a.used}; }
 
 // Whether a write of `need` bytes fits once everything it may evict is gone. older_than (an optional write): it may evict
 // only what goes before the writer in the order.
 bool Engine::ram_fits(size_t need, const qe_arch::Rank* older_than) {
-    const double now = mono_s();
-    const size_t can = qe_arch::can_free(archives_, [&](const KvArchive& a) { return arch_rank(a, now); }, older_than);
+    const size_t can = qe_arch::can_free(archives_, [&](const KvArchive& a) { return arch_rank(a); }, older_than);
     return archive_used_ - can + need <= ram_budget();
 }
 
 // Free host memory for `need` more bytes of an archive, in the one order (archive_order.h): least recently used
-// conversation first, an active main after all the others; it goes too when nothing else is left. Pinned prefixes are not
+// conversation first, every conversation alike. Pinned prefixes are not
 // part of the budget. false: no room (the caller skips archiving). An archive that is also on disk only loses its memory copy.
 bool Engine::ram_make_room(size_t need, int prio, size_t limit) {
     if (limit == (size_t)-1) limit = ram_budget();
     while (archive_used_ + need > limit) {
-        const double now = mono_s();
-        auto rank = [&](const KvArchive& a) { return arch_rank(a, now); };
+        auto rank = [&](const KvArchive& a) { return arch_rank(a); };
         auto lru = qe_arch::victim(archives_, rank);
         if (lru == archives_.end()) return false;
-        if (rank(*lru).main)
-            printf("archive: active main evicted, nothing else left: %d tokens, %.2f GB, for %.2f GB (used %.2f of %.2f GB)\n", lru->n,
-                   lru->total / 1e9, need / 1e9, archive_used_ / 1e9, limit / 1e9), fflush(stdout);
         if (pool_log_)
             printf("archive: drop %d tokens prio %d (%.2f GB) for %.2f GB of prio %d (used %.2f of %.2f GB)\n", lru->n,
                    lru->prio, lru->total / 1e9, need / 1e9, prio, archive_used_ / 1e9, limit / 1e9), fflush(stdout);
@@ -1858,7 +2033,7 @@ bool Engine::ram_make_room(size_t need, int prio, size_t limit) {
 }
 
 void Engine::disk_make_room(size_t need) {
-    while (disk_used_ + need > disk_budget_) {
+    while (disk_used_ + disk_covered_ + need > disk_budget_) {  // (superseded files not yet deleted count: rereview L2)
         auto lru = archives_.end();
         for (auto it = archives_.begin(); it != archives_.end(); ++it)
             if (!it->path.empty() && !it->hold && (lru == archives_.end() || it->used < lru->used)) lru = it;
@@ -1870,16 +2045,34 @@ void Engine::disk_make_room(size_t need) {
 
 // Drop the archives that an archive of toks[0, n) covers. born_after: spare shorter ones created later than this tick
 // (a background archive took its checkpoints at bg_prepare, so it does not hold theirs).
-void Engine::drop_covered(long long sk, const int* toks, int n, unsigned long long born_after) {
+// keep_files (#14 rereview N1 corner): the covering archive gets no file of its own (attached to a shared prefix, or
+// steered): a covered archive with a finished file stays as a disk-only entry instead of losing its file.
+void Engine::drop_covered(long long sk, const int* toks, int n, unsigned long long born_after, bool keep_files) {
     for (auto it = archives_.begin(); it != archives_.end();) {
         auto nx = std::next(it);
         if (it->sk == sk && it->n <= n && !it->pinned && !it->hold && std::equal(it->toks.begin(), it->toks.begin() + it->n, toks) &&
             !(it->born > born_after && it->n < n)) {
+            if (keep_files && !it->path.empty() && it->disk) {
+                bool ok;
+                {
+                    std::lock_guard<std::mutex> l(it->disk->mu);
+                    ok = it->disk->done && it->disk->ok;
+                }
+                if (ok) {  // its memory copy goes (as ram_make_room does), the file stays the copy
+                    if (it->ram) {
+                        it->ram.reset();
+                        archive_used_ -= it->total;
+                    }
+                    it = nx;
+                    continue;
+                }
+            }
             if (!it->path.empty()) {  // a finished file stays until the new archive's file is written (disk_flush_covered)
                 std::lock_guard<std::mutex> l(it->disk->mu);
                 if (it->disk->done && it->disk->ok) {
-                    covered_files_.push_back(it->path);
+                    covered_files_.push_back({it->path, it->total});
                     disk_used_ -= it->total;
+                    disk_covered_ += it->total;  // (rereview M1 / L2: still on the drive until deleted)
                     it->path.clear();
                 }
             }
@@ -1895,6 +2088,7 @@ void Engine::drop_covered(long long sk, const int* toks, int n, unsigned long lo
 // readable through ArchSub::hold after the archives they came from are gone.
 std::vector<Engine::ArchSub> Engine::archive_subs(const Seq& q, int n) {
     const int ng = workers_.size();
+    snap_host_wait();  // [q27-snapasync] the snapshot buffers are read on the host (stage_subs / the archive copies)
     // checkpoint states inside [0, n): live snapshots, and those of the archives this one
     // supersedes (e.g. the system-prompt state of a conversation restored after a restart)
     std::vector<ArchSub> subs;
@@ -1927,15 +2121,30 @@ std::vector<Engine::ArchSub> Engine::archive_subs(const Seq& q, int n) {
             if (fd < 0) return false;
             x.hold = std::make_shared<Bufs>(&hpool_);
             size_t o = it->data_off;
+            bool bad = false;  // a checksum mismatch (not a read error)
             for (int r = 0; r < ng && ok; r++) {
                 const size_t sb = workers_[r]->snapshot_bytes();
                 x.hold->add(sb);
                 ok = read_all(fd, x.hold->back().get(), sb,
                               o + workers_[r]->archive_bytes(0, it->n) + si * sb);
+                const std::vector<uint64_t>& hs = it->disk->hash;  // (DK-L6; empty: a 0002 file)
+                const size_t ns = it->subs.size();
+                if (ok && hs.size() == it->sizes.size() * (1 + ns))
+                    bad = !(ok = arch_hash(x.hold->back().get(), sb) == hs[r * (1 + ns) + 1 + si]);
                 o += it->sizes[r];
             }
             close(fd);
-            if (!ok) return false;
+            if (bad) {  // (review L2) the file is no copy any more: as a failed write (arch_present / drop paths skip it)
+                {
+                    std::lock_guard<std::mutex> l(it->disk->mu);
+                    it->disk->ok = false;
+                }
+                unlink(it->path.c_str());
+            }
+            if (!ok) {
+                fprintf(stderr, "disk cache: state unreadable or checksum mismatch: %s\n", it->path.c_str());
+                return false;
+            }
             for (int r = 0; r < ng; r++) x.src.push_back(x.hold->at(r).get());
         } else {
             for (int r = 0; r < ng; r++)
@@ -1962,6 +2171,7 @@ std::vector<Engine::ArchSub> Engine::archive_subs(const Seq& q, int n) {
         };
         for (auto it = archives_.begin(); it != archives_.end(); ++it) {
             if (it->sk != q.sk) continue;
+            if (!it->ram && !arch_file_ready(*it)) continue;  // (rereview L3: no wait on another conversation's write)
             if (it->pinned && it->ram && usable(it, it->n)) cands.push_back({it->n, true, it, -1});
             for (size_t si = 0; si < it->subs.size(); si++)
                 if (usable(it, it->subs[si])) cands.push_back({it->subs[si], (bool)it->ram, it, (int)si});
@@ -2019,8 +2229,8 @@ void Engine::archive_slot(int slot, bool force) {
     }
     // force (pause_slot): any length, and only an archive ending exactly at pos holds its state
     if ((n < archive_min_ && !force) || archive_budget_ == 0 || (force && n <= q.split)) return;
-    for (auto& a : archives_)
-        if (a.sk == q.sk && (force ? a.n == n && a.split == q.split && a.ram : a.n >= n) &&
+    for (auto& a : archives_)  // (rereview L4: an archive without memory whose write failed holds nothing)
+        if (a.sk == q.sk && (force ? a.n == n && a.split == q.split && a.ram : a.n >= n && arch_present(a)) &&
             std::equal(q.seq.begin(), q.seq.begin() + n, a.toks.begin())) {
             a.used = ++tick_;  // already archived
             a.last_s = std::max(a.last_s, q.last_s);
@@ -2054,7 +2264,7 @@ void Engine::archive_slot(int slot, bool force) {
                    subs[si].src[r], workers_[r]->snapshot_bytes());
     subs.clear();
     // this archive covers them (found again: ram_make_room may have dropped some of them)
-    drop_covered(q.sk, q.seq.data(), n, ~0ull);
+    drop_covered(q.sk, q.seq.data(), n, ~0ull, !disk_dir_.empty() && (a.split || a.sk >= 0 || a.total > disk_budget_));
     a.toks.assign(q.seq.begin(), q.seq.begin() + n);
     a.n = n;
     a.born = a.used = ++tick_;
@@ -2077,6 +2287,14 @@ bool Engine::bg_prepare(int slot) {
     BgArchive b;
     b.slot = slot;
     b.n = n;
+    // optional (the conversation stays in its slot): evicts only what goes before it, so never a newer conversation. The
+    // rows alone must fit before any state is gathered or copied (review M2: a refusal costs nothing)
+    const qe_arch::Rank me{q.last_s, tick_ + 1};
+    {
+        size_t rows = 0;
+        for (int r = 0; r < ng; r++) rows += workers_[r]->archive_bytes(q.split, n);
+        if (rows > archive_budget_ || !ram_fits(rows, &me)) return false;
+    }
     // the checkpoints of what bg_finish will drop, too (as in archive_slot)
     std::vector<ArchSub> subs = archive_subs(q, n);
     b.born = tick_;
@@ -2087,11 +2305,9 @@ bool Engine::bg_prepare(int slot) {
         a.sizes.push_back(workers_[r]->archive_bytes(a.split, n) + subs.size() * workers_[r]->snapshot_bytes());
         a.total += a.sizes.back();
     }
+    if (a.total > archive_budget_ || !ram_fits(a.total, &me)) return false;  // (with the states: still nothing copied)
     if (archive_used_ + a.total > ram_budget()) stage_subs(subs);
-    // optional (the conversation stays in its slot): evicts only what goes before it, so never a newer conversation and,
-    // for an ordinary one, no active main
-    const qe_arch::Rank me{qe_arch::active_main(q.prio, q.last_s, mono_s(), main_stale_s_), q.last_s, tick_ + 1};
-    if (a.total > archive_budget_ || !ram_fits(a.total, &me) || !ram_make_room(a.total, q.prio)) return false;
+    if (!ram_make_room(a.total, q.prio)) return false;
     a.ram = std::make_shared<Bufs>(&hpool_);
     for (size_t sz : a.sizes) a.ram->add(sz);
     for (auto& x : subs) a.subs.push_back(x.pos);
@@ -2127,7 +2343,7 @@ void Engine::bg_finish(bool all) {
     if (keep != cur_) use_slot(keep);
     if (std::all_of(bg_.piece.begin(), bg_.piece.end(), [](int p) { return p < 0; })) {
         // archives this one covers go (as in archive_slot), but not one made since bg_prepare
-        drop_covered(a.sk, a.toks.data(), a.n, bg_.born);
+        drop_covered(a.sk, a.toks.data(), a.n, bg_.born, !disk_dir_.empty() && (a.split || a.sk >= 0 || a.total > disk_budget_));
         a.born = a.used = ++tick_;
         a.last_s = seqs_[bg_.slot].last_s;
         if (pool_log_)
@@ -2144,20 +2360,22 @@ bool Engine::archive_more(size_t budget) {
     static const size_t min_bytes = 1 << 20;
     if (budget < min_bytes) budget = min_bytes;
     if (bg_.slot < 0) {
-        // the idle conversation worth most: highest priority, then the longest (its eviction
-        // would block a request the longest), skipping what is archived already
-        int best = -1;
+        // the longest idle conversation (its eviction would block a request the longest; no prio
+        // order, user decision 2026-11-12), skipping what is archived already; when its write is
+        // refused (it may evict only what is older than itself), the next one (review M2)
+        std::vector<int> cands;
         for (size_t j = 0; j < seqs_.size(); j++) {
             const Seq& q = seqs_[j];
             if (q.active || q.pos < archive_min_ || pf_of(j)) continue;
             bool have = false;
             for (auto& a : archives_)
-                if (a.sk == q.sk && a.n >= q.pos && (a.ram || !a.path.empty()) &&
+                if (a.sk == q.sk && a.n >= q.pos && arch_present(a) &&
                     std::equal(q.seq.begin(), q.seq.begin() + q.pos, a.toks.begin())) { have = true; break; }
             if (have) continue;
-            if (best < 0 || q.prio > seqs_[best].prio || (q.prio == seqs_[best].prio && q.pos > seqs_[best].pos)) best = j;
+            cands.push_back((int)j);
         }
-        if (best < 0 || !bg_prepare(best)) return true;
+        if (qe_pool::longest_accepted(cands, [&](int j) { return seqs_[j].pos; }, [&](int j) { return bg_prepare(j); }) < 0)
+            return true;
     }
     const int slot = bg_.slot;
     const int keep = cur_;
@@ -2177,7 +2395,7 @@ bool Engine::archive_more(size_t budget) {
 
 // Pin the state of the selected slot at pos (a prefix shared by conversations of one kind: the
 // end of the system prompt and tools) as a host copy outside the archive LRU. Within
-// QE_PREFIX_GB: the least recently used pinned prefix of the lowest priority gives way.
+// QE_PREFIX_GB: the least recently used pinned prefix gives way (no prio order, user decision 2026-11-12).
 void Engine::pin_prefix(int slot, int pos, unsigned long long affinity) {
     Seq& q = seqs_[slot];
     if (pos < 256 || prefix_budget_ == 0 || q.split > 0) return;  // attached: its prefix exists
@@ -2187,7 +2405,6 @@ void Engine::pin_prefix(int slot, int pos, unsigned long long affinity) {
         if (a.pinned && a.sk == q.sk && a.n == pos && std::equal(ids, ids + pos, a.toks.begin())) {
             a.used = ++tick_;
             a.affinity = affinity;
-            a.prio = std::max(a.prio, q.prio);
             return;
         }
     const int ng = workers_.size();
@@ -2200,7 +2417,7 @@ void Engine::pin_prefix(int slot, int pos, unsigned long long affinity) {
     while (prefix_used_ + a.total > prefix_budget_) {
         auto v = archives_.end();
         for (auto it = archives_.begin(); it != archives_.end(); ++it)
-            if (it->pinned && !it->hold && (v == archives_.end() || it->prio < v->prio || (it->prio == v->prio && it->used < v->used)))
+            if (it->pinned && !it->hold && (v == archives_.end() || it->used < v->used))
                 v = it;
         if (v == archives_.end()) return;
         prefix_used_ -= v->total;
@@ -2290,7 +2507,10 @@ int Engine::probe_cached(const int* ids, int n) const {
 // Write an archive to the disk cache in the background.
 // No new file took them over (not written to disk, or too big): the covered files go now.
 void Engine::disk_flush_covered() {
-    for (auto& p : covered_files_) unlink(p.c_str());
+    for (auto& [p, sz] : covered_files_) {
+        unlink(p.c_str());
+        disk_covered_ -= sz;
+    }
     covered_files_.clear();
 }
 
@@ -2318,6 +2538,14 @@ void Engine::disk_enqueue(KvArchive& a) {
     for (int p : a.subs) put(h, (int32_t)p);
     put(h, (uint32_t)a.sizes.size());
     for (size_t sz : a.sizes) put(h, (uint64_t)sz);
+    // checksums (filled by the writer): per GPU section, the KV rows, then each delta-net state (a state is read alone)
+    const uint32_t nh = (uint32_t)(a.sizes.size() * (1 + a.subs.size()));
+    put(h, nh);
+    j.hash_off = h.size();
+    h.resize(h.size() + (size_t)nh * 8, 0);
+    j.ns = (int)a.subs.size();
+    for (auto& w : workers_) j.snb.push_back(w->snapshot_bytes());
+    put(h, arch_hdr_hash(a.n, a.subs, a.toks.data()));  // (review L5) the token ids / positions are checked at the index too
     const char* t = (const char*)a.toks.data();
     h.insert(h.end(), t, t + (size_t)a.n * 4);
     a.data_off = h.size();
@@ -2329,7 +2557,7 @@ void Engine::disk_enqueue(KvArchive& a) {
 }
 
 void Engine::disk_writer() {
-    std::vector<std::string> covered;  // superseded files: deleted once a newer archive's file exists
+    std::vector<std::pair<std::string, size_t>> covered;  // superseded files (bytes): deleted once a newer archive's file exists
     while (true) {
         DiskJob j;
         {
@@ -2340,35 +2568,76 @@ void Engine::disk_writer() {
             disk_q_.pop_front();
             disk_busy_++;
         }
-        bool ok = false;
-        {
-            std::lock_guard<std::mutex> l(j.st->mu);
-            if (j.st->cancel) j.st->done = true;
-        }
-        if (!j.st->done) {
-            const std::string tmp = j.path + ".tmp";
-            FILE* f = fopen(tmp.c_str(), "wb");
-            if (f) {
-                ok = fwrite(j.header.data(), 1, j.header.size(), f) == j.header.size();
-                for (size_t r = 0; ok && r < j.sizes.size(); r++)
-                    ok = fwrite(j.ram->at(r).get(), 1, j.sizes[r], f) == j.sizes[r];
-                ok = (fclose(f) == 0) && ok;
-            }
-            j.ram.reset();
-            std::lock_guard<std::mutex> l(j.st->mu);
-            if (ok && !j.st->cancel) ok = rename(tmp.c_str(), j.path.c_str()) == 0;
-            else ok = false;
-            if (!ok) unlink(tmp.c_str());
-            j.st->ok = ok;
-            j.st->done = true;
-            if (!ok && !j.st->cancel) fprintf(stderr, "disk cache: write failed: %s\n", j.path.c_str());
-        }
+        // (open_findings DK-CANCEL) a cancel (disk_forget: the archive was superseded or dropped) is seen between pieces
+        // of kDiskPiece bytes, so a superseded file stops early and frees its memory and the queue
+        auto cancelled = [&] { std::lock_guard<std::mutex> l(j.st->mu); return j.st->cancel; };
+        constexpr size_t kDiskPiece = (size_t)64 << 20;
         covered.insert(covered.end(), j.covered.begin(), j.covered.end());
-        if (j.st->ok) {  // (a cancelled or failed write passes them on; files left at exit are found at the next start)
-            for (auto& p : covered)
+        auto drop_carried = [&] {  // the superseded files go (never the path just written: the same tokens and length)
+            for (auto& [p, sz] : covered) {
                 if (p != j.path) unlink(p.c_str());
+                disk_covered_ -= sz;
+            }
             covered.clear();
+        };
+        bool ok = false;
+        const std::string tmp = j.path + ".tmp";
+        std::vector<uint64_t> hs;
+        bool stop = cancelled();
+        for (size_t r = 0; r < j.sizes.size() && !stop; r++) {  // (open_findings DK-L6) payload checksums
+            const char* p = j.ram->at(r).get();
+            const size_t sb = j.snb[r], kv = j.sizes[r] - (size_t)j.ns * sb;
+            if ((stop = cancelled())) break;
+            hs.push_back(arch_hash(p, kv));
+            for (int si = 0; si < j.ns; si++) hs.push_back(arch_hash(p + kv + si * sb, sb));
         }
+        if (!stop && hs.size() * 8 + j.hash_off <= j.header.size())
+            memcpy(j.header.data() + j.hash_off, hs.data(), hs.size() * 8);
+        else
+            stop = true;
+        // one write: .tmp, synced, renamed under the state lock (a cancel after the rename leaves the archive's path to
+        // disk_forget); last: the archive's state is final here
+        auto attempt = [&](bool last) {
+            bool w = false;
+            if (FILE* f = stop ? nullptr : fopen(tmp.c_str(), "wb")) {
+                w = fwrite(j.header.data(), 1, j.header.size(), f) == j.header.size();
+                for (size_t r = 0; w && r < j.sizes.size(); r++)
+                    for (size_t o = 0; w && o < j.sizes[r]; o += kDiskPiece) {
+                        const size_t len = std::min(kDiskPiece, j.sizes[r] - o);
+                        w = !cancelled() && fwrite(j.ram->at(r).get() + o, 1, len, f) == len;
+                    }
+                // (DK-L6) on the drive before the rename: a power loss leaves the old file or a .tmp, never a short new file
+                w = w && fflush(f) == 0 && fdatasync(fileno(f)) == 0;
+                w = (fclose(f) == 0) && w;
+            }
+            std::lock_guard<std::mutex> l(j.st->mu);
+            if (w && !j.st->cancel) w = rename(tmp.c_str(), j.path.c_str()) == 0;
+            else w = false;
+            if (w) {  // (review L9) the rename on the drive before drop_carried unlinks the superseded file
+                const int dfd = open(disk_dir_.c_str(), O_RDONLY | O_DIRECTORY);
+                if (dfd >= 0) {
+                    fsync(dfd);
+                    close(dfd);
+                }
+            }
+            if (!w) unlink(tmp.c_str());
+            if (w || last || j.st->cancel) {
+                j.st->ok = w;
+                if (w) j.st->hash = hs;
+                j.st->done = true;
+                if (!w && !j.st->cancel) fprintf(stderr, "disk cache: write failed: %s\n", j.path.c_str());
+            }
+            return w;
+        };
+        ok = attempt(covered.empty());
+        // (fix_14_15_disk_rereview M1 / L1) a failed write (full drive, I/O error) drops the superseded files it carries, as
+        // before the #14 change, which frees their space, and retries once
+        if (!ok && !j.st->done) {
+            drop_carried();
+            ok = attempt(true);
+        }
+        j.ram.reset();
+        if (ok) drop_carried();  // (a cancelled write passes them on; files left at exit are found at the next start)
         j.st->cv.notify_all();
         {
             std::lock_guard<std::mutex> l(disk_mu_);
@@ -2402,11 +2671,32 @@ bool Engine::archive_load(KvArchive& a) {
         off[r] = o;
     }
     std::atomic<bool> ok{true};
-    pool_->run([&](int r) {  // one reader per GPU section (parallel requests to the drive)
-        if (!read_all(fd, bufs->at(r).get(), a.sizes[r], off[r])) ok = false;
+    const std::vector<uint64_t>& hs = a.disk->hash;  // (written before done; empty: a 0002 file)
+    const size_t ns = a.subs.size();
+    pool_->run([&](int r) {  // one reader per GPU section (parallel requests to the drive); each piece hashed as it arrives
+        char* p = bufs->at(r).get();
+        const bool chk = hs.size() == a.sizes.size() * (1 + ns);  // (empty: a 0002 file)
+        const size_t sb = workers_[r]->snapshot_bytes(), kv = a.sizes[r] - ns * sb;
+        constexpr size_t kPiece = (size_t)64 << 20;  // (a multiple of 32: the hash's block)
+        for (size_t q = 0; q <= ns && ok; q++) {  // region q: the KV rows, then each delta-net state
+            const size_t b0 = q == 0 ? 0 : kv + (q - 1) * sb, len = q == 0 ? kv : sb;
+            ArchHash hz;
+            for (size_t o = 0; o < len || len == 0; o += kPiece) {
+                const size_t l = std::min(kPiece, len - o);
+                if (l && !read_all(fd, p + b0 + o, l, off[r] + b0 + o)) { ok = false; break; }
+                if (o + l >= len) {
+                    if (chk && hz.final(p + b0 + o, l) != hs[r * (1 + ns) + q]) ok = false;
+                    break;
+                }
+                if (chk) hz.update(p + b0 + o, l);
+            }
+        }
     });
     close(fd);
-    if (!ok) return false;
+    if (!ok) {
+        fprintf(stderr, "disk cache: unreadable or checksum mismatch, dropped: %s\n", a.path.c_str());
+        return false;
+    }
     utimensat(AT_FDCWD, a.path.c_str(), nullptr, 0);  // recently used (LRU across restarts)
     ram_make_room(a.total, a.prio);
     a.ram = bufs;
@@ -2435,6 +2725,9 @@ void Engine::disk_init() {
     }
     fp << "|g" << workers_.size() << "|" << (env_str("QE_SPLIT") ? env_str("QE_SPLIT") : "");
     if (kvs_.on()) fp << "|kvsplit" << kvs_.period << "," << kvs_.a01 << "," << kvs_.a12;
+    // the 4-bit format's version: bump it on any change of the rotation signs, the levels / clip set or the nibble order
+    // (the archive sizes below only tell the row bytes; review L3)
+    if (workers_[0]->kv4()) fp << "|kv4v1";
     {   // RoPE scaling: keys rotated with YaRN (and the states computed under it) never meet native RoPE or another factor
         // (native: no token, so the archives written before keep matching)
         float t[33];
@@ -2463,7 +2756,9 @@ void Engine::disk_init() {
                 char mg[8];
                 uint32_t fl, ns, ngs;
                 int32_t n;
-                if (fread(mg, 1, 8, f) != 8 || memcmp(mg, kArchMagic, 8) != 0) break;
+                if (fread(mg, 1, 8, f) != 8) break;
+                const bool v3 = memcmp(mg, kArchMagic, 8) == 0;
+                if (!v3 && memcmp(mg, kArchMagicV2, 8) != 0) break;
                 if (fread(&fl, 4, 1, f) != 1 || fl > 65536) break;
                 std::string fps(fl, '\0');
                 if (fread(&fps[0], 1, fl, f) != fl || fps != fingerprint_) break;
@@ -2481,8 +2776,21 @@ void Engine::disk_init() {
                     a.total += sz;
                 }
                 if (!sz_ok) break;
+                std::vector<uint64_t> hs;
+                uint64_t hh = 0;
+                if (v3) {
+                    uint32_t nh;
+                    if (fread(&nh, 4, 1, f) != 1 || nh != ngs * (1 + ns)) break;
+                    hs.resize(nh);
+                    if (fread(hs.data(), 8, nh, f) != nh) break;
+                    if (fread(&hh, 8, 1, f) != 1) break;
+                }
                 a.toks.resize(n);
                 if (fread(a.toks.data(), 4, n, f) != (size_t)n) break;
+                if (v3 && arch_hdr_hash(n, a.subs, a.toks.data()) != hh) {  // (review L5) a flipped token id: not this prompt
+                    fprintf(stderr, "disk cache: header checksum mismatch, skipped: %s\n", path.c_str());
+                    break;
+                }
                 a.n = n;
                 a.data_off = ftell(f);
                 struct stat stt;
@@ -2490,6 +2798,7 @@ void Engine::disk_init() {
                 a.path = path;
                 a.disk = std::make_shared<DiskState>();
                 a.disk->done = a.disk->ok = true;
+                a.disk->hash = std::move(hs);
                 found.push_back({std::move(a), stt.st_mtime});
                 ok = true;
             } while (false);
@@ -2524,6 +2833,7 @@ void Engine::persist() {
 }
 
 void Engine::step(const int* ids, int m, bool want_logits) {
+    if (mkv_slot_ == cur_) mkv_catch_up();  // [q27-mtpkv-defer] (review L2: qe_decode / qe_prefill advance pos)
     Seq& q = seqs_[cur_];
     if (q.pos + m > q.max_t) CHECK(ensure_cap(cur_, std::min(q.pos + m + 1, max_ctx_)), "KV pool full");
     CHECK(q.pos + m <= q.max_t, "context full");
@@ -2715,7 +3025,7 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
         s = &snaps_[snap_victim(snaps_, kind, snap_reserve0_, [&](const Snapshot& x) {
             const bool ok = x.slot >= 0 && x.slot < (int)seqs_.size();
             const int end = ok ? std::max(seqs_[x.slot].pos, x.slot == cur_ && pf_of(cur_) ? pf_of(cur_)->n : 0) : 0;
-            return (ok ? seqs_[x.slot].prio : 1) + (x.pos >= 32768 && x.pos + 8192 >= end);
+            return (int)(ok && x.pos >= 32768 && x.pos + 8192 >= end);
         })];
     }
     s->slot = cur_;
@@ -2724,7 +3034,16 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
     s->sk = sk;
     s->toks.assign(ids, ids + pos);
     s->used = ++tick_;
-    pool_->run([&](int r) { workers_[r]->snapshot_save(s->bufs[r]); });
+    // [q27-snapasync] the copy runs beside the next step of this slot (QE_SNAP_ASYNC=0: synchronous, as before)
+    static const bool async = env_int("QE_SNAP_ASYNC", 1) != 0;
+    pool_->run([&](int r) {
+        if (async) workers_[r]->snapshot_save_async(s->bufs[r]);
+        else workers_[r]->snapshot_save(s->bufs[r]);
+    });
+}
+
+void Engine::snap_host_wait() {
+    for (auto& w : workers_) w->snap_host_wait();
 }
 
 // Slot choice: (1) a slot whose live state the prompt extends, (2) the slot with the longest
@@ -2769,14 +3088,14 @@ int Engine::pick_slot(const int* ids, int n, int k, unsigned long long affinity)
                 (best < 0 || seqs_[i].max_t > seqs_[best].max_t))
                 best = i;
         if (best >= 0) return best;
-        // overwrite the slot whose cached context is cheapest to lose (finished conversations
-        // first, the main thread last; then fewest tokens; ties: least recently used), so e.g. a
-        // waiting main agent's long context survives parallel subagents
+        // overwrite the slot whose cached context is cheapest to lose (fewest tokens; ties: least
+        // recently used; no prio order, user decision 2026-11-12), so e.g. a waiting agent's long
+        // context survives short parallel ones
         for (int i = 0; i < (int)seqs_.size(); i++) {
             const Seq &q = seqs_[i];
             if (!fits(q, extra)) continue;
             const Seq* b = best < 0 ? nullptr : &seqs_[best];
-            if (!b || q.prio < b->prio || (q.prio == b->prio && (q.pos < b->pos || (q.pos == b->pos && q.used < b->used))))
+            if (!b || qe_pool::overwrite_first(q.pos, q.used, b->pos, b->used))
                 best = i;
         }
         if (best >= 0) return best;
@@ -3280,6 +3599,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     pf.marks = std::move(marks);
     pfs_.push_back(std::move(pf));
     if (seqs_[slot].constrained) constrain(slot, false);  // a new request: unconstrained unless set again
+    if (seqs_[slot].banned) ban(slot, nullptr, 0);        // (and without a token ban)
     return slot;
 }
 
@@ -3365,14 +3685,16 @@ int Engine::start_finish_slot(int slot) {
     last_rows_ = last_m <= kMaxGemvTokens ? last_m : 1;
     q.pos = n;
     q.seq = pf.ids;
-    if (!pf.end_snap) take_snapshot(pf.ids.data(), n, 1);  // else saved at n - 1 (start_begin)
     int tok;
     CUDA_CHECK(cudaSetDevice(workers_[0]->device));
+    // (read before the snapshot: [q27-snapasync] its device-to-host copy queues on the copy engine ahead of later reads)
     CUDA_CHECK(cudaMemcpy(&tok, workers_[0]->out_tok_ + last_m - 1, 4, cudaMemcpyDeviceToHost));
+    if (!pf.end_snap) take_snapshot(pf.ids.data(), n, 1);  // else saved at n - 1 (start_begin)
     q.last_tok = q.pending = tok;
     if (q.pen) pool_->run([&](int r) { workers_[r]->pen_host(&tok, 1, n); });  // the first token sits at n
     if (pf.slot < (int)dcopy_.size()) dcopy_[pf.slot] = 0.f;
     q.k_avail = pf.dfl && !q.constrained && dring_of_[pf.slot] >= 0 ? kDflDrafts : pf.kstart;
+    q.k_blk = false;  // ([q27-bdfl] set only by a block-drafting batched launch)
     if (pf.dfl && q.constrained) dfl_gap(pf.slot, n);
     lk_slot_ = -1;
     lkb_inval(pf.slot);
@@ -3408,6 +3730,23 @@ void Engine::launch_step(int buf, int base, int lk) {
         dfl_gap(cur_, seqs_[cur_].pos);
     }
     buf_blk_[buf] = blk;
+    // [q27-mtpkv-defer] a step that is not a block step (MTP drafts read the slot's MTP cache): every deferred row first;
+    // a block step whose ring holds >= kMkvFlush rows of finished steps fills those first (exact: committed rows)
+    bool mkv_flush = false;
+    const bool mkv = std::all_of(workers_.begin(), workers_.end(), [](const auto& w) { return w->mkv_on(); });
+    if (!blk || !mkv) {
+        if (mkv_slot_ == cur_) {
+            if (inflight_) mkv_sync_ahead_++;  // (review q27_mtpkv_defer L6: a host sync behind the in-flight step; QE_AHEAD_LOG)
+            mkv_catch_up();
+        }
+        buf_mkv_[buf] = false;
+    } else {
+        if (mkv_slot_ >= 0 && mkv_slot_ != cur_) mkv_catch_up();
+        mkv_flush = mkv_n_ >= Worker::kMkvFlush;
+        if (mkv_flush) mkv_n_ -= Worker::kMkvFlush;
+        mkv_slot_ = cur_;
+        buf_mkv_[buf] = true;
+    }
     int kv = clamp_kv(seqs_[cur_], kv0, base);
     const bool look = lk > 0 && kv > 0;
     if (lk > 0 && !look) kv = 0;
@@ -3419,6 +3758,7 @@ void Engine::launch_step(int buf, int base, int lk) {
     seqs_[cur_].launches++;
     const bool wd = seqs_[cur_].want_drafts && kd > 0;
     seqs_[cur_].k_avail = kd;
+    seqs_[cur_].k_blk = false;
     if (workers_[0]->lsa_on())  // LSA: the graph's mode bit from host state (the catch-up runs in the step's job)
         for (auto& w : workers_) w->lsa_mode(cur_, seqs_[cur_].pos);
     const unsigned* mh = con ? mask_buffer(cur_) : nullptr;
@@ -3428,7 +3768,16 @@ void Engine::launch_step(int buf, int base, int lk) {
     // stay in the ~38-split region
     const bool rs = seqs_[cur_].pos + 2 * (kMaxSpecK + 1) + 8 <= dec38_max();
     for (auto& wp : workers_) wp->attn_rs_ = rs;
-    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look, blk, ring);
+    // [q27-sib] no tree steps while the host reads the drafts (stop sequences: Seq::drafts / stop_risk; review L1)
+    // and below QE_DF_SIB_MAXPOS keys (the leaf pass redoes a decode-attention split, which grows with the context)
+    static const int sib_maxpos = env_int("QE_DF_SIB_MAXPOS", 1 << 30);
+    for (auto& wp : workers_) wp->sib_ok_ = !seqs_[cur_].want_drafts && seqs_[cur_].pos < sib_maxpos;
+    // [q27-plain] block steps that verify the drafter's drafts (not lookup drafts) take the graph without the conditional
+    // node: a graph with an IF node makes cudaGraphLaunch wait for the previous step graph on the host, and these are the
+    // steps queued ahead. The drafter then always runs (its drafts are overridden when the step's lookup scan found some).
+    // Lookup steps keep the IF node (they are not queued ahead; the drafter is skipped while text is copied). QE_DF_PLAIN=0: off
+    const bool plain = blk && !look && df_plain(*workers_[0]);
+    buf_captured_[buf] = !workers_[0]->has_spec_graph(kv, kd, look, blk, ring, plain);
     pool_->run([&](int r) {
         Worker& w = *workers_[r];
         if (io) {
@@ -3441,7 +3790,8 @@ void Engine::launch_step(int buf, int base, int lk) {
             w.dfl_ring_select(dsel);
             if (dinv >= 0) w.dfl_ring_inval(dinv);
         }
-        w.run_spec(kv, kd, true, look, blk, ring);
+        if (mkv_flush) w.mkv_fill(Worker::kMkvFlush, w.stream);  // (review M1: eager, before the step's graph; no graph variant)
+        w.run_spec(kv, kd, true, look, blk, ring, plain);
         if (r == 0) {
             CUDA_CHECK(cudaMemcpyAsync(emit_host_ + buf * 64, w.spec_.emit, (w.lk_on() ? 32 : kv + 2) * 4,
                                        cudaMemcpyDeviceToHost, w.stream));
@@ -3456,11 +3806,22 @@ void Engine::launch_step(int buf, int base, int lk) {
 }
 
 void Engine::finish_single() {
-    if (!inflight_) return;
-    pool_->run([&](int r) { workers_[r]->undo_spec(); });
-    inflight_ = false;
-    seqs_[cur_].stale = true;
-    lk_slot_ = -1;  // the undone step appended its tokens to the device history
+    if (inflight_) {
+        pool_->run([&](int r) { workers_[r]->undo_spec(); });
+        inflight_ = false;
+        seqs_[cur_].stale = true;
+        lk_slot_ = -1;  // the undone step appended its tokens to the device history
+    }
+    mkv_catch_up();
+}
+
+void Engine::mkv_catch_up() {
+    if (mkv_slot_ < 0) return;
+    CHECK(mkv_slot_ == cur_, "mkv rows of slot %d, current slot %d", mkv_slot_, cur_);
+    pool_->run([&](int r) { workers_[r]->mkv_catch_up(); });
+    mkv_slot_ = -1;
+    mkv_n_ = 0;
+    buf_mkv_[0] = buf_mkv_[1] = false;
 }
 
 void Engine::finish_batch() {  // undo the batched step queued ahead
@@ -3497,7 +3858,7 @@ void Engine::finish_for(int slot) {
 void Engine::resync(Seq& q, int slot) {
     if (!q.stale || q.paused) return;
     pool_->run([&](int r) { workers_[r]->spec_resync(slot, q.pos, q.pending); });
-    q.k_avail = 0;
+    q.k_avail = 0, q.k_blk = false;
     q.stale = false;
     if (slot == cur_) lk_slot_ = -1;
 }
@@ -3537,11 +3898,13 @@ void Engine::release(int slot) {
     seqs_[slot].want_drafts = seqs_[slot].no_ahead = false;
     seqs_[slot].drafts.clear();
     if (seqs_[slot].constrained) constrain(slot, false);
+    if (seqs_[slot].banned) ban(slot, nullptr, 0);
 }
 
 bool Engine::trim(int slot, int pos) {
     Seq& q = seqs_.at(slot);
     if (pos >= q.pos) return true;  // the slot holds no token past pos (the last one is pending)
+    if (slot == mkv_slot_ && !(slot == cur_ && inflight_)) mkv_catch_up();  // [q27-mtpkv-defer] (rows past pos: unread)
     // the rows of a single-sequence step are in buffers every launch overwrites; a batched step's
     // stash is the slot's own (only its own next step changes it)
     const bool valid = q.rb_batched ? q.rb_epoch >= 0 && q.rb_launch == q.launches : q.rb_epoch == epoch_;
@@ -3560,7 +3923,7 @@ bool Engine::trim(int slot, int pos) {
     q.stale = true;
     if (slot == cur_) lk_slot_ = -1;
     lkb_inval(slot);
-    q.k_avail = 0;
+    q.k_avail = 0, q.k_blk = false;
     q.rb_epoch = -1;
     return true;
 }
@@ -3725,9 +4088,57 @@ void Engine::launch_batch(int buf, bool ahead) {
     bstep_[buf] = bslots_;
     epoch_++;
     for (int s : bslots_) seqs_[s].launches++;
-    const int kd = std::min(next_k(), bcap_);
+    // [q27-bdfl] sequences that draft their next step with the DFlash2 block: unconstrained, a ring of their own (never one
+    // another sequence of this step holds); the ring's stale rows dropped eagerly before the step
+    std::vector<int> dring(n, -1), dinv(n, -1);
+    bool any_blk = false;
+    if (dfl_on_ && drafter_ != 0 && n <= df_batch_) {
+        if ((int)dring_of_.size() < (int)seqs_.size()) dring_of_.resize(seqs_.size(), -1);
+        std::vector<char> held(drings_.size(), 0);
+        for (int s : bslots_)
+            if (dring_of_[s] >= 0) held[dring_of_[s]] = 1;
+        for (int i = 0; i < n; i++) {
+            const int s = bslots_[i];
+            if (!use_block(s)) continue;
+            if (dring_of_[s] < 0) {  // a ring no sequence of this step holds, no prompt in flight: free first, else least recently used
+                int fr = -1;
+                for (int r = 0; r < (int)drings_.size(); r++) {
+                    const int o = drings_[r].owner;
+                    if (held[r] || (o >= 0 && pf_of(o))) continue;
+                    if (fr < 0 || ((o < 0) != (drings_[fr].owner < 0) ? o < 0 : drings_[r].used < drings_[fr].used)) fr = r;
+                }
+                if (fr < 0) continue;  // (more block sequences than rings: this one drafts with MTP)
+                if (drings_[fr].owner >= 0) dring_of_[drings_[fr].owner] = -1, drings_[fr].owner = -1;
+            }
+            dfl_bind(s, true, INT_MAX);  // (a ring without owner now exists: it takes a free one, never one held here)
+            const int r = dring_of_[s];
+            held[r] = 1;
+            dring[i] = r;
+            dinv[i] = drings_[r].pinv;
+            drings_[r].pinv = -1;
+            any_blk = true;
+        }
+    }
+    // MTP drafts (when every sequence drafts with the block: only the MTP pass that keeps their MTP caches current)
+    const bool all_blk = any_blk && std::count(dring.begin(), dring.end(), -1) == 0;
+    const int kd = all_blk ? std::min(1, bcap_) : std::min(next_k(), bcap_);
     bkd_[buf] = kd;
-    for (int i = 0; i < n; i++) seqs_[bslots_[i]].k_avail = kd;
+    if (dfl_on_ && df_batch_ > 0)  // (review M1 / L1) a ring of a sequence that drafts with MTP here falls behind from its base
+        for (int i = 0; i < n; i++)
+            if (dring[i] < 0) {
+                int base = seqs_[bslots_[i]].pos;
+                const auto& f = bstep_[buf ^ 1];
+                const auto it = std::find(f.begin(), f.end(), bslots_[i]);
+                if (ahead && it != f.end()) base += bkvs_[buf ^ 1][it - f.begin()] + 1;
+                dfl_gap(bslots_[i], base);
+            }
+    for (int i = 0; i < n; i++) {
+        Seq& q = seqs_[bslots_[i]];
+        bblk_[buf][i] = q.k_blk;  // the drafts this step verifies (made by the slot's last step)
+        bkdn_[buf][i] = dring[i] >= 0 ? kDflDrafts : kd;
+        q.k_avail = bkdn_[buf][i];
+        q.k_blk = dring[i] >= 0;
+    }
     for (auto& c : con) std::get<2>(c)[0] = kd;
     const std::vector<int> kv(kvs, kvs + n), lkv(lkr, lkr + n), kavv(kav, kav + n);
     pool_->run([&](int r) {
@@ -3736,16 +4147,21 @@ void Engine::launch_batch(int buf, bool ahead) {
             w.upload_mask(bslots_[i], mh, kvs[i] + 1);
             w.upload_drafts(bslots_[i], io + 17, kvs[i]);
         }
-        w.run_spec_batch(bslots_, kv, kd, any_lkr ? &lkv : nullptr, any_lkr ? &kavv : nullptr);
+        for (int i = 0; i < n; i++)  // [q27-bdfl] (eager, before the step's graph, as launch_step)
+            if (dring[i] >= 0 && dinv[i] >= 0) {
+                w.dfl_ring_select(dring[i]);
+                w.dfl_ring_inval(dinv[i]);
+            }
+        w.run_spec_batch(bslots_, kv, kd, any_lkr ? &lkv : nullptr, any_lkr ? &kavv : nullptr, any_blk ? &dring : nullptr);
         if (r == 0) {
             for (int i = 0; i < n; i++)
                 CUDA_CHECK(cudaMemcpyAsync(batch_host_ + (buf * kMaxBatch + i) * 64,
                                            w.slot_spec(bslots_[i]).emit, (lkb_on_ ? 32 : kvs[i] + 2) * 4,
                                            cudaMemcpyDeviceToHost, w.stream));
             for (int i = 0; i < n; i++)
-                if (kd > 0 && seqs_[bslots_[i]].want_drafts && !seqs_[bslots_[i]].constrained)
+                if (bkdn_[buf][i] > 0 && seqs_[bslots_[i]].want_drafts && !seqs_[bslots_[i]].constrained)
                     CUDA_CHECK(cudaMemcpyAsync(batch_host_ + (buf * kMaxBatch + i) * 64 + 32,
-                                               w.slot_spec(bslots_[i]).tokens + 1, kd * 4,
+                                               w.slot_spec(bslots_[i]).tokens + 1, bkdn_[buf][i] * 4,
                                                cudaMemcpyDeviceToHost, w.stream));
             for (auto& [i, mh, io] : con)
                 if (kd > 0)
@@ -3760,7 +4176,11 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
     vram_tick();
     CHECK(n >= 1 && n <= kMaxBatch && k_ > 0, "step_batch n=%d k=%d", n, k_);
     finish_single();  // the single-sequence step queued ahead, if any
-    if (dfl_on_)  // batched steps draft with MTP: the slots' drafter rings fall behind from here
+    // batched steps draft with MTP (QE_DF_BATCH: up to that many sequences with the block drafter, launch_batch): the
+    // rings of MTP-drafting slots fall behind from here
+    // (rows only: launch_batch decides per launched set; review L5: no growth when no sequence can block, e.g. all constrained)
+    const bool bdf = dfl_on_ && drafter_ != 0 && n <= df_batch_ && std::any_of(slots, slots + n, [&](int s) { return use_block(s); });
+    if (dfl_on_ && df_batch_ == 0)  // (with QE_DF_BATCH, launch_batch records the gaps of the sequences it launches with MTP)
         for (int i = 0; i < n; i++) dfl_gap(slots[i], seqs_[slots[i]].pos);
     if (!batch_host_) {
         CUDA_CHECK(cudaSetDevice(workers_[0]->device));
@@ -3780,7 +4200,10 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
     static const int maxrows = std::max(8, std::min(kMaxBatchRows, env_int("QE_BATCH_MAXROWS", 64)));
     // beyond 10 sequences one draft each (2 rows): 2 drafts at 16 sequences (48 rows) measured -13 %, one draft
     // at 24 / 32 sequences (48 / 64 rows) +13 / +24 % over none
-    const int brows = std::min(maxrows, n <= 8 ? rows : n * (n <= 10 ? std::max(2, rows / 8) : 2));
+    int brows = std::min(maxrows, n <= 8 ? rows : n * (n <= 10 ? std::max(2, rows / 8) : 2));
+    // [q27-bdfl] block-drafting steps verify the whole block per sequence (8 rows) up to QE_DF_BROWS rows (GEMV path)
+    static const int df_brows = env_int("QE_DF_BROWS", 32);
+    if (bdf) brows = std::max(brows, std::min(n * (kDflDrafts + 1), std::min(df_brows, maxrows)));
     const int cap = std::max(0, std::min(kMaxSpecK, brows / n - 1));
     // index of each sequence in the step queued ahead (-1: not in it). The set changed: the queued
     // step stays if every sequence still in it is in the new set (released ones were undone alone
@@ -3830,16 +4253,15 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         for (int i = 0; i < n; i++) lone &= seqs_[sl[i]].paused || seqs_[sl[i]].full;
         std::vector<int> order(n);
         for (int i = 0; i < n; i++) order[i] = i;
-        // resume queue: highest prio first, then in pause order (FIFO); strictly in that order (a
-        // later one never overtakes the head, so none starves), as many as fit
+        // resume queue: in pause order (FIFO, no prio order); strictly in that order (a later one
+        // never overtakes the head, so none starves), as many as fit
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
             const Seq &x = seqs_[sl[a]], &y = seqs_[sl[b]];
             if (x.paused != y.paused) return x.paused;
             if (!x.paused) return false;
-            return x.prio != y.prio ? x.prio > y.prio : paused_.at(sl[a]).at < paused_.at(sl[b]).at;
+            return qe_pool::resumes_first(paused_.at(sl[a]).at, paused_.at(sl[b]).at);
         });
-        bool blocked = false;
-        int block_prio = -1;  // while the pool is shrunk: a head that did not fit blocks only those worth less (R4-L4)
+        bool blocked = false;  // (while the pool is shrunk a head that did not fit blocks nothing behind it, R4-L4)
         for (int i : order) {
             Seq& q = seqs_.at(sl[i]);
             CHECK(q.active, "slot %d not active", sl[i]);
@@ -3847,10 +4269,8 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
                 Paused& p = paused_.at(sl[i]);
                 // (retried after the next release or pool regrow, review N-M5; while the pool is shrunk a head that does
                 // not fit does not block the ones behind it)
-                if (!blocked && q.prio >= block_prio && (lone || p.seen != n_release_ + n_room_) && !unpause_slot(sl[i])) {
-                    if (pool_tokens_ >= pool_tokens0_) blocked = true;
-                    else block_prio = std::max(block_prio, q.prio);
-                }
+                if (!blocked && (lone || p.seen != n_release_ + n_room_) && !unpause_slot(sl[i]) && pool_tokens_ >= pool_tokens0_)
+                    blocked = true;
                 if (q.paused) p.seen = n_release_ + n_room_;
             }
             if (!q.full && !q.paused) {
@@ -3941,7 +4361,11 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         for (int j = 0; j < c; j++) out[i * 64 + j] = em[1 + j];
         const bool lkstep = blkr_[bbuf_][from[i]] > 0;
         q.count_step(lkstep, lkstep ? blkr_[bbuf_][from[i]] : bkvs_[bbuf_][from[i]], c);
-        if (!q.constrained && !bclamp_[bbuf_][from[i]] && !lkstep) observe(bkvs_[bbuf_][from[i]], c - 1);
+        // [q27-bdfl] drafts made by a block-drafting batched launch: not MTP statistics (review M1: recorded per launch;
+        // drafts of single-sequence block steps count as on master)
+        const bool bstep = bblk_[bbuf_][from[i]] && !lkstep;
+        if (!q.constrained && !bclamp_[bbuf_][from[i]] && !lkstep && !bstep) observe(bkvs_[bbuf_][from[i]], c - 1);
+        if (bstep) df_steps_++, df_tok_ += c;
         if (lkb_on_) {
             const int s = sl[i];
             if (lkb_len_[s] >= 0) lkb_len_[s] += c;
@@ -3956,7 +4380,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
             lkb_slotsteps_++;
             if (lkstep) lkb_steps_++, lkb_rows_sum_ += blkr_[bbuf_][from[i]], lkb_tok_ += c;
         }
-        if (q.want_drafts) q.drafts.assign(em + 32, em + 32 + bkd_[bbuf_]);
+        if (q.want_drafts) q.drafts.assign(em + 32, em + 32 + bkdn_[bbuf_][from[i]]);
         q.rb_pos = q.pos;
         q.rb_rows = c;
         q.rb_batched = true;
@@ -4044,7 +4468,7 @@ int Engine::spec_step(int* out) {
         h.back() = q.pending;
         pool_->run([&](int r) { workers_[r]->lk_set_history(h.data(), (int)h.size()); });
         CUDA_CHECK(cudaSetDevice(workers_[0]->device));
-        CUDA_CHECK(cudaMemcpy(&lk_next_, workers_[0]->lk_dev_ptr(), 4, cudaMemcpyDeviceToHost));
+        lk_next_ = *workers_[0]->lk_cnt_h_;  // (written by lk_set_history's stream before its sync)
         lk_slot_ = cur_;
     }
     const bool lk_live = lk_ok && lk_slot_ == cur_;
@@ -4064,6 +4488,20 @@ int Engine::spec_step(int* out) {
     ahead_ = lookahead_ && !q.constrained && !q.no_ahead && q.pos + 2 * (kr + 1) <= q.max_t &&
              (q.end == 0 || worst < q.end) && !(lk_live && (lk_next_ > 0 || buf_lk_[buf_]));
     if (ahead_) launch_step(buf_ ^ 1, worst, 0);
+    static const bool alog = env_int("QE_AHEAD_LOG", 0) != 0;  // (q27_1card: why a single step is not queued ahead)
+    if (alog) {
+        static long long n = 0, na = 0, nlk = 0, nlkb = 0, nroom = 0, ncon = 0, nend = 0;
+        n++;
+        if (ahead_) na++;
+        else if (q.constrained || q.no_ahead || !lookahead_) ncon++;
+        else if (!(q.pos + 2 * (kr + 1) <= q.max_t)) nroom++;
+        else if (!(q.end == 0 || worst < q.end)) nend++;
+        else if (lk_live && lk_next_ > 0) nlk++;
+        else nlkb++;
+        if (n % 200 == 0)
+            fprintf(stderr, "[ahead] steps %lld queued ahead %lld | not: lookup found %lld, lookup step %lld, room %lld, end %lld, constrained/off %lld"
+                    " | MTP-cache syncs behind a block step %lld\n", n, na, nlk, nlkb, nroom, nend, ncon, mkv_sync_ahead_);
+    }
     CUDA_CHECK(cudaSetDevice(workers_[0]->device));
     CUDA_CHECK(cudaEventSynchronize(emit_ev_[buf_]));
     const int* em = emit_host_ + buf_ * 64;
@@ -4071,6 +4509,10 @@ int Engine::spec_step(int* out) {
     for (int i = 0; i < cnt; i++) out[i] = em[1 + i];
     q.count_step(buf_lk_[buf_] != 0, buf_kv_[buf_], cnt);
     if (buf_blk_[buf_]) df_steps_++, df_tok_ += cnt;
+    if (buf_mkv_[buf_]) {  // [q27-mtpkv-defer] this block step left cnt rows (anchor + accepted drafts) in the ring
+        mkv_n_ += cnt;
+        buf_mkv_[buf_] = false;
+    }
     if (dfl_on_) {  // the slot's copy signal
         if ((int)dcopy_.size() < (int)seqs_.size()) dcopy_.resize(seqs_.size(), 0.f);
         dcopy_[cur_] = 0.8f * dcopy_[cur_] + (buf_lk_[buf_] ? 0.2f : 0.f);
@@ -4613,7 +5055,12 @@ void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
         printf("DFlash2 drafter: no checkpoint (QE_DFLASH, %s/dflash2 or %sQwen3.8-27B-DFlash2): MTP drafts\n", md.c_str(), parent.c_str());
         return;
     }
-    const int rings = std::max(1, env_int("QE_DF_RINGS", 2));
+    // [q27-bdfl] QE_DF_BATCH = n: batched steps of up to n sequences draft with the block too (each needs its own ring)
+    // default 2 on one card (1 card Swift: harness steady state c = 2 +8 %, c = 3 +6 %, c = 4 -5 %; real server, whole
+    // replies: c = 2 +2.8 %, c = 3 -0.9 %); 0 (MTP in every batched step) with more cards until
+    // measured there
+    df_batch_ = std::max(0, env_int("QE_DF_BATCH", workers_.size() == 1 ? 2 : 0));
+    int rings = std::max(1, env_int("QE_DF_RINGS", std::max(2, df_batch_ + 1)));
     size_t need = 0;
     dfl_st_.reset(new SafeTensors);
     try {  // any checkpoint the loader does not expect: MTP, one line, never a stop (review M3)
@@ -4654,16 +5101,32 @@ void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
     long long fit_ctx = LLONG_MAX;  // the context that would fit next to the drafter at these slots (every card)
     int bad = -1;
     size_t bad_fr = 0, bad_keep = 0;
+    // [q27-bdfl] review L2: the extra rings of batched block drafts never cost the drafter itself: without room for them
+    // the check runs again with 2 rings and batched steps keep MTP (QE_DF_BATCH=0)
+    for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt == 1) {
+        if (bad < 0 || rings <= 2 || env_set("QE_DF_RINGS")) break;
+        need -= (size_t)(rings - 2) * workers_[0]->dfl_ring_bytes();
+        rings = 2;
+        bad = -1, fit_ctx = LLONG_MAX;
+    }
     for (size_t r = 0; r < workers_.size(); r++) {
         Worker& w = *workers_[r];
         const size_t fr = w.free_bytes(), slack = w.region_slack();
-        const size_t per = w.slot_token_bytes() + (yarn ? w.ctx_bytes_per_pos((int)req) : 0) + (has_mtp() ? 4 * (size_t)(nslots + 1) : 0);
+        // (the 4-bit cache's prefill staging per position also at native contexts: re-review N2)
+        const size_t per = w.slot_token_bytes() + (yarn ? w.ctx_bytes_per_pos((int)req) : w.kv4_stage_bytes_per_key()) +
+                           (has_mtp() ? 4 * (size_t)(nslots + 1) : 0);
         const size_t base = (size_t)(res[r] * 1e9) +
                             (drafter_ == 1 ? 0 : (size_t)(nslots * (double)w.slot_fixed_bytes() * 1.05) + (yarn ? w.ctx_fixed_bytes((int)req) : 0));
         const size_t keep = base + (size_t)((drafter_ == 1 ? 16384 : req + 1024) + slack) * per;
         const long long room = fr > need + base ? (long long)((fr - need - base) / per) - 1024 - (long long)slack : 0;
         fit_ctx = std::min(fit_ctx, room);
         if (fr < need + keep && bad < 0) bad = (int)r, bad_fr = fr, bad_keep = keep;
+    }
+    if (attempt == 1 && bad < 0 && df_batch_ > 0) {
+        printf("DFlash2 drafter: no room for %d context rings: 2 rings, batched steps draft with MTP (QE_DF_BATCH=0)\n", df_batch_ + 1);
+        df_batch_ = 0;
+    }
     }
     if (bad >= 0) {
         const long long k = std::max(0LL, fit_ctx) / 1024;
@@ -4683,6 +5146,7 @@ void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
     const TensorInfo& pc = dfl_st_->get("candidate_selector.predecessor_codebook");
     const TensorInfo& sc = dfl_st_->get("candidate_selector.successor_codebook");
     dfl_cb_rows_ = (int)pc.shape[0];
+    const double cb_gb = (double)(pc.nbytes + sc.nbytes) / 1e9;  // (pc / sc point into dfl_st_, reset below)
     // pinned codebooks (2 x 127 MB): a host-RAM shortage is MTP, not a stop (review L4)
     if (cudaHostAlloc(&dfl_pred_, pc.nbytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostAlloc(&dfl_succ_, sc.nbytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
@@ -4710,8 +5174,8 @@ void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
     drings_.assign(rings, DRing{});
     dfl_on_ = true;
     printf("DFlash2 drafter: %s, %s (codebooks %.2f GB pinned host memory)\n", file.c_str(),
-           drafter_ == 1 ? "every single-sequence step (QE_DRAFTER=dflash2)" : "single-sequence steps, MTP in batched steps (QE_DRAFTER=auto)",
-           2.0 * pc.nbytes / 1e9);
+           drafter_ == 1 ? "every single-sequence step (QE_DRAFTER=dflash2)" : df_batch_ > 0 ? "single-sequence steps and batched steps of <= QE_DF_BATCH sequences (QE_DRAFTER=auto)" : "single-sequence steps, MTP in batched steps (QE_DRAFTER=auto)",
+           cb_gb);
     fflush(stdout);
 }
 
@@ -4763,6 +5227,8 @@ double Engine::dfl_bench(int iters) {
     return *std::max_element(ms.begin(), ms.end());
 }
 
+// QE_DF_COPY (opt-in, default off): single-sequence steps only. dcopy_ is updated by single-sequence steps, and batched
+// steps (QE_DF_BATCH) pick the block for every sequence that can hold a ring (review q27_bdfl L5: a performance choice)
 bool Engine::dfl_copy(int slot) {
     static const double th = env_double("QE_DF_COPY", 1.0);
     return th < 1.0 && slot < (int)dcopy_.size() && dcopy_[slot] > th;

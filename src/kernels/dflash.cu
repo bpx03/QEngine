@@ -1,3 +1,4 @@
+#include "../env.h"
 // DFlash2 block drafter kernels (dflash.cuh)
 #include <cfloat>
 #include <climits>
@@ -255,6 +256,183 @@ __global__ void __launch_bounds__(256) attn_kernel(const bf16* __restrict__ q, c
     }
 }
 
+// [q27-dfl-attn-mma] the same split / work layout on bf16 tensor cores: per block S = Q K^T (32 pairs = 8 query rows x 4
+// q heads of the kv head, <= 72 keys) and O = P V (P in bf16), the softmax of each pair in shared memory. The split's
+// visible rows are listed as in attn_kernel. Not bit-identical to attn_kernel (P is rounded to bf16): drafter numerics
+// only, outputs stay exact and only the acceptance can differ
+constexpr int kAmK = 72, kAmKs = kDflHd + 8, kAmVt = 80, kAmPb = 88, kAmPairs = kDflBlock * kQpk;
+static_assert(kRingPer <= kAmK && kDflBlock <= kAmK && kAmPairs == 32, "attn_mma shapes");
+// (S reuses the K rows' room once the scores are in registers, P the Q pairs' room: two blocks per SM)
+static_assert(kAmPairs * kAmK * 4 <= kAmK * kAmKs * 2, "attn_mma aliasing");
+// (Q fragments straight from global memory: ~46 KB, two blocks per SM)
+constexpr size_t kAmSmem = (size_t)kAmK * kAmKs * 2 + (size_t)kDflHd * kAmVt * 2 + (size_t)kAmPairs * kAmPb * 2 + kAmK * 4 + kAmPairs * 8;
+static_assert(kAmSmem + 64 <= 48 * 1024, "attn_mma: within the default dynamic smem (no per-device attribute; review L5)");
+__device__ __forceinline__ void am_mma(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__global__ void __launch_bounds__(256) attn_mma_kernel(const bf16* __restrict__ q, const bf16* __restrict__ kb,
+                                                       const bf16* __restrict__ vb, const DflRing* __restrict__ ring, int l,
+                                                       const int* __restrict__ pos, float* __restrict__ work) {
+    extern __shared__ __align__(16) unsigned char am_sm[];
+    bf16* Ks = reinterpret_cast<bf16*>(am_sm);                       // [kAmK][kAmKs]
+    bf16* Vt = Ks + kAmK * kAmKs;                                   // [kDflHd][kAmVt] (V transposed)
+    float* Ss = reinterpret_cast<float*>(Ks);                       // [32][kAmK], over the K rows after the scores
+    bf16* Pb = Vt + kDflHd * kAmVt;                                 // [32][kAmPb]
+    int* Pp = reinterpret_cast<int*>(Pb + kAmPairs * kAmPb);        // [kAmK]
+    float* Ms = reinterpret_cast<float*>(Pp + kAmK);                // [32]
+    float* Ls = Ms + kAmPairs;                                      // [32]
+    __shared__ int nrow, wcnt[8];
+    const int kvh = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, tq = lane & 3;
+    const int apos = *pos;
+    int n;
+    const bf16 *Ksrc, *Vsrc;
+    if (s < kDflSplits) {
+        const int r0 = s * kRingPer, r1 = min(r0 + kRingPer, kDflRing);
+        const int* tag = ring->tag;
+        const int r = r0 + tid;
+        const int p = r < r1 ? tag[r] : -1;
+        const bool vis = p >= 0 && p < apos && apos - p < kDflWin;
+        const unsigned bal = __ballot_sync(0xffffffffu, vis);
+        if (lane == 0) wcnt[w] = __popc(bal);
+        __syncthreads();
+        int off = 0;
+        for (int x = 0; x < w; x++) off += wcnt[x];
+        if (vis) Pp[off + __popc(bal & ((1u << lane) - 1))] = r;
+        if (tid == 0) {
+            int tot = 0;
+            for (int x = 0; x < 8; x++) tot += wcnt[x];
+            nrow = tot;
+        }
+        __syncthreads();
+        n = nrow;
+        Ksrc = ring->k[l];
+        Vsrc = ring->v[l];
+    } else {
+        n = kDflBlock;
+        if (tid < kDflBlock) Pp[tid] = tid;
+        __syncthreads();
+        Ksrc = kb;
+        Vsrc = vb;
+    }
+    // stage K rows, V transposed (zero padding: P V reads keys up to 80), Q pairs
+    for (int i = tid; i < kAmK * (kDflHd / 8); i += blockDim.x) {
+        const int j = i % kAmK, c = (i / kAmK) * 8;  // (consecutive threads: consecutive keys, so the transposed V stores spread over the banks)
+        uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+        if (j < n) {
+            const size_t o = ((size_t)Pp[j] * kDflNkv + kvh) * kDflHd + c;
+            kv = *reinterpret_cast<const uint4*>(Ksrc + o);
+            vv = *reinterpret_cast<const uint4*>(Vsrc + o);
+        }
+        *reinterpret_cast<uint4*>(Ks + j * kAmKs + c) = kv;
+        const bf16* ve = reinterpret_cast<const bf16*>(&vv);
+#pragma unroll
+        for (int e = 0; e < 8; e++) Vt[(c + e) * kAmVt + j] = ve[e];
+    }
+    for (int i = tid; i < kDflHd * (kAmVt - kAmK); i += blockDim.x) Vt[(i / (kAmVt - kAmK)) * kAmVt + kAmK + i % (kAmVt - kAmK)] = __float2bfloat16(0.f);
+    __syncthreads();
+    if (s < kDflSplits)  // positions of the listed rows (window bound per query row)
+        for (int j = tid; j < n; j += blockDim.x) Pp[j] = ring->tag[Pp[j]];
+    else if (tid < kDflBlock) Pp[tid] = -1;  // (the block's own keys: always visible)
+    __syncthreads();
+    // S = Q K^T: warp w takes key tiles w and w + 8, both pair tiles
+    const float scale = rsqrtf((float)kDflHd);
+    const int nt_n = (n + 7) / 8;
+    float cs[2][2][4];  // [key tile w, w + 8][pair tile][fragment]
+#pragma unroll
+    for (int x = 0; x < 2; x++) {
+        const int nt = w + 8 * x;
+        if (nt >= nt_n) break;
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+            float* c = cs[x][mt];
+            c[0] = c[1] = c[2] = c[3] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < kDflHd; kk += 16) {
+                // pair p = t * 4 + hq is q row (t * kDflNq + kvh * 4 + hq): pairs p and p + 8 are 2 query rows apart
+                const int p0 = mt * 16 + g;
+                const bf16* qa = q + ((size_t)(p0 / kQpk) * kDflNq + kvh * kQpk + p0 % kQpk) * kDflHd + kk + 2 * tq;
+                const bf16* qb = qa + (size_t)2 * kDflNq * kDflHd;
+                uint32_t a[4];
+                a[0] = *reinterpret_cast<const uint32_t*>(qa);
+                a[1] = *reinterpret_cast<const uint32_t*>(qb);
+                a[2] = *reinterpret_cast<const uint32_t*>(qa + 8);
+                a[3] = *reinterpret_cast<const uint32_t*>(qb + 8);
+                const bf16* kr = Ks + (nt * 8 + g) * kAmKs + kk + 2 * tq;
+                am_mma(c, a, *reinterpret_cast<const uint32_t*>(kr), *reinterpret_cast<const uint32_t*>(kr + 8));
+            }
+        }
+    }
+    __syncthreads();  // (K rows read: their room takes S)
+#pragma unroll
+    for (int x = 0; x < 2; x++) {
+        const int nt = w + 8 * x;
+        if (nt >= nt_n) break;
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int pr = mt * 16 + g + (e >> 1) * 8, j = nt * 8 + 2 * tq + (e & 1);
+                const int p = j < n ? Pp[j] : 0;
+                const bool ok = j < n && !(p >= 0 && apos + pr / kQpk - p >= kDflWin);
+                Ss[pr * kAmK + j] = ok ? cs[x][mt][e] * scale : -INFINITY;
+            }
+    }
+    for (int i = tid; i < kAmPairs * kAmK; i += blockDim.x)  // key tiles past n
+        if (i % kAmK >= nt_n * 8) Ss[i] = -INFINITY;
+    __syncthreads();
+    // softmax per pair: 8 threads per pair
+    {
+        const int pr = tid >> 3, sub = tid & 7;
+        float mx = -INFINITY;
+        for (int j = sub; j < kAmK; j += 8) mx = fmaxf(mx, Ss[pr * kAmK + j]);
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        float sum = 0.f;
+        for (int j = sub; j < 80; j += 8) {
+            const float x = j < kAmK ? Ss[pr * kAmK + j] : -INFINITY;
+            const bf16 pb = __float2bfloat16(mx == -INFINITY || x == -INFINITY ? 0.f : __expf(x - mx));
+            Pb[pr * kAmPb + j] = pb;
+            sum += __bfloat162float(pb);
+        }
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        if (sub == 0) Ms[pr] = mx, Ls[pr] = sum;
+    }
+    __syncthreads();
+    // O = P V: 2 pair tiles x 16 dim tiles, 4 per warp, k over 80 keys
+#pragma unroll
+    for (int x = 0; x < 4; x++) {
+        const int tile = w * 4 + x, mt = tile >> 4, nt = tile & 15;
+        float c[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int kk = 0; kk < 80; kk += 16) {
+            const bf16* pa = Pb + (mt * 16 + g) * kAmPb + kk + 2 * tq;
+            uint32_t a[4];
+            a[0] = *reinterpret_cast<const uint32_t*>(pa);
+            a[1] = *reinterpret_cast<const uint32_t*>(pa + 8 * kAmPb);
+            a[2] = *reinterpret_cast<const uint32_t*>(pa + 8);
+            a[3] = *reinterpret_cast<const uint32_t*>(pa + 8 * kAmPb + 8);
+            const bf16* vr = Vt + (nt * 8 + g) * kAmVt + kk + 2 * tq;
+            am_mma(c, a, *reinterpret_cast<const uint32_t*>(vr), *reinterpret_cast<const uint32_t*>(vr + 8));
+        }
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int pr = mt * 16 + g + (e >> 1) * 8, d = nt * 8 + 2 * tq + (e & 1);
+            const int t = pr / kQpk, hq = pr % kQpk;
+            work[(((size_t)s * kDflNq + kvh * kQpk + hq) * kDflBlock + t) * kAttnPart + d] = c[e];
+        }
+    }
+    if (tid < kAmPairs) {
+        const int t = tid / kQpk, hq = tid % kQpk;
+        float* wp = work + (((size_t)s * kDflNq + kvh * kQpk + hq) * kDflBlock + t) * kAttnPart;
+        wp[kDflHd] = Ms[tid];
+        wp[kDflHd + 1] = Ls[tid];
+    }
+}
+
 __global__ void __launch_bounds__(128) attn_combine_kernel(const float* __restrict__ work, bf16* __restrict__ out) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     float M = -INFINITY;
@@ -375,6 +553,36 @@ __global__ void __launch_bounds__(256) topk_merge_kernel(const float* __restrict
     }
 }
 
+// [q27-dfl-unary] the selector's unary scores from the exact bf16 rows of the head (mapped host rows, one card) instead
+// of the INT4 draft head's values: one warp per (row, candidate), fp32 dot in a fixed order
+__global__ void __launch_bounds__(256) unary_exact_kernel(const bf16* __restrict__ w, const bf16* __restrict__ hid, int m, int V,
+                                                          const int* __restrict__ cand, float* __restrict__ unary) {
+    const int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= m * kDflTopK) return;
+    const int r = gw / kDflTopK, id = cand[gw];
+    if (id < 0 || id >= V) {  // never picked next to exact scores (review L2; ids are always valid on one card)
+        if (lane == 0) unary[gw] = -INFINITY;
+        return;
+    }
+    const uint4* wr = reinterpret_cast<const uint4*>(w + (size_t)id * kDflHid);
+    const uint4* xr = reinterpret_cast<const uint4*>(hid + (size_t)r * kDflHid);
+    float s = 0.f;
+    for (int i = lane; i < kDflHid / 8; i += 32) {
+        const uint4 a = wr[i], b = xr[i];
+        const bf162* pa = reinterpret_cast<const bf162*>(&a);
+        const bf162* pb = reinterpret_cast<const bf162*>(&b);
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const float2 fa = __bfloat1622float2(pa[e]), fb = __bfloat1622float2(pb[e]);
+            s = fmaf(fa.x, fb.x, s);
+            s = fmaf(fa.y, fb.y, s);
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if (lane == 0) unary[gw] = s;
+}
+
 __global__ void cb_fetch_kernel(const bf16* __restrict__ pred_cb, const bf16* __restrict__ succ_cb, const int* __restrict__ anchor,
                                 const int* __restrict__ cand, int nc, bf16* __restrict__ pc, bf16* __restrict__ sc, int V) {
     const int b = blockIdx.x;
@@ -395,9 +603,12 @@ __global__ void cb_fetch_kernel(const bf16* __restrict__ pred_cb, const bf16* __
 
 __global__ void __launch_bounds__(256) select_kernel(const float* __restrict__ unary, const int* __restrict__ cand,
                                                      const float* __restrict__ hp, const bf16* __restrict__ pc,
-                                                     const bf16* __restrict__ sc, int m, int* __restrict__ tokens, int V) {
+                                                     const bf16* __restrict__ sc, int m, int* __restrict__ tokens, int V,
+                                                     int* __restrict__ sib, const int* __restrict__ pos, float tw) {
     __shared__ float part[8][kDflTopK];
     __shared__ int best;
+    __shared__ float conf;   // [q27-sib] product of the top-1 probabilities at draft positions 0..2
+    __shared__ int r2[3];    // runner-up at positions 0..2 (given the chosen predecessor)
     const int r = threadIdx.x, lane = r & 31, wp = r >> 5;
     int prow = 0;
     for (int j = 0; j < m; j++) {
@@ -424,10 +635,31 @@ __global__ void __launch_bounds__(256) select_kernel(const float* __restrict__ u
             best = bk;
             const int c = cand[j * kDflTopK + bk];
             tokens[1 + j] = c >= 0 && c < V ? c : tokens[0];  // (never an id past the vocabulary: review L3)
+            if (sib && j < 3) {  // [q27-sib] softmax over the 16 scores: p1, and the runner-up
+                float den = 0.f, s2 = -INFINITY;
+                int k2 = -1;
+                for (int k = 0; k < kDflTopK; k++) {
+                    float x = unary[j * kDflTopK + k];
+                    for (int w = 0; w < 8; w++) x += part[w][k];
+                    den += __expf(x - bs);
+                    if (k != bk && x > s2) s2 = x, k2 = k;
+                }
+                conf = (j == 0 ? 1.f : conf) / den;
+                const int c2 = k2 >= 0 ? cand[j * kDflTopK + k2] : -1;
+                r2[j] = c2 >= 0 && c2 < V ? c2 : -1;
+            }
         }
         __syncthreads();
         prow = 1 + j * kDflTopK + best;
         __syncthreads();
+    }
+    if (sib && r == 0) {  // [q27-sib] weak block: 4 drafts + the runner-ups of positions 0..2 as leaf rows 5..7
+        const bool weak = m == kDflDrafts && conf < tw && r2[0] >= 0 && r2[1] >= 0 && r2[2] >= 0;
+        if (weak)
+            for (int q = 0; q < 3; q++) tokens[5 + q] = r2[q];
+        sib[2] = weak ? 1 : 0;
+        sib[3] = *pos;
+        for (int i = 0; i < 8; i++) sib[4 + i] = tokens[i];
     }
 }
 
@@ -459,7 +691,9 @@ void dfl_kv_ctx(const float* kv, const bf16* kn, const float* inv, const int* po
 size_t dfl_attn_work_floats() { return (size_t)(kDflSplits + 1) * kDflNq * kDflBlock * kAttnPart; }
 void dfl_attn(const bf16* q, const bf16* kb, const bf16* vb, const DflRing* ring, int l, const int* pos, float* work,
               bf16* out, cudaStream_t st) {
-    attn_kernel<<<dim3(kDflNkv, kDflSplits + 1), 256, 0, st>>>(q, kb, vb, ring, l, pos, work);
+    static const bool mma = env_int("QE_DF_ATTN_MMA", 1) != 0;  // [q27-dfl-attn-mma] 0: the per-key warp loop
+    if (mma) attn_mma_kernel<<<dim3(kDflNkv, kDflSplits + 1), 256, kAmSmem, st>>>(q, kb, vb, ring, l, pos, work);
+    else attn_kernel<<<dim3(kDflNkv, kDflSplits + 1), 256, 0, st>>>(q, kb, vb, ring, l, pos, work);
     attn_combine_kernel<<<dim3(kDflNq, kDflBlock), 128, 0, st>>>(work, out);
 }
 void dfl_ring_inval(const DflRing* ring, const int* from, int from_host, cudaStream_t st) {
@@ -478,14 +712,17 @@ void dfl_topk_local(const float* logits, int v, int m, const int* map, int off, 
 void dfl_topk_merge(const float* gathered, int ngpu, int m, float* unary, int* cand, cudaStream_t st) {
     topk_merge_kernel<1><<<m, 256, 0, st>>>(gathered, ngpu, 1, m, nullptr, unary, cand);
 }
+void dfl_unary_exact(const bf16* w, const bf16* hid, int m, int V, const int* cand, float* unary, cudaStream_t st) {
+    unary_exact_kernel<<<(m * kDflTopK * 32 + 255) / 256, 256, 0, st>>>(w, hid, m, V, cand, unary);
+}
 void dfl_cb_fetch(const bf16* pred_cb, const bf16* succ_cb, const int* anchor, const int* cand, int m, bf16* pc, bf16* sc,
                   int V, cudaStream_t st) {
     const int nc = m * kDflTopK;
     cb_fetch_kernel<<<1 + 2 * nc, 32, 0, st>>>(pred_cb, succ_cb, anchor, cand, nc, pc, sc, V);
 }
 void dfl_select(const float* unary, const int* cand, const float* hp, const bf16* pc, const bf16* sc, int m, int* tokens,
-                int V, cudaStream_t st) {
-    select_kernel<<<1, 256, 0, st>>>(unary, cand, hp, pc, sc, m, tokens, V);
+                int V, cudaStream_t st, int* sib, const int* pos, float tw) {
+    select_kernel<<<1, 256, 0, st>>>(unary, cand, hp, pc, sc, m, tokens, V, sib, pos, tw);
 }
 // rank 0's drafts on every card (gathered [ngpu][8] int bits): tokens[1..7] = row 0 (review L1)
 __global__ void take_row0_kernel(const float* __restrict__ g, int* __restrict__ tokens) {

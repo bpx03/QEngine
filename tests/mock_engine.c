@@ -11,6 +11,9 @@
 // QE_MOCK_MASK=<end token id> (tests/test_tool_choice.py) makes the constrained steps mask-aware: a forced token equal to
 // the script's next one moves the script on, and a script token outside its row's mask ends the reply with that end
 // token (or, if the mask does not allow it either, emits the row's lowest allowed token).
+// -DMOCK_BAN (with -DMOCK_GRAMMAR) adds qe_ban_tokens ([tool-choice-ban]): an unconstrained step (and the first token)
+// that reaches a banned script token emits QE_MOCK_MASK (the end token) in its place and ends there; the log gets
+// "B <n>" for every call (n banned ids, 0: cleared).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +31,9 @@ typedef struct {
     int io[32];
     int con, ncon, stepc;
 #endif
+#ifdef MOCK_BAN
+    int ban[8], nban;
+#endif
 } Mock;
 
 static void push(Mock* m, int t) {
@@ -37,6 +43,13 @@ static void push(Mock* m, int t) {
     }
     m->seq[m->nseq++] = t;
 }
+#ifdef MOCK_BAN
+static int banned(const Mock* m, int t) {
+    for (int i = 0; i < m->nban; i++)
+        if (m->ban[i] == t) return 1;
+    return 0;
+}
+#endif
 
 void* qe_create(const char* model_dir, const char* devices, int max_t, const char* split) {
     (void)model_dir, (void)devices, (void)split;
@@ -103,6 +116,13 @@ int qe_start3(void* e, const int* ids, int n, int k, unsigned long long affinity
     }
 #endif
     m->rpos = 1;
+#ifdef MOCK_BAN
+    if (m->nban && banned(m, m->replies[m->cur][0])) {
+        const int t = atoi(getenv("QE_MOCK_MASK"));
+        push(m, t);
+        return t;
+    }
+#endif
     push(m, m->replies[m->cur][0]);
     return m->replies[m->cur][0];
 }
@@ -169,6 +189,14 @@ int qe_spec_step(void* e, int* out) {
     int c = 0;
     for (; c < want; c++) {
         int t = m->rpos < m->rlen[m->cur] ? r[m->rpos++] : r[m->rlen[m->cur] - 1];
+#ifdef MOCK_BAN
+        if (m->nban && banned(m, t)) {  // the banned token never comes: the reply ends with the end token there
+            t = atoi(getenv("QE_MOCK_MASK"));
+            out[c++] = t;
+            push(m, t);
+            break;
+        }
+#endif
         out[c] = t;
         push(m, t);
     }
@@ -179,6 +207,9 @@ int qe_last_reused(void* e) { return ((Mock*)e)->reused; }
 int qe_last_slot(void* e) { (void)e; return 0; }
 void qe_release(void* e, int slot) {
     (void)slot;
+#ifdef MOCK_BAN
+    ((Mock*)e)->nban = 0;  // (the engines: qe_release and the next qe_start_begin clear it)
+#endif
 #ifdef MOCK_GRAMMAR
     Mock* m = e;
     m->con = 0;
@@ -216,6 +247,15 @@ void qe_constrain(void* e, int slot, int on) {
     if (m->log) fprintf(m->log, "K %d\n", on), fflush(m->log);
 }
 int qe_constrained(void* e, int slot) { (void)slot; return ((Mock*)e)->con; }
+#ifdef MOCK_BAN
+void qe_ban_tokens(void* e, int slot, const int* ids, int n) {
+    Mock* m = e;
+    (void)slot;
+    m->nban = 0;
+    for (int i = 0; i < n && m->nban < 8; i++) m->ban[m->nban++] = ids[i];
+    if (m->log) fprintf(m->log, "B %d\n", n), fflush(m->log);
+}
+#endif
 // logprobs: raw logits of a row, fixed pattern around the token the row emitted (tests/test_server_mock.py check_logprobs)
 void qe_logits_capture(void* e, int slot, int on) {
     Mock* m = e;

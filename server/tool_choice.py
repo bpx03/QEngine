@@ -15,12 +15,24 @@ matcher interface, so grammar.Constraint plans its drafts and masks exactly as f
   a named tool         the same with one name: the header is forced token by token.
   auto / absent        nothing (as before).
 
-The constraint for `none` stays for the whole reply (a constrained slot is never queued ahead and uses no lookup
-drafts, so such replies decode on that slower path); `required` / named ones only until the call header.
+`none` on an engine with a static token ban (qe_ban_tokens, both Qwen engines): no constraint at all; the engine never
+picks `<tool_call>` for the slot (greedy, sampled, draft acceptance) and the reply decodes on the normal path (batched,
+run ahead, with its drafts), its text the same as through the mask. A `none` reply with logprobs, or on an engine
+without the ban, is constrained by the mask for the whole reply (a constrained slot is never queued ahead and uses no
+lookup drafts, so it decodes on that slower path); `required` / named ones only until the call header.
+
+`none` masks the `<tool_call>` token only. A call the model spells in ordinary tokens (`<function=...` as plain text) is
+text: the parsers react to the real token only, so it reaches the client as content, never as a call (as vLLM, which
+parses no tools under none). Model output that does not parse as a call is returned as content too (app.
+tool_calls_or_text), so a reply is never emptied.
+
+Client stop sequences under `required` / named: they do not match in the thinking or in the forced call (a stop such
+as "\n\n" or "\n" would end the reply before its call or cut its arguments), only after its `</tool_call>`
+(app.Job.stop_from).
 
 Without the grammar tier (an engine library without TIER 8, or a parallel mode that refuses it): `none` ends the reply
 at its first `<tool_call>` token in the answer (the text before it is the reply, finish stop; a call written inside
-<think> stays reasoning text), and `required` / named choices are not enforced (one log line at start-up and one at
+<think>, also one the model re-opened before its answer, stays reasoning text), and `required` / named choices are not enforced (one log line at start-up and one at
 the first such request); never an error.
 """
 import ctypes
@@ -170,6 +182,10 @@ class Tier:
                 self._tries.clear()
             t = self._tries[key] = root
         return t
+
+    def none_ids(self):
+        """The tokens `none` bans (the nocall state's mask: <tool_call>), for the engine's static ban (qe_ban_tokens)."""
+        return [self.call]
 
     def mask(self, kind, words):
         """Cached rows: "all" (every token), "nocall" (all but <tool_call>), "think" (all but <tool_call>, the end

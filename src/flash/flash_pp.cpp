@@ -1329,10 +1329,10 @@ void PpXfer::kv(int t0, int t1, bool mtp, int dir, int only) {
                 }
             };
             what_li_ = li;
-            what_ = "kc"; arr((char*)b.kc, (const char*)a.kc, (size_t)NKV * HD, 1);
-            what_ = "vc"; arr((char*)b.vc, (const char*)a.vc, (size_t)NKV * HD, 1);
-            what_ = "ks"; arr((char*)b.ks, (const char*)a.ks, (size_t)NKV * 4, 1);
-            what_ = "vs"; arr((char*)b.vs, (const char*)a.vs, (size_t)NKV * 4, 1);
+            what_ = "kc"; arr((char*)b.kc, (const char*)a.kc, (size_t)NKV * kv_hb(), 1);
+            what_ = "vc"; arr((char*)b.vc, (const char*)a.vc, (size_t)NKV * kv_hb(), 1);
+            what_ = "ks"; arr((char*)b.ks, (const char*)a.ks, (size_t)NKV * 4 * kv_sf(), 1);
+            what_ = "vs"; arr((char*)b.vs, (const char*)a.vs, (size_t)NKV * 4 * kv_sf(), 1);
             what_ = "ikb"; arr((char*)b.ikb, (const char*)a.ikb, (size_t)IDX_HD * 2, IDX_R);
         }
     }
@@ -1810,7 +1810,7 @@ int pp_microbatch(const std::vector<Worker*>& Wall, const std::vector<int>& b, l
     hm.legs = all_p2p ? 1 : 2;
     hm.overlap = env_int("FLASH_PP_HOP_OV", 1) != 0;   // chunked copies on the copy stream (multi-chunk batches)
     if (Worker::pp_hop16()) hm.link *= 2;               // bf16 rows: half the bytes
-    hm.stage_min = env_int("FLASH_PF_STAGE_MIN", 2048);
+    hm.stage_min = env_int("FLASH_PF_STAGE_MIN", kPfStageMinPart);  // (planner model as before [qfn-p1-stage]: 1024-2047-row micro-batches stay modelled unstaged)
     // (the per-row cost model comes from 4096-row batches; below FLASH_PP_MB_MIN, default 2048, it is not trusted)
     const int mb = flash_pp::pick_microbatch(st, np, std::min(lo > 0 ? lo : env_int("FLASH_PP_MB_MIN", 2048), hi), hi, hm);
     if (wall_ms) *wall_ms = flash_pp::pf_wall_ms(st, np, mb, hm);

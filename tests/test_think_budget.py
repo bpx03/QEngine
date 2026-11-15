@@ -300,6 +300,7 @@ def main():
     tok = args.profile.tokenizer()[0]
     order = [R_LONG,      # 1 OpenAI budget 64
              R_LONG,      # 2 no budget (reference)
+             R_LONG,      # 2b budget 65: off the mock's 3-token step grid, the close at the exact count
              R_LONG,      # 3 Anthropic stream budget_tokens 100
              R_TOOL,      # 4 OpenAI stream tool call, budget 32
              R_LONG,      # 5 max_tokens 300, no budget: answer tail
@@ -351,6 +352,19 @@ def main():
     assert m2["content"] == ANSWER and m2["reasoning_content"] == THINK.strip(), m2
     assert len(klines()) == 3, klines()
     print(f"  no budget: {r['usage']['completion_tokens_details']['reasoning_tokens']} reasoning tokens, no forcing")
+
+    # 2b. [think-close-step] budget 65: the mock's free steps emit 3 tokens (1, 4, .., 64, 67), so a close checked only
+    # after whole steps would land at 67; the engine limit held at the due point puts it at 65 exactly
+    r = c.post("/v1/chat/completions", json={"model": name, "messages": msgs, "thinking_budget": 65}).json()
+    m = r["choices"][0]["message"]
+    assert m["content"] == ANSWER and m["reasoning_content"].endswith(think_budget.WRAP), m
+    rt = r["usage"]["completion_tokens_details"]["reasoning_tokens"]
+    assert rt - 65 in {len(v) - 2 for v in ti.wrap.values()}, (rt, {k: len(v) for k, v in ti.wrap.items()})
+    head = m["reasoning_content"][:-len(think_budget.WRAP)].rstrip()
+    assert THINK.startswith(head) and len(tok.encode(head, add_special_tokens=False).ids) == 65, head[-80:]
+    k = klines()[3:]
+    assert k[0] == ["K", "1"] and k[1] == ["K", "0"] and k[2][0] == "C", k
+    print(f"  budget 65 (off the step grid): {rt} reasoning tokens, the close at 65 exactly")
 
     # 3. Anthropic streaming, thinking.budget_tokens 100: thinking block, then the text block
     t = c.post("/v1/messages", json={"model": name, "max_tokens": 4000, "stream": True, "messages": msgs,
@@ -412,8 +426,8 @@ def main():
                                      "thinking": {"type": "enabled", "budget_tokens": "x"}})
     assert r.status_code == 400, r.text
     st = gen.metrics.snapshot()["thinking"]
-    assert st["forced_budget"] == 3 and st["forced_max_tokens"] == 3 and st["forced_failed"] == 0, st
-    assert st["requests_with_budget"] == 4, st
+    assert st["forced_budget"] == 4 and st["forced_max_tokens"] == 3 and st["forced_failed"] == 0, st  # (2b included)
+    assert st["requests_with_budget"] == 5, st
     assert st["empty_replies"] == 0, st  # nothing above was an empty turn (tool call, bare close included)
     print("  no-force above budget, budget 0, max_tokens 6, 400s, /api/stats", st)
 

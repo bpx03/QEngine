@@ -384,6 +384,25 @@ bool Worker::dfl_load(const SafeTensors& st, const bf16* pred_cb, const bf16* su
     weight_bytes += d->wb;
     cache_bytes += d->cb;
     dfl_ = d;
+    // [q27-mtpkv-defer] the ring of deferred MTP KV rows (QE_DF_MTPKV_DEFER=0: block steps fill every step, as before);
+    // it fills K / V only (needs QE_DF_MTPKV_ONLY); without the room it stays off (every step fills, as before)
+    if (env_int("QE_DF_MTPKV_DEFER", 1) && env_int("QE_DF_MTPKV", 1) && env_int("QE_DF_MTPKV_ONLY", 1)) {
+        const size_t hb = (size_t)kMkvCap * c_.hidden * 2, tb = (size_t)(kMkvCap + 4) * 4;
+        void *ph = nullptr, *pt = nullptr;
+        if (cudaMalloc(&ph, hb) == cudaSuccess && cudaMalloc(&pt, tb) == cudaSuccess &&
+            cudaMemset(pt, 0, tb) == cudaSuccess) {
+            d->mem.push_back(ph);
+            d->mem.push_back(pt);
+            cache_bytes += hb + tb;
+            mkv_h_ = (bf16*)ph;
+            mkv_ctr_ = (int*)pt;
+            mkv_tok_ = mkv_ctr_ + 4;
+        } else {
+            cudaGetLastError();
+            if (ph) cudaFree(ph);
+            if (pt) cudaFree(pt);
+        }
+    }
     if (rank == 0)
         printf("DFlash2 drafter: %.2f GB weights + %.2f GB buffers and %d context rings per card, MLP %s, head %s (%d rows per card)\n",
                d->wb / 1e9, d->cb / 1e9, rings, d->tp ? "split over the cards" : "on every card", d->full_head ? "INT8 verify head" : "INT4 draft vocabulary",
@@ -399,6 +418,9 @@ void Worker::dfl_unload() {
     for (void* p : dfl_->mem) cudaFree(p);
     weight_bytes -= dfl_->wb;
     cache_bytes -= dfl_->cb;
+    if (mkv_h_) cache_bytes -= (size_t)kMkvCap * c_.hidden * 2 + (size_t)(kMkvCap + 4) * 4;
+    mkv_h_ = nullptr;  // (freed with the drafter's buffers; the caller caught the ring up before: Engine::finish)
+    mkv_tok_ = mkv_ctr_ = nullptr;
     delete dfl_;
     dfl_ = nullptr;
 }
@@ -414,13 +436,14 @@ void Worker::dfl_tap_layer(int i, int m, int r0) {
         if (kTapLayers[j] == i) dfl_tap(resid_ + (size_t)r0 * c_.hidden, m, j, dfl_->tap, r0, stream);
 }
 
-void Worker::dfl_ctx_rows(int row0, int m, const int* pos) {
+void Worker::dfl_ctx_rows(int row0, int m, const int* pos, int tap0) {
+    if (tap0 < 0) tap0 = row0;  // (tap rows of a batched step: the sequence's rows start at tap0, its positions at *pos)
     Dfl& d = *dfl_;
     const int H = kDflHid;
     cudaStream_t st = stream;
     for (int r = 0; r < m; r += kCtxRows) {
         const int mb = std::min(kCtxRows, m - r);
-        mm4(d.fc, d.tap + (size_t)(row0 + r) * kDflTaps * H, kDflTaps * H, d.y, H, mb, st);
+        mm4(d.fc, d.tap + (size_t)(tap0 + r) * kDflTaps * H, kDflTaps * H, d.y, H, mb, st);
         dfl_rms(d.y, H, d.hn, mb, kEps, d.th, st);
         for (int l = 0; l < kDflLayers; l++) {
             mm4(d.L[l].kv, d.th, H, d.kvp, 2 * kDflNkv * kDflHd, mb, st);
@@ -429,12 +452,13 @@ void Worker::dfl_ctx_rows(int row0, int m, const int* pos) {
     }
 }
 
-void Worker::dfl_block() {
+void Worker::dfl_block(const SpecState* sp) {
     Dfl& d = *dfl_;
     const int H = kDflHid, B = kDflBlock, M = kDflDrafts;
     cudaStream_t st = stream;
+    const SpecState& ss = sp ? *sp : spec_;  // (batched steps: the sequence's own tokens / position)
     if (ngpu_ > 1) begin_unit(st);  // (LL epoch of the drafter's collectives)
-    dfl_set_block_tokens(d.tok, spec_.tokens, st);
+    dfl_set_block_tokens(d.tok, ss.tokens, st);
     embed_gather(embed_, d.tok, B, H, d.x, st);
     for (int l = 0; l < kDflLayers; l++) {
         auto& L = d.L[l];
@@ -443,8 +467,8 @@ void Worker::dfl_block() {
         else gemv_w16(L.akp, d.h, H, d.dyn, kDflKp, B, st);
         dfl_conv(nullptr, d.h, d.dyn, 0, L.acb, B, d.hc, nullptr, st);
         mm4(L.qkv, d.hc, H, d.proj, kQkv, B, st);
-        dfl_qkv_block(d.proj, L.qn, L.kn, d.inv, spec_.pos, B, kEps, d.q, d.kb, d.vb, st);
-        dfl_attn(d.q, d.kb, d.vb, d.ring_cur, l, spec_.pos, d.work, d.att, st);
+        dfl_qkv_block(d.proj, L.qn, L.kn, d.inv, ss.pos, B, kEps, d.q, d.kb, d.vb, st);
+        dfl_attn(d.q, d.kb, d.vb, d.ring_cur, l, ss.pos, d.work, d.att, st);
         mm4(L.o, d.att, kDflNq * kDflHd, d.ov, H, B, st);
         dfl_conv(d.ov, nullptr, d.dyn, 1, L.acb + 2 * H, B, nullptr, d.x, st);
         dfl_rms(d.x, H, L.post_ln, B, kEps, d.h, st);
@@ -463,7 +487,8 @@ void Worker::dfl_block() {
         dfl_conv(mo, nullptr, d.dyn, 1, L.mcb + 2 * H, B, nullptr, d.x, st);
     }
     dfl_rms(d.x + H, H, d.norm, M, kEps, d.hid, st);  // rows 1..7
-    if (d.full_head) gemv(lm_head_, d.hid, H, d.logits, d.head_v, M, st);
+    if (d.full_head && h4r_ > 0) mm4(lm_head4_, d.hid, H, d.logits, d.head_v, M, st);  // (QE_DF_HEAD=full with the INT4 head)
+    else if (d.full_head) gemv(lm_head_, d.hid, H, d.logits, d.head_v, M, st);
     else mm4(draft_head_, d.hid, H, d.logits, d.head_v, M, st);
     dfl_topk_local(d.logits, d.head_v, M, d.head_map, d.head_off, d.tk, d.pairs, st);
     const float* g = d.pairs;
@@ -472,12 +497,19 @@ void Worker::dfl_block() {
         g = d.pairs_all;
     }
     dfl_topk_merge(g, ngpu_, M, d.unary, d.cand, st);
+    // [q27-dfl-unary] the selector's unary scores from the exact bf16 head rows (one card: the verify head's mapped host rows):
+    // 1 card Swift tok/step sb3 3.209 -> 3.282, 30-prompt mix 3.909 -> 3.983 (16 changed, 12 up), cost ~0; QE_DF_UNARY_EXACT=0 off
+    static const bool uex = env_int("QE_DF_UNARY_EXACT", 1) != 0;
+    if (uex && ngpu_ == 1 && h4_host_) dfl_unary_exact(h4_host_, d.hid, M, p_.vocab.size(), d.cand, d.unary, st);
     gemv_w16(d.selh, d.hid, H, d.hp, kDflRank, M, st);
-    dfl_cb_fetch(d.pred_cb, d.succ_cb, spec_.tokens, d.cand, M, d.pc, d.sc, d.cb_rows, st);
-    dfl_select(d.unary, d.cand, d.hp, d.pc, d.sc, M, spec_.tokens, d.cb_rows, st);
+    dfl_cb_fetch(d.pred_cb, d.succ_cb, ss.tokens, d.cand, M, d.pc, d.sc, d.cb_rows, st);
+    // [q27-sib] single-sequence tree graphs: weak blocks become 4 drafts + 3 sibling leaves (QE_DF_SIB_TW: the
+    // threshold on the product of the selector's top-1 probabilities at positions 0..2)
+    static const float sib_tw = (float)env_double("QE_DF_SIB_TW", 0.5);
+    dfl_select(d.unary, d.cand, d.hp, d.pc, d.sc, M, ss.tokens, d.cb_rows, st, (!sp && sib_cap_) ? sib_ : nullptr, ss.pos, sib_tw);
     if (d.bcast) {  // every card verifies the same drafts even if a replicated kernel ever differed per card
-        allgather_small(reinterpret_cast<const float*>(spec_.tokens), kDflBlock, d.tokg, comm_, rank, ctr_, st);
-        dfl_take_row0(d.tokg, spec_.tokens, st);
+        allgather_small(reinterpret_cast<const float*>(ss.tokens), kDflBlock, d.tokg, comm_, rank, ctr_, st);
+        dfl_take_row0(d.tokg, ss.tokens, st);
     }
 }
 
@@ -502,4 +534,45 @@ double Worker::dfl_bench(int iters) {
     cudaGraphExecDestroy(ge);
     cudaGraphDestroy(g);
     return ms / iters;
+}
+
+// [q27-sib] a hit leaf's rows to row a + 1 (sib_fix_kernel; nothing without a hit): the step then reads as a linear one
+void Worker::sib_fix_launch() {
+    SibFix f{};
+    f.sib = sib_;
+    f.pos = spec_.pos;
+    f.xn = xn_;
+    f.H = c_.hidden;
+    f.tap = dfl_->tap;
+    f.tapw = kDflTaps * kDflHid;
+    f.ch = dn_ch_;
+    f.qkw = 2 * dsh_.nk * 128;
+    f.gbw = 2 * dsh_.nv;
+    int li = 0, fi = 0;
+    AttnShape a{};
+    for (auto& L : layers_) {
+        if (L.full) {
+            CHECK(fi < 16, "sib_fix: full layers");
+            f.kc[fi] = (uint8_t*)L.fa.kc;
+            f.vc[fi] = (uint8_t*)L.fa.vc;
+            const AttnShape b = layer_shape(&L);
+            if (fi == 0) a = b;
+            CHECK(b.nkv == a.nkv && b.split == a.split && b.max_t == a.max_t, "sib_fix: full layers of another shape (review L5)");
+            fi++;
+        } else {
+            CHECK(li < 64, "sib_fix: DeltaNet layers");
+            f.cv[li] = spec_cv_[li];
+            f.qk[li] = spec_qk_[li];
+            f.gb[li] = spec_gb_[li];
+            f.hist[li] = L.dn.hist;
+            li++;
+        }
+    }
+    f.nl = li;
+    f.nf = fi;
+    f.nkv = a.nkv;
+    f.split = a.split;
+    CHECK(a.nkv <= 8, "sib_fix: kv heads");
+    for (int h = 0; h < a.nkv; h++) f.hrow[h] = head_rows(a, h, a.max_t);
+    sib_fix(f, stream);
 }

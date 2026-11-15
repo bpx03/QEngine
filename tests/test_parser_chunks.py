@@ -260,7 +260,8 @@ def run_job(chunks, max_new=10000, stops=(), guard=0, eos=(), sink=None, room=10
     got = [] if sink is None else sink
     LAST.clear()
     g = types.SimpleNamespace(eos=set(eos), im_start=305, image_pad=306, tok=tok, args=types.SimpleNamespace(loop_guard_tokens=guard, mtp_k=3),
-                              engine=types.SimpleNamespace(slots={0: room}, spec_io=lambda s: None, mask_buffer=lambda s: None), marks=None,
+                              engine=types.SimpleNamespace(slots={0: room}, spec_io=lambda s: None, mask_buffer=lambda s: None,
+                                                             set_limit=lambda s, t: None), marks=None,
                               think_ids=types.SimpleNamespace(ok=True, open_at_end=lambda ids, im: True))
     j = app.Job.__new__(app.Job)
     j.__dict__.update(gen=g, finished=False, max_new=max_new, n=0, grammar=grammar, p={}, tc=tc, slot=0, ids=[0],
@@ -397,7 +398,7 @@ def forced_tc():
     """The real ThinkControl over a reply that opens inside <think> (no forced close here: the mock server tests that)."""
     ti = types.SimpleNamespace(start=300, end=301, wrap_max=30, open_at_end=lambda ids, im: True,
                                is_space=lambda x: x < 256 and not bytes([x]).decode("latin-1").strip())
-    job = types.SimpleNamespace(ids=[0], max_new=10000, p={}, gen=types.SimpleNamespace(im_start=305, engine=None))
+    job = types.SimpleNamespace(ids=[0], max_new=10000, n=0, p={}, gen=types.SimpleNamespace(im_start=305, engine=None))
     return think_budget.ThinkControl(job, None, ti, False)
 
 

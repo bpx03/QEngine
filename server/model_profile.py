@@ -44,6 +44,7 @@ FAMILIES = {
         split="176,160,176",      # expert groups per card (the middle card, often the desktop one, less)
         lib="build/libqflash.so", vision=True,
         prefill_chunk_idle=4096,  # a prompt alone on the server: the engine's big batch (prefill-r3)
+        preempt_max=8192,         # tool results up to 8K join the shared prefill batches at once
         drop_empty_turns=True, merge_system=True,
     ),
 }

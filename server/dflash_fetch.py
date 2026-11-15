@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.request
 
-from qe_env import env_int, env_str
+from qe_env import env_int, env_str, fetch_open, set_env
 
 REPO = "syvai/Qwen3.8-27B-DFlash2-W4A16"
 REVISION = "4d30ec736ffc6b8688dc2ae2b502d9b48bdec279"
@@ -104,7 +104,7 @@ def _fetch(cache, out, res):
             _log(f"downloading the drafter ({FILE['size'] / 1e9:.2f} GB) from {url}")
             req = urllib.request.Request(url, headers={"User-Agent": "qengine-dflash2"})
             got, h = 0, hashlib.sha256()
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r, open(tmp, "wb") as f:
+            with fetch_open(req, TIMEOUT) as r, open(tmp, "wb") as f:  # (ENV_LOCK, review FX11-L1)
                 total = int(r.headers.get("Content-Length") or 0)
                 if total and total != FILE["size"]:
                     raise IOError(f"{total} bytes offered, {FILE['size']} expected")
@@ -154,7 +154,7 @@ def resolve(model_dir):
         out = os.path.join(cache, FILE["name"])
         if os.path.isfile(out):
             if _verified(out):
-                os.environ["QE_DFLASH"] = out
+                set_env("QE_DFLASH", out)
                 return out
             _log(f"cached {out} fails its sha256 check: fetched again")
             try:
@@ -186,7 +186,7 @@ def resolve(model_dir):
                  f"curl -L -o {out} {URL} (sha256 {FILE['sha256'][:16]}...)")
             return None
         _log(f"{LICENSE_NOTE}: {out}")
-        os.environ["QE_DFLASH"] = out
+        set_env("QE_DFLASH", out)
         return out
     except Exception as ex:  # never a stop
         _log(f"lookup failed ({type(ex).__name__}: {ex}): MTP drafts only")

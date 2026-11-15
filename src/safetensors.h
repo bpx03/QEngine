@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -33,10 +34,15 @@ void drop_file_cache(const std::string& path, void* p, size_t n, PageOut* out);
 // mmap()s one or more .safetensors files and indexes tensors by name.
 class SafeTensors {
 public:
-    void open(const std::string& path);
+    // only != nullptr: register just these names (an index that maps a name to this file); shadow: this file's tensors
+    // replace earlier ones of the same name on purpose (tuned weights), no duplicate check
+    void open(const std::string& path, const std::set<std::string>* only = nullptr, bool shadow = false);
     ~SafeTensors();
     bool has(const std::string& name) const { return tensors_.count(name) != 0; }
     const TensorInfo& get(const std::string& name) const;
+    // a tensor that lives elsewhere (another container mapped by the caller, which keeps the memory alive);
+    // replaces an entry of the same name
+    void put(const std::string& name, const TensorInfo& t) { tensors_[name] = t; }
     // the file and offset behind a mapped address (empty path: not in any mapping)
     std::string file_of(const void* p, size_t* off) const;
     // drops the page cache of every mapped file for which keep(base, size) is false (see drop_file_cache); the

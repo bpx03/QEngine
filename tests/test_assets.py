@@ -183,6 +183,40 @@ def main():
     env = {"QE_KV_SCALES": "x"}
     assert assets.check_27b_format(ckpt(m8(kv=False), "nokv"), env) is None and "QE_KV_FP8" not in env
     print("checkpoint format check: pass")
+
+    # review FX11-L1: a fetch thread opens its connections under qe_env.ENV_LOCK (getaddrinfo / OpenSSL read the
+    # environment), and the start's environment writes take the same lock, so a write never runs beside a set-up
+    import qe_env
+    import urllib.request
+    seen, real = [], urllib.request.urlopen
+    urllib.request.urlopen = lambda *a, **k: (seen.append(qe_env.ENV_LOCK.locked()), real(*a, **k))[1]
+    try:
+        serve(FILES)
+        fresh = os.path.join(tmp, "model_lock")
+        os.makedirs(fresh)
+        used, env, log = run(fresh, os.path.join(tmp, "cache_lock"), base)
+    finally:
+        urllib.request.urlopen = real
+    assert set(used) == set(FILES) and len(seen) == 3 and all(seen), (seen, log)
+    done = threading.Event()
+    with qe_env.ENV_LOCK:
+        w = threading.Thread(target=lambda: (qe_env.set_env("QE_X_TEST", "1", env), done.set()))
+        w.start()
+        assert not done.wait(0.2), "set_env wrote while the lock was held"
+    assert done.wait(5) and env["QE_X_TEST"] == "1"
+    # a stalled holder never holds the start: the write goes on after WRITE_WAIT_S
+    qe_env.WRITE_WAIT_S, wait0 = 0.2, qe_env.WRITE_WAIT_S
+    try:
+        with qe_env.ENV_LOCK:
+            qe_env.set_env("QE_X_TEST", "2", env)
+        assert env["QE_X_TEST"] == "2"
+    finally:
+        qe_env.WRITE_WAIT_S = wait0
+    import dflash_fetch
+    import lsa_map
+    assert dflash_fetch.fetch_open is qe_env.fetch_open and lsa_map.fetch_open is qe_env.fetch_open
+    assert dflash_fetch.set_env is qe_env.set_env
+    print("environment writes vs fetch connections (ENV_LOCK): pass")
     srv.shutdown()
     print("ALL PASS")
 

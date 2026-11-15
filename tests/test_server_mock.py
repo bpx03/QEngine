@@ -213,7 +213,8 @@ def run(tier0):
     assert ch["finish_reason"] == "tool_calls" and ch["message"]["tool_calls"][0]["function"]["name"] == "Bash", r
     assert len(prompts()) == n0 + 3, prompts()[n0:]
     assert prompts()[-1][1] > 0 and gen.think["empty_retried"] == 2 and gen.think["empty_retry_recovered"] == 1
-    want = sum(len(tok.encode(x, add_special_tokens=False).ids) - 1 for x in (R_THINK_EOS, R_BAD_TOOL, R_TOOL))
+    # every try's tokens, each with the end token it generated (counted like vLLM, DECISIONS 11-14)
+    want = sum(len(tok.encode(x, add_special_tokens=False).ids) for x in (R_THINK_EOS, R_BAD_TOOL, R_TOOL))
     assert r["usage"]["completion_tokens"] == want, (r["usage"], want)
     # retries used up: the last empty reply goes to the client (Anthropic)
     r = c.post("/v1/messages", json={"model": name, "max_tokens": 300,
@@ -273,6 +274,53 @@ def run(tier0):
             r = c.post(path, json={"model": name, "messages": um, **base, k: v})
             assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error", (path, k, v, r.status_code, r.text[:200])
     assert len(prompts()) == n_p, "a refused request reached the engine"
+    # 11b. wrong JSON types in the body, messages, system, tools, chat_template_kwargs, and what the chat template
+    # refuses: 400 invalid_request_error on both APIs and count_tokens, never a 500 (review PR-500)
+    tc_msgs = lambda tc: um + [{"role": "assistant", "tool_calls": tc}, {"role": "user", "content": "y"}]  # noqa: E731
+    tu_msgs = lambda b: um + [{"role": "assistant", "content": [b]}, {"role": "user", "content": "y"}]  # noqa: E731
+    bad_oai = [[1], {"messages": "x"}, {}, {"messages": [1]}, {"messages": [{"role": 1, "content": "x"}]},
+               {"messages": [{"role": "user", "content": 5}]}, {"messages": [{"role": "user", "content": {"a": 1}}]},
+               {"messages": [{"role": "user", "content": [{"type": "text", "text": 1}]}]},
+               {"messages": tc_msgs("x")}, {"messages": tc_msgs(["x"])}, {"messages": tc_msgs([{"function": "x"}])},
+               {"messages": tc_msgs([{"function": {"name": 5, "arguments": "{}"}}])},
+               {"messages": tc_msgs([{"function": {"name": "a", "arguments": 5}}])},
+               {"messages": um, "chat_template_kwargs": "x"}, {"messages": um, "chat_template_kwargs": [1]},
+               {"messages": um, "tools": "x"}, {"messages": um, "tools": {"a": 1}}, {"messages": um, "tools": ["x"]},
+               {"messages": um, "chat_template_kwargs": {"messages": []}},
+               {"messages": um, "chat_template_kwargs": {"add_generation_prompt": False}},
+               {"messages": []}, {"messages": [{"role": "nobody", "content": "x"}]}]
+    bad_ant = [[1], {"messages": "x"}, {}, {"messages": ["x"]}, {"messages": [{"content": "x"}]},
+               {"messages": [{"role": "user", "content": 5}]}, {"messages": [{"role": "user"}]},
+               {"messages": [{"role": "user", "content": ["x"]}]},
+               {"messages": [{"role": "user", "content": [{"type": "text", "text": 5}]}]},
+               {"messages": tu_msgs({"type": "tool_use", "id": "a", "name": "x", "input": "s"})},
+               {"messages": tu_msgs({"type": "tool_use", "id": "a", "name": 5, "input": {}})},
+               {"messages": um + [{"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "x", "input": {}}]},
+                                  {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": 5}]}]},
+               {"messages": um, "system": 5}, {"messages": um, "system": {"a": 1}}, {"messages": um, "system": ["x"]},
+               {"messages": um, "system": [{"type": "text", "text": 5}]},
+               {"messages": um, "tools": "x"}, {"messages": um, "tools": ["x"]}, {"messages": um, "chat_template_kwargs": "x"},
+               {"messages": um, "chat_template_kwargs": {"tools": []}}, {"messages": []}]
+    for path, cases in (("/v1/chat/completions", bad_oai), ("/v1/messages", bad_ant),
+                        ("/v1/messages/count_tokens", bad_ant)):
+        for b in cases:
+            if isinstance(b, dict) and path == "/v1/messages":
+                b = dict(b, max_tokens=16)
+            r = c.post(path, json=b)
+            assert r.status_code == 400 and r.json()["error"]["type"] == "invalid_request_error", (path, b, r.status_code, r.text[:200])
+    assert len(prompts()) == n_p, "a refused request reached the engine"
+    # (what worked before still does: null content, plain strings among OpenAI parts, unknown items in a tool result)
+    n = c.post("/v1/messages/count_tokens", json={"messages": um + [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "x", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": [5]}]}]})
+    assert n.status_code == 200, n.text
+    for b in ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}, "text": None}]}]},
+              {"messages": [{"role": "user", "content": None}, {"role": "user", "content": ["x", 5]}]}):
+        assert app.request_shape_error(b) is None, b
+    for inp in ("", [], None):
+        n = c.post("/v1/messages/count_tokens", json={"messages": tu_msgs({"type": "tool_use", "id": "a", "name": "x", "input": inp})})
+        assert n.status_code == 200, (inp, n.text)
+    print("  wrong-typed fields and template refusals: 400 on both APIs and count_tokens")
     # 12. stop strings on streamed requests and as one string (R_STOP x 3): only the text before the stop, on both APIs
     t = c.post("/v1/chat/completions", json={"model": name, "messages": um, "stop": ["xyz"], "stream": True}).text
     evs = sse_events(t)

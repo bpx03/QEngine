@@ -42,6 +42,10 @@ THINK_START, THINK_END = "<think>", "</think>"
 WRAP = "Considering the limited time, I have to stop thinking here and give the answer directly, based on my " \
        "reasoning so far."
 MIN_ANSWER = 16  # room below this after the full wrap-up: only the bare close `\n</think>\n\n`
+# [think-close-step] tokens before a forced close is due from which the reply's engine limit (set_limit) is held at the
+# due point, so no step (MTP / DFlash2 / lookup drafts) runs past it and the close lands at the exact count; above the
+# most tokens one step emits (27B lookup 13, Flash-Next lookup 17) and below near()'s margin (64: no step queued ahead)
+APPROACH = 32
 
 
 def _tail_cfg():
@@ -350,6 +354,7 @@ class ThinkControl:
         self.forced = None      # why the thinking was closed by the server: "budget" / "max_tokens"
         self.fz, self.fi = None, 0  # forced tokens in flight, how many emitted
         self.n_forced = 0       # forced tokens emitted
+        self.capped = False     # the engine limit is held at the due point (APPROACH); restored for the close / after
         self.failed = None      # the engine emitted something else than a forced token (should not happen)
         # ignore_eos (benchmarks: exactly max_tokens of raw continuation): no answer tail and no hold near it (review
         # server F3); an explicit thinking budget still applies
@@ -404,21 +409,26 @@ class ThinkControl:
                 return
             self._plan()
             return
-        if not self.open or not self.can_force or self.failed:
-            return
         room = j.max_new - j.n
+        if not self.open or not self.can_force or self.failed:
+            self._uncap(room)  # (the model closed the thinking itself inside the capped stretch)
+            return
         why = None
         if self.budget is not None and self.n >= self.budget:
             why = "budget"
         elif self.tail and room <= self.ti.wrap_max + self.tail:
             why = "max_tokens"
         if why is None:
+            self._cap(room)
             return
         text = j.det.tok.decode(j.det.ids[-4:], skip_special_tokens=False) if j.det.ids else ""
         if text.endswith("�"):  # the reply ends inside a multi-byte character: close after it
+            if self.capped:
+                e.set_limit(j.slot, 1)  # one token per step until the character is complete
             return
         p = "" if text.endswith("\n\n") else "\n" if text.endswith("\n") else "\n\n"  # a blank line before it
         seq = self.ti.wrap[p] if room >= len(self.ti.wrap[p]) + MIN_ANSWER else self.ti.bare[p]
+        self._uncap(room)  # the close's tokens (or, without room for them, the rest of the reply) under the reply's limit
         if room < len(seq) + 1:  # not even the bare close and one answer token fit: max_tokens ends the reply
             return
         self.forced, self.fz, self.fi = why, list(seq), 0
@@ -427,6 +437,25 @@ class ThinkControl:
         self._fill()
         e.constrain(j.slot, True)
         self._plan()
+
+    def _cap(self, room):
+        """Not due yet: within APPROACH tokens of the due point, hold the reply's engine limit at it (a step then
+        verifies at most the drafts that end there), so the close comes at the exact budget / answer-tail count
+        whatever the drafts. Drafts are only clamped, nothing is constrained: the step layout elsewhere is unchanged."""
+        left = []
+        if self.budget is not None:
+            left.append(self.budget - self.n)
+        if self.tail:
+            left.append(room - self.ti.wrap_max - self.tail)
+        if not left or min(left) > APPROACH:
+            return
+        self.capped = True
+        self.job.gen.engine.set_limit(self.job.slot, max(1, min(min(left), room)))
+
+    def _uncap(self, room):
+        if self.capped:
+            self.capped = False
+            self.job.gen.engine.set_limit(self.job.slot, max(0, room))  # the reply's own limit (as at its start)
 
     def _fill(self):
         """Row masks of the next forced tokens (row r: only fz[fi + r]); returns the drafts to verify."""
@@ -503,7 +532,7 @@ def empty_reply(job, tail_tokens=8):
     closed = end is not None and end in ids
     mt = job.p.get("max_tokens")
     out = {"slot": job.slot, "conversation": conv, "session": sess, "finish": job.finish, "forced": forced,
-           "thinking_tokens": tc.n if tc is not None else 0, "completion_tokens": job.n, "max_tokens": job.max_new,
+           "thinking_tokens": tc.n if tc is not None else 0, "completion_tokens": job.n_out(), "max_tokens": job.max_new,
            "max_tokens_from": "request" if mt else "context", "thinking_budget": budget,
            "think_closed": closed, "thinking_tail": tail}
     kind = "reasoning only" if out["thinking_tokens"] else "empty"
@@ -513,7 +542,7 @@ def empty_reply(job, tail_tokens=8):
         lim += f", answer tail {tc.tail}"
     out["line"] = (f"WARNING empty reply: slot {job.slot}, conversation {conv if conv is not None else '-'}"
                    f"{f' (session {sess})' if sess else ''}: {kind}, no text and no tool call; finish {fin}; "
-                   f"{out['thinking_tokens']} thinking tokens of {job.n} ({lim}); </think> "
+                   f"{out['thinking_tokens']} thinking tokens of {out['completion_tokens']} ({lim}); </think> "
                    f"{'yes' if closed else 'no'}; thinking ends {tail}")
     k, n = job.p.get("empty_retry") or (0, 0)  # server/app.py complete(): --empty-retry of non-streamed replies
     if n and job.finish == "stop":

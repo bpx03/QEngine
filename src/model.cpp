@@ -75,7 +75,7 @@ size_t Worker::slot_token_bytes() const { return tok_bytes_; }
 // per head, at most cap * A/P + A(P - A)/P: that excess (over all heads) is the slack every region
 // takes beyond cap tokens.
 void Worker::plan_bytes() {
-    head_tok_bytes_ = (size_t)c_.n_full() * 2 * 256 * (kv_fp8_ ? 1 : 2) + (has_mtp ? (size_t)2 * 256 * (mtp_fp8() ? 1 : 2) : 0);
+    head_tok_bytes_ = (size_t)c_.n_full() * 2 * kv_row() + (has_mtp ? (size_t)2 * mtp_row() : 0);
     double per_tok = 0, slack = 0;
     for (int j = 0; j < ash_.nkv; j++) {
         const PosMap& m = ash_.kv_pm[j];
@@ -84,6 +84,30 @@ void Worker::plan_bytes() {
     }
     tok_bytes_ = ((size_t)std::ceil(per_tok) + 255) / 256 * 256;
     slack_tokens_ = slack > 0 ? (size_t)std::ceil(slack / tok_bytes_) + 1 : 0;
+}
+
+size_t Worker::kv4_stage_bytes_per_key() const {
+    if (!kv4_) return 0;
+    double rows = 0;
+    for (int j = 0; j < ash_.nkv; j++) rows += (double)ash_.kv_pm[j].A / ash_.kv_pm[j].P;
+    return (size_t)std::ceil(rows * 2 * 256 * (env_int("QE_KV4_STAGE16", 0) ? 2 : 1));
+}
+
+size_t Worker::fp8_token_bytes() const {
+    const size_t h = (size_t)c_.n_full() * 2 * 256 + (has_mtp ? (size_t)2 * mtp_row() : 0);
+    double per = 0;
+    for (int j = 0; j < ash_.nkv; j++) per += (double)h * ash_.kv_pm[j].A / ash_.kv_pm[j].P;
+    return ((size_t)std::ceil(per) + 255) / 256 * 256;
+}
+
+void Worker::kv4_stage_alloc(int cap) {
+    if (!kv4_) return;
+    CUDA_CHECK(cudaSetDevice(device));
+    const size_t rows = head_rows(ash_, ash_.nkv, cap);
+    const size_t e = env_int("QE_KV4_STAGE16", 0) ? 2 : 1;
+    kv4_k_ = (uint8_t*)dalloc(rows * 256 * e, false);
+    kv4_v_ = (uint8_t*)dalloc(rows * 256 * e, false);
+    kv4_cap_ = cap;
 }
 
 void Worker::set_plan(const CardPlan& p) {
@@ -110,6 +134,15 @@ size_t Worker::free_bytes() const {
     size_t fr, tot;
     CUDA_CHECK(cudaMemGetInfo(&fr, &tot));
     return fr;
+}
+
+void Worker::snap_init() {  // [q27-snapasync] (before the slots and the KV pool; without it snapshot_save_async is synchronous)
+    CUDA_CHECK(cudaSetDevice(device));
+    if (snap_hist_ || c_.n_lin() == 0) return;
+    snap_hist_ = (bf16*)dalloc((size_t)c_.n_lin() * kConvRing * dn_ch_ * 2, false);
+    CUDA_CHECK(cudaStreamCreateWithFlags(&snap_st_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&snap_ev0_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&snap_ev_, cudaEventDisableTiming));
 }
 
 void Worker::add_slot() {
@@ -150,6 +183,7 @@ void Worker::add_slot() {
         ss.hrow = sp + 34;
         ss.drafts = sp + 40;       // [8]
         sl.pos8 = sp + 36;
+        sl.sib = sp + 96;          // [32] (zeroed above)
         sl.mpos8 = sp + 37;
         ss.eos0 = c_.eos;
         ss.eos1 = c_.eos2;
@@ -163,6 +197,8 @@ void Worker::add_slot() {
         const size_t mw = mask_words() * (kMaxSpecK + 1);
         sl.mask = (unsigned*)dalloc(mw * 4, false);
         CUDA_CHECK(cudaMemset(sl.mask, 0xff, mw * 4));
+        sl.ban = (unsigned*)dalloc(mask_words() * 4, false);
+        CUDA_CHECK(cudaMemset(sl.ban, 0xff, mask_words() * 4));
     }
     if (lkb_cap_ > 0) lkb_alloc(sl);
     slots_.push_back(sl);
@@ -279,16 +315,16 @@ bool Worker::pool_map_upto(size_t bytes) {
 void Worker::region_arrays(size_t off, int cap, std::vector<std::pair<char*, size_t>>& out) const {
     out.clear();  // (base of array, bytes per row) in layout order
     char* p = pool_ + off * slot_token_bytes();
-    const size_t e = kv_fp8_ ? 1 : 2, me = mtp_fp8() ? 1 : 2;
+    const size_t e = kv_row(), me = mtp_row();
     const size_t rows = head_rows(ash_, ash_.nkv, cap);  // all local heads
     for (int f = 0; f < 2 * c_.n_full(); f++) {
-        out.emplace_back(p, 256 * e);
-        p += rows * 256 * e;
+        out.emplace_back(p, e);
+        p += rows * e;
     }
     if (has_mtp)
         for (int f = 0; f < 2; f++) {
-            out.emplace_back(p, 256 * me);
-            p += rows * 256 * me;
+            out.emplace_back(p, me);
+            p += rows * me;
         }
     CHECK((size_t)(p - (pool_ + off * slot_token_bytes())) <= ((size_t)cap + slack_tokens_) * slot_token_bytes(),
           "region of %d keys exceeds its pool units", cap);
@@ -419,12 +455,14 @@ void Worker::select_slot(int i) {
     dn_pn_ = sl.dn_pn;
     dn_pend_ = sl.dn_pend;
     spec_ = sl.spec;
+    sib_ = sl.sib;
     tokens_ = spec_.tokens;
     pos_ = spec_.pos;
     out_tok_ = spec_.out;
     sp_ = sl.sp;
     sampling = sl.sampling;
     constrained = sl.constrained;
+    banned = sl.banned;
     lp_on_ = sl.lp_on;
 }
 
@@ -432,9 +470,12 @@ void Worker::select_slot(int i) {
 // committed the previous ones (S[cur] after it, nothing pending); a single-row step that wrote
 // the state directly goes back to the old slot with the old pending rows.
 void Worker::undo_spec() {
+    snap_join();  // [q27-snapasync]
     CUDA_CHECK(cudaSetDevice(device));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaMemcpyAsync(dn_cur_, dn_save_, 4, cudaMemcpyDeviceToDevice, stream));
+    // [q27-mtpkv-defer] the undone block step's rows leave the ring (its fill of committed rows, if any, stands)
+    if (mkv_ctr_) CUDA_CHECK(cudaMemcpyAsync(mkv_ctr_, mkv_ctr_ + 2, 4, cudaMemcpyDeviceToDevice, stream));
     if (dn_pn_) CUDA_CHECK(cudaMemcpyAsync(dn_pn_, dn_pn_ + 1, 4, cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
@@ -470,7 +511,7 @@ static void archive_layout(size_t dn_bytes, int nfull, const AttnShape& s, bool 
         for (int j = 0; j < s.nkv; j++) {
             const size_t rows = pm_rank(s.kv_pm[j], hi) - pm_rank(s.kv_pm[j], lo);
             for (int kvv = 0; kvv < 2; kvv++) {
-                p = place(rows * 256 * (f < nfull ? esz : mesz));
+                p = place(rows * (f < nfull ? esz : mesz));  // (bytes per row)
                 piece(f, j, kvv, p.first, p.second, rows);
             }
         }
@@ -478,16 +519,16 @@ static void archive_layout(size_t dn_bytes, int nfull, const AttnShape& s, bool 
 
 int Worker::archive_chunks(int lo, int hi, size_t chunk) const {
     int last = 0;
-    archive_layout(snapshot_bytes(), c_.n_full(), ash_, has_mtp, kv_fp8_ ? 1 : 2, mtp_fp8() ? 1 : 2, lo, hi, chunk,
+    archive_layout(snapshot_bytes(), c_.n_full(), ash_, has_mtp, kv_row(), mtp_row(), lo, hi, chunk,
                    [&](int, int, int, int ci, size_t, size_t) { last = ci; });
     return last + 1;
 }
 
 size_t Worker::archive_bytes(int lo, int hi) const {
     size_t end = 0;
-    archive_layout(snapshot_bytes(), c_.n_full(), ash_, has_mtp, kv_fp8_ ? 1 : 2, mtp_fp8() ? 1 : 2, lo, hi,
+    archive_layout(snapshot_bytes(), c_.n_full(), ash_, has_mtp, kv_row(), mtp_row(), lo, hi,
                    ~(size_t)0 >> 1, [&](int f, int, int, int, size_t o, size_t rows) {
-                       end = o + rows * 256 * (f < c_.n_full() ? (kv_fp8_ ? 1 : 2) : (mtp_fp8() ? 1 : 2));
+                       end = o + rows * (f < c_.n_full() ? kv_row() : mtp_row());
                    });
     return end;  // the last piece's offset + its size
 }
@@ -502,6 +543,7 @@ int Worker::archive_xfer(int slot, int lo, int hi, int copy_hi, void* const* chu
 
 int Worker::region_xfer(size_t off, int cap, int split, int lo, int hi, int copy_hi, void* const* chunks,
                         size_t chunk, bool save, bool with_dn, int piece, size_t budget) {
+    snap_join();  // [q27-snapasync]
     CUDA_CHECK(cudaSetDevice(device));
     CHECK(lo >= split && lo <= copy_hi && copy_hi <= hi && copy_hi - split <= cap, "region_xfer keys [%d, %d) of [%d, %d) into cap %d from %d",
           lo, copy_hi, lo, hi, cap, split);
@@ -510,7 +552,7 @@ int Worker::region_xfer(size_t off, int cap, int split, int lo, int hi, int copy
     if (!save) lsa_invalidate_region(off, std::max(lo, lsa_keep_));
     std::vector<std::pair<char*, size_t>> arr;
     region_arrays(off, cap, arr);
-    const size_t esz = kv_fp8_ ? 1 : 2, mesz = mtp_fp8() ? 1 : 2;
+    const size_t esz = kv_row(), mesz = mtp_row();  // bytes per row
     const int nfull = c_.n_full();
     int idx = 0, next = -1;
     size_t moved = 0;
@@ -531,8 +573,8 @@ int Worker::region_xfer(size_t off, int cap, int split, int lo, int hi, int copy
         const PosMap& m = ash_.kv_pm[j];
         const size_t n = pm_rank(m, copy_hi) - pm_rank(m, lo);  // owned keys to move
         const size_t row = pm_rank(m, lo) - pm_rank(m, split);   // their first row in the region
-        char* dev = arr[2 * f + kvv].first + (head_rows(ash_, j, cap) + row) * 256 * e;
-        const size_t bytes = n * 256 * e;
+        char* dev = arr[2 * f + kvv].first + (head_rows(ash_, j, cap) + row) * e;
+        const size_t bytes = n * e;
         if (!bytes) return;
         if (save) CUDA_CHECK(cudaMemcpyAsync(host, dev, bytes, cudaMemcpyDeviceToHost, stream));
         else CUDA_CHECK(cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, stream));
@@ -665,6 +707,7 @@ void Worker::tune_gemm() {
 }
 
 void Worker::undo_slot(int i) {
+    snap_join();  // [q27-snapasync]
     CUDA_CHECK(cudaSetDevice(device));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     SeqSlot& sl = slots_.at(i);
@@ -674,6 +717,7 @@ void Worker::undo_slot(int i) {
 }
 
 void Worker::trim_slot(int i, int r, bool stash) {
+    snap_join();  // [q27-snapasync]
     CUDA_CHECK(cudaSetDevice(device));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     lsa_invalidate(i, r);
@@ -858,7 +902,31 @@ void Worker::ce_loop() {
     }
 }
 
+size_t Worker::h4_pin_bytes() const { return (size_t)round_up(p_.vocab.e - p_.vocab.b, 16) * c_.hidden * 2; }
+
+bool Worker::h4_pin() {
+    if (h4_host_) return true;
+    if (cudaHostAlloc((void**)&h4_host_, h4_pin_bytes(), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void)cudaGetLastError();
+        h4_host_ = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void Worker::h4_unpin() {
+    if (h4_host_) cudaFreeHost(h4_host_);
+    h4_host_ = nullptr;
+    h4r_ = 0;
+}
+
 Worker::~Worker() {
+    if (h4_host_) {
+        cudaSetDevice(device);
+        cudaDeviceSynchronize();
+        cudaFreeHost(h4_host_);
+        h4_host_ = nullptr;
+    }
     if (dfl_) {  // the drafter's own allocations (dflash.cpp)
         cudaSetDevice(device);
         cudaDeviceSynchronize();
@@ -889,7 +957,10 @@ Worker::~Worker() {
     for (void* p : allocs_) cudaFree(p);
     for (void* p : graph_reserve_) cudaFree(p);
     for (auto e : evs_) cudaEventDestroy(e);
-    for (cudaStream_t s : {stream, comm_stream_, pf_stream_})
+    if (lk_cnt_h_) cudaFreeHost(lk_cnt_h_);
+    for (cudaEvent_t e : {snap_ev0_, snap_ev_})
+        if (e) cudaEventDestroy(e);
+    for (cudaStream_t s : {stream, comm_stream_, pf_stream_, snap_st_})
         if (s) cudaStreamDestroy(s);
 }
 
@@ -1111,6 +1182,11 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     }
     embed_ = embed_mapped;
     if (env_set("QE_KV_FP8")) kv_fp8_ = env_int("QE_KV_FP8", kv_fp8_) != 0;
+    {
+        const int b = env_int("QE_KV_BITS", 8);
+        kv4_ = b == 4;
+        if (b != 4 && b != 8 && rank == 0) printf("QE_KV_BITS=%d not supported (4 or 8): FP8 KV cache\n", b);
+    }
     if (env_set("QE_GLU")) glu_ = env_int("QE_GLU", glu_) != 0;
     attention_init();
     attention_prefill_init();
@@ -1197,6 +1273,10 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
                 mtp_vs_ = std::max(mtp_vs_, L.fa.vs);
             } else {
                 kv_fp8_ = false;  // no calibrated scales: keep a bf16 cache
+                if (kv4_ && rank == 0 && !kv4_noscale_said_)  // (the 4-bit cache stages fp8 for the prefill: it needs them too)
+                    printf("QE_KV_BITS=4: the checkpoint has no FP8 KV scales (QE_KV_SCALES sets a file): bf16 KV cache instead\n");
+                kv4_noscale_said_ = true;
+                kv4_ = false;
             }
         } else {
             const std::string a = pre + "linear_attn.";
@@ -1260,7 +1340,9 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         load_mtp(*mtp_st);
         const bool w4 = env_int("QE_DRAFT_HEAD_W4", 1) != 0;
         if (draft_ids.empty()) {
-            draft_head_ = load_lin(st, {{"lm_head.weight", p_.vocab.b, p_.vocab.e}}, 16, w4);
+            // (the INT4 verify head is this same RTN g128 matrix: shared below, not a second 0.65 GB copy; review L6)
+            if (w4 && h4r_ > 0) draft_head_.is4 = true;
+            else draft_head_ = load_lin(st, {{"lm_head.weight", p_.vocab.b, p_.vocab.e}}, 16, w4);
             draft_v_ = p_.vocab.size();
         } else {
             // gather the selected rows on the host, then quantize like any draft weight
@@ -1298,9 +1380,38 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         }
     }
     {
-        // INT8 (group 128, like GGUF Q8_0) halves the largest per-token read; QE_HEAD_W8=0 keeps bf16
         const std::vector<RowSpec> rows = {{"lm_head.weight", p_.vocab.b, p_.vocab.e}};
-        if (env_int("QE_HEAD_W8", 1) == 0) {
+        // [q27-head4r] QE_HEAD4R=R (default 16, 0 = the INT8 head): INT4 RTN g128 screen + exact bf16 rescore of the top-R from mapped pinned host
+        // rows; it replaces the INT8 head (VRAM 1.29 -> 0.65 GB on one card). The engine pinned the rows before the load
+        // (h4_pin, every card or none) and set h4r_; no pinned memory: the INT8 head, one line (Engine)
+        if (h4r_ > 0) {
+            int n, k;
+            bf16* tmp = gather_bf16(st, rows, 16, -1, -1, &n, &k);
+            int32_t* q = (int32_t*)g_scratch_s.get((size_t)n * k / 2 + (size_t)n * (k / 128) * 2);
+            bf16* sc = (bf16*)((char*)q + (size_t)n * k / 2);
+            quantize_w4_rtn(tmp, n, k, q, sc, stream);
+            lm_head4_.n = n;
+            lm_head4_.k = k;
+            lm_head4_.bits = 4;
+            uint4* dq = (uint4*)dalloc(w4_qbytes(n, k), true);
+            bf16* ds = (bf16*)dalloc(w4_sbytes(n, k), true);
+            repack_w4(q, sc, n, k, dq, ds, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            lm_head4_.q = dq;
+            lm_head4_.s = ds;
+            if (draft_head_.is4 && !draft_head_.q.q) draft_head_.q = lm_head4_;  // (full-vocabulary MTP draft head)
+            CHECK(h4_host_ && (size_t)n * k * 2 == h4_pin_bytes(), "head4r pinned rows");
+            h4_host_bytes_ = (size_t)n * k * 2;
+            const TensorInfo& t = st.get("lm_head.weight");
+            const int nr = p_.vocab.e - p_.vocab.b;
+            memcpy(h4_host_, t.data + (size_t)p_.vocab.b * k * 2, (size_t)nr * k * 2);
+            if (n > nr) memset(h4_host_ + (size_t)nr * k, 0, (size_t)(n - nr) * k * 2);
+            h4ws_ = h4_ws(dalloc(h4_ws_bytes(kH4MaxRows), false), kH4MaxRows);
+            if (rank == 0)
+                printf("verify head: INT4 screen (%.2f GB per card) + exact bf16 rescore of the top %d (greedy) / %d (sampling, "
+                       "logprobs) from %.2f GB pinned host rows (QE_HEAD4R=0: INT8 head)\n",
+                       (w4_qbytes(n, k) + w4_sbytes(n, k)) / 1e9, h4r_, kH4MaxR, (double)n * k * 2 / 1e9);
+        } else if (env_int("QE_HEAD_W8", 1) == 0) {  // INT8 (group 128, like GGUF Q8_0) halves the largest per-token read; QE_HEAD_W8=0 keeps bf16
             lm_head_.f = load_w16(st, rows, 16);
         } else {
             int n, k;
@@ -1422,6 +1533,17 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
         xh_tmp_ = (__half*)dalloc((size_t)kMaxBatchRows * std::max({H, act_w, 2 * H}) * 2, false);
     }
     qbuf_ = (bf16*)dalloc((size_t)M * ash_.nq * 256 * 2, false);
+    if (kv4_ && !kv_fp8_) {  // QE_KV_FP8=0 wins: a bf16 cache (no calibrated scales: cleared, and said, at the load)
+        kv4_ = false;
+        if (rank == 0) printf("QE_KV_BITS=4 needs the FP8 KV scales and QE_KV_FP8=1: %s KV cache instead\n", "bf16");
+    }
+    if (kv4_ && !((!env_set("QE_ATTN_DEC8") || env_int("QE_ATTN_DEC8", 1)) && env_int("QE_ATTN_DEC8D", 2) == 2)) {
+        kv4_ = false;  // (only attn_dec8d reads the 4-bit rows)
+        if (rank == 0) printf("QE_KV_BITS=4 needs the attn_dec8d decode kernel (QE_ATTN_DEC8=1, QE_ATTN_DEC8D=2): FP8 KV cache instead\n");
+    }
+    if (kv4_ && rank == 0)
+        printf("KV cache: 4 bits (QE_KV_BITS=4): K and V rotated, groups of 32 with fp16 scales, %d bytes per row; MTP layer fp8\n",
+               kKv4Row);
     plan_bytes();  // kv_fp8_ / has_mtp are known now
     alloc_xchg();
     logits_ = (float*)dalloc((size_t)kMaxBatchRows * p_.vocab.size() * 4, false);
@@ -1443,6 +1565,10 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
     ctr_.ss = (float*)dalloc(kCommBlocks * kMaxBatchRows * 4, false);
     ctr_.epoch = (unsigned*)dalloc(4, false);
     CUDA_CHECK(cudaMemset(ctr_.epoch, 0, 4));
+    if (ngpu_ == 1) {  // [q27-ar1-split] this Worker's own norm words (the epoch restarts with every Worker: review M1)
+        ctr_.ar1 = (unsigned long long*)dalloc(kAr1WsBytes, false);
+        CUDA_CHECK(cudaMemset(ctr_.ar1, 0, kAr1WsBytes));
+    }
     comm_bind_ll_scrub(ctr_, comm_, rank);
     {  // copy-engine AR: device ring of flag values v[i] = i (16-bit sequence numbers, copied by DMA)
         std::vector<unsigned> v(kCeVals);
@@ -1462,6 +1588,7 @@ void Worker::load(const SafeTensors& st, const SafeTensors* mtp_st, const bf16* 
 
 void Worker::reset() {
     CUDA_CHECK(cudaSetDevice(device));
+    snap_join();
     CUDA_CHECK(cudaMemsetAsync(dn_cur_, 0, 4, stream));
     CUDA_CHECK(cudaMemsetAsync(dn_save_, 0, 4, stream));
     if (dn_pn_) CUDA_CHECK(cudaMemsetAsync(dn_pn_, 0, 8, stream));
@@ -1477,8 +1604,94 @@ size_t Worker::snapshot_bytes() const {
     return (size_t)c_.n_lin() * (dn_slot_floats_ * 4 + (size_t)kConvRing * dn_ch_ * 2);
 }
 
+// [q27-snapasync] the side-stream copies of the snapshot staged by snapshot_save_async (the copy engine runs
+// device-to-host copies in order: a small read the host waits for queues behind them)
+void Worker::snap_issue() {
+    if (!snap_dst_) return;
+    const size_t hb = (size_t)kConvRing * dn_ch_ * 2;
+    CUDA_CHECK(cudaStreamWaitEvent(snap_st_, snap_ev0_, 0));
+    char* d = (char*)snap_dst_;
+    int li = 0;
+    for (auto& L : snap_S_) {
+        CUDA_CHECK(cudaMemcpyAsync(d, L, dn_slot_floats_ * 4, cudaMemcpyDeviceToHost, snap_st_));
+        d += dn_slot_floats_ * 4;
+        CUDA_CHECK(cudaMemcpyAsync(d, (char*)snap_hist_ + li * hb, hb, cudaMemcpyDeviceToHost, snap_st_));
+        d += hb;
+        li++;
+    }
+    CUDA_CHECK(cudaEventRecord(snap_ev_, snap_st_));
+    snap_dst_ = nullptr;
+}
+
+void Worker::snap_join() {
+    if (!snap_pend_ || snap_in_grace_) return;
+    cudaStreamCaptureStatus cs;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
+    // (inside a capture the wait cannot be recorded: every capturing entry joins before it begins; review L1)
+    CHECK(cs == cudaStreamCaptureStatusNone, "snapshot copy pending inside a stream capture (GPU%d)", device);
+    snap_issue();
+    CUDA_CHECK(cudaStreamWaitEvent(stream, snap_ev_, 0));
+    snap_pend_ = false;
+}
+
+void Worker::snap_host_wait() {
+    if (!snap_host_) return;
+    CUDA_CHECK(cudaSetDevice(device));  // (called from the Engine thread: review L4)
+    snap_issue();
+    CUDA_CHECK(cudaEventSynchronize(snap_ev_));
+    snap_host_ = false;
+}
+
+bool Worker::snap_grace_begin(bool safe, bool issue) {
+    // a call nested in a grace call must itself be safe beside the copy (review L2): today only the one-row run_ /
+    // forward of a one-token prefill pass
+    CHECK(!snap_in_grace_ || safe, "unsafe call nested in a snapshot grace call (GPU%d)", device);
+    if (!snap_pend_ || snap_in_grace_) return false;
+    if (safe && cur_slot_ == snap_slot_) {
+        snap_in_grace_ = true;
+        if (issue) snap_issue();  // (a call that waits for its own work on the host: the copies run beside it)
+        return true;
+    }
+    snap_join();
+    return false;
+}
+
+void Worker::snap_grace_end(bool g) {
+    if (!g) return;
+    snap_in_grace_ = false;
+    snap_join();  // (issues the copies first: they run beside the launched step)
+}
+
+void Worker::snapshot_save_async(void* dst) {
+    CUDA_CHECK(cudaSetDevice(device));
+    if (!snap_st_) return snapshot_save(dst);
+    snap_join();  // a previous copy still reads the staged rings
+    if (dn_pn_) dn_flush_cur(stream);  // the state after the last step's accepted rows (no pending rows after it)
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int cur;
+    CUDA_CHECK(cudaMemcpy(&cur, dn_cur_, 4, cudaMemcpyDeviceToHost));
+    const size_t hb = (size_t)kConvRing * dn_ch_ * 2;
+    int li = 0;
+    snap_S_.clear();
+    for (auto& L : layers_) {
+        if (L.full) continue;
+        CUDA_CHECK(cudaMemcpyAsync((char*)snap_hist_ + li * hb, L.dn.hist, hb, cudaMemcpyDeviceToDevice, stream));
+        snap_S_.push_back(L.dn.S + (size_t)cur * dn_slot_floats_);
+        li++;
+    }
+    CUDA_CHECK(cudaEventRecord(snap_ev0_, stream));
+    snap_dst_ = dst;
+    snap_pend_ = snap_host_ = true;
+    snap_slot_ = cur_slot_;
+    // issued at once: the copies run beside the host's turnaround before the step and the step itself (issued only at the
+    // step's launch, TP3 replies ended 1.6 ms later: the copies then shared PCIe with the step's exchange). The host's
+    // small reads before the step avoid the copy engine (first token read before the snapshot, lookup count mapped)
+    snap_issue();
+}
+
 void Worker::snapshot_save(void* dst) {
     CUDA_CHECK(cudaSetDevice(device));
+    snap_join();
     if (dn_pn_) {  // the state after the last step's accepted rows
         dn_flush_cur(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1500,6 +1713,7 @@ void Worker::snapshot_save(void* dst) {
 
 void Worker::snapshot_restore(const void* src) {
     CUDA_CHECK(cudaSetDevice(device));
+    snap_join();  // (the source may be the snapshot in flight; the state it overwrites is the one being copied)
     CUDA_CHECK(cudaMemsetAsync(dn_cur_, 0, 4, stream));
     if (dn_pn_) CUDA_CHECK(cudaMemsetAsync(dn_pn_, 0, 8, stream));
     const char* d = (const char*)src;
@@ -1551,6 +1765,15 @@ void Worker::set_constrained(int i, bool on) {
     if (!on) set_lp(i, false);
 }
 
+void Worker::set_ban(int i, const unsigned* host) {
+    SeqSlot& s = slots_.at(i);
+    CUDA_CHECK(cudaSetDevice(device));
+    if (host) CUDA_CHECK(cudaMemcpyAsync(s.ban, host, mask_words() * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));  // (the host mask is the caller's)
+    s.banned = host != nullptr;
+    if (i == cur_slot_) banned = s.banned;
+}
+
 void Worker::set_lp(int i, bool on) {
     auto& s = slots_.at(i);
     if (on && !s.lp) {
@@ -1581,6 +1804,11 @@ void Worker::upload_drafts(int i, const int* host, int n) {
 }
 
 void Worker::apply_head_masks() {
+    lp_copy();
+    masks_apply();
+}
+
+void Worker::lp_copy() {
     if (lp_rows_ > 0) {  // logprobs: raw logits, before the mask (row i: what emitted token i is chosen from)
         const size_t V = p_.vocab.size();
         const int rows = lp_all_ ? std::min(lp_rows_, kMaxSpecK + 1) : 1;
@@ -1588,6 +1816,9 @@ void Worker::apply_head_masks() {
                                    cudaMemcpyDeviceToHost, stream));
         lp_rows_ = 0;
     }
+}
+
+void Worker::masks_apply() {
     for (const HeadMask& h : head_masks_)
         mask_logits(logits_, p_.vocab.size(), p_.vocab.b, h.bits, h.r0, h.rows, h.stride, stream);
     head_masks_.clear();
@@ -1656,6 +1887,7 @@ void Worker::reserve_graphs(size_t bytes) {
 // debug (QE_DN_DUMP=1): delta-net state slots of the current slot before /
 // after a small plain pass, as checksums
 void Worker::dn_dump(const char* tag, int m) {
+    snap_join();  // [q27-snapasync]
     CUDA_CHECK(cudaStreamSynchronize(stream));
     int cur = 0, pn[2] = {0, 0};
     CUDA_CHECK(cudaMemcpy(&cur, dn_cur_, 4, cudaMemcpyDeviceToHost));
@@ -1683,6 +1915,13 @@ void Worker::run(int m, bool logits) {
 }
 
 void Worker::run_(int m, bool logits) {
+    // [q27-snapasync] a one-row step stores the state into S[cur ^ 1] only: it may run beside a snapshot copy of this slot
+    const bool sg = snap_grace_begin(m == 1);
+    run_g_(m, logits);
+    snap_grace_end(sg);
+}
+
+void Worker::run_g_(int m, bool logits) {
     dpath_use(0);  // (single-sequence decode path; no-op inside a batched step)
     if (debug_hidden) return forward(m, logits);
     // in_pf_ in the key (review round 3 R1): a prefill tail and a k = 0 decode step of the same row count capture
@@ -1714,6 +1953,7 @@ void Worker::run_(int m, bool logits) {
 }
 
 void Worker::forward(int m, bool logits, bool spec) {
+    snap_join();  // [q27-snapasync]
     const int H = c_.hidden, I = p_.inter.size();
     const float eps = c_.eps;
     cudaStream_t st = stream;
@@ -1734,6 +1974,7 @@ void Worker::forward(int m, bool logits, bool spec) {
             if (!early_in) mm4(L.fa.qkv, xn_, H, proj_, proj_ld_, m, st, xhx, H);
             AttnShape a = layer_shape(&L);
             a.pf_p0 = pf_p0_;
+            if (sib_cap_ && spec) a.sib = sib_;  // [q27-sib] tree step
             xchg_fill(a);
             attn_prep(proj_, proj_ld_, a, L.fa.q_norm, L.fa.k_norm, eps, inv_freq_, pos_, m,
                       qbuf_, L.fa.kc, L.fa.vc, st);
@@ -1781,12 +2022,14 @@ void Worker::forward(int m, bool logits, bool spec) {
             const int* pn = spec && dn_defer1_on() ? dn_pn_ : nullptr;  // deferred commit
             const float* pend = pn ? dn_pend_ + li * dn_pend_layer_floats() : nullptr;
             li++;
+            const int* sib = sib_cap_ && spec ? sib_ : nullptr;  // [q27-sib] tree step
             if (dn_fuse_on() && m <= 13) {  // dn_convqk: ring slots of the step must not overlap
                 dn_convqk(proj_, proj_ld_, dn_ch_, L.dn.conv_w, L.dn.hist, pos_, m, cv, dsh_, ab_,
-                          L.dn.A, L.dn.dt_bias, qk, gb, st);
+                          L.dn.A, L.dn.dt_bias, qk, gb, st, sib);
                 dn_core_only(cv, dn_ch_, dsh_, L.dn.S, dn_slot_floats_, dn_cur_, m, spec, qk, gb,
-                             dno_, st, pn, pend);
+                             dno_, st, pn, pend, sib);
             } else {
+                CHECK(!sib, "tree steps need the fused DeltaNet front end");
                 dn_conv(proj_, proj_ld_, dn_ch_, L.dn.conv_w, L.dn.hist, pos_, m, cv, st);
                 dn_core(cv, dn_ch_, dsh_, ab_, L.dn.A, L.dn.dt_bias, L.dn.S, dn_slot_floats_,
                         dn_cur_, m, spec, qk, gb, dno_, st, 0, pn, pend);
@@ -2040,21 +2283,33 @@ void Worker::forward_batch(const std::vector<int>& slots, const std::vector<int>
                 for (int j = 0; j < ms[i]; j++) sa.rs[r0[i] + j] = (unsigned char)slots[i];
         }
         allreduce_pf(resid_, M, next_norm, xn_, nxt, sa.li >= 0 ? &sa : nullptr);
+        if (dfl_cap_) dfl_tap_layer(li, M, 0);  // [q27-bdfl] DFlash2 taps of every row (the block sequences' rows are read)
     }
     for (size_t i = 0; i < slots.size(); i++)  // grammar-constrained sequences: a mask per row
         if (slots_[slots[i]].constrained)
             head_masks_.push_back({r0[i], ms[i], slots_[slots[i]].mask, mask_words()});
-    head(lm_head_, xn_, M, bout_);
+    for (size_t i = 0; i < slots.size(); i++)  // [tool-choice-ban] banned tokens: the slot's one mask on all its rows
+        if (slots_[slots[i]].banned) head_masks_.push_back({r0[i], ms[i], slots_[slots[i]].ban, 0});
     bool any_sampling = false;
-    for (int sidx : slots) any_sampling |= slots_[sidx].sampling;
+    unsigned long long full = 0;  // [q27-head4r] the sampled rows: all 64 candidates rescored; greedy rows only the first h4r_
+    for (size_t i = 0; i < slots.size(); i++)
+        if (slots_[slots[i]].sampling) {
+            any_sampling = true;
+            for (int j = 0; j < ms[i]; j++) full |= 1ull << (r0[i] + j);
+        }
+    h4_full_ = full;
+    h4_topk_ = any_sampling;  // (head() writes the sampled rows' candidates from the exact values)
+    head(lm_head_, xn_, M, bout_);
+    h4_full_ = 0;
+    h4_topk_ = false;
     if (any_sampling) {  // candidates for the sampled sequences (same logits)
-        topk_local(logits_, p_.vocab.size(), M, p_.vocab.b, topk_, st);
+        if (h4r_ == 0) topk_local(logits_, p_.vocab.size(), M, p_.vocab.b, topk_, st);
         allgather_small(topk_, M * kTopK * 2, topk_all_, comm_, rank, ctr_, st);
     }
 }
 
 void Worker::mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0,
-                       const std::vector<int>& ms, const std::vector<const bf16*>& hsrc) {
+                       const std::vector<int>& ms, const std::vector<const bf16*>& hsrc, bool kv_only) {
     const int H = c_.hidden, I = p_.inter.size();
     const float eps = c_.eps;
     cudaStream_t st = stream;
@@ -2090,6 +2345,7 @@ void Worker::mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0
     if (p_.pos_split) rope_table_seg(g, a, inv_freq_, rtab_, st);
     xchg_fill(a);
     attention_seg(g, a, proj_ld_, mtp_.q_norm, mtp_.k_norm, eps, inv_freq_, st);
+    if (kv_only) return;  // [q27-bdfl] (the K / V rows are in the slots' MTP caches: the rest only feeds MTP drafts)
     mm4(mtp_.o, act_, qw, partial_, H, M, st, xh_act_, qw);
     allreduce_add(mtp_resid_, partial_, M, H, comm_, rank, ctr_, st, mtp_.post_norm, eps,
                   h16_ && !dec_gemm_rows(M) ? nullptr : xn_, next_ll(M), false, xh_xn_);
@@ -2140,7 +2396,8 @@ void Worker::dec_gemm_warm(int) {
 }
 
 void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd,
-                            const std::vector<int>* lkr, const std::vector<int>* kav) {
+                            const std::vector<int>* lkr, const std::vector<int>* kav, const std::vector<int>* dring) {
+    snap_join();  // [q27-snapasync]
     dpath_use(1);  // the batched steps' decode path (calibration), kept by the inner calls
     struct InBatch { bool& f; explicit InBatch(bool& x) : f(x) { f = true; } ~InBatch() { f = false; } } in_batch(in_batch_);
     attn_rs_ = false;  // row split only for the single-sequence step (launch_step)
@@ -2148,8 +2405,10 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
     for (size_t i = 0; i < slots.size(); i++) {
         const int lr = lkr ? (*lkr)[i] : 0;
         key += "|" + std::to_string(slots[i]) + ":" + std::to_string(kvs[i]) + ":" +
-               std::to_string((int)slots_[slots[i]].sampling + 2 * (int)slots_[slots[i]].constrained) +
-               (lr > 0 ? "L" + std::to_string(kav ? std::min((*kav)[i], lr) : 0) : "");
+               std::to_string((int)slots_[slots[i]].sampling + 2 * (int)slots_[slots[i]].constrained +
+                              4 * (int)slots_[slots[i]].banned) +
+               (lr > 0 ? "L" + std::to_string(kav ? std::min((*kav)[i], lr) : 0) : "") +
+               (dring && (*dring)[i] >= 0 && dfl_ ? "D" + std::to_string((*dring)[i]) : "");
     }
     cudaGraphExec_t bge = batch_graphs_.get(key);
     if (!bge) {
@@ -2194,7 +2453,13 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
             lookup_fill_batch(lb, st);  // (always: the same topology with or without lookup rows - graph updates)
         }
         CHECK(!any8 || lkb_on(), "batch rows > 8 per sequence need QE_LKB");
+        // [q27-bdfl] sequences drafting with the DFlash2 block: their verify rows' taps feed their context rings
+        std::vector<int> dr(n, -1);
+        bool any_blk = false;
+        for (int i = 0; i < n && dring && dfl_; i++) any_blk |= (dr[i] = (*dring)[i]) >= 0;
+        dfl_cap_ = any_blk;
         forward_batch(slots, r0, ms);
+        dfl_cap_ = false;
         std::vector<SpecState> v(n);
         // acceptance of all sequences in one launch (QE_SPEC_BATCH=0: one launch per sequence; same
         // arithmetic): 32 serial single-thread launches cost 0.3 ms per step at n = 32
@@ -2260,6 +2525,11 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
             }
             dn_replay_seg(rp, nl, dn_ch_, dsh_, dn_slot_floats_, st);
         }
+        for (int i = 0; i < n; i++)  // [q27-bdfl] context rows of the verified rows (positions *pos + row, before the advance)
+            if (dr[i] >= 0) {
+                dfl_ring_select(dr[i]);
+                dfl_ctx_rows(0, ms[i], slots_[slots[i]].spec.pos, r0[i]);
+            }
         std::vector<const bf16*> hs(n);
         for (int i = 0; i < n; i++) hs[i] = xn_ + (size_t)r0[i] * H;
         if (lkb_on()) {  // the MTP pass's second segments: mtp_pos (set by accept) + 8 (always: same topology)
@@ -2270,15 +2540,21 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
             }
             lookup_pos8_batch(pb, st);
         }
-        mtp_batch(slots, r0, ms, hs);
+        // [q27-bdfl] every sequence drafts with the block: the MTP pass only keeps their MTP caches (K / V) current
+        const bool all_blk = any_blk && std::count(dr.begin(), dr.end(), -1) == 0;
+        mtp_batch(slots, r0, ms, hs, all_blk);
+        // (review L4) with all_blk the MTP head did not run, so bmout_ holds no drafts of this step: no select, and the
+        // finish only takes the anchor and advances the position (dfl_block below writes tokens[1..7]; the next accept
+        // rewrites the MTP fields that select would set)
+        const int kmtp = all_blk ? 0 : kd;
         SpecBatch sbt;
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n && kmtp > 0; i++) {
             v[i].mtp_out = bmout_ + r0[i];
             if (sb) sbt.s[sbt.n++] = v[i];
             else spec_select(v[i], st);
         }
         spec_select_batch(sbt, st);
-        for (int r = 1; r < kd; r++) {
+        for (int r = 1; r < kmtp; r++) {
             for (int i = 0; i < n; i++)
                 hs[i] = mtp_h_ + (size_t)(r == 1 ? r0[i] : i) * H;
             mtp_batch(slots, r1, ones, hs);
@@ -2290,10 +2566,15 @@ void Worker::run_spec_batch(const std::vector<int>& slots, const std::vector<int
         if (sb) {
             SpecBatch fb;
             for (int i = 0; i < n; i++) fb.s[fb.n++] = v[i];
-            spec_finish_batch(fb, kd, st);
+            spec_finish_batch(fb, kmtp, st);
         } else {
-            for (int i = 0; i < n; i++) spec_finish(v[i], kd, st);
+            for (int i = 0; i < n; i++) spec_finish(v[i], kmtp, st);
         }
+        for (int i = 0; i < n; i++)  // [q27-bdfl] the block drafter's 7 drafts replace the MTP drafts (tokens[0] = the anchor)
+            if (dr[i] >= 0) {
+                dfl_ring_select(dr[i]);
+                dfl_block(&slots_[slots[i]].spec);
+            }
         if (lkb_on()) lookup_step_batch(lb, st);  // drafts for the next step (count at emit[31])
         CUDA_CHECK(cudaStreamEndCapture(st, &g));
         const auto tcap1 = std::chrono::steady_clock::now();
@@ -2329,9 +2610,10 @@ static std::string batch_skey(const std::string& key) {
         const std::string t = key.substr(i + 1, j == std::string::npos ? std::string::npos : j - i - 1);
         const size_t a = t.find(':'), b = t.find(':', a + 1);
         std::string mode = t.substr(b + 1);
-        const size_t l = mode.find('L');
+        const bool blk = mode.find('D') != std::string::npos;  // [q27-bdfl] block drafting (its ring index may differ: review L3)
+        const size_t l = mode.find_first_of("LD");
         if (l != std::string::npos) mode = mode.substr(0, l);
-        r += "|" + t.substr(0, a) + ":" + mode;
+        r += "|" + t.substr(0, a) + ":" + mode + (blk ? "D" : "");
         i = j;
     }
     return r;
@@ -2363,9 +2645,14 @@ bool Worker::batch_update(const std::string& key, cudaGraph_t g, cudaGraphExec_t
 
 void Worker::head_topk(const Lin& w, const bf16* x, int m) {
     const int V = p_.vocab.size();
-    gemv(w, x, c_.hidden, logits_, V, m, stream);
-    apply_head_masks();
-    topk_local(logits_, V, m, p_.vocab.b, topk_, stream);
+    if (h4r_ > 0 && &w == &lm_head_) {  // [q27-head4r] sampling: the exact values of the INT4 top-64 (= kTopK), masks first
+        head4(x, m, ~0ull);
+        h4_topk(h4ws_, m, h4_R_, ~0ull, h4r_, p_.vocab.b, topk_, stream);
+    } else {
+        gemv(w, x, c_.hidden, logits_, V, m, stream);
+        apply_head_masks();
+        topk_local(logits_, V, m, p_.vocab.b, topk_, stream);
+    }
     allgather_small(topk_, m * kTopK * 2, topk_all_, comm_, rank, ctr_, stream);
 }
 
@@ -2379,8 +2666,18 @@ AttnShape Worker::layer_shape(const Layer* L, int win) const {
     a.kc2 = L ? L->fa.kc2 : mtp_.kc2;
     a.vc2 = L ? L->fa.vc2 : mtp_.vc2;
     a.fp8 = L ? kv_fp8_ : mtp_fp8();
+    a.kv4 = L && kv4_;
+    a.k4k = kv4_k_;
+    a.k4v = kv4_v_;
+    a.k4cap = kv4_cap_;
     a.ks = L ? L->fa.ks : mtp_ks_ * mtp_sc_mul_;
     a.vs = L ? L->fa.vs : mtp_vs_ * mtp_sc_mul_;
+    // quality gate only: QE_KVQ_EMU fake-quantises the main layers' K / V at the write (bf16 cache, QE_KV_FP8=0);
+    // QE_KVQ_EMU_MTP=1 the MTP layer too
+    static const int kvemu = env_int("QE_KVQ_EMU", 0), kvemu_mtp = env_int("QE_KVQ_EMU_MTP", 0);
+    a.kvemu = (!a.fp8 && (L || kvemu_mtp)) ? kvemu : 0;
+    static const int kvsink = env_int("QE_KVQ_SINK", 0);
+    a.kvsink = kvsink;
     // MTP drafts only need recent context: a sliding window bounds their KV reads at long
     // context. win < 0 means the dec8_first default (32K beyond 144K); the recursive draft
     // passes pass a tighter window (see run_spec), the verification pass keeps full attention.
@@ -2497,7 +2794,7 @@ static void lsa_dump(const Worker& w, int rank, int li, int ord, const AttnShape
 // QE_LSA_PF_MIN / QE_LSA_DEC_MIN: prefill chunks / decode steps starting below these positions keep the dense kernels.
 void Worker::lsa_load(const std::string& path) {
     // refusals: one behaviour (LSA off, the reason on stdout with the start-up lines, the server runs dense)
-    const char* why = !lsa_allowed_ ? lsa_refusal_.c_str() : !kv_fp8_ ? "it needs the FP8 KV cache (QE_KV_FP8=1)" : nullptr;
+    const char* why = !lsa_allowed_ ? lsa_refusal_.c_str() : !kv_fp8_ || kv4_ ? "it needs the FP8 KV cache (QE_KV_FP8=1, not QE_KV_BITS=4)" : nullptr;
     if (why) {
         if (rank == 0) printf("LSA off: %s; full attention\n", why);
         return;
@@ -2811,6 +3108,7 @@ void Worker::mixer_rows(int i, int r0, int mb, const int* pos, int slot_off, boo
 }
 
 void Worker::forward_prefill(int m, bool logits) {
+    snap_join();  // [q27-snapasync]
     struct InPf { bool& f; bool o; explicit InPf(bool& x) : f(x), o(x) { f = true; } ~InPf() { f = o; } } in_pf(in_pf_);  // (nested: restores)
     const int H = c_.hidden, I = p_.inter.size();
     const float eps = c_.eps;
@@ -3079,8 +3377,51 @@ void Worker::forward_prefill(int m, bool logits) {
     }
 }
 
-void Worker::head(const Lin& w, const bf16* x, int m, int* out, bool draft) {
-    const int V = draft ? draft_v_ : p_.vocab.size();
+void Worker::head4(const bf16* x, int m, unsigned long long full) {
+    CHECK(m <= kH4MaxRows, "head4r rows %d", m);
+    const int V = p_.vocab.size(), H = c_.hidden;
+    // the INT4 screen on the GEMV at every row count (review M3: >= 33 rows used to take the prefill GEMM, whose tuner
+    // is skipped inside a capture; the rows stay independent of their batch partners)
+    if (h16_) {  // (33..64 rows: two 32-row passes; one GEMM pass measured level, [q27-head4r-gemm])
+        xh_pack(x, H, H, m, xh_tmp_, H, stream);
+        gemv_w4h(lm_head4_, xh_tmp_, H, logits_, V, m, stream);
+    } else {
+        gemv_w4(lm_head4_, x, H, logits_, V, m, stream);
+    }
+    const bool lp = lp_rows_ > 0;
+    if (lp) full = ~0ull;
+    if (lp && !head_masks_.empty()) {  // logprobs read the raw logits: their exact top-64 before the masks, then INT4 again
+        h4_select(logits_, V, m, kH4MaxR, h4ws_, stream);
+        h4_rescore_bf16(h4_host_, x, H, m, kH4MaxR, h4ws_, stream);
+        h4_scatter(h4ws_, m, kH4MaxR, logits_, V, stream);
+        lp_copy();
+        h4_scatter(h4ws_, m, kH4MaxR, logits_, V, stream, ~0ull, 0, true);
+    }
+    masks_apply();  // before the selection (review H1): a constrained row picks among its allowed tokens' exact values
+    h4_R_ = full ? kH4MaxR : h4r_;
+    h4_select(logits_, V, m, h4_R_, h4ws_, stream);
+    h4_rescore_bf16(h4_host_, x, H, m, h4_R_, h4ws_, stream, full, h4r_);
+    // the exact values over the INT4 ones at the rescored candidates, so logits_ (logprobs copy, qe_logits, KL tools)
+    // holds what the head decides on: exact top-R, the INT4 screen elsewhere (else qe_logits read the plain INT4 screen)
+    h4_scatter(h4ws_, m, h4_R_, logits_, V, stream, lp_rows_ > 0 ? ~0ull : full, h4r_);
+    lp_copy();  // (no masks: the copy reads the exact top-64; with masks it was taken before them)
+}
+
+void Worker::head(const Lin& w0, const bf16* x, int m, int* out, bool draft) {
+    int V = draft ? draft_v_ : p_.vocab.size();
+    Lin w = w0;  // [q27-vocab-mtp] MTP drafts: the first draft_mtp_n rows of the pruned draft head (16-row tiles)
+    if (draft && draft_map_ && w.is4 && draft_mtp_n > 0 && draft_mtp_n < V && &w0 == &draft_head_) {
+        w.q.n = draft_mtp_n;
+        V = draft_mtp_n;
+    }
+    if (!draft && h4r_ > 0 && &w0 == &lm_head_) {  // [q27-head4r] every greedy row: argmax of the exact values of its INT4 top-h4r_
+        head4(x, m, h4_full_);
+        h4_pick(h4ws_, m, h4_R_, h4r_, p_.vocab.b, pairs_, stream);
+        if (h4_topk_) h4_topk(h4ws_, m, h4_R_, h4_full_, h4r_, p_.vocab.b, topk_, stream);
+        allgather_small(pairs_, 2 * m, pairs_all_, comm_, rank, ctr_, stream);
+        argmax_final(pairs_all_, ngpu_, m, out, stream);
+        return;
+    }
     gemv(w, x, c_.hidden, logits_, V, m, stream);
     if (!draft) apply_head_masks();
     argmax_local(logits_, V, m, p_.vocab.b, pairs_, stream, draft ? draft_map_ : nullptr);
@@ -3097,7 +3438,7 @@ static int mtp_draft_win() {
 }
 
 void Worker::mtp_forward(int m, const int* pos, const int* tok, const bf16* hsrc, const int* hrow,
-                         bool logits, int win) {
+                         bool logits, int win, bool kv_only) {
     const int H = c_.hidden, I = p_.inter.size();
     const float eps = c_.eps;
     cudaStream_t st = stream;
@@ -3115,6 +3456,7 @@ void Worker::mtp_forward(int m, const int* pos, const int* tok, const bf16* hsrc
     xchg_fill(a);
     attn_prep(proj_, proj_ld_, a, mtp_.q_norm, mtp_.k_norm, eps, inv_freq_, pos, m, qbuf_,
               mtp_.kc, mtp_.vc, st);
+    if (kv_only) return;  // (the K / V rows are in the cache: the rest of the layer only feeds logits and the chain)
     verify_ = m <= kPendRows;
     attend(a, qbuf_, mtp_.kc, mtp_.vc, pos, m, nullptr, nullptr, xha);
     verify_ = false;
@@ -3334,6 +3676,14 @@ void Worker::set_rope_delta(int delta) {
 }
 
 void Worker::prefill_chunk(const int* ids, int i0, int m, int n, int k, const int* rope3) {
+    // [q27-snapasync] the one-token pass after the n - 1 prompt-end snapshot writes S[cur ^ 1] only (larger chunks may
+    // write S[cur]: (cur + m) % 2): it may run beside the copy
+    const bool sg = snap_grace_begin(m == 1, true);
+    prefill_chunk_g_(ids, i0, m, n, k, rope3);
+    snap_grace_end(sg);
+}
+
+void Worker::prefill_chunk_g_(const int* ids, int i0, int m, int n, int k, const int* rope3) {
     struct InPf { bool& f; bool o; explicit InPf(bool& x) : f(x), o(x) { f = true; } ~InPf() { f = o; } } in_pf(in_pf_);  // (nested: restores)
     const bool last = i0 + m == n;
     pf_p0_ = i0;
@@ -3443,7 +3793,9 @@ void Worker::size_ctx(int max_pos) {
 size_t Worker::ctx_bytes_per_pos(int max_pos) const {
     // (LSA: none above kLsaMaxPos, where lsa_size refuses and the run is dense)
     const bool lsa = lsa_ready_ && !lsa_on_ && max_pos <= kLsaMaxPos;
-    return (size_t)ash_.nkv * sizeof(uint2) + (lsa ? lsa_bytes_per_pos((int)lsa_.size(), max_pos) : 0);
+    // (+ the 4-bit cache's prefill staging, sized to the served context: review M2)
+    return (size_t)ash_.nkv * sizeof(uint2) + (lsa ? lsa_bytes_per_pos((int)lsa_.size(), max_pos) : 0) +
+           kv4_stage_bytes_per_key();
 }
 
 size_t Worker::ctx_fixed_bytes(int max_pos) const {  // the selection scratch's part that does not grow with the context
@@ -3507,14 +3859,72 @@ void Worker::lk_set_history(const int* ids, int n) {
     CUDA_CHECK(cudaMemcpyAsync(lk_dev_.hn, &n, 4, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemsetAsync(lk_dev_.best, 0, 8, stream));
     lookup_scan_emit(lk_dev_, stream);
+    // [q27-snapasync] the drafts' count through mapped host memory (a kernel store, not the copy engine: a snapshot copy
+    // queued there would hold a 4-byte read back until it is done)
+    if (!lk_cnt_h_) {
+        CUDA_CHECK(cudaHostAlloc((void**)&lk_cnt_h_, 4, cudaHostAllocMapped | cudaHostAllocPortable));
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&lk_cnt_d_, lk_cnt_h_, 0));
+    }
+    copy_int(lk_cnt_d_, lk_dev_.lk, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void Worker::run_spec(int kv, int kd, bool launch, bool lookup, bool block, bool ring) {
+// [q27-mtpkv-defer] MTP KV of the oldest m ring rows (the same per-row arithmetic as the block step's own fill: m <= 16
+// rows take the same GEMV / norm / attn_prep code, rows are independent), then the ring drops them
+void Worker::mkv_fill(int m, cudaStream_t st) {
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaStream_t s0 = stream;
+    stream = st;
+    mtp_forward(m, mkv_ctr_ + 1, mkv_tok_, mkv_h_, nullptr, false, 0, true);
+    stream = s0;
+    mkv_compact(mkv_h_, mkv_tok_, mkv_ctr_, m, c_.hidden, st);
+}
+
+void Worker::mkv_catch_up() {
+    if (!mkv_ctr_) return;
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int c4[4] = {0, 0, 0, 0};
+    CUDA_CHECK(cudaMemcpy(c4, mkv_ctr_, 16, cudaMemcpyDeviceToHost));
+    int n = c4[0];
+    if (c4[3] || n < 0 || n > kMkvCap) {  // (never seen: rows were dropped; MTP drafts of this slot are worse, outputs exact)
+        fprintf(stderr, "[qengine] deferred MTP KV ring: error %d, rows %d (rows dropped; drafts only)\n", c4[3], n);
+        n = 0;
+    }
+    while (n >= kMkvFlush) {  // (16-row passes, then the rest: <= 32 rows take the decode GEMV path)
+        mkv_fill(kMkvFlush, stream);
+        n -= kMkvFlush;
+    }
+    if (n > 0) mkv_fill(n, stream);
+    CUDA_CHECK(cudaMemsetAsync(mkv_ctr_, 0, 4 * 4, stream));  // (also the undo mark: an undone step's rows are filled)
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void Worker::run_spec(int kv, int kd, bool launch, bool lookup, bool block, bool ring, bool plain) {
+    // [q27-snapasync] a verification keeps every row and replays the accepted ones into S[cur ^ 1] (QE_DN_DEFER1: stashes
+    // them; no pending rows right after a snapshot): never a store into S[cur], so it may run beside the snapshot copy.
+    // (Relies on dn_pn = 0: snapshot_save_async flushes the pending rows and every other writer joins before it; with
+    // pending rows the flush below would flip cur and dn_replay would write the S being copied: review L3)
+    const bool sg = snap_grace_begin(true);
+    run_spec_g_(kv, kd, launch, lookup, block, ring, plain);
+    snap_grace_end(sg);
+}
+
+bool Worker::tree_step(int kv, int kd, bool lookup, bool block) const {
+    // [q27-sib] default on (QE_DF_SIB=0 off): 1 card wide +3.5 %, sb3 +4.6..4.9 %, 32K +2.7 %, 96K +1.6 %, exact
+    static const bool sib_env = env_int("QE_DF_SIB", 1) != 0;  // (QE_DF_SIB=0: linear block steps)
+    return sib_env && sib_ok_ && block && dfl_ && !lookup && ngpu_ == 1 && !sampling && !constrained && !lsa_use_ &&
+           kv == kDflDrafts && kd == kDflDrafts && dn_fuse_on() && !dn_defer1_on() && !p_.pos_split && kv_fp8_ && !kv4_ &&
+           sib_ && sib_kernels_ok(dsh_);
+}
+
+void Worker::run_spec_g_(int kv, int kd, bool launch, bool lookup, bool block, bool ring, bool plain) {
     dpath_use(0);
     block = block && dfl_;
     ring = ring && dfl_ && !block;
-    auto key = std::make_tuple(kv, kd | (lookup ? 256 : 0) | (block ? 512 : 0) | (ring ? 1024 : 0), mode(), cur_slot_);
+    plain = plain && block;
+    const bool tree = tree_step(kv, kd, lookup, block);
+    auto key = std::make_tuple(kv, kd | (lookup ? 256 : 0) | (block ? 512 : 0) | (ring ? 1024 : 0) | (plain ? 4096 : 0) | (tree ? 8192 : 0), mode(), cur_slot_);
     cudaGraphExec_t sge = spec_graphs_.get(key);
     if (!sge) {
         cudaGraph_t g;
@@ -3526,12 +3936,17 @@ void Worker::run_spec(int kv, int kd, bool launch, bool lookup, bool block, bool
         } else if (!defer) {
             copy_int(dn_save_, dn_cur_, stream);
         }
+        if (block && mkv_on()) copy_int(mkv_ctr_ + 2, mkv_ctr_, stream);  // [q27-mtpkv-defer] the undo mark
         if (lookup) lookup_to_tokens(lk_dev_, spec_.tokens, kv, stream);  // the previous step's lookup drafts
+        if (tree) sib_check(sib_, spec_.tokens, spec_.pos, stream);  // [q27-sib] this step's drafts: a tree block?
         dfl_cap_ = block || ring;  // DFlash2: the tap rows of the verification
+        sib_cap_ = tree;
         forward(kv + 1, true, true);
         dfl_cap_ = false;
         if (sampling) spec_accept_sampled(topk_all_, ngpu_, kv, sp_, spec_, stream);
+        else if (tree) spec_accept_tree(spec_, kv, sib_, stream);
         else spec_accept(spec_, kv, stream);
+        if (tree) sib_fix_launch();  // [q27-sib] a hit leaf's rows to row a + 1 (replay, taps, MTP rows, KV, conv ring)
         if (defer) {  // accepted rows -> stash (committed by the next step)
             DnStashSegs r{};
             r.n = 1;
@@ -3598,14 +4013,18 @@ void Worker::run_spec(int kv, int kd, bool launch, bool lookup, bool block, bool
             // DFlash2 block step: the MTP pass only keeps its KV cache (batched steps of this slot draft with it),
             // the verified rows' taps go to the drafter's context, the drafter makes the next step's 7 drafts
             static const bool mtpkv = env_int("QE_DF_MTPKV", 1) != 0;
-            if (mtpkv) mtp_forward(kv + 1, spec_.mtp_pos, spec_.mtp_tok, xn_, spec_.hrow, false);
+            static const bool kvonly = env_int("QE_DF_MTPKV_ONLY", 1) != 0;  // [q27-mtpkv-only] 0: the whole MTP layer
+            if (mtpkv && mkv_on())  // [q27-mtpkv-defer] rows 0..kv to the ring (the accepted ones stay)
+                mkv_append(mkv_h_, mkv_tok_, mkv_ctr_, xn_, spec_.mtp_tok, spec_.mtp_pos, spec_.acc, kv + 1, c_.hidden, kMkvCap, stream);
+            else if (mtpkv) mtp_forward(kv + 1, spec_.mtp_pos, spec_.mtp_tok, xn_, spec_.hrow, false, 0, kvonly);
             if (lk_on()) {
                 lookup_append(lk_dev_, spec_.emit, stream);
                 lookup_scan_emit(lk_dev_, stream, spec_.emit + 31);
             }
             spec_finish(spec_, kd, stream);  // tokens[0] = the anchor, pos = its position (drafts follow)
-            if (lk_on()) if_no_lookup([&] { dfl_block(); });
+            if (lk_on() && !plain) if_no_lookup([&] { dfl_block(); });
             else dfl_block();
+            sib_cap_ = false;
             CUDA_CHECK(cudaStreamEndCapture(stream, &g));
             CHECK(instantiate(&sge, g), "out of VRAM for a speculative-step graph");
             CUDA_CHECK(cudaGraphDestroy(g));

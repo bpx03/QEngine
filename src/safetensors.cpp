@@ -13,7 +13,7 @@
 #include <cstring>
 #include <stdexcept>
 
-void SafeTensors::open(const std::string& path) {
+void SafeTensors::open(const std::string& path, const std::set<std::string>* only, bool shadow) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + path);
     struct stat st;
@@ -36,6 +36,7 @@ void SafeTensors::open(const std::string& path) {
     const size_t dsize = size - 8 - hlen;
     for (auto& [name, v] : j.obj) {
         if (name == "__metadata__") continue;
+        if (only && !only->count(name)) continue;
         TensorInfo t;
         t.dtype = v["dtype"].str;
         for (auto& d : v["shape"].arr) t.shape.push_back(d.i());
@@ -47,7 +48,7 @@ void SafeTensors::open(const std::string& path) {
         // unquantised tensors); a differing duplicate (e.g. a stale expert link next to a re-converted layer file)
         // would otherwise override silently, depending on the directory order
         auto it = tensors_.find(name);
-        if (it != tensors_.end() && (it->second.dtype != t.dtype || it->second.shape != t.shape ||
+        if (!shadow && it != tensors_.end() && (it->second.dtype != t.dtype || it->second.shape != t.shape ||
                                      it->second.nbytes != t.nbytes || memcmp(it->second.data, t.data, t.nbytes) != 0)) {
             size_t off = 0;
             throw std::runtime_error("tensor " + name + " in both " + file_of(it->second.data, &off) + " and " + path +

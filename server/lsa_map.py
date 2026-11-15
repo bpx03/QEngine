@@ -31,7 +31,7 @@ import time
 import urllib.request
 import zipfile
 
-from qe_env import env_int, env_str
+from qe_env import env_int, env_str, fetch_open
 
 # the released map for Qwen3.8-27B (INT4 and INT8 checkpoints of the same base model): d2048, the learned one
 # (0.806 vs 0.791 dense attention mass for the training-free pca-step0)
@@ -261,7 +261,7 @@ def convert(src, dst, source_name=None, want_sha=None):
 def _download(url, dst, size):
     req = urllib.request.Request(url, headers={"User-Agent": "qengine-lsa"})
     got = 0
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r, open(dst, "wb") as f:
+    with fetch_open(req, TIMEOUT) as r, open(dst, "wb") as f:  # (ENV_LOCK, review FX11-L1)
         total = int(r.headers.get("Content-Length") or 0)
         if total and size and total != size:
             raise IOError(f"{total} bytes offered, {size} expected")

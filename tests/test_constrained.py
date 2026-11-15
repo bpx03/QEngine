@@ -36,7 +36,7 @@ SCHEMA = {"type": "object", "properties": {"cities": {"type": "array", "minItems
     "required": ["name", "population", "voivodeship", "capital"], "additionalProperties": False}}},
     "required": ["cities"], "additionalProperties": False}
 
-e = Engine(MODEL)
+e = Engine(MODEL, devices=os.environ.get("QE_DEVS", "0,1,2"))  # QE_DEVS: other cards (e.g. 0: one card)
 e.set_sampling(0)
 e.set_concurrent(True)
 G = Grammars(open(os.path.join(MODEL, "tokenizer.json")).read(), e.vocab(), sorted(EOS))

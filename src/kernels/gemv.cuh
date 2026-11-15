@@ -82,7 +82,7 @@ bool gemv_w4hx(const W4& w, const __half* xh, int ldx, float* y, int ldy, int m,
 void gemv_x_init();            // once per device (workspace), before any stream capture
 // K slices (warps) per 16-row tile of the GEMV, shared with skinny; w4: INT4 decode matrices (the
 // QE_GEMV_NW_SMALL rule applies only to them, not to the split-K W16 projections)
-int pick_warps(int tiles, int units, bool w4 = false);
+int pick_warps(int tiles, int units, bool w4 = false, bool int8 = false);  // int8: INT8 / Q8 matrices (no [q27-gemv-nw] rule)
 bool skinny_use(int n, int m); // engine policy (QE_SKINNY, QE_SKINNY_MIN_M, QE_SKINNY_MIN_TILES)
 // ksplit > 1 splits K across blocks (for tiny N); partial sums go to y + s * ystride and the
 // consumer adds the ksplit slices.

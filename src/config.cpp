@@ -60,7 +60,9 @@ Config Config::load(const std::string& model_dir) {
         }
     }
     for (auto& lt : t["layer_types"].arr) c.is_full.push_back(lt.str == "full_attention");
-    c.image_pad = root.has("image_token_id") ? (int)root["image_token_id"].i() : c.eos;
+    // (review q27_pool_race L4) top level as in the Qwen3.x configs, else text_config, else no image token (eos)
+    c.image_pad = root.has("image_token_id") ? (int)root["image_token_id"].i()
+                : t.has("image_token_id") ? (int)t["image_token_id"].i() : c.eos;
     if (c.image_pad < 0 || c.image_pad >= c.vocab) c.image_pad = c.eos;
 
     auto need = [](bool ok, const char* what) {

@@ -147,7 +147,11 @@ struct CommCounters {  // per GPU, device memory
     // no peer access (comm_bind_ll_scrub): the host LL words, which comm_begin_unit clears every kLLScrubUnits units
     uint2* ll_host = nullptr;
     int ll_rank = 0, ll_ngpu = 0, ll_hidden = 0;
+    // [q27-ar1-split] one card: the norm's warp sums, [4 slots][kMaxBatchRows][24][2] words (value | idx tag, then the
+    // epoch), zeroed when the Worker is created (kAr1WsBytes)
+    unsigned long long* ar1 = nullptr;
 };
+constexpr size_t kAr1WsBytes = (size_t)4 * 64 * 24 * 2 * 8;
 
 // The host path's LL words have up to 3 readers, so no reader can clear them as the P2P path does. A word left unwritten
 // (m dropped) keeps its 16-bit tag, and the tag of a later collective equals it only if the two are >= 64 units apart.

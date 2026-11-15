@@ -26,7 +26,7 @@ EN = {"dekoduje": "decoding", "czeka": "waiting", "działa": "up", "start nr": "
       "W na GPU": "W on GPUs", "stan": "state", "kontekst": "context", "z cache": "cached", "wygen.": "generated",
       "nikt teraz nie pracuje": "nobody is working right now", "pula": "pool", "zarezerwowane": "reserved",
       "w użyciu": "in use", "archiwum": "archive", "dysk": "disk", "wzrosty": "grown", "przesunięcia": "moved",
-      "wysiedlenia": "evicted", "dla głównego": "for main", "dopuszczone obok": "backfilled",
+      "wysiedlenia": "evicted", "przy dopuszczeniu": "on admission", "kolejka LRU": "next out (LRU)", "dopuszczone obok": "backfilled",
       "nie rozpoznano głównego agenta w sesji": "main agent not identified in session",
       "pętla między turami": "cross-turn loop", "rozmowa": "conversation", "ta sama tura": "same turn",
       "bez lookup": "no lookup", "razem": "total", "wstrzymane": "paused", "wstrzymania": "preempted", "wznowienia": "resumed", "od startu": "since start", "łącznie": "all time", "czas pracy": "uptime",
@@ -165,9 +165,13 @@ def view(s, width=140, note=None):
                           f"({a['disk_bytes'] / 2**30:.1f} GB) · {_('wzrosty')} {ev['grow']}, {_('przesunięcia')} {ev['move']}, "
                           f"{_('wysiedlenia')} {ev['evict']} · {_('wstrzymane')} {en.get('paused', 0)} "
                           f"({_('wstrzymania')} {ev.get('pause', 0)}, {_('wznowienia')} {ev.get('resume', 0)}"
-                          f"{', ' + _('dla głównego') + ' ' + str(sc['main_pauses']) if sc.get('main_pauses') else ''})"
+                          f"{', ' + _('przy dopuszczeniu') + ' ' + str(sc['pauses']) if sc.get('pauses') else ''})"
                           f"{' · ' + _('dopuszczone obok') + ' ' + str(sc['backfills']) if sc.get('backfills') else ''}",
-                          style="grey62"))
+                          style="grey62"),
+                     Text(_('kolejka LRU') + ": " + ", ".join(
+                         f"#{c['id']} {big(c['tokens'])} {c['where'].replace('slot ', 's') if c['where'] != 'archive' else _('archiwum')}"
+                         f"{' ' + str(int(c['idle_s'])) + 's' if c.get('idle_s') is not None else ''}{'*' if c.get('generating') else ''}"
+                         for c in (en.get("conversations") or [])[:8]) if en.get("conversations") else "", style="grey50"))
 
     g = []
     for x in s["gpus"]:

@@ -14,6 +14,7 @@
 #include "config.h"
 #include "kernels/comm.cuh"
 #include "kernels/gemv.cuh"
+#include "kernels/head4r.cuh"
 #include "kernels/ops.cuh"
 #include "kernels/sample.cuh"
 #include "kernels/spec.cuh"
@@ -89,10 +90,16 @@ struct SeqSlot {
     // the graphs of a constrained slot (row j: the grammar state after drafts 1..j)
     unsigned* mask = nullptr;
     bool constrained = false;
+    // [tool-choice-ban] static token ban (tool_choice none): one allowed-token bitmask over the whole vocabulary
+    // (device, fixed address), applied to every target-head row of this slot (stride 0) in its normal decode path
+    // (single, batched, run-ahead, lookup / block drafts; set_ban); off: no kernel, the graphs as before
+    unsigned* ban = nullptr;
+    bool banned = false;
     float* lp = nullptr;          // logprobs: pinned host [kMaxSpecK + 1][vocab slice] (set_lp); kept once allocated
     bool lp_on = false;
     LookupDev lk;                 // lookup drafts of batched steps: this sequence's history (QE_LKB, lk_init)
     int* pos8 = nullptr;          // device: spec.pos + 8 / mtp_pos + 8 (second attention segment of > 8 rows)
+    int* sib = nullptr;           // [q27-sib] device [32]: tree-step flag / hit / the selector's record (sib_check)
     int* mpos8 = nullptr;
 };
 
@@ -154,6 +161,11 @@ public:
     // cap * share by up to A(P - A)/P rows per split head.
     size_t slot_token_bytes() const;
     size_t region_slack() const { return slack_tokens_; }
+    bool kv4() const { return kv4_; }
+    // 4-bit cache: bytes of the fp8 prefill staging per key of context on this card, and its allocation for cap keys
+    size_t kv4_stage_bytes_per_key() const;
+    size_t fp8_token_bytes() const;  // pool bytes per token this card would take with the fp8 cache
+    void kv4_stage_alloc(int cap);
     size_t slot_fixed_bytes() const;
     size_t free_bytes() const;
     void add_slot();  // a sequence slot without KV (see set_region)
@@ -230,24 +242,46 @@ public:
     // Same as forward() but through a CUDA graph captured on first use.
     void run(int m, bool logits);
     void run_(int m, bool logits);
+    void run_g_(int m, bool logits);
     void dn_dump(const char* tag, int m);
     // MTP head over m rows: pairs (hsrc[hrow + i], tok[i]) at positions pos..; drafts -> spec_.mtp_out
+    // kv_only ([q27-mtpkv-only]): stop after the K / V write (the KV-cache fill of a block step; no hidden, no logits)
     void mtp_forward(int m, const int* pos, const int* tok, const bf16* hsrc, const int* hrow,
-                     bool logits, int win = 0);
+                     bool logits, int win = 0, bool kv_only = false);
     // Prompt chunk [i0, i0+m) of an n-token prompt (eager): main forward + MTP KV fill; the
     // last chunk also produces x_n and k drafts in tokens_.
     void prefill_chunk(const int* ids, int i0, int m, int n, int k, const int* rope3 = nullptr);
+    void prefill_chunk_g_(const int* ids, int i0, int m, int n, int k, const int* rope3);
     // RoPE position shift of the current slot (text after images; 0 for text-only sequences)
     void set_rope_delta(int delta);
     // One speculative step with k drafts (CUDA graph). Emitted tokens -> spec_.emit.
     // kv: drafts verified this step (made by the previous step); kd: drafts made for the next.
     // lookup = true: the kv drafts are the device lookup drafts (lk_dev_), the MTP draft chain (drafts 2..kd) runs
     // only when the step's own lookup finds none (conditional graph node)
-    void run_spec(int kv, int kd, bool launch = true, bool lookup = false, bool block = false, bool ring = false);  // launch = false: only build the graph
+    void run_spec(int kv, int kd, bool launch = true, bool lookup = false, bool block = false, bool ring = false,
+                  bool plain = false);  // launch = false: only build the graph
+    void run_spec_g_(int kv, int kd, bool launch, bool lookup, bool block, bool ring, bool plain);
+    // [q27-mtpkv-defer] DFlash2 block steps defer the MTP KV fill: each step appends its accepted rows' MTP inputs
+    // (verify hidden, target token; positions follow on) to a small device ring (mkv_*); once the host knows of
+    // >= kMkvFlush rows of finished steps, the oldest kMkvFlush are filled in one MTP pass enqueued before the next
+    // block step (mkv_fill, eager). Before anything else reads the slot's MTP cache, Engine catches the rest up
+    // (mkv_catch_up: every row, exact). Capacity: < 16 known rows + the step in flight + the new step, up to 13 rows
+    // each (lookup block steps) = 41 < 48; an overflow or a position gap sets ctr[3] (rows dropped, reported)
+    static constexpr int kMkvCap = 48, kMkvFlush = 16;
+    bool mkv_on() const { return mkv_h_ != nullptr; }
+    void mkv_catch_up();  // (synchronises the stream) fill every ring row, empty the ring
+    void mkv_fill(int m, cudaStream_t st);  // fill the oldest m ring rows (MTP KV only), drop them from the ring
+    // plain ([q27-plain]): a block step without the IF node around the drafter (it always runs; the lookup scan still
+    // runs and its drafts override at the next step). A graph with a conditional node makes cudaGraphLaunch wait for
+    // the previous step graph on the host (~0.11 ms of GPU idle per step)
     // ring: an MTP step that still writes the DFlash2 context ring (the slot's later block steps keep their window)
-    bool has_spec_graph(int kv, int kd, bool lookup = false, bool block = false, bool ring = false) {
-        return spec_graphs_.m.count(std::make_tuple(kv, kd | (lookup ? 256 : 0) | (block ? 512 : 0) | (ring ? 1024 : 0), mode(), cur_slot_)) != 0;
+    bool has_spec_graph(int kv, int kd, bool lookup = false, bool block = false, bool ring = false, bool plain = false) {
+        return spec_graphs_.m.count(std::make_tuple(kv, kd | (lookup ? 256 : 0) | (block ? 512 : 0) | (ring ? 1024 : 0) | (plain && block ? 4096 : 0) |
+                                                         (tree_step(kv, kd, lookup, block) ? 8192 : 0), mode(), cur_slot_)) != 0;
     }
+    // [q27-sib] a block step of this sequence runs as a tree step (QE_DF_SIB, one card, greedy, kernels with tree forms)
+    bool tree_step(int kv, int kd, bool lookup, bool block) const;
+    bool sib_ok_ = true;  // [q27-sib] the engine's per-step permission (no tree while the host watches drafts: stops)
     // Lookup drafts on the GPU (QE_LOOKUP): the current sequence's token history on the device, appended and scanned
     // at the end of every single-sequence step graph; lk_dev_.lk = drafts for the next step.
     void lk_init(int cap, int mmin, int lmax);
@@ -260,6 +294,8 @@ public:
     bool lk_on() const { return lk_dev_.hd != nullptr; }
     const int* lk_dev_ptr() const { return lk_dev_.lk; }
     LookupDev lk_dev_;
+    int* lk_cnt_h_ = nullptr;  // lk_set_history: the drafts' count lk_dev_.lk[0], mapped host memory (lk_cnt_d_ its device view)
+    int* lk_cnt_d_ = nullptr;
     cudaStream_t lk_cst_ = nullptr;  // capture stream of the conditional draft chain
     int* pos8_ = nullptr;   // device: position + 8 (second half of a long verification's attention)
     bool verify_ = false;   // attend() of a verification / MTP pass (decode attention up to kPendRows rows)
@@ -270,8 +306,11 @@ public:
     // weight-streaming matmuls, all-reduces and norms run once over all rows.
     // lkr[i] > 0: sequence i verifies lkr[i] = kvs[i] lookup drafts (its own history, see LkBatch); kav[i]: its MTP
     // drafts made by the last step (the fallback when the history has no match)
+    // dring[i] >= 0 ([q27-bdfl]): sequence i drafts its next step with the DFlash2 block drafter from context ring dring[i]
+    // (its verify rows' taps go to that ring; the engine selected / invalidated the ring eagerly before), else with MTP
     void run_spec_batch(const std::vector<int>& slots, const std::vector<int>& kvs, int kd,
-                        const std::vector<int>* lkr = nullptr, const std::vector<int>* kav = nullptr);
+                        const std::vector<int>* lkr = nullptr, const std::vector<int>* kav = nullptr,
+                        const std::vector<int>* dring = nullptr);
     // batched lookup history of slot i: tokens [from, n) uploaded (tail), length := n, scan
     void lkb_sync(int i, const int* tail, int from, int n);
     bool lkb_on() const { return lkb_cap_ > 0; }
@@ -305,9 +344,13 @@ public:
                      bool save, bool with_dn, int piece = 0, size_t budget = ~(size_t)0);
     bool has_mtp = false;
     SpecState spec_;
+    int* sib_ = nullptr;          // [q27-sib] the bound slot's sib buffer
+    bool sib_cap_ = false;        // [q27-sib] capturing a tree-step graph: forward passes sib_ to attention / DeltaNet
+    void sib_fix_launch();        // [q27-sib] (dflash.cpp)
     // Pruned MTP draft vocabulary (this GPU's share of the most frequent token ids); empty =
     // full vocabulary. Set before load().
     std::vector<int> draft_ids;
+    int draft_mtp_n = 0;  // [q27-vocab-mtp] MTP drafts use the first draft_mtp_n of them (frequency order; 0: all)
     // Sampling of the current slot: params live on the device; `sampling` selects greedy vs
     // sampled graphs.
     void set_sampling(const SampleParams& p, bool on);  // penalty off (set_penalty after it)
@@ -327,7 +370,11 @@ public:
     void upload_drafts(int i, const int* host, int n);
     size_t mask_words() const { return ((size_t)c_.vocab + 31) / 32; }
     bool constrained = false;
-    int mode() const { return (sampling ? 1 : 0) | (constrained ? 2 : 0) | (attn_rs_ ? 4 : 0) | (lsa_use_ ? 8 : 0) | (lp_on_ ? 16 : 0); }
+    // [tool-choice-ban] slot i's banned tokens (host bitmask of mask_words(), nullptr: none) -> its device ban mask
+    void set_ban(int i, const unsigned* host);
+    bool banned = false;  // the selected slot's ban is on (a mode bit: its graphs hold the mask kernel)
+    int mode() const { return (sampling ? 1 : 0) | (constrained ? 2 : 0) | (attn_rs_ ? 4 : 0) | (lsa_use_ ? 8 : 0) | (lp_on_ ? 16 : 0) |
+                              (banned ? 32 : 0); }
     // logprobs (constrained slots): the target head's raw logits go to the slot's host buffer, before the mask (a mode
     // bit: only that slot's graphs, keyed by slot, hold the copy). lp_read: row of the slot's last step, this card's slice
     void set_lp(int i, bool on);
@@ -346,6 +393,19 @@ public:
     size_t snapshot_bytes() const;
     void snapshot_save(void* dst);
     void snapshot_restore(const void* src);
+    // [q27-snapasync] snapshot_save off the critical path: the conv rings are staged device-to-device on the stream
+    // (a step writes them in place), then S[cur] and the staged rings go device-to-host on a side stream. The next
+    // single-sequence step / one-token pass of this slot may run beside the copy (it never stores into S[cur]: the
+    // verification keeps its rows, dn_replay / the m = 1 recurrence write S[cur ^ 1]); it joins the copy after its
+    // launch, so everything after it is ordered behind the copy. Every other state writer or reader joins first
+    // (snap_join: stream-ordered, no host wait); readers of the host buffer wait on the host (snap_host_wait)
+    void snapshot_save_async(void* dst);
+    void snap_init();  // side stream, events, staging rings (Engine, before the first slot)
+    void snap_join();
+    void snap_host_wait();
+    bool snap_grace_begin(bool safe, bool issue = false);  // true: this call may run beside the copy (snap_grace_end joins after it)
+    void snap_issue();
+    void snap_grace_end(bool g);
 
     // Activation steering (QE_STEER / QE_STEER_DIR, src/steer.h, kernels/steer.cuh): nv vectors, w =
     // [nv][2 modes][layers][hidden] with the sidecar strength folded in (add: alpha v; project: sqrt(alpha) unit v),
@@ -375,14 +435,21 @@ public:
     void dfl_ring_select(int ring);                         // stream-ordered: the ring the next passes use
     void dfl_ring_inval(int from);                          // its rows of positions >= from (0: all) dropped
     // taps rows [row0, row0 + m) -> ring at positions *pos + row (fc, norm, every layer's K / V)
-    void dfl_ctx_rows(int row0, int m, const int* pos);
+    void dfl_ctx_rows(int row0, int m, const int* pos, int tap0 = -1);
     // drafter block: anchor spec_.tokens[0] at *spec_.pos -> drafts in spec_.tokens[1 .. 7]
-    void dfl_block();
+    void dfl_block(const SpecState* s = nullptr);  // the drafts of sequence s (null: spec_, the current slot)
     bool dfl_cap_ = false;  // forward / forward_prefill: copy the tap layers' residual rows (rows of the pass)
     bool dfl_pf_ = false;   // prefill_chunk: the prompt runs block steps (taps of the window rows, drafter at its end)
     double dfl_bench(int iters);  // ms per drafter block (eager timing of the graph-free sequence; dev check)
     // optional per-layer residual dump (host pointer, [layers][m][hidden] floats), debug only
     float* debug_hidden = nullptr;
+    size_t h4_host_bytes_ = 0;  // [q27-head4r] pinned bf16 head rows (the host-RAM plan counts them with the engine buffers)
+    // [q27-head4r] the engine pins the bf16 head rows of every card before the load, all or none (review M5): bytes of
+    // this card's shard, pin (false: no pinned memory), unpin, then the R every card loads with (0: the INT8 head)
+    size_t h4_pin_bytes() const;
+    bool h4_pin();
+    void h4_unpin();
+    void h4_set(int r) { h4r_ = h4_host_ ? r : 0; }
     uint16_t* dump_hidden = nullptr;  // host: final normed hidden (MTP input) of every prompt row
 
     int rank, device;
@@ -483,6 +550,14 @@ private:
     int* pos_mb_ = nullptr;  // position of the second micro-batch
     AttnShape layer_shape(const Layer* L, int win = 0) const;  // ash_ + kv format/scales (nullptr = MTP)
     bool kv_fp8_ = true;
+    // QE_KV_BITS=4: the main layers' cache in 4 bits (kKv4Row bytes per row, rotated; the MTP layer stays fp8); the
+    // prefill stages its keys as fp8 into kv4_k_ / kv4_v_ (kv4_cap_ keys, sized by the engine to the served context)
+    bool kv4_ = false;
+    bool kv4_noscale_said_ = false;
+    uint8_t *kv4_k_ = nullptr, *kv4_v_ = nullptr;
+    int kv4_cap_ = 0;
+    size_t kv_row() const { return kv4_ ? (size_t)kKv4Row : (size_t)256 * (kv_fp8_ ? 1 : 2); }
+    size_t mtp_row() const { return (size_t)256 * (mtp_fp8() ? 1 : 2); }
     bool has_q8_ = false;  // an INT8 checkpoint: some layer matrices in the Q8 layout (load_w4)
     float mtp_ks_ = 0.f, mtp_vs_ = 0.f;  // fp8 scales of the MTP layer cache (max over layers)
     float mtp_sc_mul_ = env_double("QE_MTP_SCALE", 1.f);
@@ -496,11 +571,14 @@ private:
     // grammar masks applied by the next non-draft head / head_topk: (first row, rows, bits)
     struct HeadMask { int r0, rows; const unsigned* bits; size_t stride; };
     std::vector<HeadMask> head_masks_;
-    void apply_head_masks();
+    void apply_head_masks();  // lp_copy(), then masks_apply()
+    void lp_copy();           // the logprobs rows of logits_ to the slot's host buffer (lp_rows_ > 0)
+    void masks_apply();       // the grammar masks on logits_
     // the selected slot's masks on rows [0, rows) of the next head (per_row: row j gets mask j
     // (speculative verification), else mask 0 on every row (prompt chunk))
     void mask_current(int rows, bool per_row) {
         if (constrained) head_masks_.push_back({0, rows, slots_.at(cur_slot_).mask, per_row ? mask_words() : 0});
+        if (banned) head_masks_.push_back({0, rows, slots_.at(cur_slot_).ban, 0});
         lp_rows_ = lp_on_ ? rows : 0;  // the next target head's rows for logprobs
         lp_all_ = per_row;             // every row (verification), else the last (a prompt chunk's end)
     }
@@ -611,12 +689,38 @@ private:
     // the current slot's pending rows -> its state (stream-ordered; no-op when none / off)
     void dn_flush_cur(cudaStream_t st);
     size_t dn_slot_floats_ = 0;
+    // [q27-snapasync] side stream, events (ev0: rings staged; ev: copy done), staged conv rings of every delta-net layer
+    cudaStream_t snap_st_ = nullptr;
+    cudaEvent_t snap_ev0_ = nullptr, snap_ev_ = nullptr;
+    bf16* snap_hist_ = nullptr;
+    bool snap_pend_ = false;      // the stream has not joined the copy yet
+    bool snap_host_ = false;      // the host has not waited for the copy yet
+    bool snap_in_grace_ = false;  // inside the one call allowed beside the copy
+    int snap_slot_ = -1;
+    void* snap_dst_ = nullptr;       // copies staged, not issued yet (snap_issue)
+    std::vector<float*> snap_S_;     // their sources: S[cur] of every delta-net layer
     bf16 *mtp_in_ = nullptr, *mtp_h_ = nullptr;
     float* mtp_resid_ = nullptr;
     bf16* final_norm_ = nullptr;
     Lin lm_head_;
     Lin draft_head_;  // lm_head used for MTP drafts (INT4 by default)
+    // [q27-head4r] QE_HEAD4R=R (default 16; 0: INT8 head): greedy verify head = INT4 screen (lm_head4_) + exact bf16 rescore of the top-R
+    // per row (rows in mapped pinned host memory h4_host_); sampling / logprobs / drafts keep their heads
+    int h4r_ = 0;
+    W4 lm_head4_{};
+    bf16* h4_host_ = nullptr;
+    H4Ws h4ws_{};
+    // head4: the INT4 screen, the masks, the exact top-R of every row in h4ws_ (R = h4_R_: kH4MaxR when a row is in `full`
+    // or logprobs are on, else h4r_), the logprobs copy. Callers pick the first h4r_ (greedy: the same pick whatever R,
+    // review M1) or take the sampling candidates (h4_topk)
+    void head4(const bf16* x, int m, unsigned long long full);
+    int h4_R_ = 0;
+    unsigned long long h4_full_ = 0;  // forward_batch: the sampled rows (rescored in full, review M6)
+    bool h4_topk_ = false;            // forward_batch: head() also writes the sampling candidates (topk_)
     int* draft_map_ = nullptr;  // device: draft row -> token id (pruned vocabulary)
+    bf16* mkv_h_ = nullptr;     // [q27-mtpkv-defer] ring rows: verify hidden (kMkvCap x hidden)
+    int* mkv_tok_ = nullptr;    // ring rows: the target token of each row
+    int* mkv_ctr_ = nullptr;    // [0] rows, [1] position of row 0, [2] rows at the start of the last step (undo), [3] error
     int draft_v_ = 0;
     const bf16* embed_ = nullptr;
     float* inv_freq_ = nullptr;
@@ -712,7 +816,7 @@ private:
     int *bout_ = nullptr, *bmout_ = nullptr;  // per-row argmax of a batched step / its MTP pass
     void forward_batch(const std::vector<int>& slots, const std::vector<int>& r0, const std::vector<int>& ms);
     void mtp_batch(const std::vector<int>& slots, const std::vector<int>& r0, const std::vector<int>& ms,
-                   const std::vector<const bf16*>& hsrc);
+                   const std::vector<const bf16*>& hsrc, bool kv_only = false);
     SampleParams* sp_ = nullptr;
     float *topk_ = nullptr, *topk_all_ = nullptr;
 };

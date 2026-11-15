@@ -29,7 +29,7 @@ prompts = [
 prompts = [prompts[i % 12] + (f" (variant {i // 12})" if i >= 12 else "") for i in range(NS)]
 ids = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True,
                                enable_thinking=False) for p in prompts]
-e = Engine(MODEL)
+e = Engine(MODEL, devices=os.environ.get("QE_DEVS", "0,1,2"))  # QE_DEVS: other cards (e.g. 0: one card)
 e.set_sampling(0)
 
 def alone(x):

@@ -16,6 +16,8 @@
 #include <vector>
 #include <cfloat>
 
+#include <cuda_fp8.h>
+
 #include "ops.cuh"
 #include "watchdog.cuh"
 
@@ -97,6 +99,24 @@ __device__ __forceinline__ int sw(int row, int ch) { return row * ROWCH + (ch ^ 
 // The 2^8 is folded into the k / v scales.
 __device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint32_t t) {
     return ((t & 0x007F007Fu) << 7) | ((t & 0x00800080u) << 8);
+}
+// 4-bit cache: nibbles n in bits 0-3 and 16-19 -> half2 (n - 8 + kKv4Off), exact
+__device__ __forceinline__ uint32_t kv4_vpair(uint32_t x) {
+    x = (x & 0x000F000Fu) | 0x64006400u;
+    __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&x), __float2half2_rn(1032.f));
+    if (kKv4Off != 0.f) h = __hadd2(h, __float2half2_rn(kKv4Off));
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+// K fragment of a 4-dim unit: x = w | w << 8 of its 2 bytes -> b0 = dims (0, 1), b1 = dims (2, 3), times the scale
+__device__ __forceinline__ void kv4_frag(uint32_t x, __half2 sc, uint32_t& b0, uint32_t& b1) {
+    const uint32_t a = kv4_vpair(x), b = kv4_vpair(x >> 4);
+    __half2 ha = __hmul2(*reinterpret_cast<const __half2*>(&a), sc), hb = __hmul2(*reinterpret_cast<const __half2*>(&b), sc);
+    b0 = *reinterpret_cast<uint32_t*>(&ha);
+    b1 = *reinterpret_cast<uint32_t*>(&hb);
+}
+__device__ __forceinline__ uint32_t hmul2u(uint32_t a, __half2 b) {
+    __half2 r = __hmul2(*reinterpret_cast<const __half2*>(&a), b);
+    return *reinterpret_cast<uint32_t*>(&r);
 }
 __device__ __forceinline__ uint4 widen8(uint32_t w0, uint32_t w1) {  // 8 fp8 -> 8 fp16
     return make_uint4(e4m3x2_to_f16x2(__byte_perm(w0, 0, 0x4140)),
@@ -1775,14 +1795,18 @@ constexpr size_t dec8d_smem() {
            (size_t)MT * 32 * (kD8J * 2 + 4) * 4;
 }
 
-template <int MT>
+// K4: the 4-bit cache (AttnShape::kv4): rows of kKv4Row bytes staged as they are; K fragments are converted with
+// their group scale, V fragments as plain (n - 8 + kKv4Off) and the scale of V goes onto P (per key and 32-dim group,
+// so each warp keeps one scaled P per group of its 64 dims); q and the output are in the rotated basis
+template <int MT, bool K4 = false>
 __device__ __forceinline__ void attn_dec8d_dev(
     const bf16* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
     const AttnShape& s, const SeqView& v, const int* __restrict__ pos, int m, float* __restrict__ work,
-    int split, int rt0, int rs) {
+    int split, int rt0, int rs, int leaf = -1) {
+    constexpr int RB = K4 ? kKv4Row : D;  // bytes per cache row
     extern __shared__ __align__(128) uint4 sm[];
-    uint8_t* stg = reinterpret_cast<uint8_t*>(sm);                       // [stage][K|V][16][256]
-    uint2* sx = reinterpret_cast<uint2*>(stg + (size_t)kD8Stages * 2 * kD8Tile * D);  // partial S
+    uint8_t* stg = reinterpret_cast<uint8_t*>(sm);                       // [stage][K|V][tile][RB]
+    uint2* sx = reinterpret_cast<uint2*>(stg + (size_t)kD8Stages * 2 * kD8Tile * RB);  // partial S
     constexpr int PW = kD8J * 2 + 4;  // words per lane: P fragments, alpha (16-byte aligned)
     uint32_t* spa = reinterpret_cast<uint32_t*>(sx + (size_t)kD8Warps * MT * kD8J * 32);  // [MT][32][PW]
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -1801,12 +1825,22 @@ __device__ __forceinline__ void attn_dec8d_dev(
     const int L = pm_rank(pm, p0 + m);
     const int k0wa = dec8_first(p0, s.win), k0w = pm_rank(pm, k0wa);
     const int chunk = dec8_chunk_pm(s, kv, p0l - k0w, p0 - k0wa);
+    // [q27-sib] tree step: leaf rows (5..7) attend at their tree position p0 + mi - 4; the leaf pass (leaf >= 0) redoes
+    // only the split holding leaf j's true position tp, with the key at tp read from the leaf's own slot p0 + 5 + j: the
+    // split's partials are then the ones of a linear row at tp (same keys, slots, tiles and order)
+    const bool tree = s.sib && s.sib[0] && m == 8;
+    const int tp = p0 + 1 + leaf;
+    if (leaf >= 0) {
+        if (!tree) return;
+        split = (pm_rank(pm, tp) - k0w) / chunk;
+    }
     const int kbeg = k0w + split * chunk, kend = min(L, kbeg + chunk);
     float* wacc = work + ((size_t)(kv * kAttnSplits + split) * kMaxGroup) * 256;
     float* wml = work + (size_t)s.nkv * kAttnSplits * kMaxGroup * 256 +
                  ((size_t)(kv * kAttnSplits + split) * kMaxGroup) * 2;
     if (kbeg >= kend) {
         for (int r = rt0 * 16 + tid; r < min(G, (rt0 + MT) * 16); r += blockDim.x) {
+            if (leaf >= 0 && r % m != 5 + leaf) continue;
             wml[r * 2] = -FLT_MAX;
             wml[r * 2 + 1] = 0.f;
         }
@@ -1816,7 +1850,7 @@ __device__ __forceinline__ void attn_dec8d_dev(
         const int rr = min(r, G - 1);
         const int hl = rr / m, mi = rr % m;
         qrow = mi * s.nq + s.kv_qb[kv] + hl;
-        qpos = p0 + mi;
+        qpos = p0 + mi - (tree && mi >= 5 ? 4 : 0);
     };
     const int d0 = warp * 64;  // this warp's dims
     // Q fragments for its 64 dims (4 chunks of 16), dims permuted like attn_dec8
@@ -1843,19 +1877,33 @@ __device__ __forceinline__ void attn_dec8d_dev(
         }
     }
     const int ntiles = (kend - kbeg + kD8Tile - 1) / kD8Tile;
-    const uint8_t* kcb = kc + head_rows(s, kv, v.max_t) * D;
-    const uint8_t* vcb = vc + head_rows(s, kv, v.max_t) * D;
-    const uint8_t* kcb2 = (const uint8_t*)v.kc2 + head_rows(s, kv, v.split) * D;
-    const uint8_t* vcb2 = (const uint8_t*)v.vc2 + head_rows(s, kv, v.split) * D;
+    const uint8_t* kcb = kc + head_rows(s, kv, v.max_t) * RB;
+    const uint8_t* vcb = vc + head_rows(s, kv, v.max_t) * RB;
+    const uint8_t* kcb2 = (const uint8_t*)v.kc2 + head_rows(s, kv, v.split) * RB;
+    const uint8_t* vcb2 = (const uint8_t*)v.vc2 + head_rows(s, kv, v.split) * RB;
     auto load_tile = [&](int stage, int tile) {
         const int k0 = kbeg + tile * kD8Tile;
-        uint8_t* ks = stg + (size_t)stage * 2 * kD8Tile * D;
-        uint8_t* vs = ks + kD8Tile * D;
+        uint8_t* ks = stg + (size_t)stage * 2 * kD8Tile * RB;
+        uint8_t* vs = ks + kD8Tile * RB;
+        if (K4) {  // 9 chunks of 16 bytes per row, no swizzle (the fragment reads below are conflict-free)
+            for (int i = tid; i < kD8Tile * (kKv4Row / 16); i += kD8Warps * 32) {
+                const int r = i / (kKv4Row / 16), c = i % (kKv4Row / 16);
+                const int key = k0 + r;
+                const bool ok = key < kend;
+                const int kk = min(key, kend - 1);
+                const bool pre = kk < splitl;
+                const size_t off = (size_t)(pre ? kk : kk - splitl) * kKv4Row + c * 16;
+                cp_async16(ks + r * kKv4Row + c * 16, (pre ? kcb2 : kcb) + off, ok);
+                cp_async16(vs + r * kKv4Row + c * 16, (pre ? vcb2 : vcb) + off, ok);
+            }
+            return;
+        }
         for (int i = tid; i < kD8Tile * 16; i += kD8Warps * 32) {
             const int r = i >> 4, c = i & 15;
             const int key = k0 + r;
             const bool ok = key < kend;
-            const int kk = min(key, kend - 1);
+            int kk = min(key, kend - 1);
+            if (leaf >= 0 && kk == tp) kk = p0 + 5 + leaf;  // [q27-sib] the leaf's own key / value
             const bool pre = kk < splitl;  // shared prefix region
             const size_t off = (size_t)(pre ? kk : kk - splitl) * D + c * 16;
             cp_async16(ks + r * D + ((c ^ (r & 7)) << 4), (pre ? kcb2 : kcb) + off, ok);
@@ -1870,7 +1918,12 @@ __device__ __forceinline__ void attn_dec8d_dev(
     float mx[MT][2], l[MT][2];
 #pragma unroll
     for (int mt = 0; mt < MT; mt++) mx[mt][0] = mx[mt][1] = -FLT_MAX, l[mt][0] = l[mt][1] = 0.f;
-    const float kscale = s.ks * 256.f, vscale = s.vs * 256.f;
+    // K4 (review M1): P x V-scale is rounded to fp16 before the PV MMA; a power of two vf lifts it out of the fp16
+    // subnormals (P ~1e-6 at long context times scales ~1e-2), sized from the layer's V range (vs x 448) so the operand
+    // vf x scale stays <= 16384 / 7.5; divided out with vscale. The K4 PV MMA accumulates in fp32 (re-review N1: a flat
+    // tile has P summing to 32, which overflowed the fp16 accumulator at vf up to 4096)
+    const float vf = K4 ? fminf(fmaxf(exp2f(floorf(log2f(16384.f / fmaxf(s.vs * 448.f, 1e-3f)))), 1.f), 4096.f) : 1.f;
+    const float kscale = K4 ? 1.f : s.ks * 256.f, vscale = K4 ? 1.f / vf : s.vs * 256.f;
     const float scale = 0.0625f * 1.4426950408889634f * kscale;
 
 #pragma unroll
@@ -1884,8 +1937,8 @@ __device__ __forceinline__ void attn_dec8d_dev(
         cp_commit();
         cp_wait<kD8Stages - 1>();
         __syncthreads();
-        const uint8_t* ks = stg + (size_t)(tile % kD8Stages) * 2 * kD8Tile * D;
-        const uint8_t* vs = ks + kD8Tile * D;
+        const uint8_t* ks = stg + (size_t)(tile % kD8Stages) * 2 * kD8Tile * RB;
+        const uint8_t* vs = ks + kD8Tile * RB;
         // partial scores over this warp's 64 dims (fp16-accumulate MMA: GA102 runs it at twice
         // the fp32-accumulate rate; 64-term partials are summed in fp32 below)
         float sc[MT][kD8J][4];
@@ -1900,9 +1953,17 @@ __device__ __forceinline__ void attn_dec8d_dev(
 #pragma unroll
             for (int j = 0; j < kD8J; j++) {
                 const int r = j * 8 + g;
-                const uint32_t w = *reinterpret_cast<const uint32_t*>(ks + r * D + ((c ^ (r & 7)) << 4) + 4 * t);
-                const uint32_t b0 = e4m3x2_to_f16x2(__byte_perm(w, 0, 0x4140));
-                const uint32_t b1 = e4m3x2_to_f16x2(__byte_perm(w, 0, 0x4342));
+                uint32_t b0, b1;
+                if (K4) {
+                    const uint8_t* kr = ks + r * kKv4Row;
+                    const uint32_t w = *reinterpret_cast<const uint16_t*>(kr + c * 8 + 2 * t);
+                    const __half2 sc2 = __half2half2(reinterpret_cast<const __half*>(kr + 128)[c >> 1]);
+                    kv4_frag(w | (w << 8), sc2, b0, b1);
+                } else {
+                    const uint32_t w = *reinterpret_cast<const uint32_t*>(ks + r * D + ((c ^ (r & 7)) << 4) + 4 * t);
+                    b0 = e4m3x2_to_f16x2(__byte_perm(w, 0, 0x4140));
+                    b1 = e4m3x2_to_f16x2(__byte_perm(w, 0, 0x4342));
+                }
 #pragma unroll
                 for (int mt = 0; mt < MT; mt++) mma_hacc(sh[mt][j], qf[mt][kk], b0, b1);
             }
@@ -1993,11 +2054,53 @@ __device__ __forceinline__ void attn_dec8d_dev(
             const float2 al = *reinterpret_cast<const float2*>(src + kD8J * 2);
             alpha[mt][0] = al.x; alpha[mt][1] = al.y;
         }
+        // K4: P x (V scale of the key, per 32-dim group of this warp's dims): pq[grp][mt][s16][4]
+        uint32_t pq[K4 ? 2 : 1][MT][kD8Tile / 16][4];
+        if (K4) {
+#pragma unroll
+            for (int gq = 0; gq < 2; gq++)
+#pragma unroll
+                for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
+                    const int k0 = s16 * 16 + 2 * t, grp = warp * 2 + gq;
+                    auto vsc = [&](int key) { return reinterpret_cast<const __half*>(vs + key * kKv4Row + 128)[grp]; };
+                    // (in fp32, saturating before the fp16 rounding: re-review N4)
+                    auto sv = [&](int key) { return __float2half_rn(fminf(__half2float(vsc(key)) * vf, 65504.f)); };
+                    const __half2 sa = __halves2half2(sv(k0), sv(k0 + 1)), sb = __halves2half2(sv(k0 + 8), sv(k0 + 9));
+#pragma unroll
+                    for (int mt = 0; mt < MT; mt++) {
+                        pq[gq][mt][s16][0] = hmul2u(pa[mt][s16][0], sa);
+                        pq[gq][mt][s16][1] = hmul2u(pa[mt][s16][1], sa);
+                        pq[gq][mt][s16][2] = hmul2u(pa[mt][s16][2], sb);
+                        pq[gq][mt][s16][3] = hmul2u(pa[mt][s16][3], sb);
+                    }
+                }
+        }
         // O += P V over this warp's 64 dims (8 n8 tiles); each V fragment serves all row tiles
 #pragma unroll
         for (int nd = 0; nd < 8; nd++) {
             const int d = d0 + nd * 8 + g, c = d >> 4, cb = d & 15;
             uint32_t bv[kD8Tile / 16][2];
+            if (K4) {
+                const int bo = d >> 1, sh = (d & 1) * 4;
+#pragma unroll
+                for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
+                    const int ka = s16 * 16 + 2 * t, kb2 = ka + 8;
+                    auto nib = [&](int key) { return ((uint32_t)vs[key * kKv4Row + bo] >> sh) & 0xFu; };
+                    bv[s16][0] = kv4_vpair(nib(ka) | (nib(ka + 1) << 16));
+                    bv[s16][1] = kv4_vpair(nib(kb2) | (nib(kb2 + 1) << 16));
+                }
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++) {
+                    float c4[4] = {0.f, 0.f, 0.f, 0.f};  // (fp32 accumulate: N1)
+#pragma unroll
+                    for (int s16 = 0; s16 < kD8Tile / 16; s16++) mma_f16(c4, pq[K4 ? nd >> 2 : 0][mt][s16], bv[s16][0], bv[s16][1]);
+                    o[mt][nd][0] = o[mt][nd][0] * alpha[mt][0] + c4[0];
+                    o[mt][nd][1] = o[mt][nd][1] * alpha[mt][0] + c4[1];
+                    o[mt][nd][2] = o[mt][nd][2] * alpha[mt][1] + c4[2];
+                    o[mt][nd][3] = o[mt][nd][3] * alpha[mt][1] + c4[3];
+                }
+                continue;
+            }
 #pragma unroll
             for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
                 const int ka = s16 * 16 + 2 * t, kb2 = ka + 8;
@@ -2029,6 +2132,7 @@ __device__ __forceinline__ void attn_dec8d_dev(
         for (int r = 0; r < 2; r++) {
             const int row = (rt0 + mt) * 16 + g + r * 8;
             if (row >= G) continue;
+            if (leaf >= 0 && row % m != 5 + leaf) continue;  // [q27-sib] the leaf pass writes only its row
 #pragma unroll
             for (int nd = 0; nd < 8; nd++) {
                 const int d = d0 + nd * 8 + 2 * t;
@@ -2042,17 +2146,24 @@ __device__ __forceinline__ void attn_dec8d_dev(
         }
 }
 
-template <int MT>
+template <int MT, bool K4 = false>
 __global__ void __launch_bounds__(kD8Warps * 32, 2) attn_dec8d_kernel(
     const bf16* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
     AttnShape s, const int* __restrict__ pos, int m, float* __restrict__ work, int rs = 0) {
-    attn_dec8d_dev<MT>(q, kc, vc, s, seq_view(s), pos, m, work, blockIdx.y % kAttnSplits, (blockIdx.y / kAttnSplits) * MT, rs);
+    attn_dec8d_dev<MT, K4>(q, kc, vc, s, seq_view(s), pos, m, work, blockIdx.y % kAttnSplits, (blockIdx.y / kAttnSplits) * MT, rs);
 }
 
-template <int MT>
+// [q27-sib] leaf pass: grid (nkv, row tiles, 3 leaves), MT 1
+__global__ void __launch_bounds__(kD8Warps * 32, 2) attn_dec8d_leaf_kernel(
+    const bf16* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+    AttnShape s, const int* __restrict__ pos, int m, float* __restrict__ work) {
+    attn_dec8d_dev<1, false>(q, kc, vc, s, seq_view(s), pos, m, work, 0, blockIdx.y, 0, blockIdx.z);
+}
+
+template <int MT, bool K4 = false>
 __global__ void __launch_bounds__(kD8Warps * 32, 2) attn_dec8d_seg_kernel(const AttnSegs gs, const AttnShape s, int rs = 0) {
     const AttnSeg& c = gs.c[blockIdx.z];
-    attn_dec8d_dev<MT>(c.q, (const uint8_t*)c.kc, (const uint8_t*)c.vc, s, seq_view(c), c.pos, c.m, c.work,
+    attn_dec8d_dev<MT, K4>(c.q, (const uint8_t*)c.kc, (const uint8_t*)c.vc, s, seq_view(c), c.pos, c.m, c.work,
                        blockIdx.y % kAttnSplits, (blockIdx.y / kAttnSplits) * MT, rs);
 }
 
@@ -3271,6 +3382,13 @@ void set_dec8d() {
                                     (int)dec8d_smem<MT>()));
     CUDA_CHECK(cudaFuncSetAttribute(attn_dec8d_seg_kernel<MT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)dec8d_smem<MT>()));
+    CUDA_CHECK(cudaFuncSetAttribute(attn_dec8d_kernel<MT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)dec8d_smem<MT>()));
+    CUDA_CHECK(cudaFuncSetAttribute(attn_dec8d_seg_kernel<MT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)dec8d_smem<MT>()));
+    if (MT == 1)
+        CUDA_CHECK(cudaFuncSetAttribute(attn_dec8d_leaf_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)dec8d_smem<1>()));
 }
 
 void attention_decode_tc_init() {
@@ -3491,9 +3609,68 @@ void attention_prefill_combine(const AttnShape& s, const float* proj, int ld, co
         prefill_combine_kernel<<<dim3(m, s.nq), 256, 0, st>>>(work, splits, m, s, proj, ld, out, pos);
 }
 
+// The 4-bit cache for the prefill kernels: keys [0, p0 + m) of every local head (shared prefix region, then the
+// slot's own) as fp8 rows of the staging arrays (split 0): K stays in the rotated basis (q is rotated too), V is
+// rotated back (the prefill kernels write the output themselves). Block: 256 threads, 8 rows of one head, K or V.
+__global__ void __launch_bounds__(256) kv4_stage_kernel(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+                                                        const AttnShape s, const int* __restrict__ pos, int m, int b16) {
+    const int j = blockIdx.y, isv = blockIdx.z, d = threadIdx.x;
+    const PosMap pm = s.kv_pm[j];
+    const int L = pm_rank(pm, pos[0] + m), splitl = pm_rank(pm, s.split);
+    const uint8_t* own = (isv ? vc : kc) + head_rows(s, j, s.max_t) * kKv4Row;
+    const uint8_t* pre = (const uint8_t*)(isv ? s.vc2 : s.kc2);
+    if (pre) pre += head_rows(s, j, s.split) * kKv4Row;
+    uint8_t* dst = (isv ? s.k4v : s.k4k) + head_rows(s, j, s.k4cap) * D * (b16 ? 2 : 1);
+    const float inv = 1.f / (isv ? s.vs : s.ks);
+    __shared__ float h[256];
+    for (int i = 0; i < 8; i++) {
+        const int r = blockIdx.x * 8 + i;
+        if (r >= L) return;  // (block-uniform)
+        const uint8_t* row = r < splitl ? pre + (size_t)r * kKv4Row : own + (size_t)(r - splitl) * kKv4Row;
+        const int bo = isv ? d >> 1 : (d >> 2) * 2 + (d & 1), sh = isv ? (d & 1) * 4 : (d & 2) * 2;
+        const float sc = __half2float(reinterpret_cast<const __half*>(row + 128)[d >> 5]);
+        float x = ((float)((row[bo] >> sh) & 15) - 8.f + kKv4Off) * sc;
+        if (isv) {  // rotate back: D H x / 16 (H symmetric, D the signs)
+            __syncthreads();
+            h[d] = x;
+            for (int len = 1; len < 256; len <<= 1) {
+                __syncthreads();
+                const float a = h[d], b = h[d ^ len];
+                __syncthreads();
+                h[d] = (d & len) ? b - a : a + b;
+            }
+            __syncthreads();
+            x = h[d] * 0.0625f * (((0x9E3779B9u * (unsigned)(d + 1)) >> 31) ? -1.f : 1.f);
+        }
+        if (b16) reinterpret_cast<bf16*>(dst)[(size_t)r * D + d] = __float2bfloat16(x);
+        else dst[(size_t)r * D + d] = __nv_cvt_float_to_fp8(x * inv, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
 void attention_prefill(const bf16* q, const void* kc, const void* vc, const AttnShape& s,
                        const float* proj, int ld, const int* pos, int m, bf16* out,
                        cudaStream_t st, float* work, size_t work_floats) {
+    if (s.kv4) {
+        CHECK(s.k4k && s.k4v && s.k4cap > 0, "4-bit KV cache: no prefill staging arrays");
+        int rows = 0;  // local rows to stage: from the host's first position when it is known, else the whole cap
+        for (int j = 0; j < s.nkv; j++)
+            rows = std::max(rows, (int)pm_cap(s.kv_pm[j], s.pf_p0 >= 0 ? std::min(s.pf_p0 + m, s.k4cap) : s.k4cap));
+        // (invariant, not a user-reachable stop: the engine serves at most k4cap - 1024 tokens per conversation and refuses
+        // longer requests with a 400 before any prefill)
+        CHECK(s.pf_p0 < 0 || s.pf_p0 + m <= s.k4cap, "4-bit KV cache: prefill to %d past the staging cap %d", s.pf_p0 + m, s.k4cap);
+        static const int b16 = env_int("QE_KV4_STAGE16", 0);  // test: bf16 staging (the bf16 prefill kernels)
+        // (the staged K is rotated, the layer's fp8 K scale was calibrated unrotated: e4m3 is floating, so only the
+        // range matters; a 4x smaller scale measured 3.96e-3 vs 4.09e-3 KL, inside the noise: review M3)
+        kv4_stage_kernel<<<dim3((rows + 7) / 8, s.nkv, 2), 256, 0, st>>>((const uint8_t*)kc, (const uint8_t*)vc, s, pos, m, b16);
+        AttnShape s2 = s;
+        s2.kv4 = 0;
+        if (b16) s2.fp8 = 0;
+        s2.split = 0;
+        s2.kc2 = s2.vc2 = nullptr;
+        s2.max_t = s.k4cap;
+        attention_prefill(q, s.k4k, s.k4v, s2, proj, ld, pos, m, out, st, work, work_floats);
+        return;
+    }
     bool xchg = false;
     for (int j = 0; j < s.nkv; j++) xchg |= s.kv_x[j] != 0;
     CHECK(!xchg || work, "position-split heads need the prefill work buffer");
@@ -3522,6 +3699,16 @@ static bool has_split_heads(const AttnShape& s) {
 
 void attention_dec8_seg(const AttnSegs& g, const AttnShape& s, int G, cudaStream_t st) {
     const int d8d = dec8d_mode();
+    if (s.kv4) {  // the 4-bit cache: attn_dec8d only (the same group-size rule as below)
+        const dim3 gd(s.nkv, kAttnSplits, g.n);
+        const int rsm = d8_rowsplit();
+        if (G > 16 && (rsm == 1 || (rsm == 2 && s.d8rs)))
+            attn_dec8d_seg_kernel<1, true><<<dim3(s.nkv, kAttnSplits * ((G + 15) / 16), g.n), kD8Warps * 32, dec8d_smem<1>(), st>>>(g, s, 0);
+        else if (G <= 16) attn_dec8d_seg_kernel<1, true><<<gd, kD8Warps * 32, dec8d_smem<1>(), st>>>(g, s);
+        else if (G <= 32) attn_dec8d_seg_kernel<2, true><<<gd, kD8Warps * 32, dec8d_smem<2>(), st>>>(g, s);
+        else attn_dec8d_seg_kernel<3, true><<<gd, kD8Warps * 32, dec8d_smem<3>(), st>>>(g, s);
+        return;
+    }
     CHECK(d8d == 2 || !has_split_heads(s), "position-split heads need attn_dec8d (QE_ATTN_DEC8D=2)");
     const dim3 gd(s.nkv, kAttnSplits, g.n);
     const int rsm = d8_rowsplit();
@@ -3546,6 +3733,18 @@ bool attention_dec8_enabled() {
 void attention_decode_tc(const bf16* q, const void* kc, const void* vc, const AttnShape& s,
                          const int* pos, int m, float* work, int G, cudaStream_t st) {
     const dim3 grid(s.nkv, kAttnSplits);
+    if (s.kv4) {  // the 4-bit cache: attn_dec8d only (the same group-size rule as below)
+        CHECK(!s.sib, "tree steps need the fp8 cache");
+        const dim3 gd(s.nkv, kAttnSplits);
+        const int rsm = d8_rowsplit();
+        const uint8_t *k8 = (const uint8_t*)kc, *v8 = (const uint8_t*)vc;
+        if (G > 16 && (rsm == 1 || (rsm == 2 && s.d8rs)))
+            attn_dec8d_kernel<1, true><<<dim3(s.nkv, kAttnSplits * ((G + 15) / 16)), kD8Warps * 32, dec8d_smem<1>(), st>>>(q, k8, v8, s, pos, m, work, 0);
+        else if (G <= 16) attn_dec8d_kernel<1, true><<<gd, kD8Warps * 32, dec8d_smem<1>(), st>>>(q, k8, v8, s, pos, m, work);
+        else if (G <= 32) attn_dec8d_kernel<2, true><<<gd, kD8Warps * 32, dec8d_smem<2>(), st>>>(q, k8, v8, s, pos, m, work);
+        else attn_dec8d_kernel<3, true><<<gd, kD8Warps * 32, dec8d_smem<3>(), st>>>(q, k8, v8, s, pos, m, work);
+        return;
+    }
     if (s.fp8 && attention_dec8_enabled()) {
         // attn_dec8d for every group size (one summation order for any number of verified rows);
         // QE_ATTN_DEC8D=0 / 1: the older attn_dec8 for all / for G <= 32
@@ -3553,9 +3752,18 @@ void attention_decode_tc(const bf16* q, const void* kc, const void* vc, const At
         CHECK(d8d == 2 || !has_split_heads(s), "position-split heads need attn_dec8d (QE_ATTN_DEC8D=2)");
         const dim3 gd(s.nkv, kAttnSplits);
         const int rsm = d8_rowsplit();
+        // [q27-sib] tree steps: the leaf pass after the step's attention (same work buffer; it overwrites one split of
+        // each leaf row)
+        auto leaf_pass = [&] {
+            if (!s.sib || m != 8) return;
+            CHECK(d8d == 2, "tree steps need attn_dec8d (QE_ATTN_DEC8D=2)");
+            attn_dec8d_leaf_kernel<<<dim3(s.nkv, (G + 15) / 16, 3), kD8Warps * 32, dec8d_smem<1>(), st>>>(
+                q, (const uint8_t*)kc, (const uint8_t*)vc, s, pos, m, work);
+        };
         if (d8d == 2 && G > 16 && (rsm == 1 || (rsm == 2 && s.d8rs))) {
             attn_dec8d_kernel<1><<<dim3(s.nkv, kAttnSplits * ((G + 15) / 16)), kD8Warps * 32, dec8d_smem<1>(), st>>>(
                 q, (const uint8_t*)kc, (const uint8_t*)vc, s, pos, m, work, 0);
+            leaf_pass();
             return;
         }
         if (d8d == 2 && G <= 16)
@@ -3567,8 +3775,10 @@ void attention_decode_tc(const bf16* q, const void* kc, const void* vc, const At
         else if (d8d)
             attn_dec8d_kernel<3><<<gd, kD8Warps * 32, dec8d_smem<3>(), st>>>(q, (const uint8_t*)kc, (const uint8_t*)vc, s, pos, m, work);
         else launch_dec8<3, kDecKG>(q, kc, vc, s, pos, m, work, st);
+        leaf_pass();
         return;
     }
+    CHECK(!s.sib, "tree steps need the fp8 decode attention");
     if (s.fp8) {
         if (G <= 16) launch<1, true, true>(grid, q, kc, vc, s, nullptr, 0, pos, m, nullptr, work, st);
         else if (G <= 32) launch<2, true, true>(grid, q, kc, vc, s, nullptr, 0, pos, m, nullptr, work, st);

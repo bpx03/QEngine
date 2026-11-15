@@ -1,4 +1,5 @@
 #include "../env.h"
+#include "ngram_ahead.h"
 #include <sys/mman.h>
 #include <cuda_profiler_api.h>
 // flash_run: load Qwen3.8-Flash-Next (qengine INT4 checkpoint) on 2 to 4 GPUs (TP; 4: opt-in), run a prompt and greedy decode.
@@ -63,16 +64,11 @@ static void ngram_row(const HostTables& ht, const std::vector<int>& h, int t, bf
 
 // rows t0 .. t0 + m - 1 of the n-gram embedding (PLE input) in parallel: host reads of the n-gram table, serial with
 // the GPU between prefill batches (prefill-r4)
-static void ngram_rows(const HostTables& ht, const std::vector<int>& h, int t0, int m, bf16* out) {
-    const int nt = m >= 256 ? 8 : 1;
-    auto part = [&](int k) {
-        for (int j = (int)((long)m * k / nt); j < (int)((long)m * (k + 1) / nt); j++) ngram_row(ht, h, t0 + j, out + (size_t)j * H);
-    };
-    if (nt == 1) { part(0); return; }
-    std::vector<std::thread> th;
-    for (int k = 1; k < nt; k++) th.emplace_back(part, k);
-    part(0);
-    for (auto& x : th) x.join();
+// (persistent workers, ngram_ahead.h)
+static void ngram_rows(const HostTables& ht, const std::vector<int>& h, int t0, int m, bf16* out,
+                       const std::atomic<bool>* cancel = nullptr) {
+    flash_ng::rows_par(h, t0, m, (unsigned short*)out, H, [&ht](const std::vector<int>& hh, int t, unsigned short* o) { ngram_row(ht, hh, t, (bf16*)o); },
+                       cancel);
 }
 
 // ---------------------------------------------------------------- pipeline-parallel modes (FLASH_PAR, flash_pp.h)
@@ -154,6 +150,7 @@ int main(int argc, char** argv) {
         if (!prompts_all.empty()) prompt = prompts_all[0];
     }
     if (prompt.empty()) { fprintf(stderr, "--ids required\n"); return 1; }
+    (void)kv4_mode();  // the KV format (FLASH_KV_BITS) before any plan sizes the pool
     // FLASH_PAR (pp_plan.h): tp (default) | pp_prefill (mode A: pipelined prefill, TP decode on the first FLASH_PP_TP
     // cards, default min(cards, 3)) | pp (mode B: pipelined prefill and decode over every card)
     PpSetup pps;
@@ -1018,11 +1015,34 @@ int main(int argc, char** argv) {
             for (int c : cuts) if (c > i && c < i + m) { m = c - i; break; }
             if (env_str("FLASH_RUN_CUTS") && env_str("FLASH_PFT")) printf("  batch [%d, %d)\n", i, i + m);
             std::vector<int> ch(prompt.begin() + i, prompt.begin() + i + m);
-            std::vector<bf16> rows((size_t)m * H);
+            const double ta0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
             const double tg0 = secs();
             for (int j = 0; j < m; j++) hist.push_back(ch[j]);
-            ngram_rows(ht, hist, (int)hist.size() - m, m, rows.data());
-            if (env_str("FLASH_PFT_HOST")) fprintf(stderr, "[pft] batch at %d: n-gram rows %.2f ms\n", i, (secs() - tg0) * 1e3);
+            bool hit0 = false;
+            // [qfn-pf-bgap] rows built during the previous batch (same token window) or now; the next batch's rows start
+            // on the helper thread while this one runs (FLASH_PF_AHEAD=0: built here, staged per rank as before)
+            static flash_ng::RowsAhead ra((size_t)H * 2, [&ht](const std::vector<int>& w, int t, int mm, unsigned short* o,
+                                                               const std::atomic<bool>* cancel) { ngram_rows(ht, w, t, mm, (bf16*)o, cancel); });
+            std::vector<bf16> rows;
+            const bf16* rws = flash_ng::RowsAhead::enabled() ? (const bf16*)ra.take((int)hist.size() - m, m, hist, &hit0) : nullptr;
+            bool pin = false, hit = hit0;
+            if (rws) {
+                pin = ra.host_pinned(rws);
+                if (i + m < np) {
+                    const int i2 = i + m;
+                    int m2 = W[0]->pf_batch_rows(np - i2, B);
+                    for (int c : cuts) if (c > i2 && c < i2 + m2) { m2 = c - i2; break; }
+                    const int h2 = (int)hist.size(), s0 = std::max(0, h2 - 2);
+                    std::vector<int> win(hist.begin() + s0, hist.end());
+                    win.insert(win.end(), prompt.begin() + i2, prompt.begin() + i2 + m2);
+                    ra.ahead_win(h2, m2, std::move(win));
+                }
+            } else {
+                rows.resize((size_t)m * H);
+                ngram_rows(ht, hist, (int)hist.size() - m, m, rows.data());
+                rws = rows.data();
+            }
+            if (env_str("FLASH_PFT_HOST")) fprintf(stderr, "[pft] batch at %d: n-gram rows %.2f ms (ahead %d, pinned %d) | at %.3f\n", i, (secs() - tg0) * 1e3, (int)hit, (int)pin, ta0 * 1e3);
             int o = 0, d = 0;
             const bool last = i + m >= np;
             std::vector<int> mt;
@@ -1030,7 +1050,7 @@ int main(int argc, char** argv) {
                 for (int j = 0; j < m; j++) mt.push_back(i + j + 1 < np ? prompt[i + j + 1] : -1);
             job = [&](int r) {
                 int oo, dd = -2;
-                W[r]->prefill_batch(ch.data(), i, m, rows.data(), &oo, use_mtp ? mt.data() : nullptr, last, &dd);
+                W[r]->prefill_batch(ch.data(), i, m, rws, &oo, use_mtp ? mt.data() : nullptr, last, &dd, pin);
                 if (r == 0) { o = oo; d = dd; }
             };
             pool_run();
@@ -1254,7 +1274,7 @@ int main(int argc, char** argv) {
         while ((int)gen_toks.size() < gen) {
             const double a0 = secs();
             const bool lk = Lnext > 0;
-            const int ks = lk ? Lnext : kdraft;  // after a lookup step the chain ran on the device when needed
+            const int ks = lk ? Lnext : W[0]->conf_next(kdraft);  // after a lookup step the chain ran on the device when needed
             static const bool xrank = env_int("FLASH_XRANK", 0);  // debug: per-rank emitted tokens
             static const int ecv = env_int("FLASH_EC_VERIFY", 0);
             std::vector<std::vector<int>> per(ng);

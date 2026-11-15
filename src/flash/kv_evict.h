@@ -1,13 +1,14 @@
 #pragma once
 // Flash-Next: the one eviction order and the rules of an archive copy.
 //
-// Order, for every path that frees memory (archive room, host-RAM guard, VRAM slots, idle reclaim): least recently
-// used conversation first; an active main (the tracker's main, used within FLASH_MAIN_STALE_S) after all the others.
-// No guarantee: it goes when it must.
+// Order: least recently used conversation first, every conversation alike (user decision 2026-11-12: no main priority; the
+// scheduling value a request carries orders nothing here). The archive (archive room, host-RAM guard): only the ram-mode spare
+// tiers go before (Rank::spare). VRAM slots and the idle reclaim: plain LRU.
 //
 // A conversation's copy: segs in order, later ones overwrite earlier ones; kv_n, not a segment's t1, bounds the valid
 // rows [0, kv_n) (a fork or a cut keeps a segment reaching past its own rows). A state serves a restore only at a
-// position within kv_n whose tokens were compared with the prompt. Only a whole copy is ever dropped (drop_copy); cut
+// position within kv_n whose tokens were compared with the prompt. Only a whole copy is ever dropped (drop_copy; KV in RAM: a
+// resident one's rows alone, drop_rows); cut
 // is for the sequence itself getting shorter.
 // Header only, so that tests/kv_evict_unit.cpp runs these on a model of the archive without a GPU.
 #include <algorithm>
@@ -17,18 +18,19 @@
 namespace kve {
 
 struct Rank {
-    bool main = false;            // active main: evicted last
     unsigned long long used = 0;  // last use (start or release), a tick
+    // the archive order (copies, FE::copy_rank). FLASH_KV=ram,
+    // a conversation resident in the host KV pool: 2 its archived rows (they are in the pool too: dropping
+    // them loses nothing, its next sync writes them again; its states stay), 1 its states but its last turn end (restore points
+    // below the live end, a branch or a rewritten turn; drop_spare_states); spare copies go before any conversation, rows first.
+    // 0: not spare (an archived conversation; a resident with only its last turn end left). An archived conversation is a whole
+    // re-prefill when it returns, a resident's checkpoint only when it branches (repro: protecting the states lost 12 archived ones)
+    int spare = 0;
 };
-inline bool goes_first(const Rank& a, const Rank& b) { return a.main != b.main ? b.main : a.used < b.used; }
-inline bool active_main(bool main_turn, double last_ms, double now_ms, double stale_s) {
-    return main_turn && now_ms - last_ms < stale_s * 1000.0;
+inline bool goes_first(const Rank& a, const Rank& b) {
+    if (a.spare != b.spare) return a.spare > b.spare;
+    return a.used < b.used;
 }
-
-// A main turn that branched off `parent` at L moved the main there: the parent, the old branch, is no main any more (review M6:
-// for FLASH_MAIN_STALE_S it outlived live subagents' conversations). Not when the parent is generating, and not for a branch at
-// a small part of it: a second session sharing only the system prompt, each session keeps its own main.
-inline bool main_moved(int L, int parent_len, bool parent_generating) { return !parent_generating && L * 2 >= parent_len; }
 
 // The conversation whose archive copy goes next: the first in the order among those skip() lets go, none without a copy.
 template <class L, class Skip, class RankOf>
@@ -79,52 +81,116 @@ bool make_room(size_t need, size_t limit, Used used, CanFree can_free, Next next
     return true;
 }
 
-// The idle reclaim: which idle conversations leave VRAM for the expert cache, in the order. An ordinary one after `Tord` seconds
-// idle. Active mains only under pressure, after max(Tord, Tmain), while together they hold at least 1/16 of the pool: then the
-// oldest go until the rest hold less (review M7: several small mains together kept 42 % of the pool, each below the 1/16 of its
-// own). A list on a snapshot of the ranks: the order cannot change during the sort.
+// The idle reclaim: which idle conversations leave VRAM for the expert cache, least recently used first: each after `Tord`
+// seconds idle, every conversation alike (user decision 2026-11-12; before, an active main waited FLASH_EC_RECLAIM_MAIN_S, 30 s,
+// under pressure, and only while the idle mains held >= 1/16 of the pool). A list on a snapshot of the ranks: the order cannot
+// change during the sort.
 struct IdleSlot {
     int slot = 0, cap = 0;  // cap: periods of its region
     double idle_s = 0;
     Rank rank;
     bool above = false;     // its region starts at or above the end of every generating one (KV in VRAM: it alone holds the top up)
 };
-// Under pressure an idle ordinary conversation above every generating region leaves before Tord: after Tabove (< 0: never) and,
+// Under pressure an idle conversation above every generating region leaves before Tord: after Tabove (< 0: never) and,
 // with min_size, only when it holds >= 1/16 of the pool (a finished subagent above the main)
 inline bool at_once(const IdleSlot& q, bool pressure, double Tabove, bool min_size, int np) {
-    return pressure && q.above && !q.rank.main && Tabove >= 0 && q.idle_s >= Tabove && (!min_size || (long long)q.cap * 16 >= np);
+    return pressure && q.above && Tabove >= 0 && q.idle_s >= Tabove && (!min_size || (long long)q.cap * 16 >= np);
 }
-inline std::vector<int> reclaim_order(std::vector<IdleSlot> v, bool pressure, double Tord, double Tmain, int np, double Tabove = -1,
+inline std::vector<int> reclaim_order(std::vector<IdleSlot> v, bool pressure, double Tord, int np, double Tabove = -1,
                                       bool min_size = false) {
     std::sort(v.begin(), v.end(), [](const IdleSlot& a, const IdleSlot& b) { return goes_first(a.rank, b.rank); });
-    const auto main_ok = [&](const IdleSlot& q) { return pressure && Tmain > 0 && q.idle_s >= std::max(Tord, Tmain); };
-    long long mains = 0;
-    for (const auto& q : v)
-        if (q.rank.main && main_ok(q)) mains += q.cap;
     std::vector<int> out;
-    for (const auto& q : v) {
-        if (!q.rank.main) {
-            if (q.idle_s >= Tord || at_once(q, pressure, Tabove, min_size, np)) out.push_back(q.slot);
-        } else if (main_ok(q) && mains * 16 >= np) {
-            out.push_back(q.slot);
-            mains -= q.cap;
-        }
-    }
+    for (const auto& q : v)
+        if (q.idle_s >= Tord || at_once(q, pressure, Tabove, min_size, np)) out.push_back(q.slot);
     return out;
 }
 
-// A reclaim's archive write was refused: does this conversation leave VRAM anyway? Under pressure the first refused ordinary one
-// of a pass does (user decision 2026-11-06), so a full archive of newer copies cannot keep the oldest one there; `ord` runs in the
+// A reclaim's archive write was refused: does this conversation leave VRAM anyway? Under pressure the first refused one (any
+// conversation) of a pass does (user decision 2026-11-06), so a full archive of newer copies cannot keep the oldest one there; `ord` runs in the
 // order, so that one is the first of what can leave VRAM. An older archived copy holds no VRAM and did not free enough, so it stays.
 // At most one per pass: pressure is measured again before the next. Whatever the reason of the refusal, also bigger than the whole
-// archive. Not an active main: larger than the archive it would re-prefill on every turn. Generating and paused ones are not in `ord`.
+// archive. Every conversation alike (user decision 2026-11-12, no main priority: a session's main leaves as any other, with the
+// partial copy it has; before, it stayed in VRAM pass after pass, #1928). Generating and paused ones are not in `ord`.
 struct RefusedWrite {
     bool used = false;
-    bool leaves(bool pressure, bool active_main) {
-        if (!pressure || active_main || used) return false;
+    bool leaves(bool pressure) {
+        if (!pressure || used) return false;
         return used = true;
     }
 };
+
+// Host memory below the margin (FE::mem_guard): give back what the deficit asks for, losing as little as possible. Order: whole
+// free slabs (release), slabs emptied by moving their blobs into the free ranges of the others (compact: nothing is lost), then
+// copies in the one order. An eviction's bytes lower the deficit only once a slab is empty (they are free ranges inside slabs
+// others still use) or the allocator gives pageable pages back; evicting on until MemAvailable moved lost 10-150x the deficit
+// (1.3.5.9: a 0.1 GB deficit cost 10 conversations, 15.8 GB, 0 GB returned). So, bounded:
+//  - no eviction while compaction waits for a holder (a disk write, a disk read, a prompt's checkpoints keep bytes in a slab) and
+//    the pinned slabs' free ranges (room()) already cover the deficit: a later pass returns them once the holder let go;
+//  - at most the deficit + one slab evicted per pressure episode (`ep`: kept by the caller across passes until memory went back
+//    or the deficit is gone), counting each victim's own bytes (an eviction that frees nothing, its blobs shared with a fork, a
+//    pinned prefix or a disk write, still counts);
+//  - urgent (deficit above `urgent`, the host close to its limit): no wait, at most the deficit + one slab in this pass and twice
+//    the deficit + one slab in the episode (victims whose blobs a disk write holds free nothing now; review N4).
+// deficit(): bytes below the margin now; release(d): whole free slabs back; compact(d): 1 returned a slab, 0 cannot (the pieces do
+// not fit: evicting more frees ranges), -1 waits for a holder; room(): free
+// bytes inside the pinned slabs; evict(cost): one copy in the order goes, its own bytes in `cost`, false when none is left.
+// bounded = false: no limit (FLASH_ARCHIVE_GUARD_BOUND=0). Returns the bytes evicted in this pass.
+template <class Deficit, class Release, class Compact, class Room, class Evict>
+size_t give_back(Deficit deficit, Release release, Compact compact, Room room, Evict evict, size_t& ep, size_t slab, size_t urgent,
+                 bool bounded = true) {
+    size_t now = 0, d;
+    release(deficit());
+    while ((d = deficit()) > 0) {
+        const int c = compact(d);
+        if (c > 0) continue;
+        if (bounded) {
+            if (d > urgent) {
+                if (now >= d + slab || ep >= 2 * d + slab) break;
+            } else if ((c < 0 && room() >= d) || ep >= d + slab) {
+                break;
+            }
+        }
+        size_t f = 0;
+        if (!evict(f)) break;
+        now += f;
+        ep += f;
+        release(deficit());
+    }
+    return now;
+}
+
+// KV in RAM, a resident conversation's states but its last turn end (the turn-end state, kind 4 or 6, at the highest position:
+// where its latest turn ended, the resume point for a regenerated or edited reply): the states a spare eviction of level 1
+// drops (spare_states: whether there are any). Every resident alike
+template <class C>
+const void* last_turn_end(const C& c) {
+    const void* k = nullptr;
+    int pos = -1;
+    for (const auto& s : c.ck)
+        if ((s->kind == 4 || s->kind == 6) && s->pos > pos) { pos = s->pos; k = s.get(); }
+    return k;
+}
+template <class C>
+bool spare_states(const C& c) {
+    if (c.end) return true;
+    const void* k = last_turn_end(c);
+    for (const auto& s : c.ck)
+        if (s.get() != k) return true;
+    return false;
+}
+template <class C>
+void drop_spare_states(C& c) {
+    const void* k = last_turn_end(c);
+    c.end = nullptr;
+    c.ck.erase(std::remove_if(c.ck.begin(), c.ck.end(), [&](const auto& s) { return s.get() != k; }), c.ck.end());
+}
+// KV in RAM, a resident conversation: only its archived rows go (the pool holds them); its states stay, they are valid restore
+// points while it is resident (ck_usable: the rows below them are in its region); the next sync writes all rows again
+template <class C>
+void drop_rows(C& c) {
+    c.segs.clear();
+    c.kv_n = 0;
+}
 
 // the whole copy goes (a resident conversation keeps its state in the slot; its next sync writes all of it again)
 template <class C>
@@ -154,25 +220,26 @@ void fork_from(C& d, const C& from, const int* ids, int L) {
     d.prio = from.prio;
 }
 // a new state of c, at most `keep` of them: drop the oldest periodic (3), divergence (5), turn-end (4), prompt-end (2), then
-// system-end (1) state. The end of the main's last turn (6: a turn end while c's latest request was a main turn; one per
-// conversation) goes last: a side task or fork extending c in place for many turns must not cost the main its resume point
+// system-end (1) state. c's latest turn end (last_turn_end: the turn-end state at the highest position) goes last, for every
+// conversation alike (user decision 2026-11-12): without that each turn's prompt-end state would push out the one turn end
+// left (4 goes before 2), and the ram-mode spare drop keeps exactly that state. It is protected here, not marked on the state:
+// a fork shares its parent's State objects, so a mark would let one conversation's turn demote the other's (review L2). A kind
+// 6 (the mark of earlier builds, read back from a disk-cache file) counts as a turn end (4).
 template <class C, class P>
 void add_ck(C& c, P s, int keep) {
     auto& v = c.ck;
     v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& x) { return x->pos == s->pos; }), v.end());
-    if (s->kind == 4 && c.prio >= 2) {
-        for (auto& x : v)
-            if (x->kind == 6) x->kind = 4;
-        s->kind = 6;
-    }
     v.push_back(s);
     while ((int)v.size() > keep) {
+        const void* k = last_turn_end(c);
         int drop = -1;
-        for (int want : {3, 5, 4, 2, 1, 6}) {
+        for (int want : {3, 5, 4, 2, 1}) {
             for (int i = 0; i < (int)v.size() - 1; i++)
-                if (v[i]->kind == want) { drop = i; break; }
+                if (v[i].get() != k && (v[i]->kind == want || (want == 4 && v[i]->kind == 6))) { drop = i; break; }
             if (drop >= 0) break;
         }
+        for (int i = 0; drop < 0 && i < (int)v.size() - 1; i++)
+            if (v[i].get() != k) drop = i;
         if (drop < 0) drop = 0;
         v.erase(v.begin() + drop);
     }

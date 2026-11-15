@@ -2,7 +2,7 @@
 # QEngine: Qwen3.8-27B INT4 inference server for 3x RTX 3090 (sm_86, tensor parallel 3).
 # GPU code (SASS) for sm_86 (RTX 3000 series, tuned on the 3090), sm_89 (RTX 4000) and sm_120 (RTX 5000): see CUDA_ARCHS below.
 # The model is NOT baked in: mount it at /app/models/Qwen3.8-27B-INT4 (see docker-compose.yml).
-# Qwen3.8-Flash-Next (preview): mount it too and set QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4.
+# Qwen3.8-Flash-Next: mount it too and set QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4.
 #
 #   docker build -t qengine .                       # with vision (torch, ~+4 GB)
 #   docker build -t qengine --build-arg VISION=0 .  # text only, no torch
@@ -50,7 +50,7 @@ RUN if [ "$VISION" = "1" ]; then \
 WORKDIR /app
 COPY server ./server
 COPY --from=build /src/build/libqengine.so ./build/libqengine.so
-# Qwen3.8-Flash-Next engine (preview): picked by the server when QE_MODEL points to a Flash-Next directory
+# Qwen3.8-Flash-Next engine: picked by the server when QE_MODEL points to a Flash-Next directory
 COPY --from=build /src/build/libqflash.so ./build/libqflash.so
 # next-token KL against the BF16 reference set (`docker run ... qengine kl --ref /ref --work /work`, README "Quality")
 COPY --from=build /src/build/flash_run ./build/flash_run
@@ -168,7 +168,7 @@ ENTRYPOINT ["/usr/local/bin/qengine-entrypoint"]
 ARG REVISION=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
-      org.opencontainers.image.description="QEngine: Qwen3.8-27B INT4 (and Qwen3.8-Flash-Next preview) inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in, not tuned), OpenAI/Anthropic-compatible API; model not included" \
+      org.opencontainers.image.description="QEngine: Qwen3.8-27B and Qwen3.8-Flash-Next inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in, not tuned), OpenAI/Anthropic-compatible API; model not included" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"

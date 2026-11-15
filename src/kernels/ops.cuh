@@ -107,6 +107,10 @@ struct PattnScratch {
     int* ctr = nullptr;
 };
 
+// 4-bit KV row: [128 B nibbles][8 x fp16 group scales]; value = (n - 8 + kKv4Off) * scale
+constexpr int kKv4Row = 144;
+constexpr float kKv4Off = 0.5f;  // (kv4_store writes half-offset levels)
+void kv4_row_test(const float* x, int krow, uint8_t* out);  // kv4_27b L7 test (device x[256], out[kKv4Row])
 struct AttnShape {
     int nq, nkv;          // local heads
     int kv_qb[8], kv_qe[8];  // local q-head range of each local kv head
@@ -144,6 +148,9 @@ struct AttnShape {
     // RoPE table of the step's rows (rope_table): [row][32] (cos, sin) in double, row = xrow0 + mi
     // (seg kernels: the sequence's first row + mi); null: attn_prep computes the trig itself
     const double2* rtab = nullptr;
+    // [q27-sib] single-sequence tree step (null: off): sib[0] = 1 -> rows 5..7 are sibling leaves of rows 0..2 (RoPE
+    // position p0 + row - 4, K / V at slot p0 + row; attention re-done for the split of the true position: sib_attn)
+    const int* sib = nullptr;
     // Shared prefix (branch cache-priority): keys [0, split) are read from kc2 / vc2
     // ([nkv][split][256], a region shared by several slots), keys >= split from the slot's own
     // region (kc / vc) at row key - split; split = 0: everything in the own region.
@@ -165,6 +172,20 @@ struct AttnShape {
     const void* vc2 = nullptr;
     int fp8 = 0;          // cache holds e4m3 values x / scale (else bf16)
     float ks = 1.f, vs = 1.f;  // per-tensor k / v scales (fp8 only)
+    // QE_KVQ_EMU (quality gate only, bf16 cache): fake-quantise K / V at the write (kvq_fake in ops.cu);
+    // bits 0-3 K bits (0 = as is, 8 = fp8 per-tensor, 4 = 4-bit), 4-7 V bits, 8-11 log2 group,
+    // bit 12 Hadamard rotation, bits 13-15 quantiser (0 sym 15 levels, 1 asym 16, 2 NF4, 3 sym 16 half-offset)
+    int kvemu = 0;
+    // 4-bit cache (QE_KV_BITS=4, main layers; fp8 stays 1 so every routing decision is the fp8 one): rows of kKv4Row
+    // bytes (128 B of nibbles + 8 fp16 scales of 32 dims), K and V rotated by a randomised Hadamard transform (q too;
+    // the decode combine rotates the output back), see kv4 in ops.cu / attn_prefill.cu
+    int kv4 = 0;
+    // prefill with the 4-bit cache: keys staged as fp8 (K rotated, V rotated back) into these [nkv][pm_cap(k4cap)][256]
+    // arrays, then the fp8 prefill kernels run on them (attention_prefill)
+    uint8_t* k4k = nullptr;
+    uint8_t* k4v = nullptr;
+    int k4cap = 0;
+    int kvsink = 0;  // QE_KVQ_SINK: positions below it are not fake-quantised (attention-sink test)
     int dchunk_min = -1;  // QE_DEC_CHUNK_MIN: fp8 decode split rule (-1 = 38 splits up to 52K, 0 = old L/82)
     // attn_dec8d row split: 1 = one 16-row tile per block (decode of one sequence below
     // kD8RsMax keys, set by the engine from the host-side length); results are bit-identical either way
@@ -265,11 +286,34 @@ constexpr int kMaxSpecK = 7;  // verification rows k + 1 <= 8 = kMaxGemvTokens
 bool dn_fuse_on();
 void dn_convqk(const float* proj, int ld, int ch, const bf16* conv_w, bf16* hist, const int* pos,
                int m, float* cv, const DeltaShape& s, const float* ab, const float* A,
-               const float* dt_bias, float* qk, float* gb, cudaStream_t st);
+               const float* dt_bias, float* qk, float* gb, cudaStream_t st, const int* sib = nullptr);
 // pn / pend (optional, write_all only): deferred commit, see dn_stash_seg
 void dn_core_only(const float* conv_out, int ch, const DeltaShape& s, float* S, size_t slot_floats,
                   const int* cur, int m, bool write_all, const float* qk, const float* gb, float* o,
-                  cudaStream_t st, const int* pn = nullptr, const float* pend = nullptr);
+                  cudaStream_t st, const int* pn = nullptr, const float* pend = nullptr, const int* sib = nullptr);
+// [q27-sib] sibling leaf rows of a single-sequence 8-row block step (QE_DF_SIB): rows 0..4 = anchor + 4 drafts, rows
+// 5..7 = the selector's runner-up at draft positions 0..2 (leaf j: parent row j, position p0 + 1 + j).
+// sib buffer (per slot, device int[32]): [0] effective flag of this step, [1] hit leaf (-1), [2] the selector's flag,
+// [3] its anchor position, [4..11] its tokens. sib_check at the step start: [0] = [2] && pos / tokens unchanged (only
+// acceptance depends on it: rows 5..7 are verified exactly whatever tokens they hold; review L6).
+void sib_check(int* sib, const int* tokens, const int* pos, cudaStream_t st);
+// every kernel of a tree step's path has its tree form under the current switches (else the step stays linear)
+bool sib_kernels_ok(const DeltaShape& s);
+// after acceptance: a hit leaf j's rows move to row j + 1 (the step's buffers then read as a linear step)
+struct SibFix {
+    int* sib;
+    const int* pos;
+    bf16* xn; int H;                 // final-norm rows
+    bf16* tap; int tapw;             // drafter taps (row width in bf16)
+    int nl;                          // DeltaNet layers
+    float* cv[64]; float* qk[64]; float* gb[64]; bf16* hist[64];
+    int ch, qkw, gbw;
+    int nf;                          // full-attention layers
+    uint8_t* kc[16]; uint8_t* vc[16];
+    size_t hrow[8];                  // head_rows of each local kv head
+    int nkv, split;
+};
+void sib_fix(const SibFix& f, cudaStream_t st);
 // in_proj rows + conv / gate inputs for the chunk prep that computes the front end itself
 struct DnConvIn {
     const float* proj = nullptr;
@@ -421,6 +465,7 @@ struct DnSegs {
     const int* pn[kMaxSegs];     // deferred commit (null: off): pending rows of each sequence
     const float* pend[kMaxSegs]; // their stash for this layer
     unsigned char fin[kMaxSegs]; // 1: single row (no drafts, always accepted): write the state now
+    const int* sib = nullptr;    // [q27-sib] single sequence (n == 1): tree step flag (rows 5..7: leaves, no commit)
 };
 void dn_conv_seg(const DnSegs& g, const float* proj, int ld, int ch, const bf16* conv_w, float* out,
                  cudaStream_t st);
@@ -478,8 +523,13 @@ void dn_single_begin(int* cur, int* save, int* pn, cudaStream_t st);
 // keep only the first r accepted rows of a step that stashed its rows (deferred commit): r = 0 is
 // the step's undo (cur := save, pn[0] := pn[1]), else pn[0] := pn[1] + r (Engine::trim)
 void dn_trim(int* cur, const int* save, int* pn, int r, cudaStream_t st);
-// decode recurrence kernel: lanes per value column 8 / 4 / 2 (dn_core2), 0 = dn_core_dev (QE_DN_CORE2)
+// decode recurrence kernel: lanes per value column 8 / 4 / 2 (dn_core2), 0 = dn_core_dev (QE_DN_CORE2); batched steps
+// take dn_core4_seg first (QE_DN_CPT, default padded CPT 2; dn_cpt_set)
 void dn_core2_set(int lanes);
+void dn_cpt_set(int v);  // tests: batched dn_core4_seg (0 off, 2 / 4 dense CPT, 3 / 5 padded, -1 env)
+void dn_core3_set(int v);  // tests: batched core dn_core3 (0 off = dn_core_seg_kernel, 1 dense rows, 2 padded, -1 env)
+void dn_single_cpt_set(int cpt);  // tests: CPT of the single-sequence verify core (0: dn_core_kernel, 2 / 4, -1: default rule)
+int dn_core_ran();  // tests: the core variant the last dn_core_only / dn_core_seg call launched (codes: ops.cu g_dn_ran)
 bool dn_direct_on();  // QE_DN_DIRECT (default 1): fin for single-row sequences of a batched step
 struct DnStashSegs {
     int n;

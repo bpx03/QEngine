@@ -931,6 +931,85 @@ __device__ __forceinline__ void steer_vals7(const float* __restrict__ w, float s
         }
 }
 
+// [q27-ar1-split] one card, MODE 1 with the fused norm: a row over 8 blocks of 96 threads (768 = kLL16Threads, the same
+// word -> thread map), so 64 blocks share the reads instead of 8. Each warp publishes its sum of squares in the Worker's
+// own buffer (CommCounters::ar1, zeroed at its creation): word 0 = (idx + 1) << 32 | value, then a fence, word 1 = the
+// epoch + 1. A reader waits for word 1 == epoch + 1 and then for word 0's idx: word 1 is written after word 0, so a
+// current epoch implies the value is this call's or an earlier idx of this epoch (the idx check rejects those). Every
+// block adds the row's 24 sums in warp order: the norm's reduction tree of allreduce_ll16_kernel, bit-identical. The
+// blocks of a call must be co-resident: <= 32 rows (the gate) x 8 blocks of 96 threads (review L2)
+constexpr int kAr1Threads = 96;
+__global__ void __launch_bounds__(kAr1Threads) ar1_norm_kernel(float* __restrict__ resid, const float* __restrict__ partial, int h,
+                                                               bool coal, const unsigned* __restrict__ epoch, int idx,
+                                                               unsigned long long* __restrict__ wsb,
+                                                               const bf16* __restrict__ norm_w, float eps, bf16* __restrict__ xn,
+                                                               __half* __restrict__ xh) {
+    __shared__ float s_w[kLL16Threads / 32];
+    const int row = blockIdx.x, tid = threadIdx.x, w = blockIdx.y * kAr1Threads + tid;
+    const unsigned ep = *epoch;
+    const unsigned itag = (unsigned)idx + 1u, etag = ep + 1u;
+    const int slot = ((ep & 1) << 1) | (idx & 1);
+    const int hw = (h + 6) / 7;
+    const bool on = w < hw;
+    auto cidx = [&](int e) { return coal ? w + hw * e : 7 * w + e; };
+    const float* pr = partial + (size_t)row * h;
+    float* rr = resid + (size_t)row * h;
+    float rv[7], nwv[7], acc[7];
+#pragma unroll
+    for (int e = 0; e < 7; e++) {
+        const int i = cidx(e);
+        const bool ok = on && i < h;
+        rv[e] = ok ? rr[i] : 0.f;
+        nwv[e] = ok ? __bfloat162float(norm_w[i]) : 0.f;
+        acc[e] = ok ? 0.f + round_bf16(round_bf16(pr[i])) : 0.f;  // (the packed word, then MODE 1's sum from 0: -0 -> +0 as there, review L1)
+    }
+    float q = 0.f;
+    if (on)
+#pragma unroll
+        for (int e = 0; e < 7; e++) {
+            const int i = cidx(e);
+            if (i >= h) break;
+            const float r = rv[e] + acc[e];
+            rr[i] = r;
+            acc[e] = r;
+            q += r * r;
+        }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) q += __shfl_xor_sync(0xffffffffu, q, o);
+    volatile unsigned long long* ws = wsb + ((size_t)slot * kMaxBatchRows + row) * (kLL16Threads / 32) * 2;
+    if ((tid & 31) == 0) {
+        ws[2 * (w >> 5)] = ((unsigned long long)itag << 32) | __float_as_uint(q);
+        __threadfence();
+        ws[2 * (w >> 5) + 1] = etag;
+    }
+    if (tid < kLL16Threads / 32) {
+        unsigned long long v = 0;
+        for (unsigned wc = 0;;) {
+            if ((unsigned)ws[2 * tid + 1] == etag) {
+                v = ws[2 * tid];
+                if ((unsigned)(v >> 32) == itag) break;
+            }
+            QE_WD_POLL(wc, kWdLL16, 0, etag, (unsigned)(v >> 32));
+        }
+        s_w[tid] = __uint_as_float((unsigned)v);
+    }
+    __syncthreads();
+    float tot = 0.f;
+#pragma unroll
+    for (int x = 0; x < kLL16Threads / 32; x++) tot += s_w[x];
+    const float rs = rsqrtf(tot / h + eps);
+    bf16* o = xn + (size_t)row * h;
+    if (on)
+#pragma unroll
+        for (int e = 0; e < 7; e++) {
+            const int i = cidx(e);
+            if (i >= h) break;
+            const float v = acc[e] * rs * (1.f + nwv[e]);
+            if (xn) o[i] = __float2bfloat16(v);
+            if (xh) store_xh(xh + (size_t)row * h, i, v);
+        }
+}
+
 // NT < kLL16Threads (QE_AR_SPLIT): a row's words over gridDim.y blocks of NT threads (w = blockIdx.y NT + tid), for
 // all-reduces without the fused norm and steering (the QFN decode adds into y): more SMs issue the P2P stores and
 // polls; the per-word arithmetic is the same (bit-identical).
@@ -984,7 +1063,7 @@ __global__ void __launch_bounds__(NT) allreduce_ll16_kernel(
         } else if (c.p2p) {
             for (int g = 0; g < c.ngpu; g++)
                 if (g != rank) st_ll16(pregion(g, rank) + w, mine);
-        } else {
+        } else if (c.ngpu > 1) {  // (one card: no reader; the words went to pinned host memory, ~94 KB per 8-row call)
             st_ll16(region(rank) + w, mine);
         }
     }
@@ -1649,6 +1728,10 @@ static bool ar_rsum() {
     static const bool on = env_int("QE_AR_RSUM", 1);
     return on;
 }
+static bool ar1_split() {  // [q27-ar1-split] QE_AR1_SPLIT=0: one card keeps one 768-thread block per row
+    static const bool v = env_int("QE_AR1_SPLIT", 1) != 0;
+    return v;
+}
 static bool ar_split() {  // QE_AR_SPLIT: LL16 rows without the fused norm over 128-thread blocks (1, default) or one block
     static const bool v = env_int("QE_AR_SPLIT", 1) != 0;
     return v;
@@ -1713,6 +1796,10 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
                     allreduce_ll16_kernel<2, 128><<<g, 128, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx, norm_w, eps, xn, xh, S);
                 else
                     allreduce_ll16_kernel<1, 128><<<g, 128, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx, norm_w, eps, xn, xh, S);
+                fused = true;
+            } else if (mode == 1 && c.ngpu == 1 && norm_w && S.li < 0 && m <= kMaxGemvW4Tokens && ctr.ar1 && ar1_split()) {
+                ar1_norm_kernel<<<dim3(m, kLL16Threads / kAr1Threads), kAr1Threads, 0, st>>>(resid, partial, h, c.coal, ctr.epoch, ll_idx,
+                                                                                         ctr.ar1, norm_w, eps, xn, xh);
                 fused = true;
             } else if (mode == 2)
                 allreduce_ll16_kernel<2><<<m, kLL16Threads, 0, st>>>(resid, partial, h, c, rank, ctr, ll_idx,

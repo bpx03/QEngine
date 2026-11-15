@@ -11,8 +11,9 @@
 QEngine is an open-source (MIT) inference engine for two models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
 nothing extra to install or set for any of them (tuned on the RTX 3090):
 
-- **Qwen3.8-Flash-Next** (routed experts INT4 from Intel's AutoRound checkpoint, the parts every token passes through
-  in INT8 or calibrated INT4; converted for QEngine): a sparse mixture-of-experts model with 512 routed experts, 262K
+- **Qwen3.8-Flash-Next**, run from our checkpoint [bpx03/Qwen3.8-Flash-Next-QEngine](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine)
+  (routed experts INT4 from Intel's AutoRound quantization, repacked bit-exact; the parts every token passes through in
+  INT8 or calibrated INT4): a sparse mixture-of-experts model with 512 routed experts, 262K
   context (up to 1M opt-in) and image input. Runs on 2 or more cards (tuned for 3 and 2).
 - **Qwen3.8-27B** (INT4, the RedHatAI W4A16 checkpoint plus its MTP head): a dense model with 262K context (up to 1M
   opt-in, with optional sparse attention for long prompts) and image input. Tuned for 3 cards, also runs on 2, and on 1 as an experiment.
@@ -26,98 +27,48 @@ the default settings:
 
 | output tok/s, server, default settings | Flash-Next, 3 cards | Flash-Next, 2 cards | 27B, 3 cards |
 |---|---:|---:|---:|
-| single-stream decode, narrative / code | 313 / 411 | 209 / 221 | 274 / 423 |
-| prefill, 10K / 90K-token prompt (tok/s) | 6,186 / 7,249 | 3,797 / 6,357 | 6,437 / 5,159 |
-| 8 agents at once (total output) | 867 | 285 | 1,205 |
+| single-stream decode, narrative / code | 311 / 454 | 201 / 226 | 279 / 516 |
+| prefill, 10K / 90K-token prompt (tok/s) | 8,057 / 8,372 | 4,265 / 7,134 | 6,309 / 5,113 |
+| 8 agents at once (total output) | 760 | 198 | 1,129 |
 
-(1.3.5, November 6, 2026; method under [Benchmarks](#benchmarks).)
+(1.3.6, November 15, 2026; method under [Benchmarks](#benchmarks). Replies with thinking off sample with the model
+card's presence penalty 1.5 when the client sends none, and these runs send none; without it the 8-agent points are
+852 / 224-256 / 1,210 tok/s. The Flash-Next 3-card 8-agent value is the mean of 7 runs, 709-828; 27B prefill on cool cards, as in earlier releases.)
 
-**What is new in 1.3.5.9 (stable, `latest`; it also holds everything from 1.3.5.1 to 1.3.5.8 below):** one fix: Flash-Next pins its host-backed expert groups on 4 KB pages, as it already did for the model files. On a host whose RAM was fragmented (a large page cache next to a big pinned `FLASH_KV=ram` pool), the 2 MB pages made every page fault compact memory first, so a start with a 4M-token pool took over 3 minutes in the expert load instead of about 40 s, and a 6M-token pool start looked hung. `FLASH_PIN_THP=1` brings the 2 MB pages back ([docs/advanced.md](docs/advanced.md)). Checked with a 4M-token pool start (ready in about a minute); nothing else changed, and the full stress and quality runs and the numbers above are from 1.3.5.
+**Flash-Next quality**, measured together with the speed: next-token KL divergence against the official BF16 model on
+the public set [jyohukuchan/qwen38-flash-next-bf16-logits](https://huggingface.co/datasets/jyohukuchan/qwen38-flash-next-bf16-logits),
+scored with its own `compare.py`: mean KL **0.114**, top-1 agreement **89.6 %**, WikiText-2 KL **0.125** (0.126 when
+the context went through batched prefill). 1.3.6 release build, November 15, 2026; details and the command under
+[Quality](#quality).
 
-**What is new in 1.3.5.8 (the previous stable; it also holds everything from 1.3.5.1 to 1.3.5.7 below):** the 27B drafts
-with the **DFlash2 block drafter** when one conversation decodes alone: +6 to +34 % on 3 cards and +17 to +38 % on one
-card on short prompts, output unchanged; batches of several conversations keep MTP. It is on by default on 2 and 3
-cards, and the server downloads it on the first start (1.28 GB, pinned and checked). **On a single card it costs
-about 38K tokens of context (191K → 153K), so there it is off unless you ask for it** (a lower `--max-ctx`, as the
-start-up line says, or `QE_DRAFTER=dflash2`; see [DFlash2](#dflash2-block-drafter-27b-on-when-it-fits)). Flash-Next on
-2 cards with the KV cache in VRAM (the default there) no longer slows down when sub-agents run next to a long main
-conversation: idle conversations move out of the way of a growing one, and a finished sub-agent above a generating
-conversation leaves VRAM after 0.5 s (`FLASH_EC_RECLAIM_ABOVE_S`, [docs/advanced.md](docs/advanced.md)). `tool_choice`
-(`none`, `required` / `any`, a named function) is honoured on both APIs (see [API](#api)). Cards joined by an NVLink
-bridge use it through CUDA peer access, and a bridge added after the first start is now noticed (the start-up link
-measurement is cached per link setup). A `tokenizer.json` with a truncation setting (some finetunes ship
-`max_length: 4096`) no longer cuts longer prompts silently. `tools/convert_flash_next.py` also converts W4A16 exports
-(auto_gptq dense INT4, fused MTP experts) and an FP8 n-gram table (`tools/convert_ngram_fp8.py`), contributed by
-@Berberian007 ([#23](https://github.com/bpx03/QEngine/pull/23)). The licence is now MIT. Checked with smoke tests
-against 1.3.5.7; the full stress and quality runs and the numbers above are from 1.3.5.
+**What is new in 1.3.6** (stable, `latest`):
 
-**What is new in 1.3.5.7 (it also holds everything from 1.3.5.1 to 1.3.5.6 below):** `--lsa` works with no manual steps: the 27B downloads the released index map once (pinned URL and sha256), converts it without torch and caches it (Docker: the `qengine-cache` volume), so `--max-ctx 1M --lsa` is all it takes; a 262K prompt took 57 s instead of 79 s here, 512K 117 s instead of 232 s (see [Long documents](#long-documents-27b-opt-in)). During the load each layer's model-file pages leave the page cache once every card has read them (`QE_LOAD_DROP`), so a host or container short of RAM no longer reclaims hard while the server starts. Small fixes: a grammar-constrained image prompt no longer fails with the opt-in grammar lookup (`QE_LK_GRAMMAR=1`), two 27B image prompts prefilling at once no longer share one image table, the 27B host-RAM plan counts only the snapshots it pins at start, and the OpenRouter `reasoning.enabled` / `reasoning.exclude` fields are read (see [API](#api)). Checked with smoke tests against 1.3.5.6; the full stress and quality runs and the numbers above are from 1.3.5.
+- **A 4-bit KV cache for both models, opt-in.** `QE_KV_BITS=4` gives the 27B about 1.5x the context on small cards,
+  and `FLASH_KV_BITS=4` lets Flash-Next keep about 1.8x the tokens in the same host RAM with `FLASH_KV=ram`. FP8 stays
+  the default, because 4 bits are not lossless (see [Smaller cards](#gpus) and [Host memory](#host-memory-flash-next)).
+- **Flash-Next drafts as far as its draft head is sure.** When one conversation decodes alone, each step verifies 3 to
+  5 MTP drafts, picked from the draft head's confidence, so single-stream replies are faster. Greedy text can differ
+  from 1.3.5.9 where two tokens are nearly tied, because the verify width changes; `FLASH_MTP_CONF=0` goes back.
+- **27B: a smaller verify head and DFlash2 for two conversations.** The output head is an INT4 screen whose top
+  candidates are rescored exactly from the BF16 rows in host RAM, so greedy output still takes the BF16 argmax while
+  every card keeps 0.64 GB more VRAM. On one card, two conversations decoding together both draft with DFlash2
+  (`QE_DF_BATCH`), and single-card decode is faster. When the drafter is unsure, a single-card step also verifies its
+  second choices for the first three positions in the same rows (`QE_DF_SIB`), with identical output.
+- **Sampled replies sample a step's verify rows in parallel** on both models. It matters most with a presence or
+  frequency penalty, such as the non-thinking default above; the output is the same (`QE_SAMPLE_PAR=0` goes back).
+- **Faster Flash-Next prefill and decode** from a series of smaller kernel and scheduling changes, each with the same
+  output. On 3 cards with peer access, appends of 1,024 to 2,047 tokens now stage their host-held experts by the copy
+  engine too (`FLASH_PF_STAGE_MIN`). The 27B copies a prompt's end state to the host beside the first decode step instead of before it.
+- **Fixes and behaviour changes:** `usage.completion_tokens` counts the end token the model generated, as vLLM does;
+  a tool call that does not parse reaches the client as text instead of an empty reply; the thinking budget closes
+  at exactly its count, whatever the drafts; and no conversation gets priority any more, the main agent thread
+  included: memory, pauses and the prefill queue treat every conversation alike (least recently used, aged by waiting).
 
-**What is new in 1.3.5.6:** a fix for a 27B crash (`illegal memory access`, Xid 13) when the n-gram lookup drafted tokens from a conversation with images; 27B agent conversations under load keep their prompt-cache states between turns, so they no longer re-prefill from the system prompt (the snapshot store now scales with the sequence slots, see [Host memory](#host-memory-flash-next)); decode through host memory is fast again on boards where P2P stores are expensive ([#20](https://github.com/bpx03/QEngine/issues/20), [#21](https://github.com/bpx03/QEngine/issues/21)): the host path is now the no-peer path of 1.3.4.3, with peer access kept for prefill, and `QE_DECODE_COMM=auto` picks P2P or that path (see [Link probe](#link-probe-and-flash_comm--qe_comm)). Checked with smoke tests and speed comparisons against 1.3.5.5; the full stress and quality runs and the numbers above are from 1.3.5.
+1.3.6 went through the full release checks on our machine: a 262K-token stress run with images on 3 and on 2 cards,
+VRAM and host-RAM hogs taken mid-run (the engine shrinks and keeps serving), the 8-pack quality suite three times, the
+KL measurement below, and speed runs of both models.
 
-**What is new in 1.3.5.5 (experimental, not `latest`):** a fix for Flash-Next on 4 cards, which could lose details in long prompts; `reasoning_effort: "none"` (also `reasoning: {"effort": "none"}`) turns thinking off (see [API](#api)); the served context is never larger than the KV pool, with a `context:` start-up line (see [context and the KV archive](#both-models-context-and-the-kv-archive)); with `FLASH_KV=ram` the host-RAM plan counts the KV pool, so a host that is short of RAM no longer pages to swap (see [Host memory](#host-memory-flash-next)). Lightly tested.
-
-**What is new in 1.3.5.4 (experimental, not `latest`):** `logprobs` and `top_logprobs` on both models (see [API](#api)); on exactly 4 equal cards `auto` now picks `tp` when peer access checks out, and falls back to `pp` by itself (see [Parallel mode](#parallel-mode-flash-next-flash_par)); a fix for a possible crash during the load, from settings written while the load threads read them ([#11](https://github.com/bpx03/QEngine/issues/11)); machines that don't report a card's NUMA node get their host buffers spread over all nodes. Lightly tested.
-
-**What is new in 1.3.5.3 (experimental, not `latest`):** a disk cache for Qwen3.8-Flash-Next: with `--disk-cache DIR` its conversations survive a restart, as on the 27B. Off by default. See [the archive section](#both-models-context-and-the-kv-archive). Lightly tested. Also new: sampling defaults per reply mode from the model cards, so non-thinking replies get presence penalty 1.5 and 27B thinking gets temperature 1.0; not measured yet, see [API](#api).
-
-**What is new in 1.3.5.2 (experimental, not `latest`):** optional INT8 layer weights for Qwen3.8-27B: closer to BF16, slower, with a smaller KV pool. See [Qwen3.8-27B](#qwen38-27b). Lightly tested; INT4 stays the default.
-
-**What is new in 1.3.5.1 (experimental, not `latest`):** image input in `FLASH_PAR=pp`, and start-up log lines that say what the pipeline modes really do. Lightly tested, so feedback is welcome.
-
-**What is new in 1.3.5:** mostly fixes, from every open issue and my own code reviews: a use-after-free in the 27B archive, disk cache fixes, a reply parser that no longer depends on where a decode step ends, stop strings that no longer leak, one eviction order for both models, and memory taken by other programs no longer takes the server down. New: 27B context up to 1M (`--max-ctx`, opt-in), sparse attention for long prompts (`--lsa`, opt-in), faster Flash-Next prefill, and a decode transport that picks itself per machine. `--disk-cache` on Flash-Next now stops the start with an error ([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.5)).
-
-**What is new in 1.3.4.3:** the default thinking budget can be set per reasoning effort
-(`QE_THINKING_BUDGET=low:4096,medium:16384,xhigh:32768`, see [Thinking budget](#thinking-budget-and-the-answer-tail);
-`/v1/messages` also reads Anthropic's `output_config.effort`). Two fixes: an idle Flash-Next server no longer keeps
-CPU cores busy (about 2 cores before, about 0.02 now, on 3 cards), and after the load the engine releases the page
-cache of the weight files, so they no longer push the n-gram table out of RAM when it is read through the page cache
-([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4.3)).
-
-**What is new in 1.3.4.2:** faster Flash-Next decode (+14 % with 8 agents, +7 to +12 % single-stream; one
-conversation's output bit for bit as 1.3.4.1), the web dashboard's agents table and `qetop` work again, and both
-show the running version and build ([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4.2)).
-
-**What is new in 1.3.4.1:** new default Flash-Next weights (the DeltaNet projections in INT8, the shared expert and
-the n-gram projections calibrated; KL against BF16 0.119 instead of 0.267), the CUDA-graph room under agent load
-(`FLASH_GRAPH_MB`), and a steering vector that cannot be loaded no longer stops the server
-([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4.1)). The 1.3.4 weights stay available
-(`--revision v1.3.4`, see [Model files](#qwen38-flash-next)).
-
-**What is new in 1.3.4** (details in the [release notes](https://github.com/bpx03/QEngine/releases/tag/v1.3.4)):
-
-- fast tensor parallelism **without GPU P2P** (the stock NVIDIA driver) for both models;
-- `FLASH_PAR`: Flash-Next can run as a **layer pipeline** over the cards; at start the server picks tensor or pipeline
-  parallel from a link probe and a per-card calibration, splits uneven cards by speed, and runs 4 or more cards as a
-  pipeline;
-- **host-memory defaults that fit the machine**: the start-up plans host RAM from what the machine has, so smaller
-  hosts no longer swap;
-- a hard **thinking budget** and a reserved **answer tail**, so a reply never ends inside its reasoning;
-- **empty replies are sampled again** (non-streamed requests), clearer logs for empty turns and dropped history;
-- an overlong prompt gets **OpenAI's context-length error text** on the OpenAI path;
-- a stalled engine fails its requests at once and restarts; prompts that can never start fail at once with the reason;
-- the Docker images carry code for the **RTX 3000, 4000 and 5000 series** (tuned on the 3090).
-
-**Better on non-standard setups.** QEngine is tuned on 3× RTX 3090 with GPU P2P and plenty of host RAM; 1.3.4 is
-aimed at setups that differ from that, and should improve them:
-
-- **no P2P** (stock driver, x4 / x8 slots, dual-socket or NUMA): Flash-Next on 3 cards, 10K-token prefill 3.75 →
-  1.83 s, 90K 34.95 → 17.03 s, decode within about 4 % of P2P; 27B, 16K prefill 3.94 → 2.68 s
-  ([details](#with-and-without-gpu-p2p));
-- **long prompts on slow links**: `FLASH_PAR=pp`, a layer pipeline, picked automatically where it wins
-  ([Parallel mode](#parallel-mode-flash-next-flash_par));
-- **small host RAM** (e.g. 64-96 GB): the host-memory plan adapts; no swapping with the defaults
-  ([Host memory](#host-memory-flash-next));
-- **mixed or uneven cards**: a per-card calibration and a layer split by speed;
-- **4 or more cards**: pipeline mode; `FLASH_PAR=pptp` is experimental;
-- **RTX 3000, 4000 and 5000 series**: built in, nothing to set (tuned on the 3090; [what has run where](#gpus)).
-
-If a setup like this is still slow or misbehaves, please open an issue with the start-up log, started with
-`FLASH_BOX_REPORT=1` (it adds `[box]` lines on each card and link; on 4 or more cards they are on by default): those,
-the `[qflash] parallel mode` line and the `host RAM plan` line are what we need.
-
-1.3.3.1 fixed a case where a reply could pick up text from another conversation running at the same time; if you run
-an older version, please upgrade.
+Older releases and what changed in each: [releases page](https://github.com/bpx03/QEngine/releases).
 
 ## Contents
 
@@ -130,8 +81,9 @@ an older version, please upgrade.
 - [Benchmarks](#benchmarks)
 - [Troubleshooting and FAQ](#troubleshooting-and-faq)
 - [Repository layout and tests](#repository-layout-and-tests)
+- [Changelog](#changelog)
 - [Support](#support)
-- [Changelog, license, disclaimer](#changelog)
+- [License](#license), [Disclaimer](#disclaimer)
 
 More settings, measurements and the troubleshooting table: [docs/advanced.md](docs/advanced.md).
 
@@ -144,8 +96,11 @@ memory to the machine, from 64 GB up; see [Host memory](#host-memory-flash-next)
 
 ### 1. Get a model
 
+The `hf` command comes with the Hugging Face hub client: `pip install -U "huggingface_hub[cli]"`.
+
 ```bash
-# Qwen3.8-Flash-Next, ready to run (~129 GB): converted weights, INT8 n-gram table and three small files
+# Qwen3.8-Flash-Next: our checkpoint is the supported way to run it (~129 GB, ready to run: converted weights,
+# INT8 n-gram table and three small files)
 hf download bpx03/Qwen3.8-Flash-Next-QEngine --local-dir models/Qwen3.8-Flash-Next-QE-INT4
 # (the previous, 1.3.4 weights: add --revision v1.3.4; see "Model files" under Models)
 
@@ -160,15 +115,19 @@ Requirements on the host: the NVIDIA driver and the
 models; it picks the engine from the model's `config.json`.
 
 ```bash
-docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
-  -p 8080:8080 -p 127.0.0.1:9393:9393 \
+docker run -d --name qengine --restart unless-stopped --gpus all --ipc=host --ulimit memlock=-1 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:9393:9393 \
   -v /path/to/models:/app/models:ro -v qengine-cache:/root/.cache/qengine \
   -e QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4 \
   ghcr.io/bpx03/qengine:latest
 ```
 
 - Without `QE_MODEL` the container serves `/app/models/Qwen3.8-27B-INT4`.
-- Images: `latest` / `1.3.5.9` (text only, ~0.4 GB download) and `vision` / `1.3.5.9-vision` (with the image encoder, ~3.2 GB download). Earlier: `1.3.5.8`, `1.3.5.8-vision`, `1.3.5.7`, `1.3.5.7-vision`, `1.3.5.6`, `1.3.5.6-vision`, `1.3.5` and `1.3.5-vision`; experimental `1.3.5.5`, `1.3.5.5-vision`, `1.3.5.4`, `1.3.5.4-vision`, `1.3.5.3`, `1.3.5.3-vision`, `1.3.5.2`, `1.3.5.2-vision`, `1.3.5.1`, `1.3.5.1-vision`.
+- The API listens on 127.0.0.1 only, as the source start does. To reach it from other machines, publish it as
+  `-p 8080:8080` (all interfaces) and put a firewall or an authenticating proxy in front: the server has no API keys.
+- `--restart unless-stopped` matters: after a stalled GPU the server exits with code 75 and relies on a restart (see
+  [Failure handling](#serving-behaviour)).
+- Images: `latest` / `1.3.6` (text only, ~0.4 GB download) and `vision` / `1.3.6-vision` (with the image encoder, ~3.2 GB download). Earlier: `1.3.5.9`, `1.3.5.9-vision`, `1.3.5.8`, `1.3.5.8-vision`, `1.3.5.7`, `1.3.5.7-vision`, `1.3.5.6`, `1.3.5.6-vision`, `1.3.5` and `1.3.5-vision`; experimental `1.3.5.5`, `1.3.5.5-vision`, `1.3.5.4`, `1.3.5.4-vision`, `1.3.5.3`, `1.3.5.3-vision`, `1.3.5.2`, `1.3.5.2-vision`, `1.3.5.1`, `1.3.5.1-vision`.
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`; `QE_DEVICES`, if set, wins over `QE_GPUS`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -177,7 +136,9 @@ docker run -d --name qengine --gpus all --ipc=host --ulimit memlock=-1 \
 - `--ipc=host` and `--ulimit memlock=-1` are needed for the pinned host memory. On SELinux hosts (Fedora, RHEL) add
   `--security-opt label=disable`.
 - Port 8080: the API. Port 9393: monitoring dashboard, `/api/stats`, Prometheus `/metrics`.
-- Compose: `QE_MODELS_DIR=/path/to/models docker compose up -d` (see `docker-compose.yml`).
+- Compose: `QE_MODELS_DIR=/path/to/models docker compose up -d` (see `docker-compose.yml`). It builds the image
+  from this checkout (it does not pull `ghcr.io/bpx03/qengine`) and serves the 27B; for Flash-Next add
+  `QE_MODEL: /app/models/Qwen3.8-Flash-Next-QE-INT4` under `environment:`.
 - Build it yourself: `docker build -t qengine .` (with vision), `--build-arg VISION=0` (text only),
   `--build-arg CUDA_ARCHS=86` (RTX 3090 code only, faster build), `--build-arg REVISION=$(git rev-parse HEAD)` (the
   build hash the monitoring headers show; without it they say `build unknown`).
@@ -210,11 +171,13 @@ python3 server/app.py --help                                   # all command-lin
 |---|---|---|
 | 3 cards (tuned) | `server/run.sh 8080 --model <dir>` | the default: GPUs 0,1,2 |
 | 2 cards | `QE_DEVICES=0,2 server/run.sh 8080 --model <dir>` | Flash-Next keeps about half of its experts in host RAM; the 27B serves 32 slots with `QE_MAX_SEQS=32` |
-| 1 card (27B only, experimental) | `QE_DEVICES=0 QE_MAX_SEQS=1 server/run.sh 8080` | one conversation, ~191K tokens of context; `QE_MAX_SEQS` up to 4; MTP drafts unless you lower `--max-ctx` to what the start-up line says (about 150K) or set `QE_DRAFTER=dflash2` ([DFlash2](#dflash2-block-drafter-27b-on-when-it-fits)) |
+| 1 card (27B only, experimental) | `QE_DEVICES=0 QE_MAX_SEQS=1 server/run.sh 8080` | one conversation, 206,848 tokens of context; `QE_MAX_SEQS` up to 4; MTP drafts unless you lower `--max-ctx` to what the start-up line says (`--max-ctx 165K` on our 24 GB card) or set `QE_DRAFTER=dflash2` ([DFlash2](#dflash2-block-drafter-27b-on-when-it-fits)) |
 | a card also drives a desktop | Flash-Next `FLASH_EC_MARGIN_MB=256,2048,256`; 27B `QE_RESERVE_GB=1.5,3,1.5` | more free VRAM on that card (values in GPU order) |
 | 4 or more cards (Flash-Next) | `QE_DEVICES=0,1,2,3 server/run.sh 8080 --model <dir>` | exactly 4 equal cards with verified P2P: `tp`, otherwise a pipeline (`pp`); see [4 or more cards](#4-or-more-cards) |
 | long documents, short answers (Flash-Next) | `FLASH_PAR=pp` | pipeline mode: faster long prompts, slower single-stream decode |
 | many long conversations (Flash-Next) | `FLASH_KV=ram FLASH_KV_RAM_TOKENS=4M` | KV cache in host RAM, ~74K tokens per GB |
+| more KV per GB (Flash-Next) | `FLASH_KV_BITS=4` | 4-bit KV cache: 7,488 instead of 13,520 bytes per token (~134K tokens per GB with `FLASH_KV=ram`); see [Host memory](#host-memory-flash-next) |
+| small cards, more context (27B) | `QE_KV_BITS=4` | 4-bit KV cache: about 1.5x the context on 8-12 GB cards; see [Smaller cards](#gpus) |
 
 The first start on a new card count tunes the GEMMs and caches the table in `~/.cache/qengine`.
 
@@ -231,7 +194,62 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 The served names are `qwen3.8-flash-next-qengine` and `qwen3.8-27b-qengine` (`--served-name` changes it).
 For **Claude Code**, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and `CLAUDE_CODE_ATTRIBUTION_HEADER=0`.
 
+### 5. Behind llama-swap (or another model switcher)
+
+I run QEngine behind [llama-swap](https://github.com/mostlygeek/llama-swap) myself. A source build:
+
+```yaml
+healthCheckTimeout: 900          # the first start of a model takes longer (see below)
+models:
+  qwen3.8-flash-next-qengine:
+    cmd: bash -c 'cd /path/to/QEngine && exec server/run.sh ${PORT} --model /path/to/models/Qwen3.8-Flash-Next-QE-INT4'
+    checkEndpoint: /health
+  qwen3.8-27b-qengine:
+    cmd: bash -c 'cd /path/to/QEngine && exec server/run.sh ${PORT} --model /path/to/models/Qwen3.8-27B-INT4'
+    checkEndpoint: /health
+```
+
+The Docker form (the switcher stops the container by name):
+
+```yaml
+  qwen3.8-flash-next-qengine:
+    cmd: >
+      docker run --rm --name qengine-fn --gpus all --ipc=host --ulimit memlock=-1
+      -p 127.0.0.1:${PORT}:8080 -v /path/to/models:/app/models:ro -v qengine-cache:/root/.cache/qengine
+      -e QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4 ghcr.io/bpx03/qengine:latest
+    cmdStop: docker stop -t 60 qengine-fn
+    checkEndpoint: /health
+```
+
+- `exec` matters: it makes the server the process the switcher stops, so a stop ends the engine and frees the cards.
+- `GET /health` answers only once the model is loaded and the API is up, so it is the readiness check.
+- A start takes longer the first time on a machine: the GEMMs are tuned for the card count, the 27B downloads its
+  tuned MTP head and draft ranking and the DFlash2 drafter (about 1.28 GB), and with `--lsa` the index map. All of it
+  is cached in `~/.cache/qengine` (Docker: keep the `qengine-cache` volume), so later starts skip it.
+- Only one engine can hold a card. A second one that starts while the first is still exiting waits up to
+  `QE_GPU_LOCK_WAIT_S` (60 s) and then stops with the first one's pid and command line. So the switcher must stop one
+  QEngine model before it starts another on the same GPUs (llama-swap does that by default: one model at a time).
+  Two models side by side need separate cards (`QE_DEVICES`, Docker `QE_GPUS`).
+
 ## Hardware and interconnect
+
+QEngine is tuned on 3× RTX 3090 with GPU P2P and plenty of host RAM, but it adapts by itself to machines that differ
+from that:
+
+- **no P2P** (stock driver, x4 / x8 slots, dual-socket or NUMA): both engines exchange through pinned host memory by
+  DMA, close to the P2P speed ([details](#with-and-without-gpu-p2p));
+- **long prompts on slow links**: `FLASH_PAR=pp`, a layer pipeline, picked automatically where it wins
+  ([Parallel mode](#parallel-mode-flash-next-flash_par));
+- **small host RAM** (e.g. 64-96 GB): the host-memory plan adapts, with no swapping at the defaults
+  ([Host memory](#host-memory-flash-next));
+- **mixed or uneven cards**: a per-card calibration and a layer split by speed;
+- **4 or more cards**: see [4 or more cards](#4-or-more-cards); `FLASH_PAR=pptp` is experimental;
+- **small cards** (8-16 GB): see [Smaller cards](#gpus);
+- **RTX 3000, 4000 and 5000 series**: built in, nothing to set ([what has run where](#gpus)).
+
+If a setup like this is still slow or misbehaves, please open an issue with the start-up log, started with
+`FLASH_BOX_REPORT=1` (it adds `[box]` lines on each card and link; on 4 or more cards they are on by default): those,
+the `[qflash] parallel mode` line and the `host RAM plan` line are what I need to look into it.
 
 ### GPUs
 
@@ -247,9 +265,19 @@ and a source build targets the GPUs it finds (`-DCMAKE_CUDA_ARCHITECTURES` sets 
 The 4000 and 5000 series use the settings tuned for the 3090, so they may have speed left unused. What limits a card
 is its memory; see below.
 
-**Smaller cards** (measured on our 3090s with all but 12 GB or 8 GB of each card taken by another process before the
-start, November 3, 2026; defaults otherwise, 16 conversation slots; c=1 / c=4: greedy decode of 400-token replies,
-thinking off; prefill of an 11.5K-token prompt; a 53K-token needle):
+How many cards each model runs on:
+
+| model | cards | how |
+|---|---|---|
+| Qwen3.8-Flash-Next | 3 (tuned), 2 | tensor parallel or pipeline, picked at start (`FLASH_PAR=auto`) |
+| Qwen3.8-Flash-Next | 4 or more | pipeline (`FLASH_PAR=pp`); tested only as 4 pipeline stages on our 3 cards |
+| Qwen3.8-Flash-Next | 1 | not supported |
+| Qwen3.8-27B | 3 (tuned), 2 | tensor parallel |
+| Qwen3.8-27B | 1 | experimental, `QE_MAX_SEQS` 1 to 4 |
+
+**Smaller cards** (Flash-Next; measured on our 3090s with all but 12 GB or 8 GB of each card taken by another process
+before the start, November 3, 2026; defaults otherwise, 16 conversation slots; c=1 / c=4: greedy decode of 400-token
+replies, thinking off; prefill of an 11.5K-token prompt; a 53K-token needle; the 27B follows below):
 
 | model | cards x free VRAM | context | c=1 / c=4 tok/s | prefill tok/s | needle |
 |---|---|---:|---:|---:|---|
@@ -257,10 +285,6 @@ thinking off; prefill of an 11.5K-token prompt; a 53K-token needle):
 | Flash-Next | 3 x 8 GB | 262,144 | 47.2 / 91.1 | 3,819 | pass |
 | Flash-Next | 2 x 12 GB | 262,144 | 40.7 / 78.7 | 3,546 | pass |
 | Flash-Next | 2 x 8 GB | 65,536 (fitted at start) | 34.7 / 55.1 | 2,263 | pass |
-| 27B | 3 x 12 GB | 178,865 (KV pool fitted at start) | 215.4 / 641.1 | 6,571 | pass |
-| 27B | 3 x 8 GB | 44,675 (9 slots, fitted at start) | 220.6 / 619.3 | 6,288 | pass (26K) |
-| 27B | 2 x 12 GB | 30,720 (14 slots, fitted at start) | 171.6 / 340.5 | 4,678 | pass (18K) |
-| 27B | 2 x 8 GB | does not start (the weights do not fit) | - | - | - |
 
 - Flash-Next keeps its dense weights, slot state and KV cache on the cards and puts the experts that do not fit in
   host RAM (on 8 GB cards nearly all of them, so decode is host-link bound). The minimum per card is about 7.5 GB on
@@ -272,14 +296,40 @@ thinking off; prefill of an 11.5K-token prompt; a 53K-token needle):
   with fewer slots and a smaller VRAM reserve (logged; `QE_MAX_SEQS`, `QE_RESERVE_GB` set them) so the KV cache holds
   at least a 32K context: 8 GB cards work on 3 cards, 12 GB cards on 2. Below that it stops with a message (exit
   code 3).
+- 27B on one card needs about 15.8 GB for the weights alone, so a single 16 GB card does not start; 2 x 16 GB does.
 
-| model | cards | how |
-|---|---|---|
-| Qwen3.8-Flash-Next | 3 (tuned), 2 | tensor parallel or pipeline, picked at start (`FLASH_PAR=auto`) |
-| Qwen3.8-Flash-Next | 4 or more | pipeline (`FLASH_PAR=pp`); tested only as 4 pipeline stages on our 3 cards |
-| Qwen3.8-Flash-Next | 1 | not supported |
-| Qwen3.8-27B | 3 (tuned), 2 | tensor parallel |
-| Qwen3.8-27B | 1 | experimental, `QE_MAX_SEQS` 1 to 4 |
+**27B on smaller cards, and with a 4-bit KV cache (opt-in, `QE_KV_BITS=4`)** for more context. Each key and value
+row is rotated (a fixed random Hadamard transform, which spreads the outlier channels) and stored in 4 bits with one
+fp16 scale per 32 values: 144 bytes per row instead of 256 with FP8, so the pool holds 1.6-1.7x the tokens (the MTP
+layer stays FP8). Measured like the table above (November 14, 2026, same day for both caches, before the INT4
+verify head of 1.3.6, which leaves each card more room for the KV pool; the 3 x 8 GB FP8 row is from November 3;
+needle at about 60 % of the served context; slots as fitted for FP8):
+
+| cards x free VRAM | KV cache | context | c=1 / c=4 tok/s | prefill tok/s | needle |
+|---|---|---:|---:|---:|---|
+| 3 x 12 GB | FP8 | 255,649 | 220.2 / 630.1 | 6,372 | pass |
+| 3 x 12 GB | 4-bit | 262,144 | 189.8 / 653.4: the context now fits DFlash2, which is slower than MTP on this story prompt (`QE_DRAFTER=mtp`: 212.9 / 664.6) | 6,231 | pass |
+| 3 x 8 GB | FP8 | 44,675 (9 slots) | 220.6 / 619.3 | 6,288 | pass |
+| 3 x 8 GB | 4-bit | 67,584 (9 slots) | 215.2 / 630.2 | 6,364 | pass |
+| 2 x 12 GB | FP8 | 30,720 (14 slots) | 171.5 / 338.5 | 4,568 | pass |
+| 2 x 12 GB | 4-bit | 46,080 (14 slots) | 190.7 / 513.3 | 4,537 | pass |
+| 1 x 24 GB, `QE_MAX_SEQS=1` | 4-bit | 240,640 with DFlash2 (262,144 with `QE_DRAFTER=mtp`; FP8 on 1.3.5.8: about 191K) | 102.9 / - | 2,550 | pass |
+| 2 x 8 GB | either | does not start (the weights do not fit) | - | - | - |
+
+- Quality: next-token KL against a bf16 KV cache over 100K / 32K / 64K-token documents is 4.4e-3 with 4 bits and
+  1.5e-3 with FP8 (for scale: the INT4 weights against BF16 are 1.45e-2); top-1 agreement stays at FP8's level, a
+  passphrase needle at 130K (3 depths) and 239K passes, MTP / DFlash2 acceptance within 2 %. It is opt-in because it
+  is not lossless against FP8; on cards with room the FP8 default is the better choice.
+- Speed: decode within 2 % of FP8 at 32K and faster at long context (128K: -9 % time per step); prefill 0.4 % slower
+  at 128K and 3 % at 256K (the prompt's keys are converted for the prefill kernels, about 0.5 KB per key and KV head
+  of the served context). On 3 x 12 GB the context now fits the DFlash2 drafter, which `QE_DRAFTER=auto` then loads,
+  as on 24 GB cards: warm c=1, it is 10 % faster than MTP alone on code and 7 % slower on prose, the same on both
+  memory sizes (the c=1 numbers in the table are a first, cold request).
+- Also checked with 4 bits: conversations restored from the RAM archive continue bit-identically, the disk cache
+  resumes after a restart, the KV pool shrinks and grows back when another process takes and frees 16 GB of a card,
+  and `--max-ctx 512K` (YaRN) serves 524,288 tokens on 3 cards with a 331K-token needle found.
+- Not with `QE_LSA` (sparse attention reads FP8 keys; it is turned off with a start-up line) and not with
+  `QE_KV_FP8=0`. Conversations archived or saved to disk with one cache format are not reused by the other.
 
 GPU selection: `QE_DEVICES=0,2` (physical ids; Docker `QE_GPUS`), or `--devices` (indices within
 `CUDA_VISIBLE_DEVICES`). By default every visible GPU is used. Each engine locks the GPUs it uses: a second engine on
@@ -377,7 +427,9 @@ a message), activation capture; lookup drafts are off. Structured output and the
 We have no 4-card machine: the 4-way split was
 tested as 4 pipeline stages on our 3 cards (two stages on one card), where it gave the same output bit for bit as 3
 stages. `pptp` was tested only in a 3-card layout (`0,1|2`), where its next-token probabilities match `tp` within the
-run-to-run noise. Reports from 4-card machines are welcome.
+run-to-run noise. A community run on four RTX 5080 cards (`tp`, 1.3.5.7 and 1.3.5.9, [#24](https://github.com/bpx03/QEngine/issues/24))
+confirmed Flash-Next's long-context recall there: needles found up to 240,664 tokens at 262K and up to 843,147 at 1M,
+the same level as on 3 cards. More reports from 4-card machines are welcome.
 
 **Since 1.3.5.4 (experimental):** on exactly 4 equal cards, `auto` picks `tp` when peer access between all of them passes the data check
 at start and `tp` fits the free VRAM; otherwise it picks `pp`. With 5 or more cards it is always `pp`. If `tp` can't start
@@ -386,7 +438,7 @@ at start and `tp` fits the free VRAM; otherwise it picks `pp`. With 5 or more ca
 load can still stop later on a request: use `FLASH_PAR=pp` there. This rule rests on one user's measurements on one rig
 (4× RTX 5080 16 GB behind one PCIe switch, 1.3.5): one 1,000-token stream at 310.3 tok/s in `tp` against 145.4 in `pp`. On
 1.3.4.3, prefill at 32K was higher in `pp` (7,367 against 5,466 tok/s), so for mostly long uncached prompts set
-`FLASH_PAR=pp`. The rest was tested on 3 cards only. Until that release, on 1.3.5.x, `auto` always picks `pp` on 4 cards and
+`FLASH_PAR=pp`. The rest was tested on 3 cards only. On 1.3.5 to 1.3.5.3, `auto` always picks `pp` on 4 cards and
 prints `peer access no` even if your cards have P2P, so set `FLASH_PAR=tp` yourself.
 
 ### Link probe and `FLASH_COMM` / `QE_COMM`
@@ -450,11 +502,6 @@ must be pinned: about 14 GB on 3 cards, about 31 GB on 2, plus a margin), full s
 about 85 GB; 27B started with 24 GB free (the lowest we tried). Below its minimum Flash-Next stops at start with a
 message naming the shortfall, before it pins anything.
 
-27B prompt-cache states (snapshots of the recurrent state, about 80 MB of pinned host RAM each on 2 cards): up to 4 per
-sequence slot (at least 32; `QE_SNAPSHOTS`). The first 32 are pinned at start, the rest only as many agent
-conversations fill the store and only while the host has room. With 32 for every slot count, 8 agent conversations on
-32 slots dropped each other's states and re-prefilled from the system prompt.
-
 | part | host RAM |
 |---|---|
 | host-resident experts (what VRAM cannot hold) | about 12 GB (3 cards), about 31 GB (2 cards) |
@@ -474,14 +521,27 @@ and the desktop: max(8 GB, 8 % of RAM). The rest goes, in this order, to:
    its rows;
 3. the archive and the pinned system prompts, which get what is left, up to 48 + 8 GB.
 
-With `FLASH_KV=ram` the KV pool in host RAM (`FLASH_KV_RAM_TOKENS`, 13,520 bytes per token, 13.5 GB at the default 1M)
-is in the plan as well. It is pinned at start, like the experts and the n-gram table, so these three together must fit
+With `FLASH_KV=ram` the KV pool in host RAM (`FLASH_KV_RAM_TOKENS`, 13,520 bytes per token, 13.5 GB at the default 1M;
+7,488 bytes and 7.5 GB with `FLASH_KV_BITS=4`) is in the plan as well. It is pinned at start, like the experts and the n-gram table, so these three together must fit
 both the RAM the machine has and what is free at start (`MemAvailable` minus the margin). When they do not, the plan
 gives way in this order: the archive and the pinned prompts first; then the KV pool, down to the seats times the
 context (`FLASH_MAX_SEQS` x `--max-ctx`, so every seat still holds a full window); then down to one window; then the
 n-gram table moves to the page cache (it costs decode speed for every request, so it goes last). The experts are never
 reduced; if even the smallest plan does not fit, the log warns and the server starts anyway. The start-up line shows
 the pool and what is pinned at start next to what was free.
+
+**Flash-Next with a 4-bit KV cache (opt-in, `FLASH_KV_BITS=4`).** Each key and value row of the attention layers (the
+MTP layer too) is rotated (a fixed random Hadamard transform, which spreads the outlier channels) and stored in 4 bits
+with one fp16 scale per 32 values: 576 bytes per layer and token instead of 1,040 with FP8, 7,488 instead of 13,520
+bytes per token in all. The VRAM pool keeps its 262,144 tokens and gives the freed memory to the expert cache; with
+`FLASH_KV=ram` the same host RAM holds 1.8x the tokens (1.05M tokens: 7.9 GB pinned instead of 14.2). Measured on 3 cards
+(November 14, 2026, same day for both caches): KL against the FP8 cache 4.95e-2 on 32K-100K documents (two FP8 runs
+that differ only in summation order: 2.52e-2), top-1 agreement 92.2 %; needle at 130K and at 1M (`FLASH_KV=ram`,
+YaRN) pass; prefill of a 90K prompt 1-2 % faster, decode steps unchanged, MTP drafts accepted 3 % less (3.00 vs 3.10
+tokens per step at 90K). Other values of `FLASH_KV_BITS` and settings that select an attention kernel without a
+4-bit reader (`FLASH_ATTN_TC`, `FLASH_ATTN_DEC=0`) keep the FP8 cache and log it. On 2 cards, prompts of about
+115K-188K prefill in 4096-row batches with the 4-bit cache (the smaller K/V arrays have less room for the big
+batches).
 
 Nothing is planned beyond the RAM the machine has, so the defaults do not push it into swap. With about 140 GB or
 more (3 cards) or about 160 GB or more (2 cards), the plan is exactly the defaults above. The log has one line with
@@ -551,7 +611,8 @@ and limits pinned host memory, which the archive and Flash-Next's host-resident 
 - an expert cache: the least-used expert groups live in pinned host memory and are copied into free VRAM while hot;
 - attention KV in FP8, split by position over the cards, with the indexer's top-512 block selection beyond 2K
   tokens; 262,144 tokens of context per conversation;
-- MTP drafts (k = 3) plus lookup drafts, steps launched ahead, CUDA graphs;
+- MTP drafts plus lookup drafts (one conversation decoding alone: 3 to 5 drafts per step, picked from the draft head's
+  confidence; batched steps: up to 3), steps launched ahead, CUDA graphs;
 - up to 16 conversations at once with batched decoding; prompts that arrive together share prefill batches (the
   expert weights are read once for all of them);
 - prefix reuse, checkpoints and a host-RAM archive of conversations; image input (`--vision 1`); structured output.
@@ -582,11 +643,8 @@ server/run.sh 8080 --model models/Qwen3.8-Flash-Next-QE-INT4-v1.3.4       # Dock
 | embeddings, n-gram table | BF16 / INT8 | the n-gram table ships as INT8 |
 | norms, gates, DeltaNet a / b and conv, indexer | BF16 | |
 | activations, accumulation | BF16 / FP16, FP32 accumulation | prefill GEMMs use INT8 activations |
-| attention KV cache | FP8 (E4M3) | |
+| attention KV cache | FP8 (E4M3) | 4-bit opt-in: `FLASH_KV_BITS=4` |
 | MTP draft head | INT8, group 128 (experts and shared expert INT4) | attention and fc BF16 in the files, converted at load |
-
-To build the directory yourself from Intel's checkpoint (169 GB download), see
-[docs/advanced.md](docs/advanced.md#build-the-flash-next-model-directory-yourself).
 
 **Context up to 1M tokens (opt-in)**: `FLASH_KV=ram server/run.sh 8080 --model <dir> --max-ctx 1M` turns on the
 model card's YaRN RoPE scaling (Qwen3.8-27B: `--max-ctx 1M` on 3 cards, `--max-ctx 512K` on 2, no `FLASH_KV`). It applies to every request of that server, so use it only on a server meant for long
@@ -602,15 +660,27 @@ Details: [docs/advanced.md](docs/advanced.md#kv-cache-in-host-ram-flash-next).
 
 ### Qwen3.8-27B
 
-- INT4 weights repacked at load (a few seconds, no conversion) into tensor-core layouts; `lm_head` in INT8.
+- INT4 weights repacked at load (a few seconds, no conversion) into tensor-core layouts.
+- Verify head: an INT4 copy of `lm_head` screens the vocabulary, and each row's top 16 candidates (top 64 for sampled
+  rows and logprobs) are rescored exactly from the BF16 rows in pinned host RAM, so greedy output takes the BF16
+  argmax. It needs 2.5 GB of pinned host RAM on one card (0.85 GB per card on 3) and 0.64 GB less VRAM per card than
+  an INT8 head. Without that host RAM, or with `QE_HEAD4R=0`, every card uses the INT8 head.
 - Tensor parallel over PCIe; the four full-attention KV heads are split by position (3 cards with P2P), so no KV head
   is duplicated. All-reduces run inside the kernels and inside CUDA graphs.
 - Speculative decoding, verified over the full vocabulary, so outputs are unchanged: the [DFlash2 block
   drafter](#dflash2-block-drafter-27b-on-when-it-fits) (7 drafts per step) for a conversation that decodes alone,
   when its memory fits; MTP with 1 to 7 drafts per step, chosen from the measured acceptance, for everything else.
   Lookup drafts on the GPU.
-- Up to 32 conversations (`QE_MAX_SEQS`, default 16); KV cache in FP8 in one pool per card (about 1M tokens on 3
-  cards with P2P); 262,144 tokens per conversation.
+- Up to 32 conversations (`QE_MAX_SEQS`, default 16); KV cache in FP8 in one pool per card (1,232,896 tokens on 3
+  cards with P2P; `QE_KV_BITS=4` stores it in 4 bits for small cards, see [GPUs](#gpus)); 262,144 tokens per
+  conversation.
+- Prompt-cache states (snapshots of the recurrent state, about 80 MB of pinned host RAM each on 2 cards): up to 4 per
+  sequence slot (at least 32; `QE_SNAPSHOTS`). The first 32 are pinned at start, the rest only as many agent
+  conversations fill the store and only while the host has room. With 32 for every slot count, 8 agent conversations
+  on 32 slots dropped each other's states and re-prefilled from the system prompt. The state at the end of each
+  prompt is copied to the host beside the first decode step instead of before it (about 6 ms less to the first token
+  and per reply on one card, 2 ms on three; 16 MB of VRAM per card for the staged convolution rings;
+  `QE_SNAP_ASYNC=0` copies it before the first step, as before).
 
 **Release files.** Two files are attached to every [release](https://github.com/bpx03/QEngine/releases/latest):
 `model_mtp_ft.safetensors` (849 MB, an MTP head fine-tuned on the engine's own answers) and `token_rank.bin` (the
@@ -636,7 +706,7 @@ hidden states of five layers of the model and proposes 7 tokens per step; the mo
 greedy output is identical to MTP, and sampled output follows the same distribution (only the random draws differ).
 
 **Where it helps.** It is used for a conversation that decodes alone: one chat, one agent, one long answer. Measured
-on this hardware (server, one conversation, against the MTP default of the same build):
+on this hardware (1.3.5.8; server, one conversation, against the MTP default of the same build):
 
 | setup | short code | short prose | short math | 131K context |
 |---|---:|---:|---:|---:|
@@ -646,9 +716,18 @@ on this hardware (server, one conversation, against the MTP default of the same 
 The gain depends on the text: code and other predictable output gain most; long reasoning that MTP and lookup
 drafts already predict well gains little (a 32K prompt with a long thinking part: +2 %).
 
-Where it does not: as soon as two or more conversations decode in the same step (sub-agents, parallel requests) the
-step drafts with MTP, as before, so batched throughput is unchanged. Grammar-constrained replies (`tool_choice`,
-`response_format`) also keep MTP. Agent turns that edit a file already in the context come out about 3 % slower,
+Second choices on one card: when the drafter is unsure about its first three drafts (greedy replies), the step
+verifies four drafts plus the drafter's second choice for each of the first three positions in the same 8 rows; a
+right second choice keeps one more token. Output is identical. Measured on one card (engine, same build on / off):
++3.5 % on a 30-prompt mix, +4.6..4.9 % on the three short benchmark prompts, +2.7 % / +1.6 % at 32K / 96K, about level
+on file edits. `QE_DF_SIB=0` turns it off.
+
+Two conversations at once on one card: when exactly two conversations decode in the same step, each drafts with its
+own DFlash2 context (8 rows each); output stays identical to each conversation decoding alone. Measured on one card
+(server, two 512-token replies at once): +2.8 % for the pair as a whole; +8 % per step while both run (engine benchmark). With three or more
+conversations in a step, and on 2 or 3 cards, batched steps draft with MTP as before (three at once on one card was
+level to slightly slower, four 5 % slower). `QE_DF_BATCH=0` turns it off; `QE_DF_BATCH=n` allows it up to n
+conversations per step. Grammar-constrained replies (`response_format`, a forced tool call until its header, `logprobs`) always keep MTP; a `tool_choice: none` reply drafts as usual. Agent turns that edit a file already in the context come out about 3 % slower,
 because the model copies text the drafter no longer sees (it keeps the last ~2K positions); turns that write new text
 are faster.
 
@@ -656,9 +735,9 @@ are faster.
 
 | cards | VRAM per card | KV pool (all conversations together) | context per conversation |
 |---|---:|---|---|
-| 1 | 1.16 GB | about −38K tokens | `QE_MAX_SEQS=1`: **191K → 153K** (default `QE_RESERVE_GB=1.5`; 220K → 184K at `0.5`) |
-| 2 | 0.82 GB | 662K → 610K (16 slots) | 262,144, unchanged |
-| 3 | 0.70 GB | 1.26M → 1.19M (16 slots) | 262,144, unchanged |
+| 1 | 1.20 GB (three context rings for the two-conversation steps; `QE_DF_BATCH=0`: 1.16 GB) | about −38K tokens | `QE_MAX_SEQS=1`: **206,848 → about 165,000** (default `QE_RESERVE_GB=1.5`) |
+| 2 | 0.82 GB | 675,840 → 623,616 tokens | 262,144, unchanged |
+| 3 | 0.70 GB | 1,298,432 → 1,232,896 tokens | 262,144, unchanged |
 
 On 2 and 3 cards the default context still fits. **On one card it does not**, which is why a single card stays on MTP
 by default.
@@ -669,7 +748,7 @@ by default.
   fit with it, and prints one line saying which drafter it loaded and why (memory needed against memory free). The
   context is never lowered to make room for it. On 2 and 3 cards it is on with the defaults. **On one card the
   default `--max-ctx 262144` does not fit, so a single card stays on MTP**, and the start-up line tells you what this
-  machine needs, e.g. `For DFlash2: --max-ctx <= 150K or QE_DRAFTER=dflash2` (the number is computed from your free
+  machine needs, e.g. `For DFlash2: --max-ctx <= 165K or QE_DRAFTER=dflash2` (the number is computed from your free
   VRAM). Either ask for that context or force it:
   ```bash
   # one card: room for DFlash2 by asking for less context (use the number from your start-up line)
@@ -782,16 +861,20 @@ sorted JSON keys, so a client that reorders the same tools keeps the prompt cach
 order). The chat template is `server/templates/qwen38_syssafe.jinja` (the model's template, accepting several leading
 system messages). `--template` replaces it. A reply starts as reasoning only if the template's generation prompt opens
 `<think>`: with a custom template that does not, a model reasoning without writing the tag shows that text in `content`,
-followed by a literal `</think>`.
+followed by a literal `</think>`. Since 1.3.6 a `<tool_call>` that does not parse as a call (prose inside the tag,
+broken markup), or a call that `tool_choice` filters out, reaches the client as plain text in `content`, streamed or
+not, on both APIs, instead of an empty reply.
 
 **`tool_choice`** on both APIs: `auto` (default), `none` (Anthropic `{"type": "none"}`: the tools stay in the prompt, the
 tool-call token is masked, so the model answers in text), `required` (Anthropic `any`) and a named function (OpenAI
 `{"type": "function", "function": {"name": ...}}`, Anthropic `{"type": "tool", "name": ...}`): the answer starts with
-that call after any thinking. Enforced in the engine through the same masks as structured output: a `none` reply runs
-on that slower constrained path for the whole reply, a forced call through its thinking and the call header (on
-Flash-Next such a reply also steps outside the batch, so other replies running beside it slow down). Calls to other
-tools than a named one are dropped. An unknown name, or a forcing choice without tools or together with
-`response_format`, is a 400.
+that call after any thinking. Enforced in the engine: `none` bans the tool-call token in the normal decode path, so
+such a reply keeps its batching and speculative drafts and runs as fast as `auto` (with `logprobs` it is masked on the
+constrained path instead). A forced call runs through its thinking and the call header on the same masks as structured
+output (on Flash-Next such a reply steps outside the batch until then). Calls to other tools than a named one are
+dropped. Client stop sequences do not cut a forced reply before its call is complete; they
+apply after it. Under `none` a call the model writes out as plain text is text and arrives in `content`. An
+unknown name, or a forcing choice without tools or together with `response_format`, is a 400.
 
 **Structured output**: `response_format` with `json_object` or `json_schema`, enforced in the engine (llguidance
 grammars) together with speculative decoding. Stop sequences are supported.
@@ -801,7 +884,10 @@ top_p 0.95, top_k 20, min_p 0, presence penalty 0. Non-thinking: temperature 0.7
 penalty 1.5. `--temperature`, `--top-p`, `--top-k`, `--min-p` and `--presence-penalty` set one value for both modes, and a
 value in the request wins. Greedy requests (temperature 0) get no penalty. The cards warn that a higher presence penalty may
 occasionally mix languages and slightly lower quality: `--presence-penalty 0`, or `presence_penalty: 0` in a request, turns
-it off. These defaults have not been measured here, including the speed cost of presence 1.5 and tool calls under it.
+it off. The speed cost of presence 1.5 was measured on Flash-Next (3 cards, 8 agents at once, November 15, 2026):
+with a step's verify rows sampled one after another it took 17-20 % of the throughput; since 1.3.6 they are sampled
+in parallel (`QE_SAMPLE_PAR`), which gave +16 % on that test (697 → 808 tok/s). Its effect on answer quality and
+tool calls has not been measured here.
 `presence_penalty` and `frequency_penalty` are applied on the GPU.
 
 **`logprobs` / `top_logprobs`** on `/v1/chat/completions` (`top_logprobs` 0-20, streamed too; since 1.3.5.4, experimental). The numbers
@@ -810,7 +896,9 @@ temperature, top-p, top-k, min-p and penalties, never a draft head's. Steering, 
 only the tokens of `content`, not reasoning or tool-call tokens; with `logprobs` the non-streamed `content` is not stripped,
 so the entries join to it. Such a request decodes one token per step without draft speedup, about 3x slower, and while it
 runs a normal reply beside it drops to about 0.4-0.45 of its speed alone. In `pp` the numbers carry the mode's own
-rounding, so use `tp` for KL-grade measurements. Prompt logprobs and `/v1/completions` are not available.
+rounding, so use `tp` for KL-grade measurements. On the 27B the top 64 values of each row are exact BF16 logits; the
+normaliser also sums the INT4 screen's values for the rest of the vocabulary (log-prob error about 0.01 at most).
+Prompt logprobs and `/v1/completions` are not available.
 
 **Thinking and reasoning effort**: thinking is on by default (`--think 0` turns it off by default;
 `chat_template_kwargs.enable_thinking` per request). `reasoning_effort` (`xhigh` = the template default, `high` is the
@@ -856,13 +944,19 @@ zero. A budget stops that:
   request turned the budget off) or `none`.
 
 At the budget the server writes a one-sentence wrap-up and `</think>` (27 tokens; `QE_THINK_WRAP` changes the
-sentence), and the model goes on with its answer or tool call. The reasoning holds at most the budget plus one decode
-step plus the wrap-up.
+sentence), and the model goes on with its answer or tool call. The reasoning holds exactly the budget plus the
+wrap-up: near the budget (and near the answer tail) the server caps how many drafts a step may verify, so the close
+lands at the same token whatever the drafts (before 1.3.6 it could come up to one decode step late, and the
+text then depended on the drafter).
 
 `max_tokens` counts thinking and answer together. **Answer tail**: when `max_tokens` would run out inside `<think>`,
 the same close comes early enough to leave the answer the last eighth of `max_tokens` (64 to 2048 tokens;
 `QE_THINK_TAIL`, a token count, `0` = off), with or without a budget (not with `ignore_eos`). `finish_reason` is `length` only when the answer
 itself is cut off; `usage.completion_tokens_details.reasoning_tokens` reports the thinking tokens.
+`usage.completion_tokens` (Anthropic `output_tokens`) counts the end-of-turn token the model generated, as vLLM
+does: a reply of 7 text tokens that ends on its own reports 8. A reply cut by `max_tokens` or a stop string has no
+end token, and neither has structured output that ends when its grammar is complete (the server ends that turn
+itself). Before 1.3.6 the end token was never counted.
 
 **Cost of the forced tokens.** They are verified like drafts, up to 4 per step on Flash-Next and up to 8 on the 27B,
 together with MTP and lookup drafts. On the 27B a constrained request stays in the batched step with the others. On
@@ -878,7 +972,9 @@ agent loops) end the task on a turn without text and without a tool call. Such a
 (finish `stop`) is sampled again up to 2 times (`--empty-retry N` / `QE_EMPTY_RETRY`, `0` = off). The prompt is
 cached, so a retry costs only its decode. Never retried: streams (the bytes are already sent), greedy (`temperature`
 0) and seeded requests, structured output, `ignore_eos`, requests with stop sequences. `usage.completion_tokens`
-counts every try; `finish_reason` is the last try's.
+counts every try; `finish_reason` is the last try's. A tool call that does not parse is retried the same way; when
+the last try still does not parse, its text is returned as `content` (streams: at once), so the client never gets an
+empty turn from it.
 
 ### Images
 
@@ -901,37 +997,46 @@ vectors, per-request selection and credits: [docs/advanced.md](docs/advanced.md#
 ## Serving behaviour
 
 **Scheduling.** Shortest-prefill-first queue with aging; long prompts are prefilled in chunks between decode steps
-of the running conversations; short requests can cut in between the chunks of a long prefill. A request that does not
+of the running conversations; short requests can cut in between the chunks of a long prefill (Flash-Next: requests
+up to 8K tokens, e.g. tool results, join the next prefill batch at once while the long prompt keeps half of it, on
+servers whose prefill is bound by host-backed expert copies; `--long-share`). A request that does not
 fit the KV pool lets smaller ones start first, until it has waited `--backfill-wait` seconds (30).
 
 **Agents.** Requests are grouped by the client's session id (Claude Code `metadata.user_id`) and by message history
 (a client without a session id: by system prompt);
-the **main agent thread** (the conversation that receives the others' results) goes first in the prefill queue, on a
-long subagent prefill in progress, and is evicted last while it is active. When subagents fill the pool, the main thread is admitted
-at once by pausing the lowest-priority decoding conversations; they resume where they stopped. `--main-agent-re`
-forces the main thread by a regex on the system prompt or tool names.
+the **main agent thread** (the conversation that receives the others' results) is recognised for the logs and
+`/api/stats` only: the prefill queue, the shared prefill batches and memory treat every conversation alike (least
+left to compute, aged by waiting time). When the pool is full, a request is admitted by pausing the most
+recently admitted decoding conversations (the pool's own order) once it has waited `--pause-wait` seconds (3), and not
+while another one is paused; they resume where they stopped. `--main-agent-re`
+forces the main-thread label by a regex on the system prompt or tool names.
 
 **KV pool under pressure** (both models). Idle conversations go to the host-RAM archive first. The archive frees memory
-in one order: least recently used whole conversation first, the main thread used in the last 5 minutes after all the
-others, with no guarantee: when nothing else is left it goes too, with a log line. On Flash-Next the same order frees
-VRAM, a generating conversation never leaves VRAM, and an idle main thread never makes a request wait. On Qwen3.8-27B
-VRAM slots free finished conversations first and the main thread last. When the running conversations still do not fit, the lowest-priority one
+in one order: least recently used whole conversation first, every conversation alike (the main agent thread too), each
+loss with a log line. The same order frees VRAM slots on both models; a generating conversation never leaves VRAM, and an
+idle one never makes a request wait. When the running conversations still do not fit, the most recently admitted one
 is paused: its KV goes to the archive and its stream pauses without an end token; it resumes exactly where it stopped
 once the others keep their headroom. A reply ends early only when a single conversation is larger than the pool.
+On Flash-Next every slot release, archive drop and restore from the archive prints one line (conversation id, tokens,
+seconds idle, where it went and why), and `/api/stats` (`engine.conversations`, also in `qetop`) lists the known
+conversations least recently used first, in a slot or in the archive, so the next one to leave is the first.
 
 **Speculative decoding.** MTP drafts plus lookup drafts (when recent tokens repeat an earlier part of the
-conversation, as in file edits). Greedy and sampled outputs keep the model's distribution.
+conversation, as in file edits); on the 27B the [DFlash2 block drafter](#dflash2-block-drafter-27b-on-when-it-fits)
+for a conversation that decodes alone. Greedy and sampled outputs keep the model's distribution.
 
 **Loops.** A reply whose last 600 tokens are one short fragment repeated is ended (`--loop-guard-tokens`). When an
 agent keeps repeating earlier turns, whether one call or a short cycle of a few calls (same tool, exactly the same
-arguments apart from a Bash `description`), each getting exactly the same result as before, for 3 turns
+arguments apart from the `description` of a shell call), each getting exactly the same result as before, for 3 turns
 (`--loop-guard-turns`; calls that differ only in an id, such as a batch of deletes, and polls whose output changes are
 not a loop), the next turn is generated with reasoning on even when thinking is off (at most 2048 reasoning tokens,
 `--loop-guard-think`; the cached prompt is kept), with a short note on the tool result, a presence penalty on the
 repeated reply and no lookup drafts. The reasoning comes on top of the request's `max_tokens`, and stop sequences apply
 only to the answer. A guarded turn thinks even when the client disabled thinking (`enable_thinking: false`, `thinking: {"type": "disabled"}`,
 `thinking_budget: 0`); `--loop-guard-think 0` turns this off. A long stretch of unchanged results can be legitimate waiting, so the guard backs off: it applies at 3,
-6 and 12 turns, then every 24 turns. Right after a user message it only turns reasoning on. Conversations without tool results are never flagged. `"loop_guard": false` in a request turns it off.
+6 and 12 turns, then every 24 turns (also for a client that sends only its last turns). Right after a user message it only turns reasoning on (harness text such as
+`<system-reminder>` or `<task-notification>` blocks is not a user message). The note is left out when it would push the prompt over the context.
+Conversations without tool results are never flagged. `"loop_guard": false` in a request turns it off.
 
 **Turn end.** A generated `<|im_start|>` ends the reply like the end-of-turn token, so a reply never continues into a
 turn the model made up. The log line (`stopping at a generated <|im_start|> ...`) shows the first and last 16 tokens of
@@ -1000,7 +1105,7 @@ without such strings in their content are tokenized exactly as before.
   mode and the CUDA-graph memory per card.
 
 **Monitoring.** Live dashboard and Prometheus metrics on `http://127.0.0.1:9393/` (`--metrics-port`), terminal
-monitor `server/qetop.py`. Both show the running version and build in the header (e.g. `QEngine 1.3.4.3 (build abc1234)`).
+monitor `server/qetop.py`. Both show the running version and build in the header (e.g. `QEngine 1.3.6 (build abc1234)`).
 
 ## Settings
 
@@ -1015,7 +1120,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `server/run.sh <port>` | - | starts the server on `127.0.0.1:<port>`; extra arguments go to `server/app.py` |
 | `--model <dir>` (Docker `QE_MODEL`) | `models/Qwen3.8-27B-INT4` | the model directory; the engine is picked from its `config.json` |
 | `QE_DEVICES` (Docker: `QE_DEVICES`, else `QE_GPUS`) | all visible GPUs (Docker `0,1,2`) | physical GPU ids, e.g. `0,2` |
-| `--max-ctx` | `262144` | context per conversation (`256K`, `512K`, `1M` accepted); above 262,144 turns on YaRN RoPE scaling (factor context / 262,144; Flash-Next also needs `FLASH_KV=ram`; 27B: up to what the VRAM pool holds, about 1.2M on 3 cards, 580K on 2) |
+| `--max-ctx` | `262144` | context per conversation (`256K`, `512K`, `1M` accepted); above 262,144 turns on YaRN RoPE scaling (factor context / 262,144; Flash-Next also needs `FLASH_KV=ram`; 27B: up to what the VRAM pool holds, 1,232,896 tokens on 3 cards and 623,616 on 2 with the defaults; `QE_KV_BITS=4` raises it) |
 | `--lsa` / `QE_LSA=auto` | off | 27B: sparse attention for long prompts (opt-in, lossy): 512K prompts about 2x faster, 1M about 3x, decode at 1M 2x. The released index map (Prefrontal AI, Apache-2.0) is downloaded on the first start into `~/.cache/qengine/lsa` (Docker: the `qengine-cache` volume); offline without it the server runs with full attention. `--lsa MAP` / `QE_LSA=MAP` takes a map file ([docs](docs/advanced.md#sparse-attention-for-long-prompts-opt-in)) |
 | `--think` | `1` | thinking on by default (a request's `enable_thinking` wins) |
 | `--reasoning-effort` / `QE_REASONING_EFFORT` | the template's (`xhigh`) | default effort: `xhigh`, `high` / `max` (= `xhigh`), `medium`, `low`, `minimal` (= `low`), `none` (thinking off) |
@@ -1048,6 +1153,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `FLASH_ATTN_DMIN` | `16` | decode attention of batched steps (more than one wave of blocks): a row uses one key split per N key tiles (at most 8), so short contexts do not pay for 8 splits; `0` = always 8 splits |
 | `FLASH_KV` | `vram` | `ram`: KV cache in pinned host RAM |
 | `FLASH_KV_RAM_TOKENS` | `1M` | with `FLASH_KV=ram`: KV tokens of all conversations together (`K` / `M` / `G`); the host-RAM plan lowers it when the host is short (at least one window) |
+| `FLASH_KV_BITS` | `8` | `4`: 4-bit KV cache (opt-in, not lossless against FP8): 7,488 instead of 13,520 bytes per token, about 1.8x the tokens with `FLASH_KV=ram`; see [Host memory](#host-memory-flash-next) |
 | `FLASH_KV_ARCHIVE_GB` | `48` (less on smaller machines) | host-RAM archive of conversations; `0` = off; a set value wins over the [host-RAM plan](#host-memory-flash-next) |
 | `FLASH_PREFIX_GB` | `8` (less on smaller machines) | host RAM for pinned system prompts; `0` = off |
 | `FLASH_NGRAM_PIN` | set by the host-RAM plan (`1` when it fits) | `1`: pin the n-gram table; `0`: read it through the page cache |
@@ -1059,7 +1165,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `FLASH_PRELOAD` | `1` | Flash-Next: when CUDA was started before the engine (the vision encoder) with lazy module loading, load the engine's kernels at start instead of at their first use; `0` off |
 | `QE_RAM_WAIT_S` | `20` | seconds the start waits for free host RAM (MemAvailable) when it is short of the full plan (as long as it rises, or while the previous QEngine server on these cards is still exiting with 1 GB or more on them); `0` plans at once |
 | `QE_NO_ROOM_S` | `10` | 27B: seconds a queued request that fits nowhere waits with nothing running, then it ends with an error that says why; `0` = no deadline |
-| `QE_PAUSE_TIMEOUT_S` | `900` | 27B: seconds a reply may wait for GPU memory another process holds before it ends with an error, counted from when that wait began: one that cannot continue, or a paused one that cannot resume because the KV cache gave memory back; a reply paused only for a higher-priority one has no deadline |
+| `QE_PAUSE_TIMEOUT_S` | `900` | 27B: seconds a reply may wait for GPU memory another process holds before it ends with an error, counted from when that wait began: one that cannot continue, or a paused one that cannot resume because the KV cache gave memory back; a reply paused only to make room for another start has no deadline |
 | `FLASH_NGRAM_SPIN_MS` | `50` | page-cache mode of the n-gram table: ms the row-copy thread spins after the last request, then it polls every 50 µs (1 ms after a second); `-1` = always spin |
 | `QE_HOST_RESERVE_GB` | max(8, 8 % of RAM) | at start only: RAM the plan leaves to the system and the desktop (both models). `QE_MEM_MARGIN_GB` is the one that acts while serving |
 | `FLASH_RUN_TIMEOUT_S` | `120` | engine step monitor in seconds; `0` = off |
@@ -1069,13 +1175,16 @@ Environment variables are read at start; an empty value counts as unset. A value
 | setting | default | what it does |
 |---|---|---|
 | `QE_MAX_SEQS` | `16` | conversations kept in the KV pool, up to 32; 1 to 4 on one card |
+| `QE_DF_BATCH` | `2` on one card, `0` on more | batched steps of up to this many conversations draft with [DFlash2](#dflash2-block-drafter-27b-on-when-it-fits) (one context ring each, 43 MB per card); `0`: batched steps draft with MTP |
 | `QE_DRAFTER` | `auto` | drafter of a conversation that decodes alone: `auto` loads [DFlash2](#dflash2-block-drafter-27b-on-when-it-fits) when the requested context and slots fit with it (logged, with the `--max-ctx` that would fit; one card with the default `--max-ctx` stays on MTP), `dflash2` always (context shrinks to fit), `mtp` never (no download) |
 | `QE_DFLASH` | – | path to a local DFlash2 checkpoint (directory or file) instead of the download |
+| `QE_KV_BITS` | `8` | `4`: 4-bit KV cache (opt-in, not lossless against FP8): about 1.5x the context on small cards; `--lsa` is then off (logged); see [Smaller cards](#gpus) |
+| `QE_HEAD4R` | `16` | 27B verify head: INT4 screen + exact BF16 rescore of the top N per row (pinned host RAM); `0` = INT8 head |
 | `QE_RESERVE_GB` | `1.5` | VRAM per card left outside the KV pool; e.g. `1.5,3,1.5` for a desktop on GPU1 |
 | `QE_KV_ARCHIVE_GB` | `32` (less below 64 GB of RAM) | host-RAM archive of conversations; `0` = off; a set value wins |
 | `QE_PREFIX_GB` | `8` (less below 64 GB of RAM) | host RAM for pinned system prompts |
 | `QE_COMM` | `auto` | prefill transfer path: `auto`, `p2p`, `ce`, `host` |
-| `QE_FETCH_ASSETS` | `1` | `0`: do not download the tuned MTP head and draft ranking |
+| `QE_FETCH_ASSETS` | `1` | `0`: no downloads at start: not the tuned MTP head and draft ranking, not the DFlash2 drafter (MTP drafts only), not the `--lsa` index map (full attention) |
 | `--disk-cache DIR` | off | persistent prompt cache that survives restarts (Flash-Next: experimental, since 1.3.5.3) |
 
 ## Benchmarks
@@ -1084,7 +1193,21 @@ All numbers were measured by us on one machine: 3× RTX 3090 (24 GB, PCIe 4.0 x1
 the patched driver unless noted), one NUMA node; "2 cards" are two of its cards. QEngine runs with its defaults. They
 describe that machine; your numbers depend on the cards, links, driver and host.
 
+Since 1.3.6 the server counts the end token a reply generates in `usage` (see
+[Thinking budget and the answer tail](#thinking-budget-and-the-answer-tail)), and benchmark clients take their token
+counts from it, so 1.3.6 numbers include one more token per reply that ends on its own than the older numbers below.
+
 ### Qwen3.8-Flash-Next
+
+**1.3.6** (November 15, 2026; 3 cards, P2P, the club-3090 `rebench-full.sh` setup: 8 slots, thinking on, effort low,
+vision on): single-stream decode narrative / code 305.6 / 449.3 tok/s, prefill 10K / 90K 8,207 / 8,394 tok/s, decode
+at 10K / 90K depth 315 / 296 tok/s, 1 / 2 / 4 requests at once 305 / 422 / 653 tok/s total, soak median decode 411.4
+tok/s, verify-stress 8/8, soak PASS. The club bench sends no presence penalty, so the server's non-thinking default
+1.5 applies; with `QE_PRESENCE_PENALTY=0` (the default before 1.3.5.3) the same run gives 325.0 / 444.4 tok/s
+single-stream. Plain defaults (`server/run.sh`, 16 slots): 311 / 454 tok/s single-stream, prefill 8,057 / 8,372, 8
+agents at once 760 tok/s (mean of 7 runs, 709-828; real-text prompts 976-993). 2 cards (0, 2), plain defaults: 201 /
+226 tok/s single-stream, prefill 4,265 / 7,134, 8 agents at once 198 tok/s (224-256 with presence 0); a 262K-token
+prompt with image traffic passes on both.
 
 **1.3.5** (November 6, 2026; 3 cards, P2P, the club-3090 `rebench-full.sh` setup: 8 slots, thinking on, effort low, vision on): single-stream decode narrative / code 313.6 / 404.8 tok/s, prefill 10K / 90K 6,128 / 7,515 tok/s, decode at 10K / 90K depth 350 / 290 tok/s (one reply each), 1 / 2 / 4 requests at once 293 / 430 / 651 tok/s total, soak median decode 372.4 tok/s, verify-stress 8/8, soak PASS. At the plain defaults, thinking off: 3 cards 312.9 / 410.7 tok/s, prefill 6,186 / 7,249, 8 agents at once (`vllm bench serve`, 500 tokens in, 2,000 out) 867 tok/s, a noisy point, other runs 935 and 956. 2 cards (0, 2): 208.7 / 220.7 tok/s, prefill 3,797 / 6,357, 8 agents at once 285 tok/s, a 262K-token prompt and image traffic pass.
 
@@ -1127,6 +1250,12 @@ Burst prefill, slow links and the KV-in-RAM runs: [docs/advanced.md](docs/advanc
 
 ### Qwen3.8-27B
 
+**1.3.6** (November 15, 2026; 3 cards, P2P, defaults, DFlash2 loaded): single-stream decode narrative / code 278.7 /
+515.5 tok/s, prefill 10K / 90K 6,309 / 5,113 tok/s (cool cards; right after other runs 5,769 / 4,784), 8 agents at
+once 1,129 tok/s (1,210 with `QE_PRESENCE_PENALTY=0`). With the club-3090 `bench.sh` settings: 281.2 / 507.0 tok/s,
+prefill 6,133 / 4,997. Short single replies (385 tokens, greedy: a Python function, a short story, a proof): 474 / 264
+/ 401 tok/s on 3 cards; 212 / 150 / 196 tok/s on one card (`QE_MAX_SEQS=1 --max-ctx 150K`, DFlash2).
+
 1.3.5 (November 6, 2026; 3 cards, P2P): single-stream decode narrative / code 274.1 / 422.5 tok/s, prefill 10K / 90K 6,437 / 5,159 tok/s, 8 agents at once 1,205 tok/s. With the club-3090 `bench.sh` settings: 276.1 / 418.9 tok/s. Prefill measured on its own on cooled cards.
 
 Serving benchmark (October 2026, QEngine 1.0), 3 cards, `vllm bench serve` as the client; output tokens/s:
@@ -1141,15 +1270,12 @@ Later changes (W4A8 GEMM for batched passes of 33 rows or more, less admission h
 and short at 32 to 1,039 tok/s in a same-day A/B. Prefill of one new prompt (median time to first token): 32K tokens
 5.35 s, 200K tokens 50.7 s.
 
-Fewer cards (October 2026): 2 cards ~162 tok/s single stream, a ~387K-token KV pool with 32 slots and the full 262K
-context; 1 card ~104 tok/s with one conversation (~112K tokens of context), ~96 tok/s with 4 slots (~85K tokens).
-
 ### Quality
 
 **Closeness to BF16.** Next-token KL divergence against the official BF16 model on a public reference set (21 cases,
 32,359 positions: prose, code, Japanese, Chinese, SQL, agent turns and WikiText-2), scored with the set's own
-`compare.py`; every position through QEngine's decode path (forwards of up to 16 tokens) on 3 cards (November 6,
-2026; the 1.3.4 row November 2). The last column scores the last 512 positions of the long cases after the context before them went through
+`compare.py`; every position through QEngine's decode path (forwards of up to 16 tokens) on 3 cards (1.3.6 release
+build, November 15, 2026, identical to 1.3.5 to every digit; the 1.3.4 row November 2). The last column scores the last 512 positions of the long cases after the context before them went through
 the server's batched prefill (our own harness, not part of the command below). Lower is closer to BF16:
 
 | Flash-Next weights | mean KL | top-1 agreement | WikiText-2 KL | KL, context by batched prefill (last 512 positions) |
@@ -1178,22 +1304,23 @@ docker run --rm --gpus all -e QE_GPUS=0,1,2 -e QE_MODEL=/app/models/Qwen3.8-Flas
 is printed and written to `/work/summary.json`.
 
 club-3090 8-pack (benchlocal, 150 scenarios, 4,096-token answer budget per scenario): Flash-Next on 3 cards, vision
-on, the club's launch settings; three full runs on QEngine 1.3.5 (November 6, 2026), each on a fresh server. Scenarios
+on, the club's launch settings; three full runs on QEngine 1.3.6 (November 15, 2026), each on a fresh server. Scenarios
 passed: run 1 / 2 / 3, mean pass@1, mean pass@3 (up to 3 attempts per scenario):
 
 | pack | N | thinking off: runs | mean | pass@3 | thinking on: runs | mean | pass@3 |
 |---|---:|---|---:|---:|---|---:|---:|
-| toolcall | 15 | 13 / 12 / 13 | 12.7 | 14.0 | 13 / 13 / 13 | 13.0 | 14.0 |
-| instructfollow | 15 | 14 / 12 / 14 | 13.3 | 14.0 | 14 / 15 / 15 | 14.7 | 15.0 |
-| structoutput | 15 | 13 / 12 / 12 | 12.3 | 14.0 | 13 / 13 / 14 | 13.3 | 14.0 |
-| dataextract | 15 | 12 / 12 / 10 | 11.3 | 12.7 | 13 / 13 / 13 | 13.0 | 13.7 |
-| reasonmath | 15 | 13 / 14 / 15 | 14.0 | 15.0 | 13 / 15 / 13 | 13.7 | 15.0 |
-| bugfind | 15 | 15 / 15 / 15 | 15.0 | 15.0 | 14 / 14 / 14 | 14.0 | 15.0 |
-| hermesagent | 20 | 12 / 13 / 14 | 13.0 | 15.7 | 15 / 13 / 15 | 14.3 | 17.0 |
-| cli | 40 | 28 / 31 / 28 | 29.0 | 32.3 | 32 / 29 / 31 | 30.7 | 33.7 |
-| **total** | 150 | 120 / 121 / 121 | **120.7** | 132.7 | 127 / 125 / 128 | **126.7** | 137.3 |
+| toolcall | 15 | 13 / 13 / 13 | 13.0 | 13.0 | 14 / 14 / 13 | 13.7 | 14.0 |
+| instructfollow | 15 | 15 / 13 / 13 | 13.7 | 13.7 | 14 / 15 / 15 | 14.7 | 15.0 |
+| structoutput | 15 | 13 / 14 / 14 | 13.7 | 14.0 | 13 / 13 / 13 | 13.0 | 13.7 |
+| dataextract | 15 | 11 / 9 / 11 | 10.3 | 11.0 | 11 / 13 / 12 | 12.0 | 13.3 |
+| reasonmath | 15 | 13 / 15 / 15 | 14.3 | 14.3 | 15 / 15 / 14 | 14.7 | 14.7 |
+| bugfind | 15 | 15 / 14 / 15 | 14.7 | 15.0 | 15 / 15 / 14 | 14.7 | 15.0 |
+| hermesagent | 20 | 14 / 14 / 14 | 14.0 | 16.7 | 14 / 15 / 14 | 14.3 | 17.0 |
+| cli | 40 | 31 / 29 / 30 | 30.0 | 35.0 | 29 / 30 / 29 | 29.3 | 32.3 |
+| **total** | 150 | 125 / 121 / 125 | **123.7** | 132.7 | 125 / 130 / 124 | **126.3** | 135.0 |
 
-No engine errors in the three runs; one tool call that didn't parse recovered on its retry, and the loop guard fired once.
+No engine errors, no empty replies and no graph fallbacks in the three runs. On 1.3.5 (November 6) the same suite gave
+120.7 / 126.7 (thinking off / on).
 
 AutomationBench sales (Zapier, 100 tasks, a 1.3.4 pre-release build with default settings, Flash-Next on 3 cards,
 16 at once, November 1, 2026): 47 % of tasks passed, mean partial credit 0.78; the 5 zero-score tasks were wrong
