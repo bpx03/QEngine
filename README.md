@@ -29,11 +29,13 @@ the default settings:
 |---|---:|---:|---:|
 | single-stream decode, narrative / code | 311 / 454 | 201 / 226 | 279 / 516 |
 | prefill, 10K / 90K-token prompt (tok/s) | 8,057 / 8,372 | 4,265 / 7,134 | 6,309 / 5,113 |
-| 8 agents at once (total output) | 760 | 198 | 1,129 |
+| 8 agents at once, server, random 500-token prompts (total output) | 760 | 198 | 1,129 |
+| 8 agents at once, server, agent-session prompts (total output) | 983 | — | — |
+| 8 sequences, engine only (C API, no HTTP server), agent-session prompts | 1,091 | — | — |
 
 (1.3.6, November 15, 2026; method under [Benchmarks](#benchmarks). Replies with thinking off sample with the model
 card's presence penalty 1.5 when the client sends none, and these runs send none; without it the 8-agent points are
-852 / 224-256 / 1,210 tok/s. The Flash-Next 3-card 8-agent value is the mean of 7 runs, 709-828; 27B prefill on cool cards, as in earlier releases.)
+852 / 224-256 / 1,210 tok/s. The Flash-Next 3-card random-prompt 8-agent value is the mean of 7 runs, 709-828; agent-session prompts: mean of 3 server runs, 976-993; engine only: 1,058 greedy on the engine's own test prompts; 27B prefill on cool cards, as in earlier releases.)
 
 **Flash-Next quality**, measured together with the speed: next-token KL divergence against the official BF16 model on
 the public set [jyohukuchan/qwen38-flash-next-bf16-logits](https://huggingface.co/datasets/jyohukuchan/qwen38-flash-next-bf16-logits),
