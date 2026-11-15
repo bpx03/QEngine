@@ -1359,7 +1359,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         has_mtp_ = true;
     }
     if (p_.last()) {  // (pipeline: the head lives on the last stage only)
-        const bf16* lm = format_ == WeightFormat::Int8 ? nullptr : B(st, "lm_head.weight");
+        const bf16* lm = B(st, "lm_head.weight");  // QFN conversion preserves the shared head in BF16.
         const int nv = p_.voc1 - p_.voc0;
         // rows permuted: the draft vocabulary of this slice first (its first ndraft_ rows are the draft head), map_ =
         // local row -> token id
@@ -1369,15 +1369,9 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             if (t >= p_.voc0 && t < p_.voc1 && !in[t - p_.voc0]) { in[t - p_.voc0] = 1; rows.push_back(t); }
         ndraft_ = ((int)rows.size() + 15) / 16 * 16;
         for (int t = p_.voc0; t < p_.voc1; t++) if (!in[t - p_.voc0]) rows.push_back(t);
-        if (format_ == WeightFormat::Int8) {
-            std::vector<Int8Block> bl;
-            for (int i = 0; i < nv; i++) bl.push_back({"lm_head", rows[i], 1, 0, H, i, 0});
-            lm_ = load_w8_packed(st, nv, H, bl, this, A, st_);
-        } else {
-            std::vector<Bf16Block> bl;
-            for (int i = 0; i < nv; i++) bl.push_back({lm + (size_t)rows[i] * H, H, 1, H, i, 0});
-            lm_ = load_w8(nv, H, bl, this, A, st_);
-        }
+        std::vector<Bf16Block> bl;
+        for (int i = 0; i < nv; i++) bl.push_back({lm + (size_t)rows[i] * H, H, 1, H, i, 0});
+        lm_ = load_w8(nv, H, bl, this, A, st_);
         lmap_ = (int*)dalloc((size_t)nv * 4);
         CUDA_CHECK(cudaMemcpy(lmap_, rows.data(), (size_t)nv * 4, cudaMemcpyHostToDevice));
         if (ndraft_ == 0) ndraft_ = nv;
@@ -1390,15 +1384,9 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
             for (size_t i = p_.rank; i < draft_ids_.size(); i += p_.ngpu) mine.push_back(draft_ids_[i]);
             const int nd = ((int)mine.size() + 15) / 16 * 16;
             while ((int)mine.size() < nd) mine.push_back(mine.back());  // padding rows repeat a token (ties: same id)
-            if (format_ == WeightFormat::Int8) {
-                std::vector<Int8Block> db;
-                for (int i = 0; i < nd; i++) db.push_back({"lm_head", mine[i], 1, 0, H, i, 0});
-                dlm_ = load_w8_packed(st, nd, H, db, this, A, st_);
-            } else {
-                std::vector<Bf16Block> db;
-                for (int i = 0; i < nd; i++) db.push_back({lm + (size_t)mine[i] * H, H, 1, H, i, 0});
-                dlm_ = load_w8(nd, H, db, this, A, st_);
-            }
+            std::vector<Bf16Block> db;
+            for (int i = 0; i < nd; i++) db.push_back({lm + (size_t)mine[i] * H, H, 1, H, i, 0});
+            dlm_ = load_w8(nd, H, db, this, A, st_);
             dmap_ = (int*)dalloc((size_t)nd * 4);
             CUDA_CHECK(cudaMemcpy(dmap_, mine.data(), (size_t)nd * 4, cudaMemcpyHostToDevice));
         }

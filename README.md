@@ -610,6 +610,7 @@ path. Format selection never depends on `config.json`. Existing upstream mixed I
 Selected matrices: routed and shared experts, DeltaNet projections, QSA q/k/v/o, PLE key/value and MTP attention,
 experts and fc_embedding/fc_hidden. Other tensors remain byte-identical. `--check <dir> --src <bf16 dir>`
 re-quantizes and compares codes, scales and headers.
+The shared `lm_head.weight` stays BF16 on disk; full and balanced-draft heads use the existing runtime W8 loader.
 
 Native W8 uses lossless repacking into the existing W8 layout. INT8 expert groups use BF16 scales and FP32
 tensor-core accumulation per 128-k group; INT4 keeps its existing arithmetic. Residency, cold staging and borrowed
