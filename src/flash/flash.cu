@@ -4684,7 +4684,10 @@ void Worker::ple(Layer& L, int pos, int m, const bf16* rows) {
     flush_y(m);
     float* key = gates_;
     float* val = proj_;
-    if (pf_) {
+    if (L.ple_key8.q) {
+        rows8(L.ple_key8, pler_, H, key, RW, m, st_);
+        rows8(L.ple_val8, pler_, H, val, H, m, st_);
+    } else if (pf_) {
         gemm_w4(L.ple_key, pler_, H, key, RW, m, st_);
         gemm_w4(L.ple_val, pler_, H, val, H, m, st_);
     } else {
