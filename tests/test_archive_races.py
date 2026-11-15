@@ -6,7 +6,8 @@
   pinned:    the state at the system-prompt end has aged out of the snapshots: the file takes it from the pinned prefix.
 
 usage: flock .gpu.lock python3 tests/test_archive_races.py <libqengine.so> [devices=0,1,2]
-A part runs in its own process with freed memory overwritten (glibc perturb), so a use after free shows as a crash.
+A part runs in its own process with freed memory overwritten (glibc perturb) and archive buffers from the heap
+(QE_ARCHIVE_PINNED=0), so a use after free shows as a crash.
 A part whose path was not reached fails too."""
 import os, shutil, struct, subprocess, sys, tempfile
 
@@ -84,7 +85,9 @@ def main():
     rc = 0
     tmp = tempfile.mkdtemp(prefix="qe_races_")
     for name, gb, extra in (("supersede", "1.2", {}), ("window", "32", {}), ("pinned", "32", {"QE_SNAPSHOTS": "4", "QE_DISK_CACHE": tmp})):
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=devs, QE_POOL_LOG="1", QE_KV_ARCHIVE_GB=gb,
+        # QE_ARCHIVE_PINNED=0: archive buffers from the C++ heap (large: mmap, unmapped on free), so a use after free of a
+        # dropped archive faults; pinned slabs keep freed bytes intact (fix_14_15_disk_rereview L5)
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=devs, QE_POOL_LOG="1", QE_KV_ARCHIVE_GB=gb, QE_ARCHIVE_PINNED="0",
                    GLIBC_TUNABLES="glibc.malloc.perturb=165")
         env.pop("QE_DISK_CACHE", None)
         env.update(extra)

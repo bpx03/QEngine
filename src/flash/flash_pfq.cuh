@@ -351,7 +351,7 @@ __global__ void __launch_bounds__(256) k_act_to_q(__half* __restrict__ act, int 
     *reinterpret_cast<uint4*>(row + 16 * i) = make_uint4(o4[0], o4[1], o4[2], o4[3]);
     if (i == 0) { const float sxv = sc * kXhScale; *reinterpret_cast<float2*>(row + GRP) = make_float2(sxv, -kQMagic * sxv); }
 }
-template <int Bits, int NTT, int TT>  // TT: 16-row output tiles per warp
+template <int Bits, int NTT, int TT, bool PK = true>  // TT: 16-row output tiles per warp (block: 4 x TT tiles); PK: half2 slot stores
 __device__ __forceinline__ void dn_q_job(const PfJob* __restrict__ jobs, int job, int ngj, const __half* __restrict__ act,
                                          SlotBuf slots) {
     static_assert(Bits == 4 || Bits == 8, "Bits");
@@ -419,6 +419,34 @@ __device__ __forceinline__ void dn_q_job(const PfJob* __restrict__ jobs, int job
                 acc[a][j][3] = __fmaf_rn(__fmaf_rn(__uint_as_float(ci[a][j][3]), x1[j].x, x1[j].y), s8[a], acc[a][j][3]);
             }
     }
+    if constexpr (PK) {
+        // [qfn-moe-ncu] lane pairs g, g ^ 1 swap one rounded half each (shuffle of the fp16 bits): the even lane writes
+        // token n0's columns g, g + 1 (and g + 8, g + 9), the odd lane token n0 + 1's g - 1, g (and g + 7, g + 8): one
+        // 4-byte store per lane instead of two 2-byte ones (ncu: lg-throttle stalls); the stored halves are the same
+        const bool ev = (g & 1) == 0;
+#pragma unroll
+        for (int j = 0; j < NTT; j++) {
+            const int n0 = 8 * j + 2 * t4;
+#pragma unroll
+            for (int a = 0; a < TT; a++) {
+                const int row0 = (rb + a) * 16;
+                const __half h0 = __float2half_rn(acc[a][j][0] * (1.f / kSlotScale));
+                const __half h1 = __float2half_rn(acc[a][j][1] * (1.f / kSlotScale));
+                const __half h2 = __float2half_rn(acc[a][j][2] * (1.f / kSlotScale));
+                const __half h3 = __float2half_rn(acc[a][j][3] * (1.f / kSlotScale));
+                const unsigned s0 = __half_as_ushort(ev ? h1 : h0), s1 = __half_as_ushort(ev ? h3 : h2);
+                const unsigned r = __shfl_xor_sync(0xffffffffu, s0 | (s1 << 16), 4);
+                const __half q0 = __ushort_as_half((unsigned short)(r & 0xffffu)), q1 = __ushort_as_half((unsigned short)(r >> 16));
+                const int n = ev ? n0 : n0 + 1, c0 = row0 + (g & ~1);
+                if (n < pn) {
+                    __half* o = slots.row(poff + n) + c0;
+                    *reinterpret_cast<__half2*>(o) = ev ? __halves2half2(h0, q0) : __halves2half2(q0, h1);
+                    *reinterpret_cast<__half2*>(o + 8) = ev ? __halves2half2(h2, q1) : __halves2half2(q1, h3);
+                }
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int j = 0; j < NTT; j++) {
         const int n0 = 8 * j + 2 * t4;
@@ -438,8 +466,8 @@ __device__ __forceinline__ void dn_q_job(const PfJob* __restrict__ jobs, int job
         }
     }
 }
-template <int Bits, int TT = 2>  // grid (H / 16 / 4 / TT, jobs)
-__global__ void __launch_bounds__(128) k_moe_dn_q(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
+template <int Bits, int TT = 2, bool PK = true, int MINB = 1>  // grid (H / 16 / 4 / TT, jobs)
+__global__ void __launch_bounds__(128, MINB) k_moe_dn_q(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                   const __half* __restrict__ act, SlotBuf slots) {
     const int job = blockIdx.y;
     if (job >= *njobs) return;
@@ -452,14 +480,14 @@ __global__ void __launch_bounds__(128) k_moe_dn_q(const PfJob* __restrict__ jobs
         sb.lo = lo;
     }
     switch ((jobs[job].n + 7) >> 3) {
-        case 1: dn_q_job<Bits, 1, TT>(jobs, job, ngj, act, sb); break;
-        case 2: dn_q_job<Bits, 2, TT>(jobs, job, ngj, act, sb); break;
-        case 3: dn_q_job<Bits, 3, TT>(jobs, job, ngj, act, sb); break;
-        case 4: dn_q_job<Bits, 4, TT>(jobs, job, ngj, act, sb); break;
-        case 5: dn_q_job<Bits, 5, TT>(jobs, job, ngj, act, sb); break;
-        case 6: dn_q_job<Bits, 6, TT>(jobs, job, ngj, act, sb); break;
-        case 7: dn_q_job<Bits, 7, TT>(jobs, job, ngj, act, sb); break;
-        default: dn_q_job<Bits, 8, TT>(jobs, job, ngj, act, sb); break;
+        case 1: dn_q_job<Bits, 1, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 2: dn_q_job<Bits, 2, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 3: dn_q_job<Bits, 3, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 4: dn_q_job<Bits, 4, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 5: dn_q_job<Bits, 5, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 6: dn_q_job<Bits, 6, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 7: dn_q_job<Bits, 7, TT, PK>(jobs, job, ngj, act, sb); break;
+        default: dn_q_job<Bits, 8, TT, PK>(jobs, job, ngj, act, sb); break;
     }
 }
 
@@ -739,7 +767,10 @@ __global__ void __launch_bounds__(256) k_qpf_union(const int* __restrict__ sel, 
     }
     if (threadIdx.x == 0) qu.U[blockIdx.x] = U;
 }
-template <bool PVH, bool QKH>  // fp16-accumulate P.V (per 16-key tile, flushed into fp32) / Q.K^T
+// K4 (4-bit rows, kv4_mode): a ring slot holds K / V nibble rows [2][QP_KT][128] and their fp16 group scales
+// [2][QP_KT][8] (inside the fp8 slot), widened to fp16 (code - 7.5) s, one rounding (key / value scales 1). PVH: a 16-key tile's fp16 sum
+// of P x V is at most 16 max|V| (P <= 1, no factor folded in): finite while |V| < 4094
+template <bool PVH, bool QKH, bool K4 = false>  // fp16-accumulate P.V (per 16-key tile, flushed into fp32) / Q.K^T
 __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restrict__ qb, const uint8_t* __restrict__ kc,
                                                             const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                             const float* __restrict__ vs, const int* __restrict__ pos0,
@@ -759,7 +790,7 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     __shared__ int s_rc[QP_R], s_nr[QP_R], s_U;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     const size_t rb0 = rbase ? (size_t)rbase[0] : 0;
-    if (rbase && !km.pt) { const size_t rb = rb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }
+    if (rbase && !km.pt) kv_region<K4>(rb0, kc, vc, ks, vs);
     // persistent (prefill-r4, qu.ctr set): a grid of one block per SM takes the (kv head, key split, row group) items
     // from a counter (wave quantization: 256 items on 82 SMs were 4 waves, the last one 10 % full); else one item per
     // block (grid NKV x groups x S)
@@ -881,8 +912,37 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
         for (int r = 0; r < QP_R; r++) msk |= (kr >= s_rc[r] && kr < s_nr[r]) ? (1u << r) : 0u;
     };
     // cp.async of tile `tile` (fp8 K / V rows, their scales; keys no row uses: zero-filled) into ring slot tile % QP_NST
+    constexpr int NPC4 = (2 * QP_KT * 9 + NTH - 1) / NTH;  // (K4: 2 x 16 keys x (8 nibble pieces + 1 scale piece))
     auto issue = [&](int tile) {
-        if (tile < tile1) {
+        if (K4 && tile < tile1) {
+            const int sl = tile % QP_NST;
+            unsigned char* rb = raw + (size_t)sl * 2 * QP_KT * HD;
+#pragma unroll
+            for (int i = 0; i < NPC4; i++) {
+                const int q = threadIdx.x + i * NTH;
+                if (q < 2 * QP_KT * 9) {
+                    const bool scl = q >= 2 * QP_KT * 8;
+                    const int qq = scl ? q - 2 * QP_KT * 8 : q;
+                    const int key = scl ? qq & (QP_KT - 1) : qq >> 4, kv = scl ? qq / QP_KT : (qq >> 3) & 1, c = qq & 7;
+                    int kr; unsigned msk;
+                    key_of(tile * QP_KT + key, kr, msk);
+                    const uint8_t *k8, *v8;
+                    const float *s0, *s1;
+                    kv_rowp<true>(km, kc, vc, ks, vs, rb0, msk ? kr : 0, kvh, k8, v8, s0, s1);
+                    const void* src = scl ? (const void*)(kv ? s1 : s0) : (const void*)((kv ? v8 : k8) + c * 16);
+                    unsigned char* dp = scl ? rb + 2 * QP_KT * (HD / 2) + ((size_t)kv * QP_KT + key) * 16
+                                            : rb + ((size_t)kv * QP_KT + key) * (HD / 2) + c * 16;
+                    const unsigned dst = (unsigned)__cvta_generic_to_shared(dp);
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(msk ? 16 : 0));
+                }
+            }
+            if (threadIdx.x < QP_KT) {
+                const int key = threadIdx.x;
+                int kr; unsigned msk;
+                key_of(tile * QP_KT + key, kr, msk);
+                rmeta[(size_t)sl * 3 * QP_KT + 2 * QP_KT + key] = __uint_as_float(msk);
+            }
+        } else if (tile < tile1) {
             const int sl = tile % QP_NST;
             unsigned char* rb = raw + (size_t)sl * 2 * QP_KT * HD;
 #pragma unroll
@@ -894,7 +954,7 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
                     key_of(tile * QP_KT + key, kr, msk);
                     const uint8_t *k8, *v8;
                     const float *s0, *s1;
-                    kv_rowp(km, kc, vc, ks, vs, rb0, msk ? kr : 0, kvh, k8, v8, s0, s1);
+                    kv_rowp<false>(km, kc, vc, ks, vs, rb0, msk ? kr : 0, kvh, k8, v8, s0, s1);
                     const uint8_t* src = (kv ? v8 : k8) + c * 16;
                     const unsigned dst = (unsigned)__cvta_generic_to_shared(rb + ((size_t)kv * QP_KT + key) * HD + c * 16);
                     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(msk ? 16 : 0));
@@ -921,6 +981,27 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
         const int sl = tile % QP_NST;
         const unsigned char* rb = raw + (size_t)sl * 2 * QP_KT * HD;
         __half* Kb = KV + (size_t)buf * 2 * QP_KT * QD_SROW;
+        if constexpr (K4) {
+#pragma unroll
+            for (int i = 0; i < (2 * QP_KT * 8 + NTH - 1) / NTH; i++) {
+                const int q = threadIdx.x + i * NTH;
+                if (q < 2 * QP_KT * 8) {
+                    const int key = q >> 4, kv = (q >> 3) & 1, c = q & 7;
+                    const unsigned short sb = reinterpret_cast<const unsigned short*>(rb + 2 * QP_KT * (HD / 2) + ((size_t)kv * QP_KT + key) * 16)[c];
+                    n4x32_st(*reinterpret_cast<const uint4*>(rb + ((size_t)kv * QP_KT + key) * (HD / 2) + c * 16), sb,
+                             Kb + ((size_t)kv * QP_KT + key) * QD_SROW + c * 32);
+                }
+            }
+            if (threadIdx.x < QP_KT) {
+                const int key = threadIdx.x;
+                const float* rm = rmeta + (size_t)sl * 3 * QP_KT;
+                float* km = kmeta + buf * 3 * QP_KT;
+                km[key] = 1.f;
+                km[QP_KT + key] = 1.f;
+                km[2 * QP_KT + key] = rm[2 * QP_KT + key];
+            }
+            return;
+        }
 #pragma unroll
         for (int i = 0; i < NPC; i++) {
             const int q = threadIdx.x + i * NTH;

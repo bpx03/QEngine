@@ -25,7 +25,7 @@ text = open(os.path.join(ROOT, "tests", "data", "cache_text.txt")).read()
 N = int(os.environ.get("POOL_GEN", "1200"))
 prompts = [tok.encode(f"Conversation {i}. Explain this code in detail, function by function:\n"
                       + text[i * 15000:(i + 1) * 15000]).ids for i in range(4)]
-e = Engine(MODEL, max_t=262144)
+e = Engine(MODEL, max_t=262144, devices=os.environ.get("QE_DEVS", "0,1,2"))  # QE_DEVS: other cards
 e.set_sampling(0)
 print("pool", e.pool_tokens, "tokens; prompts", [len(p) for p in prompts], flush=True)
 

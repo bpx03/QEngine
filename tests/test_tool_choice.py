@@ -1,7 +1,8 @@
 """CPU test of tool_choice (server/tool_choice.py) on both APIs, streamed and not, on the mock engine: with the grammar
 tier (tests/mock_engine.c -DMOCK_GRAMMAR, mask-aware with QE_MOCK_MASK) `none` blocks a scripted call, `required` /
 Anthropic `any` force one where the script answers in text, a named tool is forced, also after a forced close of
-<think>; without the grammar tier (tier 0+1 mock) `none` ends the reply at the call and `required` decodes as auto.
+<think>; without the grammar tier (tier 0+1 mock) `none` ends the reply at the call and `required` decodes as auto; with the
+engine ban (-DMOCK_BAN, qe_ban_tokens) `none` is never constrained and gives the masked path's text.
 Bad values are 400s; auto / absent are unchanged. No GPU.
 
   python tests/test_tool_choice.py            # Flash-Next model directory (tokenizer / template)
@@ -57,6 +58,9 @@ READ_CALL = "<tool_call>\n<function=Read>\n<parameter=path>\na.txt\n</parameter>
 R_TWO = "Both.\n</think>\n\n" + CALL + "\n" + READ_CALL + "<|im_end|>"  # two calls: Bash, then Read
 READFILE = {"type": "function", "function": {"name": "ReadFile", "description": "Read a whole file",
                                              "parameters": READ["function"]["parameters"]}}  # a call inside the open <think>, then the end of turn
+# a <think> the model re-opens with a call in it, both in one step of the mock (3 tokens: <think>, " ", <tool_call>)
+R_REOPEN = "plan\n</think>\n\n<think> " + CALL + "<|im_end|>"
+R_REOPEN_OFF = "<think> " + CALL + "<|im_end|>"  # the same with thinking off (no ThinkControl), one step
 MSGS = [{"role": "user", "content": "list the files"}]
 
 
@@ -164,7 +168,8 @@ def masked(so):
              R_TEXT, R_TOOL, R_TEXT, R_TOOL,                      # 5-8 required / any / named
              R_TOOL_OFF, R_TEXT_OFF,                              # 9-10 thinking off: named, any of two
              R_TOOL, R_LONG, R_TEXT_CALL, R_TOOL,                 # 11 auto, 12 budget + required, 13 logprobs, 14 none
-             R_TOOL, R_TEXT_OFF, R_TWO]                           # 15 absent, 16 shared name prefix, 17 extra call
+             R_TOOL, R_TEXT_OFF, R_TWO,                           # 15 absent, 16 shared name prefix, 17 extra call
+             R_TOOL, R_TOOL, R_TOOL]                              # 18-19 required + stop "\n\n", 20 required + stop "\n"
     gen, c, name, log, boot, tok = server(so, order, "mask")
     assert gen.tool_tier is not None and "tool_choice: not enforced" not in boot, boot
     check_header(gen)
@@ -287,10 +292,87 @@ def masked(so):
     assert [t["function"]["name"] for t in r["choices"][0]["message"]["tool_calls"]] == ["Bash"], r
     print("  400 for a bad name, a forced call without tools or with response_format, an unknown value; none "
           "without tools ok")
+    # 18-20. review L2: a client stop that the forced part contains ("\n\n" after </think>, "\n" in the header) does not
+    # cut the reply before its call; stops match from the end of the header on
+    r = oai("required", stop=["\n\n"]).json()
+    ch = r["choices"][0]
+    assert ch["finish_reason"] == "tool_calls" and json.loads(ch["message"]["tool_calls"][0]["function"]["arguments"]) \
+        == {"command": "ls"}, r
+    text, uses, stop = ant_stream(sse(ant({"type": "any"}, stream=True, stop_sequences=["\n\n"]).text))
+    assert [u["name"] for u in uses] == ["Bash"] and stop == ["tool_use"], (text, uses, stop)
+    r = oai("required", stop=["\n"]).json()  # ("\n" is in the header and in the arguments: neither is cut)
+    ch = r["choices"][0]
+    assert ch["finish_reason"] == "tool_calls" and json.loads(ch["message"]["tool_calls"][0]["function"]["arguments"]) \
+        == {"command": "ls"}, r
+    print("  required / any / named with a client stop: the forced header is never cut")
+
+
+def banned(so):
+    """[tool-choice-ban] an engine with qe_ban_tokens (mock -DMOCK_BAN): `none` bans <tool_call> in the engine, the slot
+    is never constrained (no K lines), the text is the masked path's; logprobs, required and auto keep their paths."""
+    order = [R_TEXT_CALL, R_TEXT_CALL, R_TEXT_CALL, R_TEXT_CALL, R_BLOCK_CALL, R_TEXT_CALL, R_TEXT, R_TOOL, R_TEXT_CALL]
+    gen, c, name, log, boot, tok = server(so, order, "ban")
+    assert gen.tool_ban and gen.tool_tier is not None, boot
+
+    def lines():
+        return [l.split() for l in open(log) if l[0] in "KCB"]
+
+    def oai(tc, stream=False, **kw):
+        body = {"model": name, "messages": MSGS, "tools": [BASH], "temperature": 0, **kw}
+        if tc is not None:
+            body["tool_choice"] = tc
+        return c.post("/v1/chat/completions", json=dict(body, stream=stream))
+
+    def ant(tc, stream=False):
+        body = {"model": name, "messages": MSGS, "tools": [ANT_BASH], "max_tokens": 400, "temperature": 0,
+                "tool_choice": tc}
+        return c.post("/v1/messages", json=dict(body, stream=stream))
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        # 1-4. none on both APIs, streamed and not: the same text as through the mask (masked() 1-4), no constraint
+        k0 = len(lines())
+        r = oai("none").json()
+        ch = r["choices"][0]
+        assert ch["message"]["content"] == "I will list the files." and "tool_calls" not in ch["message"], r
+        assert ch["finish_reason"] == "stop", r
+        assert lines()[k0:] == [["B", "1"]], lines()[k0:]  # banned once per start, never constrained
+        content, _, calls, fins = oai_stream(sse(oai("none", stream=True).text))
+        assert content.strip() == "I will list the files." and not calls and fins == ["stop"], (content, calls, fins)
+        r = ant({"type": "none"}).json()
+        assert [b["type"] for b in r["content"]] == ["thinking", "text"] and r["stop_reason"] == "end_turn", r
+        assert r["content"][1]["text"] == "I will list the files.", r
+        text, uses, stop = ant_stream(sse(ant({"type": "none"}, stream=True).text))
+        assert text.strip() == "I will list the files." and not uses and stop == ["end_turn"], (text, uses, stop)
+        # 5. none, a call inside the open <think>: banned there too (the reply ends, nothing is called)
+        r = oai("none").json()
+        ch = r["choices"][0]
+        assert "tool_calls" not in ch["message"] and "<tool_call>" not in json.dumps(r), r
+        assert all(l[0] == "B" for l in lines()[k0:]) and len(lines()[k0:]) == 5, lines()[k0:]
+        # 6. none with logprobs: the mask path (constrained with its logits), the same text
+        k0 = len(lines())
+        r = oai("none", logprobs=True).json()
+        assert r["choices"][0]["message"]["content"].strip() == "I will list the files.", r
+        assert lines()[k0][:2] == ["K", "1"] and not any(l[0] == "B" for l in lines()[k0:]), lines()[k0:]
+        # 7. required: the mask path as before (forced header); 8. auto: nothing
+        k0 = len(lines())
+        r = oai("required").json()
+        assert r["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "Bash", r
+        assert lines()[k0] == ["K", "1"] and not any(l[0] == "B" for l in lines()[k0:]), lines()[k0:]
+        k0 = len(lines())
+        r = oai(None).json()
+        assert r["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "Bash" and lines()[k0:] == [], r
+        # 9. the next none after them bans again (each start sets it; release clears it)
+        k0 = len(lines())
+        assert oai("none").json()["choices"][0]["message"]["content"] == "I will list the files."
+        assert lines()[k0:] == [["B", "1"]], lines()[k0:]
+    assert "| tool_choice none (ban)" in out.getvalue(), out.getvalue()
+    print("  engine ban: none never constrained, the same text on both APIs (also a call in <think>); logprobs, "
+          "required, auto unchanged")
 
 
 def fallback(so):
-    order = [R_TEXT_CALL, R_TEXT_CALL, R_BLOCK_CALL, R_TOOL, R_TEXT_CALL]
+    order = [R_TEXT_CALL, R_TEXT_CALL, R_BLOCK_CALL, R_TOOL, R_TEXT_CALL, R_REOPEN, R_REOPEN_OFF]
     gen, c, name, log, boot, tok = server(so, order, "plain")
     assert gen.tool_tier is None and "tool_choice: not enforced through masks" in boot, boot
     out = io.StringIO()
@@ -314,6 +396,17 @@ def fallback(so):
             r = c.post("/v1/chat/completions", json={"model": name, "messages": MSGS, "tools": [BASH],
                                                      "temperature": 0, "tool_choice": "required"}).json()
             assert r["choices"][0]["message"]["content"] is not None or r["choices"][0]["message"].get("tool_calls")
+        # none: a call inside a <think> the model re-opened stays reasoning too (review L8), the reply runs to its end
+        r = c.post("/v1/chat/completions", json={"model": name, "messages": MSGS, "tools": [BASH], "temperature": 0,
+                                                 "tool_choice": "none"}).json()
+        ch = r["choices"][0]
+        assert "tool_calls" not in ch["message"] and ch["finish_reason"] == "stop", r
+        assert "<function=Bash>" in ch["message"]["reasoning_content"], r
+        r = c.post("/v1/chat/completions", json={"model": name, "messages": MSGS, "tools": [BASH], "temperature": 0,
+                                                 "tool_choice": "none",
+                                                 "chat_template_kwargs": {"enable_thinking": False}}).json()
+        ch = r["choices"][0]
+        assert "tool_calls" not in ch["message"] and "<function=Bash>" in (ch["message"].get("reasoning_content") or ""), r
     log_out = out.getvalue()
     assert log_out.count("tool_choice none: the reply ends at the tool call") == 2, log_out
     assert log_out.count("tool_choice required: not enforced") == 1, log_out
@@ -328,10 +421,12 @@ def main():
     units()
     os.environ["QE_MOCK_MASK"] = "0"  # (replaced by the end token id below, once the tokenizer is known)
     so_g = build(["-DMOCK_GRAMMAR"], "mock_grammar.so")
+    so_b = build(["-DMOCK_GRAMMAR", "-DMOCK_BAN"], "mock_ban.so")
     so_p = build([], "mock_plain.so")
     tok = app.parse_args(["--model", MODEL, "--metrics-port", "0"]).profile.tokenizer()[0]
     os.environ["QE_MOCK_MASK"] = str(tok.token_to_id("<|im_end|>"))
     masked(so_g)
+    banned(so_b)
     fallback(so_p)
     print("ok")
 

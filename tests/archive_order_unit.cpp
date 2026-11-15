@@ -8,20 +8,18 @@
 
 #define EXPECT(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
 static int fails = 0;
-static const double kStale = 1800, kNow = 100000;
+static const double kNow = 100000;
 
 struct A {
     std::string name;
-    int prio = 1;
+    int prio = 1;  // the scheduling value: no order reads it (user decision 2026-11-12)
     double last_s = 0;
     unsigned long long used = 0;
     size_t total = 1;
     bool ram = true, pinned = false;
     int hold = 0;
 };
-static qe_arch::Rank rank_of(const A& a) {
-    return {qe_arch::active_main(a.prio, a.last_s, kNow, kStale), a.last_s, a.used};
-}
+static qe_arch::Rank rank_of(const A& a) { return {a.last_s, a.used}; }
 
 struct Model {  // Engine's loop: fits first, then one victim at a time
     std::list<A> l;
@@ -53,36 +51,25 @@ static A conv(const char* n, double age_s, int prio = 1, size_t total = 1) {
 }
 
 int main() {
-    using qe_arch::active_main;
-    // kStale: a test value of FLASH_MAIN_STALE_S, not its default; only the tracker's main
-    EXPECT(active_main(2, kNow - 1799, kNow, kStale));
-    EXPECT(!active_main(2, kNow - 1800, kNow, kStale));
-    EXPECT(!active_main(1, kNow - 1, kNow, kStale));
-    EXPECT(!active_main(0, kNow - 1, kNow, kStale));
-    {   // LRU over conversations; a finished one (prio 0) has no class of its own; the active main last
+    {   // plain LRU over conversations, every one alike: a main (prio 2) and a finished one (prio 0) have no class of their own
         Model m;
         m.l = {conv("main", 1000, 2), conv("new", 5), conv("old", 900), conv("finished", 100, 0)};
         EXPECT(m.write(conv("w", 0), 3));
-        EXPECT(m.gone.size() == 2 && m.gone[0] == "old" && m.gone[1] == "finished");
+        EXPECT(m.gone.size() == 2 && m.gone[0] == "main" && m.gone[1] == "old");
         EXPECT(m.write(conv("w2", 0), 3));
-        EXPECT(m.gone.back() == "new");
-        // the active main stays although it is the oldest
+        EXPECT(m.gone.back() == "finished");
         EXPECT(m.write(conv("w3", 0), 3));
-        EXPECT(m.gone.back() == "w");
+        EXPECT(m.gone.back() == "new");
     }
-    {   // the old main holds nothing back: plain LRU past the staleness limit, and it does not refuse a write
+    {   // a recently used main goes before an older ordinary one only by its own last use
         Model m;
-        m.l = {conv("oldmain", 7200, 2), conv("a", 8000), conv("b", 60)};
+        m.l = {conv("main", 10, 2), conv("a", 8000), conv("b", 60)};
         EXPECT(m.write(conv("w", 0), 3));
         EXPECT(m.gone.back() == "a");
         EXPECT(m.write(conv("w2", 0), 3));
-        EXPECT(m.gone.back() == "oldmain");
-    }
-    {   // nothing else left: the active main goes for an ordinary write
-        Model m;
-        m.l = {conv("main", 10, 2, 2)};
-        EXPECT(m.write(conv("w", 0), 2));
-        EXPECT(m.gone.size() == 1 && m.gone[0] == "main");
+        EXPECT(m.gone.back() == "b");
+        EXPECT(m.write(conv("w3", 0), 3));
+        EXPECT(m.gone.back() == "main");
     }
     {   // not evictable: pinned, held (a restore, a paused slot), no memory copy (being loaded for a restore / on disk only)
         Model m;
@@ -93,7 +80,7 @@ int main() {
         EXPECT(m.gone.size() == 1 && m.gone[0] == "x");
         EXPECT(!m.write(conv("w2", 0, 1, 2), 2));  // the rest cannot go
     }
-    {   // a write that cannot fit evicts nothing (not the main either)
+    {   // a write that cannot fit evicts nothing
         Model m;
         A h = conv("held", 10, 1, 3);
         h.hold = 1;
@@ -101,14 +88,15 @@ int main() {
         EXPECT(!m.write(conv("w", 0, 1, 3), 5));
         EXPECT(m.gone.empty() && m.l.size() == 3);
     }
-    {   // an optional write: only what goes before the writer; never a newer conversation or, for an ordinary writer, a main
+    {   // an optional write: only what goes before the writer, never a newer conversation; a main writer is no exception
         Model m;
-        m.l = {conv("main", 2000 - 1000, 2), conv("older", 500), conv("newer", 5)};
+        m.l = {conv("main", 50, 2), conv("older", 500), conv("newer", 5)};
         EXPECT(m.write(conv("w", 100), 3, true));
         EXPECT(m.gone.size() == 1 && m.gone[0] == "older");
-        EXPECT(!m.write(conv("w2", 200), 3, true));   // older than all the rest: refused, nothing lost
+        EXPECT(!m.write(conv("w2", 200), 3, true));     // older than all the rest: refused, nothing lost
+        EXPECT(!m.write(conv("w3", 300, 2), 3, true));  // a main writer as old: refused too (no tier)
         EXPECT(m.gone.size() == 1);
-        EXPECT(m.write(conv("w3", 1, 2), 3, true));   // an active main takes a non-main, the oldest
+        EXPECT(m.write(conv("w4", 1, 2), 3, true));     // a newer writer takes the oldest, here the earlier writer
         EXPECT(m.gone.back() == "w");
         // a full archive of idle conversations does not churn: the oldest writer stops at once
         Model c;

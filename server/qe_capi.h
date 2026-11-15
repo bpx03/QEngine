@@ -73,6 +73,8 @@ int qe_prefill_pos(void* e, int slot);  // prompt rows prefilled so far, -1 if n
 // up to budget rows; done[i] = 1: prompt i complete (start_finish_slot next). Returns the prompts that got rows, 0: no
 // shared batch (the caller prefills them one by one)
 int qe_prefill_multi(void* e, const int* slots, int n, int budget, int* done);
+int qe_prefill_multi_caps(void* e, const int* slots, int nslots, int budget, int* done, const int* caps);  // caps[i] > 0: at most that many rows of prompt i (whole 512-row chunks)
+int qe_conv_list(void* e, long long* out, int max);  // known conversations, LRU first: id, tokens, slot (-1 archive), idle ms, tick, generating
 int qe_prefill_pass_bound(void* e);  // 1: a prefill pass costs the PCIe copy of the host-backed experts (big batches pay)
 
 // ======================================================= TIER 3 "batch": concurrent sequences (all or none)
@@ -112,6 +114,13 @@ unsigned* qe_mask_buffer(void* e, int slot);  // pinned [8][(vocab + 31) / 32] a
 int* qe_spec_io(void* e, int slot);           // pinned int[32]: [0] model drafts n, [1..] drafts; [16] n to verify, [17..]
 void qe_constrain(void* e, int slot, int on);
 int qe_constrained(void* e, int slot);
+// Optional (both Qwen engines; [tool-choice-ban], the server's tool_choice none): a static token ban of a slot, called
+// after qe_start_begin. ids[0, n) are never chosen for the slot's reply by the target head (greedy argmax, sampling with
+// the banned tokens' probability 0 and the rest renormalised, draft acceptance: a draft with a banned token is rejected
+// like any mismatch), on the slot's normal decode path (batched, queued ahead, lookup / MTP / block drafts; not a
+// constrained slot). n = 0 clears it; the next qe_start_begin and qe_release clear it too. Without any ban the engines
+// run exactly as without this function. At most 7 ids (Flash-Next keeps 7 per card; more are refused with a log line).
+void qe_ban_tokens(void* e, int slot, const int* ids, int n);
 
 // ======================================================= TIER "logprobs" (both, + the grammar tier): OpenAI logprobs
 // A constrained slot (qe_constrain first; off with it) keeps the target head's raw logits, before the mask, in a per-slot

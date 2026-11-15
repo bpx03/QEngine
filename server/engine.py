@@ -10,7 +10,7 @@ import os
 import re
 
 from steering import SteeringMixin
-from qe_env import env_str
+from qe_env import env_str, env_write
 
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -49,6 +49,7 @@ SIGS = {
     "qe_start_finish": (c_int, [c_void_p]),
     "qe_prefill_more_slot": (c_int, [c_void_p, c_int, c_int]),
     "qe_prefill_multi": (c_int, [c_void_p, P_int, c_int, c_int, P_int]),
+    "qe_prefill_multi_caps": (c_int, [c_void_p, P_int, c_int, c_int, P_int, P_int]),
     "qe_prefill_pass_bound": (c_int, [c_void_p]),
     "qe_start_finish_slot": (c_int, [c_void_p, c_int]),
     "qe_num_prefills": (c_int, [c_void_p]),
@@ -69,6 +70,7 @@ SIGS = {
     "qe_last_from_archive": (c_int, [c_void_p]),
     "qe_slot_info": (None, [c_void_p, c_int, P_i64]),
     "qe_archive_info": (None, [c_void_p, P_double]),
+    "qe_conv_list": (c_int, [c_void_p, P_i64, c_int]),
     "qe_pool_counters": (None, [c_void_p, P_i64]),
     "qe_watch_stops": (None, [c_void_p, c_int, c_int]),
     "qe_set_no_ahead": (None, [c_void_p, c_int, c_int]),
@@ -78,6 +80,7 @@ SIGS = {
     "qe_spec_io": (ctypes.POINTER(ctypes.c_int32), [c_void_p, c_int]),
     "qe_constrain": (None, [c_void_p, c_int, c_int]),
     "qe_constrained": (c_int, [c_void_p, c_int]),
+    "qe_ban_tokens": (None, [c_void_p, c_int, P_int, c_int]),
     "qe_logits_capture": (None, [c_void_p, c_int, c_int]),
     "qe_logits_read": (c_int, [c_void_p, c_int, c_int, ctypes.POINTER(c_float)]),
     "qe_start_mm": (c_int, [c_void_p, P_int, c_int, c_int, c_u64, c_int, c_void_p, c_int, P_int, c_int]),
@@ -135,7 +138,7 @@ GROUPS = {
     "vision": ("qe_start_mm", "qe_start_begin"),
 }
 SINGLE = ("qe_par_info", "qe_host_mem_info", "qe_graph_info", "qe_set_exit_hook", "qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_kv_in_ram", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
-          "qe_reset", "qe_set_lookahead")
+          "qe_reset", "qe_set_lookahead", "qe_ban_tokens")
 
 
 def bind(lib):
@@ -154,7 +157,8 @@ def bind(lib):
 class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/steering.py)
     def __init__(self, model_dir, devices="0,1,2", max_t=262144, split="", lib_path=None, vocab=None):
         self.lib_path = lib_path or env_str("QE_LIB") or os.path.join(_ROOT, "build", "libqengine.so")
-        self.lib = ctypes.CDLL(self.lib_path)
+        with env_write():  # its constructor writes the environment (qe_process_env) while a fetch thread may run (FX11-L1)
+            self.lib = ctypes.CDLL(self.lib_path)
         self._init(model_dir, devices, max_t, split, vocab)
 
     def _init(self, model_dir, devices, max_t, split, vocab):
@@ -377,7 +381,7 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         """True: each prefill pass copies the host-backed experts over PCIe (2 cards): larger batches pay off."""
         return "qe_prefill_pass_bound" in self.fns and bool(self.lib.qe_prefill_pass_bound(self.h))
 
-    def prefill_multi(self, slots, budget):
+    def prefill_multi(self, slots, budget, caps=None):
         """One batch over several prompts in flight (Flash-Next, batched prefill): rows of the prompts on `slots` (priority
         order) up to `budget` tokens. Returns the slots whose prompts are complete (start_finish next), or None when no
         shared batch ran (the caller prefills one prompt on its own)."""
@@ -385,7 +389,11 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             return None
         arr = (ctypes.c_int * len(slots))(*slots)
         done = (ctypes.c_int * len(slots))()
-        if self.lib.qe_prefill_multi(self.h, arr, len(slots), int(budget), done) <= 0:
+        if caps and any(caps) and "qe_prefill_multi_caps" in self.fns:  # caps[i] > 0: at most that many rows of slots[i]
+            ca = (ctypes.c_int * len(slots))(*[int(c or 0) for c in caps])
+            if self.lib.qe_prefill_multi_caps(self.h, arr, len(slots), int(budget), done, ca) <= 0:
+                return None
+        elif self.lib.qe_prefill_multi(self.h, arr, len(slots), int(budget), done) <= 0:
             return None
         return [s for s, d in zip(slots, done) if d]
 
@@ -447,9 +455,19 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         """The KV pool's size in tokens now (the pool_tokens attribute is its size at start)."""
         return self.lib.qe_pool_tokens(self.h) if "qe_pool_tokens" in self.fns else self.pool_tokens
 
+    def pause_state(self):
+        """(pause events so far, sequences paused now) from the pool counters; None without them."""
+        if "qe_pool_counters" not in self.fns:
+            return None
+        c = (ctypes.c_longlong * 6)()
+        self.lib.qe_pool_counters(self.h, c)
+        return int(c[3]), int(c[5])
+
     def pause_for(self, n, prio):
-        """Pause decoding sequences of lower prio (lowest first, never a prefill) until a new sequence of n
-        tokens fits; True: it fits now (nothing is paused when it cannot be made to fit)."""
+        """Pause decoding sequences (never a prefill), the most recently admitted first (src/pool_order.h; prio is
+        not read), until a new sequence of n tokens fits; True: it fits now (nothing is paused when it cannot be
+        made to fit). Paused sequences are not counted as used here (can_admit counts them): the caller must not
+        call it while one is paused, or the newcomer takes the room the paused one waits for."""
         if "qe_pause_for" not in self.fns:
             return False
         return bool(self.lib.qe_pause_for(self.h, int(n), int(prio)))
@@ -517,10 +535,11 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
 
     def archive_more(self, budget=64 << 20):
         """Archive idle conversations to host memory, about `budget` bytes per GPU per call
-        (call when nothing runs); True when nothing is left to archive."""
+        (call when nothing runs); truthy when nothing is left to archive now: 1 done, 2 not now (the host is below its
+        memory margin: ask again later)."""
         if "qe_archive_more" not in self.fns:
             return True
-        return bool(self.lib.qe_archive_more(self.h, int(budget)))
+        return int(self.lib.qe_archive_more(self.h, int(budget)))
 
     def set_prio(self, slot, prio):
         """Eviction value of the slot's conversation: 0 finished, 1 normal, 2 main thread."""
@@ -537,8 +556,9 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
     def num_pinned(self):
         return self.lib.qe_num_pinned(self.h) if "qe_num_pinned" in self.fns else 0
 
-    def pool_info(self):
-        """Monitoring snapshot (call from the engine thread): slots, archives, pool events."""
+    def pool_info(self, convs=True):
+        """Monitoring snapshot (call from the engine thread): slots, archives, pool events; convs: also the known
+        conversations, LRU first (the metrics snapshot; internal callers pass False)."""
         L, h = self.lib, self.h
         slots = []
         b = (ctypes.c_longlong * 7)()
@@ -556,7 +576,15 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         c = (ctypes.c_longlong * 6)()  # grow, move, evict, pause, resume, paused now
         if "qe_pool_counters" in self.fns:
             L.qe_pool_counters(h, c)
-        return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots,
+        cl = []
+        if convs and "qe_conv_list" in self.fns:  # least recently used first: the next to leave VRAM / the archive
+            m = 256
+            cb = (ctypes.c_longlong * (6 * m))()
+            for k in range(L.qe_conv_list(h, cb, m)):
+                r = cb[6 * k:6 * k + 6]
+                cl.append({"id": r[0], "tokens": r[1], "where": "slot %d" % r[2] if r[2] >= 0 else "archive",
+                              "idle_s": round(r[3] / 1000.0, 1) if r[3] >= 0 else None, "generating": bool(r[5])})
+        return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots, "conversations": cl,
                 "archives": {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
                              "pinned_bytes": a[4], "pinned_used": a[5]},
                 "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},
@@ -614,6 +642,13 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
 
     def constrained(self, slot):
         return bool(self.lib.qe_constrained(self.h, int(slot)))
+
+    def ban_tokens(self, slot, ids):
+        """[tool-choice-ban] tokens the slot's reply never gets (qe_ban_tokens: after start_begin; the slot stays on the
+        normal decode path: batched, run ahead, with its drafts); [] clears it (the next start does too)."""
+        assert len(ids) <= 7, "qe_ban_tokens: at most 7 ids"
+        a = (ctypes.c_int * max(1, len(ids)))(*[int(t) for t in ids])
+        self.lib.qe_ban_tokens(self.h, int(slot), a, len(ids))
 
     def capture_logits(self, slot):
         """OpenAI logprobs: the slot decodes constrained with every token allowed (one token per step unless drafts are

@@ -99,6 +99,7 @@ def conv_markers():
 def make_gen(model):
     prof = Profile(model)
     g = app.Generator.__new__(app.Generator)
+    g.profile = prof  # (Generator.build reads the model profile)
     g.tok, tj, _ = prof.tokenizer()
     g.tmpl = app.Template(TMPL)
     g.marks = Markers(g.tok, tj)
@@ -331,7 +332,8 @@ def check_model(model):
         d = app.Detok(g.tok, g.marks.out)
         mk_text = "".join(d.push([t]) for t in seq)
         return types.SimpleNamespace(finish="stop", text_all=app.unmark(mk_text), text_mk=mk_text, tc=None, gen=gg,
-                                     det=d, ids=[], p={}, slot=0, n=len(seq), max_new=100)
+                                     det=d, ids=[], p={}, slot=0, n=len(seq), max_new=100,
+                                     n_out=lambda: len(seq))
     quoted = pl("says </think> and <tool_call> here") + [eth] + pl("\n\n")
     assert empty_reply(job(quoted)) is not None  # reasoning only: empty, although it quotes both tags
     assert empty_reply(job(quoted[:-2] + pl("\n\nAnswer"))) is None

@@ -110,6 +110,84 @@ __global__ void k_dn_conv_b(const float* __restrict__ proj, int ld, int ch, cons
         h0 = h1; h1 = h2; h2 = x;
     }
 }
+// k_dn_rec_d per segment (grid (vl, 16, nseg)): the slot's state, deferred-commit buffers and step counter
+__global__ void __launch_bounds__(128) k_dn_rec_b(const float* __restrict__ cv, int ch, int kl, int vl, int k_first,
+                                                  int v_first, const float* __restrict__ ab, const float* __restrict__ A,
+                                                  const float* __restrict__ dtb, float* const* __restrict__ tS,
+                                                  float* const* __restrict__ tp, const int* __restrict__ rslot,
+                                                  const int* __restrict__ bpn, const unsigned* __restrict__ stepcs,
+                                                  float* __restrict__ o, int rps) {
+    // [qfn-gdn-bank] q / k rows padded: lane group (t & 15) reads its 8 entries at a 12-float stride (was 8: a 2-4-way
+    // shared-memory bank conflict on the 16 lane groups); same values, same order
+    __shared__ __align__(16) float qs[16 * 12], ks[16 * 12];
+    __shared__ float red[32];
+    const int hv = blockIdx.x, cg = blockIdx.y, sg = blockIdx.z, t = threadIdx.x;
+    const int r0 = sg * rps, slot = rslot[r0];
+    const int col = cg * 8 + (t >> 4), kb = (t & 15) * 8, kbp = (t & 15) * 12;
+    const int kh = (v_first + hv) / (LNV / LNK) - k_first;
+    const unsigned par = stepcs[slot] & 1u;
+    float* pend = tp[slot];
+    const float* pold = pend + (size_t)(1u - par) * MAXP * vl * DREC;
+    float* pnew = pend + (size_t)par * MAXP * vl * DREC;
+    float* sp = tS[slot] + ((size_t)hv * 128 + col) * 128 + kb;
+    float s[8];
+    {
+        const float4 a = *reinterpret_cast<const float4*>(sp), b = *reinterpret_cast<const float4*>(sp + 4);
+        s[0] = a.x; s[1] = a.y; s[2] = a.z; s[3] = a.w; s[4] = b.x; s[5] = b.y; s[6] = b.z; s[7] = b.w;
+    }
+    const int n = bpn[sg];
+    for (int r = 0; r < n; r++) {
+        const float* pr = pold + ((size_t)r * vl + hv) * DREC;
+        const float beta = pr[256], decay = pr[257];
+        float mem = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) { s[i] *= decay; mem += s[i] * pr[kb + i]; }
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) mem += __shfl_xor_sync(0xffffffffu, mem, off);
+        const float delta = (pr[128 + col] - mem) * beta;
+#pragma unroll
+        for (int i = 0; i < 8; i++) s[i] += pr[kb + i] * delta;
+    }
+    *reinterpret_cast<float4*>(sp) = make_float4(s[0], s[1], s[2], s[3]);
+    *reinterpret_cast<float4*>(sp + 4) = make_float4(s[4], s[5], s[6], s[7]);
+    const float Ah = A[hv], dt = dtb[hv];
+    for (int rr = 0; rr < rps; rr++) {
+        const int r = r0 + rr;
+        const float* row = cv + (size_t)r * ch;
+        const float q = row[kh * 128 + t], k = row[kl * 128 + kh * 128 + t];
+        const float qq = block_sum<128>(q * q, red), kk = block_sum<128>(k * k, red);
+        qs[DNP(t)] = q * rsqrtf(qq + 1e-6f) * rsqrtf(128.f);
+        ks[DNP(t)] = k * rsqrtf(kk + 1e-6f);
+        __syncthreads();
+        const float b = ab[(size_t)r * dn_ab_ld(vl) + hv], a = ab[(size_t)r * dn_ab_ld(vl) + vl + hv];
+        const float beta = sigm(b);
+        const float xa = a + dt;
+        const float spl = xa > 20.f ? xa : log1pf(__expf(xa));
+        const float decay = __expf(Ah * spl);
+        const float v = row[2 * kl * 128 + hv * 128 + col];
+        {
+            float* pw = pnew + ((size_t)rr * vl + hv) * DREC;
+            if (cg == 0) {
+                pw[t] = ks[DNP(t)];
+                if (t == 0) { pw[256] = beta; pw[257] = decay; }
+            }
+            if ((t & 15) == 0) pw[128 + col] = v;
+        }
+        float mem = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) { s[i] *= decay; mem += s[i] * ks[kbp + i]; }
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) mem += __shfl_xor_sync(0xffffffffu, mem, off);
+        const float delta = (v - mem) * beta;
+        float out = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) { s[i] += ks[kbp + i] * delta; out += s[i] * qs[kbp + i]; }
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) out += __shfl_xor_sync(0xffffffffu, out, off);
+        if ((t & 15) == 0) o[((size_t)r * vl + hv) * 128 + col] = out;
+        __syncthreads();
+    }
+}
 // k_dn_rec_b with the per-row q / k normalization, beta and decay precomputed by k_dn_qk (qk [m][2][kl][128], gb [m][2][vl]):
 // the row loop needs no block reductions or barriers (same formulas: bit-identical)
 __global__ void __launch_bounds__(128) k_dn_rec_bq(const float* __restrict__ cv, int ch, int kl, int vl, int k_first,
@@ -409,7 +487,7 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     gemv_w8_rows(L.qkv, x_, H, proj_, ld, m, st_);
     gemv_w16_rows(L.idx, x_, H, proj2_, (IDX_NH + 1) * IDX_HD, m, st_);
     const int nqp = ql, qh0 = p_.q0;
-    k_qsa_prep<<<dim3(nqp + 4, m), 256, 0, st_>>>(proj_, ld, L.q_norm, L.k_norm, posd_, qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, p_, nqp,
+    (kv4_ ? k_qsa_prep<true> : k_qsa_prep<false>)<<<dim3(nqp + 4, m), 256, 0, st_>>>(proj_, ld, L.q_norm, L.k_norm, posd_, qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, p_, nqp,
                                                    qh0, rp, rb, rs, kvmap(L));
     k_idx_prep_b<<<m / rps, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, rp, rb, rs, gates_, tab(TB_IT, li),
                                               kb.ikb, p_, rps);
@@ -426,8 +504,9 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     xi.seq = xiseq_;
     xi.done = xidone_;
     k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb);
-    if (idx_gk_) k_idx_local<true><<<m, 1024, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
-    else k_idx_local<<<m, 1024, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
+    const int ilt = idx_local_threads(m);  // (1024 for <= 32 rows, as measured; 512 above)
+    if (idx_gk_) k_idx_local<true><<<m, ilt, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
+    else k_idx_local<<<m, ilt, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
     if (p_.ngpu > 1) k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_);
     xpull(xi, 2, m, 0, IDX_TOPB);  // (no peer access: the flags into device memory)
     k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp, idx_gk_, kvs_ ? L.kvp : KvPool(), rb,
@@ -437,7 +516,10 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     AttnDst d{};
     d.o[0] = attn_x_;
     for (int z = 1; z < dec_split_; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
-    k_qsa_dec<<<dim3(NKV, m, dec_split_), 128, QD_SMEM, st_>>>(qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, posd_, d, p_, xq, isel_, insel_, lbmax,
+    qd_kv1_decide();  // (the first k_qsa_dec launch of the worker may be this one, review L1)
+    const bool kv1 = qd_kv1_ == 1 && kv1_dec(m);  // [qfn-kv1-dec]
+    auto qdf = kv4_ ? (kv1 ? k_qsa_dec<true, 0, true> : k_qsa_dec<false, 0, true>) : kv1 ? k_qsa_dec<true> : k_qsa_dec<false>;
+    qdf<<<dim3(NKV, m, dec_split_), 128, kv1 ? QD_SMEM1 : QD_SMEM, st_>>>(qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, posd_, d, p_, xq, isel_, insel_, lbmax,
                                                                rp, rb, false, kvmap(L), kvs_ && m <= MAXM ? psel_ : nullptr, qd_mint(m, dec_split_));
     if (dec_split_ > 1) k_attn_merge<<<dim3(NQ, m), HD, 0, st_>>>(d, dec_split_);
     KCHK("qsa_b attn");
@@ -448,7 +530,7 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     xc.scnt = xscnt_;
     if (p_.ngpu > 1) k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(attn_x_, m, xc, p_);
     xpull(xc, 1, m, (size_t)xper(p_) * 4, xper(p_));
-    k_qsa_comb2<<<dim3(ql, m), HD, 0, st_>>>(attn_x_, m, proj_, ld, ab_, ql * HD, xc, p_, nqp * HD);
+    k_qsa_comb2<<<dim3(ql, m), HD, 0, st_>>>(attn_x_, m, proj_, ld, ab_, ql * HD, xc, p_, nqp * HD, kv4_);
     KCHK("qsa_b comb");
     gemv_w8_rows(L.o, ab_, ql * HD, part_, H, m, st_);
 }
@@ -506,8 +588,12 @@ void Worker::trunk_b(int m, const int* toks, int nseg, int rps) {
     }
     CUDA_CHECK(cudaMemcpyAsync(Rsave_, R_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));
     hc_read(mixer_, m, false);
-    if (bsamp_) head_sample_b(m, otok_);
-    else head(m, otok_);
+    if (bsamp_) head_sample_b(m, otok_, nullptr, bvt_ + 1);  // ([pen-par] rows in parallel: row j + 1's input = the draft row j verifies)
+    else {
+        ban_rows_ = rslot_;  // [tool-choice-ban] (every row its slot's ban)
+        head(m, otok_);
+        ban_rows_ = nullptr;
+    }
 }
 
 // MTP block over m rows (verify rows: chain = false, rows of the trunk; chain: one row per segment from Rminb_)
@@ -602,6 +688,10 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     qe_wd_crumb(wdid_, dev_, "batch step (sequences, drafts)", nseg, k);
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(nseg >= 1 && nseg * (k + 1) <= MAXM && !qsa_a_ && dec_k_ && dec_split_ <= 8, "flash batch: %d x %d rows", nseg, k + 1);
+    // one segment per slot (k_bmeta / k_accept_b / the stash rows and the parallel sampler's counters assume it: pen_par
+    // review L3)
+    for (int i = 0; i < nseg; i++)
+        for (int j = i + 1; j < nseg; j++) CHECK(slots[i] != slots[j], "flash batch: slot %d in two segments", slots[i]);
     sv_stash();
     ws_save();  // the bound slot's recurrent state back to its storage (the batch reads every slot's storage)
     for (int s = 0; s < (int)slots_.size(); s++) kvrb_h_[s] = bases[s] * p_.own;
@@ -638,7 +728,7 @@ void Worker::batch_launch(const int* slots, const int* bases, const int* lims, i
     } else {
         bool ran = false;
         if (!it->second) {
-            if (graph_skip()) {  // after a failed retry (out of memory): no capture for a while
+            if (graph_skip() || graph_refused(&it->second)) {  // after a failed retry (out of memory): no capture for a while; a too-big shape
                 batch_body(nseg, k);
                 ran = true;
             } else {

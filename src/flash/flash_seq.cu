@@ -35,7 +35,7 @@ void Worker::kv_pieces_at(int base, int t0, int t1, std::vector<Piece>& out) {
     const size_t rb = (size_t)base * p_.own;  // region start row
     // pooled indexer keys: blocks of 4 rows; a block cut by r0 is copied again (its pooled key may have changed)
     const int b0 = r0 / IDX_R, b1 = (r1 + IDX_R - 1) / IDX_R;
-    const size_t row = (size_t)NKV * HD;
+    const size_t row = (size_t)NKV * kv_hb(), srow = (size_t)NKV * kv_sf();  // K / V bytes, scale floats per row
     for (const KvBase& k : kvb_) {
         // streaming: the K / V rows are the host rows (copies use cudaMemcpyDefault; writers call kv_inval)
         uint8_t* kc = k.hm ? k.hm->hk : k.kc;
@@ -44,8 +44,8 @@ void Worker::kv_pieces_at(int base, int t0, int t1, std::vector<Piece>& out) {
         float* vs = k.hm ? k.hm->hvs : k.vs;
         out.push_back({(char*)kc + (rb + r0) * row, (size_t)(r1 - r0) * row});
         out.push_back({(char*)vc + (rb + r0) * row, (size_t)(r1 - r0) * row});
-        out.push_back({(char*)(ks + (rb + r0) * NKV), (size_t)(r1 - r0) * NKV * 4});
-        out.push_back({(char*)(vs + (rb + r0) * NKV), (size_t)(r1 - r0) * NKV * 4});
+        out.push_back({(char*)(ks + (rb + r0) * srow), (size_t)(r1 - r0) * srow * 4});
+        out.push_back({(char*)(vs + (rb + r0) * srow), (size_t)(r1 - r0) * srow * 4});
         out.push_back({(char*)(k.ikb + (rb / IDX_R + b0) * IDX_HD), (size_t)(b1 - b0) * IDX_HD * 2});
     }
 }
@@ -97,6 +97,13 @@ void Worker::pieces_of(const SlotState& q, bool pend, std::vector<Piece>& out) c
 // workspace (alloc_state) holds the bound one
 void Worker::alloc_slots() {
     int ns = p_.max_seqs > 0 ? p_.max_seqs : env_int("FLASH_MAX_SEQS", 16);
+    if (ns > 16 || ns < 1) {  // (the batch tables and per-slot graphs are sized for 16: a larger value used to be cut silently)
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            fprintf(stderr, "[flash] %s=%d: sequence slots are 1 to 16, using %d (conversations past the slots stay in the host "
+                            "archive, FLASH_KV_ARCHIVE_GB)\n", p_.max_seqs > 0 ? "pipeline stage slots" : "FLASH_MAX_SEQS", ns,
+                    std::max(1, std::min(16, ns)));
+    }
     ns = std::max(1, std::min(16, ns));
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV;
@@ -108,6 +115,10 @@ void Worker::alloc_slots() {
     lp_slot_.assign(ns, 0);
     lp_host_.assign(ns, nullptr);
     mask_d_ = (unsigned*)dalloc((size_t)MASK_ROWS * MASK_WORDS * 4);
+    ban_d_ = (int*)dalloc((size_t)ns * BAN_W * 4);
+    CUDA_CHECK(cudaMemset(ban_d_, 0, (size_t)ns * BAN_W * 4));
+    bcur_d_ = (int*)dalloc(4);
+    CUDA_CHECK(cudaMemset(bcur_d_, 0, 4));
     pen_ = (PenState*)dalloc((size_t)ns * pen_state_bytes(VOCAB));
     nolk_d_ = (int*)dalloc((size_t)ns * 4);
     pseed_d_ = (int*)dalloc((size_t)kPenSeedMax * 4);
@@ -276,6 +287,7 @@ void Worker::use_slot(int s, int base) {
             CUDA_CHECK(cudaStreamSynchronize(st_));
         }
         cur_slot_ = s;
+        if (ban_any_) ban_bind(s);  // [tool-choice-ban] the single-sequence heads' slot (stream-ordered, review M1)
         con_ = con_slot_.empty() ? false : con_slot_[s] != 0;
         lp_h_ = lp_of(s);
         prev_m_ = sprev_[s];
@@ -464,6 +476,40 @@ static void graph_nodes(cudaGraph_t g, size_t& all, size_t& kern) {
     }
 }
 
+// [qfn-pf-carve] every kernel node of a prefill graph (and of its child graphs) gets one shared-memory carveout, so the
+// pass's compute and comm kernels share one SM configuration (mb_corun: gate_up beside 16 spinning comm-like blocks
+// x1.41 -> x1.04 with one common carveout); decode graphs keep the per-kernel defaults (device-wide prefer-shared cost
+// c=8 +1.7 %: its grouped MoE kernels live on L1). Returns the kernel nodes set.
+static size_t graph_carve(cudaGraph_t g, int pct) {
+    size_t n = 0, done = 0;
+    if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess || !n) { (void)cudaGetLastError(); return 0; }
+    std::vector<cudaGraphNode_t> v(n);
+    if (cudaGraphGetNodes(g, v.data(), &n) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    cudaKernelNodeAttrValue val{};
+    val.sharedMemCarveout = (unsigned)pct;
+    for (cudaGraphNode_t x : v) {
+        cudaGraphNodeType t;
+        if (cudaGraphNodeGetType(x, &t) != cudaSuccess) { (void)cudaGetLastError(); continue; }
+        if (t == cudaGraphNodeTypeKernel) {
+            if (cudaGraphKernelNodeSetAttribute(x, cudaLaunchAttributePreferredSharedMemoryCarveout, &val) == cudaSuccess) done++;
+            else (void)cudaGetLastError();
+        } else if (t == cudaGraphNodeTypeGraph) {
+            cudaGraph_t c = nullptr;
+            if (cudaGraphChildGraphNodeGetGraph(x, &c) == cudaSuccess && c) done += graph_carve(c, pct);
+            else (void)cudaGetLastError();
+        }  // (conditional-node bodies are not reached and keep the default: only decode's lk_chain builds them)
+    }
+    return done;
+}
+
+// a captured graph larger than the whole budget (inst_graph's refusal test, without consuming gextra_nodes_)
+bool Worker::graph_too_big(cudaGraph_t g) const {
+    if (!gbudget_) return false;
+    size_t nodes = gextra_nodes_, knodes = 0;
+    graph_nodes(g, nodes, knodes);
+    return graph_oom::est_bytes(nodes, knodes) > gbudget_;
+}
+
 // graph instantiation with little free memory (graph_oom.h, club-3090#1846: 4 slots, the expert cache sized to the
 // 256 MB margin, many conversation shapes): on OOM drop every other cached graph and retry once; if that fails too
 // the caller runs the step eagerly and the next graph_oom::kCoolSteps missing graphs are not captured. Never aborts.
@@ -479,6 +525,7 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind) {
     // captured work eagerly; run_cached does not capture that key again)
     gbig_last_ = gbudget_ && need > gbudget_;
     if (gbig_last_) {
+        if (!gbig_slots_.insert(e).second) return false;  // (counted once per shape: too_big counts shapes)
         if (gbig_++ == 0)
             fprintf(stderr, "[flash] GPU%d: a %s graph (%zu nodes, est %.0f MB) is larger than the graph budget (%.0f MB, "
                     "FLASH_GRAPH_MB%s): such steps run without a CUDA graph\n", dev_, kind, nodes, need / 1048576.0,
@@ -493,6 +540,18 @@ bool Worker::inst_graph(cudaGraphExec_t* e, cudaGraph_t g, const char* kind) {
         pf_noroom_++;
         pf_noroom_last_ = true;
         return false;
+    }
+    // FLASH_PF_CARVE: carveout percent of the prefill graphs' kernel nodes (default 100 = maximum shared; -1: off), set
+    // only once the graph has room (review L5). On purpose every prefill-side graph kind is carved, the MTP-fill ones
+    // (prefill_mtp / prefill_batch_mtp) included; their eager runs keep the driver default (review L3). Read once per
+    // process: an A/B needs a restart
+    {
+        static const int pcv = env_int("FLASH_PF_CARVE", 100);
+        if (pf_side && pcv >= 0 && pcv <= 100) {
+            const size_t nk = graph_carve(g, pcv);
+            static bool said = false;
+            if (glog && !said) { said = true; fprintf(stderr, "[flash] GPU%d: prefill graph carveout %d %% on %zu kernel nodes\n", dev_, pcv, nk); }
+        }
     }
     const double gf0 = glog ? free_bytes() / 1048576.0 : 0.0;
     static const graph_oom::Inject inj = [] {
@@ -617,7 +676,7 @@ void Worker::kv_move(int from, int to, int ntok) {
     if (from == to || ntok <= 0) return;
     CUDA_CHECK(cudaSetDevice(dev_));
     const int nr = kv_rows(ntok);
-    const size_t row = (size_t)NKV * HD;
+    const size_t row = (size_t)NKV * kv_hb(), sr = (size_t)NKV * kv_sf();  // K / V bytes, scale floats per row
     const int shift = std::abs(from - to) * p_.own;
     const int chunk = std::max(IDX_R, std::min(shift, 8192) / IDX_R * IDX_R);
     const size_t fb = (size_t)from * p_.own, tb = (size_t)to * p_.own;
@@ -632,13 +691,13 @@ void Worker::kv_move(int from, int to, int ntok) {
             if (k.hm) {  // KV in RAM: host rows, moved on the host (a copy may span several pinned slabs)
                 memmove(k.hm->hk + (tb + r) * row, k.hm->hk + (fb + r) * row, (size_t)n * row);
                 memmove(k.hm->hv + (tb + r) * row, k.hm->hv + (fb + r) * row, (size_t)n * row);
-                memmove(k.hm->hks + (tb + r) * NKV, k.hm->hks + (fb + r) * NKV, (size_t)n * NKV * 4);
-                memmove(k.hm->hvs + (tb + r) * NKV, k.hm->hvs + (fb + r) * NKV, (size_t)n * NKV * 4);
+                memmove(k.hm->hks + (tb + r) * sr, k.hm->hks + (fb + r) * sr, (size_t)n * sr * 4);
+                memmove(k.hm->hvs + (tb + r) * sr, k.hm->hvs + (fb + r) * sr, (size_t)n * sr * 4);
             } else {
             CUDA_CHECK(cudaMemcpyAsync(k.kc + (tb + r) * row, k.kc + (fb + r) * row, (size_t)n * row, cudaMemcpyDeviceToDevice, st_));
             CUDA_CHECK(cudaMemcpyAsync(k.vc + (tb + r) * row, k.vc + (fb + r) * row, (size_t)n * row, cudaMemcpyDeviceToDevice, st_));
-            CUDA_CHECK(cudaMemcpyAsync(k.ks + (tb + r) * NKV, k.ks + (fb + r) * NKV, (size_t)n * NKV * 4, cudaMemcpyDeviceToDevice, st_));
-            CUDA_CHECK(cudaMemcpyAsync(k.vs + (tb + r) * NKV, k.vs + (fb + r) * NKV, (size_t)n * NKV * 4, cudaMemcpyDeviceToDevice, st_));
+            CUDA_CHECK(cudaMemcpyAsync(k.ks + (tb + r) * sr, k.ks + (fb + r) * sr, (size_t)n * sr * 4, cudaMemcpyDeviceToDevice, st_));
+            CUDA_CHECK(cudaMemcpyAsync(k.vs + (tb + r) * sr, k.vs + (fb + r) * sr, (size_t)n * sr * 4, cudaMemcpyDeviceToDevice, st_));
             }
             CUDA_CHECK(cudaMemcpyAsync(k.ikb + (tb / IDX_R + b0) * IDX_HD, k.ikb + (fb / IDX_R + b0) * IDX_HD, (size_t)(b1 - b0) * IDX_HD * 2,
                                        cudaMemcpyDeviceToDevice, st_));

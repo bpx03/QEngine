@@ -148,10 +148,12 @@ def main():
         p = None
         # D recomputes only its question; every file kept the system-prompt state D resumed from
         all_kept = all(c in sub for _, sub in last_files)
-        ok = n - c < 64 and c0 == 0 and d == d0 and ce >= c and e == e0 and all_kept
+        # superseded files are deleted once the newer file is written: A's newest file and B's remain (rereview L5)
+        no_stale = len(last_files) == 2
+        ok = n - c < 64 and c0 == 0 and d == d0 and ce >= c and e == e0 and all_kept and no_stale
         print(f"{'PASS' if ok else 'FAIL'}: D recomputed {n - c} of {n}, reply {'=' if d == d0 else '!='} cold; "
               f"E recomputed {ne - ce} of {ne}, reply {'=' if e == e0 else '!='} cold; "
-              f"state {c} in every file: {all_kept}", flush=True)
+              f"state {c} in every file: {all_kept}; files after the turns {len(last_files)} (2 expected)", flush=True)
         return 0 if ok else 1
     finally:
         if p is not None and p.poll() is None:

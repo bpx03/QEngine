@@ -269,6 +269,18 @@ void qe_draft_stats(void* e, int slot, long long* out) { ((Engine*)e)->draft_sta
 // DFlash2 block drafter: {block steps, their tokens}; ms per drafter block (development check, -1: no drafter)
 void qe_dfl_stats(void* e, long long* out) { out[0] = ((Engine*)e)->df_steps_, out[1] = ((Engine*)e)->df_tok_; }
 double qe_dfl_bench(void* e, int iters) { return ((Engine*)e)->dfl_bench(iters); }
+// kv4_27b L7 test: host x[256] -> host out[kKv4Row] (4-bit row: nibbles + 8 fp16 group scales); returns kKv4Row
+int qe_test_kv4_row(const float* x, int krow, unsigned char* out) {
+    float* dx; uint8_t* d;
+    CUDA_CHECK(cudaMalloc(&dx, 256 * 4));
+    CUDA_CHECK(cudaMalloc(&d, kKv4Row));
+    CUDA_CHECK(cudaMemcpy(dx, x, 256 * 4, cudaMemcpyHostToDevice));
+    kv4_row_test(dx, krow, d);
+    CUDA_CHECK(cudaMemcpy(out, d, kKv4Row, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(dx));
+    CUDA_CHECK(cudaFree(d));
+    return kKv4Row;
+}
 void qe_finish(void* e) { ((Engine*)e)->finish(); }
 double qe_warmup(void* e, int modes) { return ((Engine*)e)->warmup(modes); }
 int qe_last_copied(void* e) { return ((Engine*)e)->last_copied(); }
@@ -295,6 +307,9 @@ unsigned* qe_mask_buffer(void* e, int slot) { return ((Engine*)e)->mask_buffer(s
 int* qe_spec_io(void* e, int slot) { return ((Engine*)e)->spec_io(slot); }
 void qe_constrain(void* e, int slot, int on) { ((Engine*)e)->constrain(slot, on != 0); }
 int qe_constrained(void* e, int slot) { return ((Engine*)e)->constrained(slot) ? 1 : 0; }
+void qe_ban_tokens(void* e, int slot, const int* ids, int n) {
+    if (slot >= 0 && slot < ((Engine*)e)->num_slots()) ((Engine*)e)->ban(slot, ids, n);  // (a bad slot: ignored, review L3)
+}
 void qe_logits_capture(void* e, int slot, int on) { ((Engine*)e)->logits_capture(slot, on != 0); }
 int qe_logits_read(void* e, int slot, int row, float* out) {
     return ((Engine*)e)->logits_read(slot, row, out) ? ((Engine*)e)->config().vocab : 0;
@@ -1243,10 +1258,11 @@ struct DnBench {
     float *o = nullptr, *pend = nullptr;
     int *cur = nullptr, *acc = nullptr, *pn = nullptr, *save = nullptr;
     DnBench(int nseg_, int m_, int lazy = 1) : nseg(nseg_), m(m_) {
-        s.nk = 6; s.nv = 16;
+        s.nk = env_int("QE_DNB_NK", 6); s.nv = env_int("QE_DNB_NV", 16);  // (QE_DNB_*: other cards' shapes, e.g. 1 card 16 / 48)
+        CHECK(s.nk >= 1 && s.nv >= s.nk && s.nv <= 64, "QE_DNB_NK / NV %d %d", s.nk, s.nv);  // (v2k[64], review L6)
         s.lazy_t = lazy;
-        for (int h = 0; h < 16; h++) s.v2k[h] = h * 6 / 16;
-        s.ab_pad = 16; s.ab_splits = 1; s.ab_rows = nseg * m;
+        for (int h = 0; h < s.nv; h++) s.v2k[h] = h * s.nk / s.nv;
+        s.ab_pad = s.nv; s.ab_splits = 1; s.ab_rows = nseg * m;
         ch = 2 * s.nk * 128 + s.nv * 128;
         prf = dn_pend_row_floats(s);
         slot = (size_t)s.nv * 128 * 128;
@@ -1337,6 +1353,8 @@ struct DnBench {
 // us per step (CUDA graph of one step, iters launches); npend = accepted rows per sequence (acc + 1)
 extern "C" double qe_bench_dn_state(int nseg, int m, int npend, int mode, int iters, int lanes, int lazy) {
     dn_core2_set(lanes);
+    dn_cpt_set(0);  // (lanes 0 = dn_core_dev, as before [q27-dn-core3-pad]; review M2)
+    struct CptReset { ~CptReset() { dn_cpt_set(-1); } } cpt_reset;
     CHECK(nseg >= 1 && nseg <= kMaxSegs && m >= 1 && m <= kPendRows && npend >= 1 && npend <= m, "args");
     DnBench b(nseg, m, lazy);
     std::vector<int> a(nseg, npend - 1), p(2 * nseg, 0);
@@ -1366,10 +1384,189 @@ extern "C" double qe_bench_dn_state(int nseg, int m, int npend, int mode, int it
     return ms * 1e3 / iters;
 }
 
+// [q27-dn-core4-occ] us per single-sequence verification core of 48 layers (dn_core_only, write_all, no pending rows:
+// the engine's default verify step), CUDA graph; the kernel variant follows QE_DN_SINGLE_CPT (QE_DNB_NK / NV: the shape)
+extern "C" double qe_bench_dn_single(int m, int iters) {
+    CHECK(m >= 1 && m <= kPendRows, "qe_bench_dn_single: m %d (1..%d: larger take another kernel)", m, kPendRows);
+    DnBench b(1, m);
+    {
+        std::mt19937 rng(1);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> h(2 * b.slot);
+        for (auto& x : h) x = nd(rng) * 0.05f;
+        for (int l = 0; l < b.L; l++) CUDA_CHECK(cudaMemcpy(b.S[l], h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    }
+    cudaStream_t st;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+    for (int l = 0; l < b.L; l++)
+        dn_core_only(b.cv[l], b.ch, b.s, b.S[l], b.slot, b.cur, m, true, b.qk[l], b.gb[l], b.o, st, nullptr, nullptr);
+    CUDA_CHECK(cudaStreamEndCapture(st, &g));
+    const int ran = dn_core_ran();
+    // (rel136_fixes_review L2: no time under the variant's name when another kernel ran; rel136 review L6: the reference
+    // QE_DN_SINGLE_CPT=0 and QE_DN_CORE2_SINGLE are timed as before, with the kernel that ran on stderr)
+    const int want = env_int("QE_DN_SINGLE_CPT", -1);
+    const bool asks_cpt = !env_int("QE_DN_CORE2_SINGLE", 0) && (want < 0 || (want >= 2 && want <= 6));
+    if (!asks_cpt) fprintf(stderr, "qe_bench_dn_single: m %d ran kernel %d\n", m, ran);
+    if (asks_cpt && (ran < 2 || ran > 6)) {
+        fprintf(stderr, "qe_bench_dn_single: QE_DN_SINGLE_CPT variant not taken at m %d (ran %d): refused\n", m, ran);
+        cudaGraphDestroy(g); cudaStreamDestroy(st);
+        return -1.0;
+    }
+    CUDA_CHECK(cudaGraphInstantiate(&ge, g, 0));
+    for (int i = 0; i < 3; i++) CUDA_CHECK(cudaGraphLaunch(ge, st));
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0, st);
+    for (int i = 0; i < iters; i++) CUDA_CHECK(cudaGraphLaunch(ge, st));
+    cudaEventRecord(e1, st);
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    float ms;
+    cudaEventElapsedTime(&ms, e0, e1);
+    CUDA_CHECK(cudaGetLastError());
+    cudaGraphExecDestroy(ge); cudaGraphDestroy(g); cudaStreamDestroy(st);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    return ms * 1e3 / iters;
+}
+
+// [q27-dn-core3-pad] batched core variant for the tests: 0 the default chain (dn_core_seg_kernel), 1 / 2 dn_core3 dense /
+// padded, 12 / 14 dn_core4_seg CPT 2 / 4 dense, 13 / 15 padded
+static void dn_batch_variant(int v) {  // (0: the chain before [q27-dn-core3-pad], dn_core4_seg off)
+    dn_core2_set(v == 0 ? 0 : 8);
+    dn_core3_set(v == 1 || v == 2 ? v : 0);
+    dn_cpt_set(v >= 12 ? v - 10 : 0);
+}
+
+// [q27-dn-core3-pad] batched verification core, variant v (dn_batch_variant) against the reference dn_core_seg_kernel:
+// nseg sequences, segment z with m_z = max(1, m - z % 3) rows, np < 0: no pending-row pointers, else np_z = (np + z) % lazy
+// pending rows (the defer layout, lazy window `lazy`), fin (one-row direct pass) on every one-row segment with even z;
+// outputs pre-filled with NaN bytes. Returns the number of differing output / state floats (every layer)
+extern "C" long long qe_test_dn_core3(int nseg, int m, int np, int seed, int v, int lazy) {
+    CHECK(nseg >= 1 && nseg <= kMaxSegs && m >= 1 && m <= kPendRows && lazy >= 1 && (nseg >= 2 || (v != 1 && v != 2)),
+          "qe_test_dn_core3 args (dn_core3 needs 2+ segments)");
+    DnBench A(nseg, m, lazy), B(nseg, m, lazy);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_real_distribution<float> ud(0.f, 1.f);
+    std::vector<int> mz(nseg), r0(nseg), npz(nseg, 0);
+    int rows = 0;
+    for (int z = 0; z < nseg; z++) {
+        mz[z] = std::max(1, m - z % 3);
+        r0[z] = rows;
+        rows += mz[z];
+        if (np >= 0) npz[z] = std::min((np + z) % std::max(1, lazy), dn_pcap(A.s));
+    }
+    for (int i = 0; i < A.L * nseg; i++) {
+        std::vector<float> h(2 * A.slot);
+        for (auto& x : h) x = nd(rng) * 0.05f;
+        CUDA_CHECK(cudaMemcpy(A.S[i], h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(B.S[i], h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    }
+    for (int l = 0; l < A.L; l++) {
+        std::vector<float> hcv((size_t)rows * A.ch), hqk((size_t)rows * 2 * A.s.nk * 128), hgb((size_t)rows * 2 * A.s.nv);
+        for (auto& x : hcv) x = nd(rng);
+        for (auto& x : hqk) x = nd(rng) * 0.0884f;
+        for (auto& x : hgb) x = 0.5f + 0.5f * ud(rng);
+        for (DnBench* b : {&A, &B}) {
+            CUDA_CHECK(cudaMemcpy(b->cv[l], hcv.data(), hcv.size() * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(b->qk[l], hqk.data(), hqk.size() * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(b->gb[l], hgb.data(), hgb.size() * 4, cudaMemcpyHostToDevice));
+        }
+    }
+    std::vector<int> cur(nseg), pn(2 * kMaxSegs, 0);
+    for (int z = 0; z < nseg; z++) cur[z] = rng() % 2, pn[2 * z] = npz[z];
+    std::vector<float> hp((size_t)nseg * A.L * dn_pcap(A.s) * A.prf);
+    for (auto& x : hp) x = nd(rng) * 0.1f;
+    for (DnBench* b : {&A, &B}) {
+        CUDA_CHECK(cudaMemcpy(b->cur, cur.data(), nseg * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(b->pn, pn.data(), pn.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(b->pend, hp.data(), hp.size() * 4, cudaMemcpyHostToDevice));
+    }
+    long long bad = 0;
+    int ran_bad = -1;
+    const size_t on = (size_t)rows * A.s.nv * 128;
+    std::vector<float> oa(on), ob(on), sa(2 * A.slot), sb(sa.size());
+    for (int l = 0; l < A.L; l++) {
+        for (int k = 0; k < 2; k++) {
+            DnBench& b = k ? B : A;
+            CUDA_CHECK(cudaMemset(b.o, 0xff, on * 4));  // (outputs a kernel leaves unwritten show up: review L6)
+            dn_batch_variant(k ? v : 0);
+            DnSegs g{};
+            g.n = nseg;
+            for (int z = 0; z < nseg; z++) {
+                g.r0[z] = r0[z]; g.m[z] = mz[z]; g.S[z] = b.S[(size_t)l * nseg + z]; g.cur[z] = b.cur + z;
+                if (np >= 0) { g.pn[z] = b.pn + 2 * z; g.pend[z] = b.pend_of(z, l); }
+                g.fin[z] = mz[z] == 1 && z % 2 == 0;
+            }
+            dn_core_seg(g, b.cv[l], b.ch, b.s, b.qk[l], b.gb[l], b.slot, b.o, 0);
+            if (dn_core_ran() != (k ? v : 0)) ran_bad = dn_core_ran();  // (rel136_fixes_review L2: a silent fallback)
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(oa.data(), A.o, on * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(ob.data(), B.o, on * 4, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < on; i++) bad += memcmp(&oa[i], &ob[i], 4) != 0;
+        for (int z = 0; z < nseg; z++) {
+            CUDA_CHECK(cudaMemcpy(sa.data(), A.S[(size_t)l * nseg + z], sa.size() * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(sb.data(), B.S[(size_t)l * nseg + z], sb.size() * 4, cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < sa.size(); i++) bad += memcmp(&sa[i], &sb[i], 4) != 0;
+        }
+    }
+    dn_core3_set(-1); dn_cpt_set(-1); dn_core2_set(-1);
+    CUDA_CHECK(cudaGetLastError());
+    if (ran_bad >= 0) {  // the variant did not run at this shape (another kernel did): no vacuous pass
+        fprintf(stderr, "qe_test_dn_core3: variant %d not taken (nseg %d m %d lazy %d: ran %d): refused\n", v, nseg, m, lazy, ran_bad);
+        return -1;
+    }
+    return bad;
+}
+
+// [q27-dn-core3-pad] us per batched verification core of 48 layers (nseg x m rows, np pending rows: defer layout), variant v
+extern "C" double qe_bench_dn_core3(int nseg, int m, int np, int iters, int v) {
+    CHECK(nseg >= 1 && nseg <= kMaxSegs && m >= 1 && m <= kPendRows && (nseg >= 2 || (v != 1 && v != 2)),
+          "qe_bench_dn_core3 args (dn_core3 needs 2+ segments)");
+    DnBench b(nseg, m);
+    std::vector<int> pn(2 * kMaxSegs, 0);
+    for (int z = 0; z < nseg; z++) pn[2 * z] = np > 0 ? np : 0;
+    CUDA_CHECK(cudaMemcpy(b.pn, pn.data(), pn.size() * 4, cudaMemcpyHostToDevice));
+    dn_batch_variant(v);
+    cudaStream_t st;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+    b.core(np >= 0, st);
+    CUDA_CHECK(cudaStreamEndCapture(st, &g));
+    if (dn_core_ran() != v) {  // (rel136_fixes_review L2: no time under the variant's name when another kernel ran)
+        fprintf(stderr, "qe_bench_dn_core3: variant %d not taken (nseg %d m %d: ran %d): refused\n", v, nseg, m, dn_core_ran());
+        cudaGraphDestroy(g); cudaStreamDestroy(st);
+        dn_core3_set(-1); dn_cpt_set(-1); dn_core2_set(-1);
+        return -1.0;
+    }
+    CUDA_CHECK(cudaGraphInstantiate(&ge, g, 0));
+    for (int i = 0; i < 3; i++) CUDA_CHECK(cudaGraphLaunch(ge, st));
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0, st);
+    for (int i = 0; i < iters; i++) CUDA_CHECK(cudaGraphLaunch(ge, st));
+    cudaEventRecord(e1, st);
+    CUDA_CHECK(cudaEventSynchronize(e1));
+    float ms;
+    cudaEventElapsedTime(&ms, e0, e1);
+    CUDA_CHECK(cudaGetLastError());
+    cudaGraphExecDestroy(ge); cudaGraphDestroy(g); cudaStreamDestroy(st);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    dn_core3_set(-1); dn_cpt_set(-1); dn_core2_set(-1);
+    return ms * 1e3 / iters;
+}
+
 // Master (replay) vs deferred commit over `steps` random verification steps of nseg sequences
 // with m rows (random acceptance, random flushes and undos): returns the number of output / final
 // state floats that differ bitwise (0 = bit identical).
 extern "C" long long qe_test_dn_defer(int nseg, int m, int steps, int seed, int lanes, int lazy) {
+    dn_cpt_set(0);  // (reference and lanes as before [q27-dn-core3-pad]: dn_core4_seg off; review M2)
+    struct CptReset { ~CptReset() { dn_cpt_set(-1); } } cpt_reset;
     DnBench A(nseg, m), B(nseg, m, lazy);
     std::mt19937 rng(seed);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -1444,8 +1641,16 @@ extern "C" long long qe_test_dn_defer(int nseg, int m, int steps, int seed, int 
 }
 
 // dn_core2 (lanes) vs dn_core_dev on a plain (non-speculative) pass of m rows from slot cur:
-// returns the number of differing output / state floats
+// returns the number of differing output / state floats. cpt: the single-sequence variant of B (dn_single_cpt_set;
+// -1 = QE_DN_SINGLE_CPT / the default rule); qe_dn_core_ran() afterwards names the kernel B ran (review q27_dncore L6)
+extern "C" long long qe_test_dn_single(int m, int cur0, int lanes, int seed, int np, int cpt);
 extern "C" long long qe_test_dn_core2_plain(int m, int cur0, int lanes, int seed, int np) {
+    return qe_test_dn_single(m, cur0, lanes, seed, np, -1);
+}
+static int g_dn_ran_b = -1;
+extern "C" int qe_dn_core_ran() { return g_dn_ran_b; }
+extern "C" long long qe_test_dn_single(int m, int cur0, int lanes, int seed, int np, int cpt) {
+    CHECK(m >= 1 && m <= kPendRows, "qe_test_dn_single: m %d", m);
     DnBench A(1, m), B(1, m);
     std::mt19937 rng(seed);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -1471,13 +1676,20 @@ extern "C" long long qe_test_dn_core2_plain(int m, int cur0, int lanes, int seed
             CUDA_CHECK(cudaMemcpy(b->pn, pn2, 8, cudaMemcpyHostToDevice));
         }
     }
+    // np < 0: a plain pass; np == 0: verification without pending rows (pn = null, the engine's default); np > 0: with np
+    // pending rows. A = the reference dn_core_kernel, B = the default launch (dn_core4 for verification) or dn_core2 lanes
     const bool spec = np >= 0;
     dn_core2_set(0);
+    dn_single_cpt_set(0);
     dn_core_only(A.cv[0], A.ch, A.s, A.S[0], A.slot, A.cur, m, spec, A.qk[0], A.gb[0], A.o, 0,
-                 spec ? A.pn : nullptr, spec ? A.pend : nullptr);
+                 np > 0 ? A.pn : nullptr, np > 0 ? A.pend : nullptr);
     dn_core2_set(lanes);
+    dn_single_cpt_set(cpt);
     dn_core_only(B.cv[0], B.ch, B.s, B.S[0], B.slot, B.cur, m, spec, B.qk[0], B.gb[0], B.o, 0,
-                 spec ? B.pn : nullptr, spec ? B.pend : nullptr);
+                 np > 0 ? B.pn : nullptr, np > 0 ? B.pend : nullptr);
+    g_dn_ran_b = dn_core_ran();
+    dn_single_cpt_set(-1);
+    dn_core2_set(0);
     CUDA_CHECK(cudaDeviceSynchronize());
     long long bad = 0;
     std::vector<float> a((size_t)m * A.s.nv * 128), b(a.size()), sa(2 * A.slot), sb(sa.size());

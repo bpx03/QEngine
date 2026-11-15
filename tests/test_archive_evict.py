@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""27B archive eviction order (GPU, server, HTTP; fix-27b-evict). A small archive, 1 slot (every new conversation sends the last one to the archive), a main thread forced with
---main-agent-re, several other conversations:
-  A  an active main stays while the others' old writes go; its next turn resumes from the archive without a re-prefill;
-  B  once it is stale (FLASH_MAIN_STALE_S) it is an ordinary old conversation: it goes first, without the main's log line,
-     and the new write is archived (before the fix it refused all other writes for good);
-  C  a large active main that leaves no room: the others go first, then it goes too, with a log line of its tokens and
-     bytes; the writer is archived; no crash.
+"""27B archive eviction order (GPU, server, HTTP; fix-27b-evict, plain LRU since no-main-prio 6068b244 / DECISIONS
+2026-11-12: no main-thread priority). A small archive, 1 slot (every new conversation sends the last one to the archive),
+a main thread marked with --main-agent-re (it still logs prio 2), several other conversations:
+  A  the least recently used conversation goes first, main or not: the main (used first) is the first drop, then the
+     others in their order of use; its next turn still answers;
+  B  the main is an ordinary old conversation: it goes in LRU order, without an active-main log line, and the new writes
+     are archived (none refused);
+  C  a large main: no crash, the writer is archived, the main is evicted in its LRU turn and its next turn works from a
+     re-prefill.
 usage: flock .gpu.lock python3 tests/test_archive_evict.py <libqengine.so> [port=8181] [devices=0,1,2]
   env: AE_ARCHIVE_GB (default 2.2), AE_STALE_S (default 40). Exit 0: pass. Past the 10 s of the quick suites."""
 import json, os, random, re, signal, subprocess, sys, tempfile, time, urllib.request
@@ -74,7 +76,7 @@ try:
     time.sleep(1)
     SMALL, BIG = 1500, 20000
 
-    # A: an active main keeps its place while the others' old writes go
+    # A: plain LRU: the least recently used conversation goes first, main or not
     m = conv("main", SMALL, True)
     reply, n0, _ = chat(m)
     m += [{"role": "assistant", "content": reply}, {"role": "user", "content": "One more short answer, please."}]
@@ -82,10 +84,13 @@ try:
         chat(conv(f"sub{i}", SMALL))
     l = log()
     print(*[x for x in l.splitlines() if x.startswith("archive:")][-14:], sep="\n", flush=True)
-    check(re.search(r"archive: drop \d+ tokens prio [01]\b", l) is not None, "A: other conversations' old writes evicted")
-    check(re.search(r"archive: drop \d+ tokens prio 2", l) is None and "active main evicted" not in l, "A: the active main not evicted")
+    d = re.findall(r"archive: drop (\d+) tokens prio (\d)", l)
+    check(len(d) >= 2, f"A: the archive filled and evicted: {d}")
+    check(len(d) >= 1 and d[0][1] == "2", f"A: the least recently used (the main, used first) goes first: {d[:3]}")
+    check(all(x[1] != "2" for x in d[1:]), f"A: then the others, in their order of use: {d}")
+    check("active main evicted" not in l, "A: no active-main protection line")
     reply, n1, c1 = chat(m)
-    check(c1 >= n0 * 0.9, f"A: active main restored without a re-prefill: {c1} of {n1} tokens cached, first turn {n0}")
+    check(n1 > n0 and len(reply) > 0, f"A: the evicted main answers its next turn ({c1} of {n1} tokens cached)")
     m += [{"role": "assistant", "content": reply}, {"role": "user", "content": "And one more, please."}]
 
     # B: stale: the same main is an ordinary old conversation
@@ -103,7 +108,7 @@ try:
     check("active main evicted" not in l, "B: no active-main log line for a stale one")
     check(re.search(r"archive: slot \d+ \d+ tokens", l) is not None and "archive: no room" not in l, "B: new writes archived, none refused")
 
-    # C: a large active main: the others first, then it, with the log line
+    # C: a large main: LRU like the rest; no crash, the writer archived, re-prefill after the eviction works
     t0 = len(log())
     big = conv("bigmain", BIG, True)
     _, nb, _ = chat(big)
@@ -115,13 +120,12 @@ try:
     chat(conv("dsub3", SMALL))
     l = log()[t0:]
     print(*[x for x in l.splitlines() if x.startswith("archive:")], sep="\n", flush=True)
-    mm = re.search(r"archive: active main evicted, nothing else left: (\d+) tokens, ([\d.]+) GB", l)
-    check(mm is not None and int(mm.group(1)) >= nb, f"C: log line names the main's tokens and bytes: {mm.group(0) if mm else None}")
-    if mm:
-        after = l[mm.end():]
+    dm = [mt for mt in re.finditer(r"archive: drop (\d+) tokens prio (\d)", l) if int(mt.group(1)) >= nb]
+    check(len(dm) >= 1, f"C: the large main evicted in its LRU turn: {[mt.group(0) for mt in dm]}")
+    if dm:
+        after = l[dm[0].end():]
         check(re.search(r"archive: slot \d+ \d+ tokens prio [01]", after) is not None, "C: the writer archived after it")
-        before = l[:mm.start()]
-        check(before.count("archive: drop") >= 1, "C: others went before it")
+    check("archive: no room" not in l, "C: no write refused")
     check(p.poll() is None, "server alive")
     reply, n2, c2 = chat(big + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "Short answer."}])
     check(n2 > nb and c2 < nb * 0.5, f"C: the evicted main still answers, from a re-prefill: {c2} of {n2} cached")

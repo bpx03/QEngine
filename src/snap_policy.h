@@ -13,9 +13,9 @@
 #pragma once
 #include <cstddef>
 
-// Within the kind, the lowest value goes first, then the least recently used: value(entry) is the
-// conversation's priority (main agent 2, normal 1, finished subagent 0) plus 1 for a state past
-// 32K tokens within 8K of its slot's current end (expensive to recompute: a near-max-context
+// Within the kind, the lowest value goes first, then the least recently used: value(entry) is 1
+// for a state past 32K tokens within 8K of its slot's current end, else 0 (no conversation
+// priority, user decision 2026-11-12; expensive to recompute: a near-max-context
 // conversation's end state and latest checkpoints stay while short prompts come and go; its
 // older turns' checkpoints do not).
 // S: sequence of entries with `.kind` (0/1) and `.used` (LRU tick). Returns the index of the entry

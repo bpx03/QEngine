@@ -37,7 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agents import Tracker
-from qe_env import env_float, env_int, env_str
+from qe_env import env_float, env_int, env_str, set_env
 import loop_guard
 from content_markers import OUT_MARK, SENT, Markers, escape_out, mark, out_marks, unmark
 from engine import Engine, EngineRefused, SequenceFault, StartRefused
@@ -234,8 +234,8 @@ class Template:
 
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
-        env.filters["tojson"] = lambda x, indent=None, separators=None, sort_keys=False: json.dumps(
-            x, ensure_ascii=False, indent=indent, separators=separators, sort_keys=sort_keys)
+        env.filters["tojson"] = lambda x, indent=None, separators=None, sort_keys=False, ensure_ascii=False: json.dumps(
+            x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
         self.t = env.from_string(open(path).read())
 
     def render(self, messages, tools=None, **kw):
@@ -619,6 +619,19 @@ def canonical_tools(tools):
     return [_canon_json(t, head=True) for t in sorted(tools, key=name)]
 
 
+def tool_calls_or_text(parser, tools, tchoice, no_calls):
+    """The calls of a reply's tool text that tool_choice allows, and that tool text as plain content when no call is
+    left (nothing parses, tool_choice filters the calls out, or tool_choice is none; raw, marks removed; "" otherwise). A model-emitted <tool_call> whose body is not a
+    call (prose, broken markup) then reaches the client as text instead of an empty reply, as vLLM's tool parsers
+    return the model output as content when the parse fails."""
+    if not parser.tool_text:
+        return [], ""
+    parsed = [] if no_calls else parse_tool_calls(parser.tool_text, tools)
+    calls = tool_choice.filter_calls(tchoice, parsed) if not no_calls else []
+    # review r17 L10: calls that parse but tool_choice filters out also leave the reply empty otherwise
+    return calls, ("" if calls else unmark(parser.tool_text))
+
+
 def parse_tool_calls(text, tools):
     schemas = {}  # name -> properties of its parameter schema (None: the schema lists none)
     for t in tools or []:
@@ -712,15 +725,50 @@ class Admission:
 
     def __init__(self, gen):
         self.g, self.e, a = gen, gen.engine, gen.args
-        self.aging, self.pre_min, self.pre_max = a.prefill_aging, a.preempt_min, a.preempt_max
-        self.main_bonus = getattr(a, "main_bonus", 0)
+        self.aging, self.pre_min = a.prefill_aging, a.preempt_min
         self.backfill_wait = getattr(a, "backfill_wait", 0)
+        # a request pauses others only after waiting this long (a short turn does not pay two full KV transfers of a
+        # sequence that would end in seconds; review M1)
+        self.pause_wait = getattr(a, "pause_wait", PAUSE_WAIT)
         self.k = a.mtp_k
         self.last_note = 0.0
         # several prompts in one prefill batch (Flash-Next): every admitted text prompt joins the next batches
         self.multi = gen.engine.can_prefill_multi() if hasattr(gen.engine, "can_prefill_multi") else False
         # passes bound by the PCIe copies of the host-backed experts (2 cards): the large batch also while requests wait
         self.pass_bound = self.multi and gen.engine.prefill_pass_bound()
+        # shared batches: cut-ins at any time, the longest prompt in flight keeps this share of the rows (0: the old
+        # cut-in rounds with the preempt_min gap). Default (None): 0.5 where passes are copy-bound (measured there,
+        #), else 0; an explicit value applies on any Flash-Next server
+        ls = getattr(a, "long_share", None)
+        if ls is None:
+            ls = LONG_SHARE if self.pass_bound else 0.0
+        elif not 0.0 <= ls <= 0.95:
+            print(f"[sched] --long-share {ls} out of [0, 0.95]: {min(0.95, max(0.0, ls))} used", flush=True)
+        self.long_share = min(0.95, max(0.0, ls)) if self.multi else 0.0
+        self.long_job, self.credit, self.pos0 = None, 0.0, None
+        # --fill-passes 1 (opt-in, with a share): the other prompts in flight take each shared batch first, oldest
+        # first; the longest prompt fills the rest of every pass and keeps at least long_share of its rows (it leads
+        # capped to that share when the others want more). Default 0: the per-pass credit rule; full
+        # passes did not beat it on short appends in the user profile
+        # (not in mode B, FLASH_PAR=pp: its stage queues take whole prompts and ignore row caps)
+        self.fill = bool(getattr(a, "fill_passes", 0)) and (getattr(gen.engine, "par", None) or {}).get("mode", "tp") != "pp"
+        self.caps = {}
+        # --preempt-max default: the profile's (Flash-Next 8192) with the shared-batch cut-ins, else the old 1024
+        if getattr(a, "preempt_max", None) is None:
+            d = getattr(getattr(gen, "profile", None), "defaults", None) or {}
+            a.preempt_max = d.get("preempt_max", 1024) if self.long_share > 0 else 1024
+        self.pre_max = a.preempt_max
+        # pass-bound (a pass costs ~0.65 s of PCIe expert copies whatever its rows): the big batch also while others decode,
+        # ~2x the prompt rows per decode stall of +0.13 s (agents + long prompts: short-turn TTFT p90 -41..-58 %,
+        #), at most the measured 4096; an explicit --prefill-chunk keeps its value
+        busy = min(getattr(a, "prefill_chunk_idle", 0), PASS_BOUND_CHUNK)
+        if self.pass_bound and getattr(a, "prefill_chunk_auto", False) and busy > a.prefill_chunk > 0:
+            a.prefill_chunk = busy
+            print(f"[sched] prefill chunk {a.prefill_chunk} also while sequences decode (passes bound by expert copies)",
+                  flush=True)
+        if self.long_share > 0:
+            print(f"[sched] cut-ins up to {self.pre_max} tokens join the shared prefill batches at once; the longest prompt "
+                  f"keeps {self.long_share:.2f} of the rows", flush=True)
         if self.multi:
             print(f"[sched] several queued prompts share prefill batches"
                   f"{' (passes bound by host-backed expert copies: large batches also while requests wait)' if self.pass_bound else ''}",
@@ -744,20 +792,19 @@ class Admission:
     def pick_next(self, now, prefills):
         """The queued requests that may be prefilled next, best first (empty: keep waiting): the
         least left to compute, aged so that nothing starves (every second of waiting is worth
-        `aging` tokens), the main agent thread ahead by `main_bonus` tokens (it waits for nobody
-        else; a subagent overtakes it only after waiting main_bonus / aging seconds). While a long
-        prompt is in progress only a request with at most preempt_max tokens left may cut in (and
-        one at a time), or a main-thread request of any size on a long prompt that is not main."""
+        `aging` tokens); every conversation alike (no main-thread rule, user decision 2026-11-12).
+        While a long prompt is in progress only a request with at most preempt_max tokens left may
+        cut in (this cut-in rule only with --long-share 0; with a share the shared-batch rule below
+        applies)."""
         q = self.g.queue
         if not q:
             return []
         self.estimate(now)
-        order = sorted(range(len(q)), key=lambda i: q[i].est - (now - q[i].t_enq) * self.aging
-                       - (self.main_bonus if q[i].prio >= 2 else 0))
+        order = sorted(range(len(q)), key=lambda i: q[i].est - (now - q[i].t_enq) * self.aging)
         if not prefills:
             return order
         join = []
-        if self.multi and len(prefills) < MULTI_MAX:
+        if self.multi and len(prefills) < MULTI_MAX and self.long_share <= 0:
             # text prompts join the shared batches of the ones in flight while all of them fit one batch (a long prompt
             # gains nothing from sharing and admitting it early only claims its KV region ahead); else the cut-in rule
             cap = self.join_cap()
@@ -765,11 +812,29 @@ class Admission:
             join = [i for i in order if not getattr(q[i].ids, "mm", None) and left + q[i].est <= cap]
             if join:
                 return join
-        if self.pre_max <= 0 or (len(prefills) >= 2 and not self.multi):
-            return []
         left_of = lambda j: len(j.ids) - max(0, self.e.prefill_pos(j.slot))
         long_ = max(prefills, key=left_of)
         pos = max(0, self.e.prefill_pos(long_.slot))
+        if self.long_share > 0:
+            # (this includes the join rule above: a prompt that fits one batch with the ones in flight also joins)
+            # shared batches with a guaranteed share for the longest prompt (batch_order): a text prompt with at most
+            # preempt_max tokens left joins the next batch at once, whatever the long one has done since the last
+            # cut-in. Before, it waited for preempt_min tokens of the long prompt between rounds, and a 1-8K tool result
+            # (above preempt_max 1024) waited for the whole long prompt
+            if len(prefills) >= MULTI_MAX:
+                return []
+            cap = self.join_cap()
+            left = sum(left_of(j) for j in prefills)
+            # (by size and age only, no main-thread rule: user decision 2026-11-12, every conversation alike)
+            elig = lambda i: not getattr(q[i].ids, "mm", None) and (q[i].est <= self.pre_max or left + q[i].est <= cap)
+            # nothing starves: once the best queued request by the aged order cannot join (too large, images) and has
+            # waited backfill_wait, nothing more joins, the prompts in flight drain and it starts next (before: shorts
+            # arriving every few seconds kept the batch busy and a 20K prompt or an image turn waited without bound)
+            if not elig(order[0]) and now - q[order[0]].t_enq > self.backfill_wait:
+                return []
+            return [i for i in order if elig(i)]
+        if self.pre_max <= 0 or (len(prefills) >= 2 and not self.multi):
+            return []
         if len(long_.ids) - pos < self.pre_min:
             return []
         cuts = [j for j in prefills if j is not long_]
@@ -787,35 +852,97 @@ class Admission:
         # join_cap / (join_cap + preempt_min) of the prompt rows (~36 % with the defaults) and the long one finishes
         if long_.cut_at is not None and pos - long_.cut_at < min(self.pre_min, long_.round_tok * self.pre_min / self.join_cap()):
             return []
-        return [i for i in order if not getattr(q[i].ids, "mm", None) and
-                (q[i].est <= self.pre_max or (q[i].prio >= 2 and long_.prio < 2))]
+        return [i for i in order if not getattr(q[i].ids, "mm", None) and q[i].est <= self.pre_max]
 
     def join_cap(self):  # prompt rows in flight that still share one prefill batch (the idle batch + a tail chunk)
         return max(self.g.args.prefill_chunk, self.g.args.prefill_chunk_idle) + 512
 
-    def batch_order(self, now, prefills):
-        """Prompts in flight in the order they get rows of a shared prefill batch: least left first, aged, main thread
-        ahead (as pick_next); a long prompt gets what is left of the batch. Prompts that end within one batch (cut-ins)
-        always come before longer ones: aged by its wait in the queue, a long prompt in progress for ~45 s sorted ahead
-        of a cut-in, took the whole batch and the cut-in waited for all of it (KV in RAM, t8 + 262K: TTFT p50 58 s)."""
+    def batch_order(self, now, prefills, budget=None):
+        """Prompts in flight in the order they get rows of a shared prefill batch: least left first, aged (as
+        pick_next); a long prompt gets what is left of the batch. Prompts that end within one batch (cut-ins) come
+        before longer ones: aged by its wait in the queue, a long prompt in progress for ~45 s sorted ahead of a
+        cut-in, took the whole batch and the cut-in waited for all of it (KV in RAM, t8 + 262K: TTFT p50 58 s).
+        With --long-share the longest prompt is placed explicitly: first while it is owed rows, else last."""
         cap = self.join_cap()
+        left = {id(j): len(j.ids) - max(0, self.e.prefill_pos(j.slot)) for j in prefills}
         def key(j):
-            left = len(j.ids) - max(0, self.e.prefill_pos(j.slot))
-            return (left > cap, left - (now - j.t_enq) * self.aging - (self.main_bonus if j.prio >= 2 else 0))
-        return sorted(prefills, key=key)
+            return (left[id(j)] > cap, left[id(j)] - (now - j.t_enq) * self.aging)
+        order = sorted(prefills, key=key)
+        self.pos0 = None
+        self.caps = {}
+        if self.long_share > 0 and self.fill and len(prefills) >= 2:
+            # full passes: the others by age (oldest first), the longest prompt last, so it
+            # takes whatever rows they leave. When they want more than (1 - long_share) of the batch, it leads instead,
+            # capped to long_share of the rows (whole 512-row chunks), and they share the rest: every pass is full and
+            # the long prompt gets at least its share of every pass (no pass of its own that the others wait out)
+            long_ = max(prefills, key=lambda j: left[id(j)])
+            others = sorted((j for j in prefills if j is not long_), key=lambda j: j.t_enq)
+            T = min(int(budget), cap - 512) if budget else cap - 512  # (the engine's batch: min(budget, its batch rows))
+            keep = max(512, int(self.long_share * T) // 512 * 512)
+            self.long_job, self.credit = None, 0.0
+            if sum(left[id(j)] for j in others) <= T - keep or left[id(long_)] <= keep:
+                return others + [long_]
+            self.caps = {id(long_): keep}
+            return [long_] + others
+        if self.long_share > 0 and len(prefills) >= 2:
+            # the longest prompt keeps long_share of the prompt rows: the batch rows it got short of its share since the
+            # cut-ins began (credit) put it first in the next batch (the engine then gives it the whole batch), else it
+            # goes last and gets what the cut-ins leave (placed last explicitly: by the aged key a long prompt in flight
+            # for a while sorted ahead of a 5-8K cut-in, which then waited for all of it)
+            long_ = max(prefills, key=lambda j: left[id(j)])
+            if long_ is not self.long_job:
+                self.long_job, self.credit = long_, 0.0
+            order.remove(long_)
+            if self.credit > 0:
+                order.insert(0, long_)
+            else:
+                order.append(long_)
+            self.pos0 = {id(j): len(j.ids) - left[id(j)] for j in prefills}
+        else:
+            self.long_job, self.credit = None, 0.0
+        return order
+
+    def account(self, prefills, budget):
+        """After a batch of batch_order's prompts: the long prompt's credit grows by its share of the batch and shrinks
+        by the part of the batch's rows it got, per pass (bounded by one pass either way, so neither side banks a long
+        run). Per pass, not per row: a pass costs about the same whatever its rows where passes are copy-bound, and a
+        row count let small cut-in batches (a few hundred rows, without the long prompt) take most of the passes (62K
+        prompt 28 -> 56 s next to agents)."""
+        if self.pos0 is None or self.long_job is None:  # (--fill-passes: no credit to keep)
+            return
+        if len(prefills) < 2:  # the long prompt ran alone: no cut-in to share with, nothing owed either way
+            self.credit, self.pos0 = 0.0, None
+            return
+        rows = {}
+        for j in prefills:
+            p0 = self.pos0.get(id(j))
+            if p0 is None:
+                continue
+            p = self.e.prefill_pos(j.slot)
+            rows[id(j)] = max(0, (len(j.ids) if p < 0 else min(p, len(j.ids))) - p0)
+        tot = sum(rows.values())
+        if tot > 0:
+            self.credit = min(1.0, max(-1.0, self.credit + self.long_share - rows.get(id(self.long_job), 0) / tot))
+        self.pos0 = None
+        p = self.e.prefill_pos(self.long_job.slot)
+        if p < 0 or p >= len(self.long_job.ids):  # (it ended in this batch: not kept referenced until the next one)
+            self.long_job, self.credit = None, 0.0
 
     def admit_next(self, now, prefills):
         """Index of the queued request to start now, or None. The best candidate that fits the pool
         goes; one that does not fit lets the next ones that fit start before it (backfill) until it
-        has waited backfill_wait seconds: then only a request of a higher prio may still pass it.
-        A main-thread request that does not fit pauses decoding sequences worth less (never a
-        prefill, never another main thread) when that makes it fit."""
+        has waited backfill_wait seconds: then nothing passes it any more.
+        A request that does not fit and has waited pause_wait seconds pauses decoding sequences
+        (never a prefill) when that makes it fit: the most recently admitted ones first
+        (src/pool_order.h), whoever they are. Never while a sequence is paused: it resumes first
+        (the engines' pause_for does not count paused rooms, can_admit does: a newcomer would take
+        the room the paused one waits for, again for every arrival)."""
         g, e = self.g, self.e
         blocked = None
         for i in self.pick_next(now, prefills):
             j = g.queue[i]
-            if blocked is not None and now - blocked.t_enq > self.backfill_wait and j.prio <= blocked.prio:
-                continue  # starvation guard: nothing of the same or a lower class passes it any more
+            if blocked is not None and now - blocked.t_enq > self.backfill_wait:
+                continue  # starvation guard: nothing passes it any more
             need = len(j.ids) + self.k + 2
             if e.can_admit(need):
                 if blocked is not None:
@@ -823,11 +950,18 @@ class Admission:
                     self.note(f"[sched] backfill: {need} tokens start while {len(blocked.ids)} tokens "
                               f"(waiting {now - blocked.t_enq:.1f} s) do not fit")
                 return i
-            if j.prio >= 2 and e.pause_for(need, j.prio):
-                g.sched["main_pauses"] += 1
-                g.cur_slot = -1  # a paused slot may have been the current single sequence
-                print(f"[sched] main thread ({need} tokens): paused lower-prio sequences to admit it", flush=True)
-                return i
+            ps = e.pause_state() if hasattr(e, "pause_state") else None
+            if ps is not None and ps[1] == 0 and now - j.t_enq >= self.pause_wait:
+                ok = e.pause_for(need, j.prio)  # (any request, by the pool order: the most recently admitted first)
+                ps2 = e.pause_state()  # (also after a False: pause_slot may have failed after pausing some)
+                if ps2 is not None and ps2[0] > ps[0]:  # (counted and logged only when something was paused)
+                    g.sched["pauses"] += 1
+                    g.cur_slot = -1  # a paused slot may have been the current single sequence
+                    print(f"[sched] {need} tokens (waited {now - j.t_enq:.1f} s): paused {ps2[0] - ps[0]} of the most "
+                          f"recently admitted decoding sequences{' to admit it' if ok else ' (then the pause failed: not admitted)'}",
+                          flush=True)
+                if ok:
+                    return i
             if blocked is None:
                 blocked = j
         if blocked is not None:
@@ -865,6 +999,7 @@ class Generator:
         wsch = set("ĠĊĉčĀ \t\n")  # byte-level BPE spellings of whitespace
         self.ws_ids = {i for t, i in self.tok.get_vocab().items() if i < self.special_min and t and set(t) <= wsch}
         self.guards = {"triggers": 0, "recent": []}  # /api/stats loop_guard
+        self.guard_seen = collections.OrderedDict()  # loop guard: stretch -> (total, repeats) for guard_total
         self.seg_lock = threading.Lock()
         # end of turn: generation_config.json eos_token_id ([<|im_end|>, <|endoftext|>] for both
         # models) plus those two tokens by name
@@ -922,6 +1057,9 @@ class Generator:
         if self.tool_tier is not None and not self.tool_tier.ok:
             self.tool_tier = None
         self.tool_choice_noted = False  # the first request whose required / named tool_choice is not enforced
+        # [tool-choice-ban] tool_choice none through the engine's static token ban (no constrained path); QE_TOOL_BAN=0:
+        # the mask path as before (off-switch)
+        self.tool_ban = self.tool_tier is not None and self.engine.has("qe_ban_tokens") and env_int("QE_TOOL_BAN", 1) != 0
         if self.tool_tier is None:
             print("tool_choice: not enforced through masks (the engine has no grammar C API"
                   f"{': ' + self.engine.refused['grammar'] if getattr(self.engine, 'refused', {}).get('grammar') else ''}"
@@ -944,7 +1082,7 @@ class Generator:
         self.metrics = Metrics(stats, args.served_name)
         # main agent thread detection (server/agents.py) and the scheduler's counters, both in /api/stats
         self.agents = Tracker(override=getattr(args, "main_agent_re", None))
-        self.sched = {"main_pauses": 0, "main_cutins": 0, "backfills": 0}
+        self.sched = {"pauses": 0, "backfills": 0}
         snap = self.metrics.snapshot
         version, build = version_info(getattr(self.engine, "lib_path", None))  # qetop / dashboard header
         # parallel mode of the engine (FLASH_PAR / the boot-time pick: mode, why, probe numbers)
@@ -1085,50 +1223,72 @@ class Generator:
                 else:
                     parts.append({"type": "text", "text": "[image omitted: this server runs without vision]"})
             m["content"] = parts
+        plain, kw0 = messages, dict(kw)  # (a note that would not fit: the turn goes without it, below)
         if guard and self.args.loop_guard_note and not guard["human"]:  # the repeated results tell it it is looping
             messages, guard["note"] = loop_guard.add_note(messages, guard["turns"], guard["distinct"])
-        messages = self.clean_history(messages, info, track)
-        if getattr(self.args, "sort_tools", 1):
-            tools = canonical_tools(tools)
-        mk = getattr(self, "marks", None)
-        if mk is not None:  # added-token strings in the request's text -> sentinels (server/content_markers.py)
-            text = self.tmpl.render(mk.protect_messages(messages), mk.protect(tools), **kw)
-        else:
-            text = self.tmpl.render(messages, tools, **kw)
-        if guard and guard_think and getattr(self.args, "loop_guard_think", 0) > 0 and kw.get("enable_thinking") is False \
-                and text.endswith(EMPTY_THINK):
-            # a looping agent on a no-think server: this turn reasons first (session 92997599: 10/10 replays broke the
-            # loop, presence / note alone did not). The prompt is rendered without thinking (same system header and
-            # history, so the cached prefix holds) and only the generation prompt's empty think block is opened.
-            text = text[:len(text) - len(EMPTY_THINK)] + "<think>\n"
-            kw["enable_thinking"] = True
-            guard["think"] = self.args.loop_guard_think
-        sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
-        label = "main agent" if info is not None and info.main else agent_label(sys_txt, messages)
-        affinity = int.from_bytes(hashlib.blake2b(sys_txt.encode(), digest_size=8).digest(), "little")
-        if env_str("QE_DUMP_PROMPTS"):
-            d = env_str("QE_DUMP_PROMPTS")
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
-                f.write(mk.restore(text) if mk is not None else text)
-        ids = self.encode(text)
-        ids.label, ids.agent, ids.guard = label, info, guard
-        if images:
-            from vision import load_image_bytes
-            t0 = time.time()
-            try:
-                raw = [load_image_bytes(s) for s in images]
-                with self.vision_lock:
-                    exp, emb, rope3, delta = self.vision.expand(list(ids), raw)
-            except InputError:
-                raise
-            except Exception as ex:  # undecodable base64 / not an image / URL not reachable / placeholder mismatch
-                raise InputError(f"image input: {ex}") from ex
-            hint = ids.hint
-            ids = Ids(exp)
-            ids.hint, ids.mm, ids.label, ids.agent, ids.guard = hint, (emb, rope3, delta), label, info, guard
-            ids.img = (len(images), emb.shape[0])
-            print(f"{len(images)} image(s): {emb.shape[0]} tokens, encoded in {time.time() - t0:.2f}s", flush=True)
+
+        def build(messages, tools, kw):
+            messages = self.clean_history(messages, info, track)
+            if getattr(self.args, "sort_tools", 1):
+                tools = canonical_tools(tools)
+            mk = getattr(self, "marks", None)
+            r_msgs, r_tools = (mk.protect_messages(messages), mk.protect(tools)) if mk is not None else (messages, tools)
+            text = self.tmpl.render(r_msgs, r_tools, **kw)
+            if guard and guard_think and getattr(self.args, "loop_guard_think", 0) > 0 and kw.get("enable_thinking") is False \
+                    and self.can_force and text.endswith(EMPTY_THINK):  # (review 2 L6: only with the budget enforced)
+                # a looping agent on a no-think server: this turn reasons first (session 92997599: 10/10 replays broke the
+                # loop, presence / note alone did not). The prompt is rendered without thinking (same system header and
+                # history, so the cached prefix holds) and only the generation prompt's empty think block is opened.
+                text = text[:len(text) - len(EMPTY_THINK)] + "<think>\n"
+                kw["enable_thinking"] = True
+                guard["think"] = self.args.loop_guard_think
+            sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
+            label = "main agent" if info is not None and info.main else agent_label(sys_txt, messages)
+            affinity = int.from_bytes(hashlib.blake2b(sys_txt.encode(), digest_size=8).digest(), "little")
+            if env_str("QE_DUMP_PROMPTS"):
+                d = env_str("QE_DUMP_PROMPTS")
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
+                    f.write(mk.restore(text) if mk is not None else text)
+            return self.encode(text), label, affinity
+
+        try:
+            ids, label, affinity = build(messages, tools, kw)
+        except jinja2.TemplateError as ex:  # the template's own checks (no messages, an unknown role, ...): HTTP 400
+            raise InputError(f"the chat template refused the messages: {ex}") from ex
+        raw = []  # the request's images, read once
+
+        def finish(ids, label):  # the labels, the image tokens
+            ids.label, ids.agent, ids.guard = label, info, guard
+            if images:
+                from vision import load_image_bytes
+                t0 = time.time()
+                try:
+                    raw[:] = raw or [load_image_bytes(s) for s in images]
+                    with self.vision_lock:
+                        exp, emb, rope3, delta = self.vision.expand(list(ids), raw)
+                except InputError:
+                    raise
+                except Exception as ex:  # undecodable base64 / not an image / URL not reachable / placeholder mismatch
+                    raise InputError(f"image input: {ex}") from ex
+                hint = ids.hint
+                ids = Ids(exp)
+                ids.hint, ids.mm, ids.label, ids.agent, ids.guard = hint, (emb, rope3, delta), label, info, guard
+                ids.img = (len(images), emb.shape[0])
+                print(f"{len(images)} image(s): {emb.shape[0]} tokens, encoded in {time.time() - t0:.2f}s", flush=True)
+            return ids
+
+        ids = finish(ids, label)
+        if guard and guard.get("note") and self.too_long(ids):
+            # the note would push the prompt over the context (review L6): the guarded turn goes without it (reasoning
+            # and penalty stay), rendered again from the client's own messages (checked with the image tokens)
+            kw.clear()
+            kw.update(kw0)
+            guard.pop("think", None)
+            guard["note"] = False
+            print(f"loop guard: the note would make the prompt {len(ids)} tokens, over the context: left out", flush=True)
+            ids, label, affinity = build(plain, tools, kw)
+            ids = finish(ids, label)
         return ids, affinity
 
     def loop_check(self, messages, info):
@@ -1142,14 +1302,33 @@ class Generator:
             print(f"loop guard: {ex!r}", flush=True)
             return None
         k = st["turns"]
-        if k < a.loop_guard_turns or not (st["human"] or loop_guard.due(st, a.loop_guard_turns)):
+        if k >= loop_guard.WINDOW:
+            st = dict(st, total=self.guard_total(st, getattr(getattr(info, "conv", None), "id", None)))
+        # a human just spoke: guarded at once, unless the turn before had human text too (a client that adds text after
+        # every result: the back-off then holds, review 2 L2)
+        human_now = st["human"] and not st.get("human_prev")
+        if k < a.loop_guard_turns or not (human_now or loop_guard.due(st, a.loop_guard_turns)):
             return None
         # the human just spoke (maybe "run it again"): only think first, no penalty, no note
-        pres = 0.0 if st["human"] else a.loop_guard_penalty if k < 2 * a.loop_guard_turns else max(a.loop_guard_penalty, 2.0)
+        pres = 0.0 if human_now else a.loop_guard_penalty if k < 2 * a.loop_guard_turns else max(a.loop_guard_penalty, 2.0)
         conv = getattr(getattr(info, "conv", None), "id", None)
         sess = getattr(getattr(info, "session", None), "key", "") or ""
-        return {"turns": k, "distinct": st["distinct"], "human": st["human"], "presence": pres, "conv": conv,
+        return {"turns": k, "distinct": st["distinct"], "human": human_now, "presence": pres, "conv": conv,
                 "session": sess[2:10], "main": bool(getattr(info, "main", False))}
+
+    def guard_total(self, st, conv):
+        """The turn count due() keys on past the window (review 2 L3): the history's own, while it grows; a client that
+        keeps only its last turns sends the same count on every turn, so a repeat of the same stretch at the same count
+        adds one (a re-sent identical request counts as a turn too). Bounded: the last 256 stretches."""
+        key = (conv, st.get("key"))
+        with self.seg_lock:
+            seen = self.guard_seen.get(key)
+            n = seen[1] + 1 if seen is not None and seen[0] == st["total"] else 0
+            self.guard_seen[key] = (st["total"], n)
+            self.guard_seen.move_to_end(key)
+            while len(self.guard_seen) > 256:
+                self.guard_seen.popitem(last=False)
+        return st["total"] + n
 
     def guard_note(self, guard):
         """A guarded turn starts: warning line, diag log, /api/stats (qetop)."""
@@ -1442,7 +1621,7 @@ class Generator:
         if j.empty_n < NOPROG_STEPS or time.time() - t_tok < NOPROG_S:
             return
         try:
-            pi = self.engine.pool_info()
+            pi = self.engine.pool_info(convs=False)
             pz = pi["slots"][j.slot]["paused"]
             if pz:  # paused: preempted by a reply worth more (waits for it, no deadline, as before), or waiting for
                 # GPU memory another process holds (vram): a long, explicit deadline (QE_PAUSE_TIMEOUT_S), counted from
@@ -1486,7 +1665,6 @@ class Generator:
         prefills = []
         decode_until = 0.0  # while another prompt is prefilled, decode steps run until this time
         bg_done = True  # idle archiving has nothing left (reset only when a request ends without a decode step; else the idle persist)
-        pre_min, pre_max = self.args.preempt_min, self.args.preempt_max
         burst_wait = max(0.0, getattr(self.args, "burst_wait", 5.0)) / 1000.0
 
         adm = Admission(self)
@@ -1550,12 +1728,19 @@ class Generator:
                     # restart / model swap even without a clean shutdown)
                     # (waited in slices of at most HANG_S / 2 with a beat in between: --persist-idle above QE_HANG_S
                     # must not look like a hang)
+                    # an archiver stopped for host memory retries once a second here too, also while the disk
+                    # persist waits for --persist-idle (qfn_archive_loss re-review L1)
+                    if bg_done == 2 and time.time() - last_mg > 1.0:
+                        last_mg = time.time()
+                        bg_done = False
+                        continue
                     if self.dirty and idle_persist > 0 and self.args.disk_cache:
                         if idle_since is None:
                             idle_since = time.monotonic()
                         rest = idle_persist - (time.monotonic() - idle_since)
                         if rest > 0:
-                            self.cv.wait(min(rest, HANG_S / 2) if HANG_S > 0 else rest)
+                            w = min(rest, HANG_S / 2) if HANG_S > 0 else rest
+                            self.cv.wait(min(w, 1.0) if bg_done == 2 else w)
                             continue
                         idle_since = None
                         if not self.queue and not self.ctrl:
@@ -1571,6 +1756,8 @@ class Generator:
                             pass
                         finally:
                             self.cv.acquire()
+                        if bg_done == 2:  # the archiver stopped for host memory: try again (it says 2 again while short)
+                            bg_done = False
                 if self.queue or active or prefills or self.ctrl:
                     idle_since = None
                 if not active and not prefills:
@@ -1616,10 +1803,8 @@ class Generator:
                                 long_.round_tok = 0  # a new cut-in round
                             long_.round_tok += admit.est
                             long_.cut_at = max(0, e.prefill_pos(long_.slot))
-                            if admit.prio >= 2 and long_.prio < 2 and admit.est > pre_max:
-                                self.sched["main_cutins"] += 1
-                            print(f"[sched] {admit.est} tokens to prefill cut in on {len(long_.ids)} at "
-                                  f"{long_.cut_at}{' (main thread)' if admit.prio >= 2 else ''}", flush=True)
+                            print(f"[sched] {admit.est} tokens to prefill cut in on {len(long_.ids)} at {long_.cut_at}",
+                                  flush=True)
                 if admit is None:
                     break
                 self.dirty = True
@@ -1655,7 +1840,7 @@ class Generator:
                         admit.slot = -1
                         if admit.n_refused == 1:  # logged once per request
                             try:
-                                pi = e.pool_info()
+                                pi = e.pool_info(convs=False)
                                 busy = sum(1 for x in pi["slots"] if x["active"])
                                 note = f"{busy} active slots, {pi['events']['evict']} evictions, {pi['paused']} paused"
                             except Exception:
@@ -1708,8 +1893,11 @@ class Generator:
                         ready = None
                         self.beat("prefill")
                         if adm.multi and len(prefills) >= 2:  # one batch over the prompts in flight
-                            order = adm.batch_order(tc, prefills)
-                            ready = e.prefill_multi([j.slot for j in order], budget)
+                            order = adm.batch_order(tc, prefills, budget)
+                            slots = [j.slot for j in order]
+                            # (row caps only with --fill-passes: the long prompt leads capped to its share)
+                            ready = (e.prefill_multi(slots, budget, caps=[adm.caps.get(id(j), 0) for j in order])
+                                     if adm.caps else e.prefill_multi(slots, budget))
                             if ready is not None:
                                 self.cur_slot = -1  # a piece prefilled alone binds its own slot: the next step resumes
                                 tr("prefill_multi", tc, len(order))
@@ -1723,6 +1911,7 @@ class Generator:
                             self.cur_slot = cur.slot
                             if done:
                                 finished = [cur]
+                        adm.account(prefills, budget)  # (a no-op unless batch_order set a long prompt's share)
                         tc = time.time() - tc
                         decode_until = time.time() + (tc * share / (1 - share) if 0 < share < 1 else 0)
                     if finished:
@@ -1859,6 +2048,9 @@ def repetition_period(ids, max_period=200, min_span=600, min_reps=5):
 
 STOP_ROLLBACK = env_int("QE_STOP_ROLLBACK", 2)
 MULTI_MAX = 8  # prompts in flight that share prefill batches (the engine's FLASH_MAX_PREFILLS default)
+PAUSE_WAIT = 3.0  # --pause-wait default (s): how long a request that does not fit waits before it pauses others
+LONG_SHARE = 0.5  # --long-share default where passes are copy-bound (the knee for short appends)
+PASS_BOUND_CHUNK = 4096  # the prefill chunk while others decode on pass-bound servers (measured)
 
 
 class Job:
@@ -1869,8 +2061,19 @@ class Job:
     stop_sent = 0  # stop sequences: the length of text_all that went to the client (stop_scan)
     answer_at = 0  # stop sequences match from here; None: a guard-opened thinking turn whose answer has not begun (stop_from)
     answer_max = None  # a guard-opened thinking turn: the client's max_tokens, for the answer alone
+    tool_banned = False  # [tool-choice-ban] tool_choice none through the engine's static ban (begin_start)
+    tool_hold = False  # tool_choice required / named: client stops wait until the forced call is complete (stop_from)
+    cut_think = (False, True)  # tool_choice none, no grammar tier, no ThinkControl: (inside <think>, no answer yet)
     lp = None  # OpenAI logprobs: top_logprobs of each token, None: off (no engine or token work at all)
     lp_row = 0  # logprobs: the row of the token being fed
+
+    def n_out(self):
+        """Generated tokens as usage reports them: the reply's tokens plus the end token the model generated (EOS /
+        <|im_end|>, as vLLM counts it; DECISIONS 11-14). Not when the reply ended by length, a stop string, a tool call
+        cut or the server's own stops: no end token was generated; structured output that ends when its grammar
+        completes counts none either (vLLM would sample one more step). self.n stays the reply's text tokens
+        (max_tokens, trims, context checks)."""
+        return self.n + (1 if self.eos_end and not self.cut else 0)
 
     def __init__(self, gen, ids, p, on_text, cancelled, affinity):
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
@@ -1885,9 +2088,8 @@ class Job:
         self.t_enq, self.est, self.t_est = time.time(), None, 0.0  # scheduler: prefill-cost estimate
         self.cut_at = None  # prefill position at the last cut-in by a short request (fairness)
         self.round_tok = 0  # prompt tokens of the cut-in round in progress on this (long) prompt
-        # eviction value of the conversation (engine prio) and its scheduling class: the main agent
-        # thread (server/agents.py) is kept (it returns after its subagents) and goes first; a
-        # subagent that ended its turn without a tool call is finished and goes first on eviction
+        # the main-thread label (server/agents.py): logs, /api/stats and the CACHE_PARTIAL check only. Neither the
+        # scheduler nor the engines order by it (no main-thread priority, user decision 2026-11-12)
         info = getattr(ids, "agent", None)
         self.prio = 2 if (gen.agents.is_main_now(info) if info is not None
                           else getattr(ids, "label", "") == "main agent") else 1
@@ -1935,11 +2137,19 @@ class Job:
         e.set_prio(self.slot, self.prio)
         self.grammar = self.p.get("grammar")
         tcs = self.p.get("tool_choice")
+        self.tool_banned = False
         if self.grammar is None and tcs and not tcs.get("cut") and g.tool_tier is not None:
-            # tool_choice none / required / named (server/tool_choice.py): a fresh automaton per start, through the
-            # grammar path; it knows from the prompt whether the reply opens inside <think>
-            opens = g.think_ids.ok and g.think_ids.open_at_end(self.ids, g.im_start)
-            self.grammar = Constraint(g.tool_tier.matcher(tcs, opens), sorted(g.eos))
+            if tcs["mode"] == tool_choice.NONE and g.tool_ban and self.lp is None:
+                # tool_choice none: the engine never picks <tool_call> for this reply (static ban, set per start after
+                # start_begin, which clears it); the slot stays batched, runs ahead and keeps its drafts
+                e.ban_tokens(self.slot, g.tool_tier.none_ids())
+                self.tool_banned = True
+            else:
+                # tool_choice none (with logprobs, or no engine ban) / required / named (server/tool_choice.py): a fresh
+                # automaton per start, through the grammar path; it knows from the prompt whether the reply opens
+                # inside <think>
+                opens = g.think_ids.ok and g.think_ids.open_at_end(self.ids, g.im_start)
+                self.grammar = Constraint(g.tool_tier.matcher(tcs, opens), sorted(g.eos))
         self.grammar_s = 0.0
         if self.grammar is not None:  # constrained from the first token on (prompt's last chunk)
             tg = time.perf_counter()
@@ -2053,6 +2263,11 @@ class Job:
                                    self.p.get("think_budget_src"))
         if guard and guard.get("think") and self.tc is not None:  # (also without a client max_tokens)
             self.answer_at = None
+        self.cut_think = (False, g.think_ids.ok)  # tool_choice none without the grammar tier and without ThinkControl
+        # tool_choice required / named (review L2): a client stop ("\n\n", "\n") must not cut the thinking or the forced
+        # call header (the reply would end with no call); stops match from the end of the header on (stop_from)
+        self.tool_hold = bool(self.stops) and isinstance(getattr(self.grammar, "m", None), tool_choice.ToolMatcher) \
+            and (self.p.get("tool_choice") or {}).get("mode") == tool_choice.REQUIRED
         self.feed([first])
 
     def feed(self, pending):
@@ -2094,17 +2309,25 @@ class Job:
             if self.grammar is not None:
                 self.grammar_s += time.perf_counter() - tg
         cut_call = (self.p.get("tool_choice") or {}).get("cut") and not self.p.get("ignore_eos")
-        think_open = cut_call and self.tc is not None and self.tc.open
+        # (a block the model re-opens: as ThinkControl.track; without one, a reply that starts outside <think>, as Parser)
+        think_open, think_fresh = ((self.tc.open, self.tc.fresh) if self.tc is not None else self.cut_think) \
+            if cut_call else (False, False)
         for i, t in enumerate(pending):
             if cut_call:  # tool_choice none without the grammar tier: the reply ends at a call in the answer
                 if think_open:
                     think_open = t != g.think_ids.end
+                elif think_fresh and t == g.think_ids.start:  # re-opened <think> (review L8): a call in it stays reasoning
+                    think_open = True
                 elif t == g.tool_tier_call:
                     print(f"tool_choice none: the reply ends at the tool call the model began after {self.n + i} "
                           f"tokens (no grammar tier to mask it)", flush=True)
                     self.finish, stop_now = "stop", True
                     pending = pending[:i]
                     break
+                elif think_fresh and not g.think_ids.is_space(t):
+                    think_fresh = False
+            if cut_call and self.tc is None:
+                self.cut_think = (think_open, think_fresh)
             if t in g.eos and not self.p.get("ignore_eos"):
                 self.finish, stop_now = "stop", True
                 self.eos_end = True
@@ -2132,7 +2355,10 @@ class Job:
             self.tc.track(pending)
             if self.answer_max is not None and not self.tc.open:  # thinking done: max_tokens for the answer from here
                 self.max_new = min(self.max_new, self.tc.n + 1 + self.answer_max)
-                self.answer_max = None  # (the engine's limit stays the larger one: only verifies a few drafts more)
+                self.answer_max = None
+                # the engine's limit follows (review 2 L5): a reply that ends by length leaves no verified drafts past
+                # its end in the slot, so the next turn resumes from the live end
+                g.engine.set_limit(self.slot, max(0, self.max_new - self.n))
         if STEP_PROF:
             q0 = _pc()
         s = self.det.push(pending) if pending else ""  # (parser tags marked: server/content_markers.py)
@@ -2222,7 +2448,16 @@ class Job:
         """Where client stop sequences may match in text_all, None: not yet. On a guard-opened thinking turn they start at
         the answer's first character: the client asked for no reasoning, and its stops (ReAct "Observation:", "\\n\\n") must
         not end the reply mid-thought or in the blank line after </think>. The real </think> (marked): a block can reopen,
-        and the same string in the text is text."""
+        and the same string in the text is text. tool_choice required / named (tool_hold): not before the forced call is
+        complete (thinking, header and arguments: a stop such as "\n" or "\n\n" would cut its arguments, and the client
+        would run a call with truncated values), then from the end of its real </tool_call> on."""
+        if self.tool_hold:
+            i = self.text_mk.find(mark("<tool_call>")) if self.grammar is None else -1  # (the first real one: forced)
+            j = self.text_mk.find(mark("</tool_call>"), i) if i >= 0 else -1
+            if j < 0:
+                return None
+            self.tool_hold = False
+            self.answer_at = j + len("</tool_call>")
         if self.answer_at is None and not self.tc.open:
             tag = mark("</think>")
             i = self.text_mk.rfind(tag)
@@ -2309,18 +2544,10 @@ class Job:
             trimmed = None
             if getattr(self, "keep", None) is not None:
                 trimmed = self.gen.engine.trim(self.slot, len(self.ids) + self.keep)
-            self.gen.engine.release(self.slot)
-            if getattr(self, "det", None) and not getattr(self.ids, "mm", None) and (
-                    not self.cut or getattr(self, "keep", None) is not None):
-                out = self.det.ids if not self.cut else self.det.ids[:self.keep]
-                if not promoted:  # (the next turn renders a </think> the tokens don't have: not a changed reply)
-                    self.gen.remember(self.affinity, self.ids, out)
-                self.gen.remember_turn(self.ids, out)
-                self.gen.engine.add_corpus(out)
             t2 = time.time()
             self.stats = {"prompt_tokens": len(self.ids), "cached_tokens": self.reused,
                           "cache_src": self.src,
-                          "completion_tokens": self.n, "finish": self.finish, "slot": self.slot,
+                          "completion_tokens": self.n_out(), "finish": self.finish, "slot": self.slot,
                           "prefill_s": self.t1 - self.t0, "decode_s": t2 - self.t1}
             if self.lp is not None:
                 self.stats["logprobs"] = self.lp_out  # (entries no text carried: the HTTP side's last chunk)
@@ -2355,7 +2582,7 @@ class Job:
                     print(er["line"], flush=True)
             if self.p.get("tool_choice"):
                 self.stats["tool_choice"] = self.p["tool_choice"]["mode"] + (" (cut)" if self.p["tool_choice"].get("cut")
-                                                                             else "")
+                                                                             else " (ban)" if self.tool_banned else "")
             if self.grammar is not None:
                 self.stats["grammar_s"] = self.grammar_s
                 self.stats["grammar_steps"] = self.gsteps
@@ -2363,7 +2590,23 @@ class Job:
             self.gen.metrics.finished(self)
             if STEP_PROF and self.prof:
                 prof_write(self)
+            # [q27-end-drain] the reply is done before the release: release() waits for the speculative step queued
+            # ahead (one step, ~21 ms on one 27B card), which the client should not wait for. The slot is still released
+            # right here, on this (the generator's) thread, before it takes the next request: the order of slot reuse
+            # is unchanged. remember / remember_turn feed encode() of the NEXT request, which runs on the HTTP thread
+            # as soon as the client has the reply, so they run before done (review q27_1card3 M1: a fast agent turn
+            # inside the release window would otherwise re-tokenize the reply text and miss the prefix cache)
+            keep_out = None
+            if getattr(self, "det", None) and not getattr(self.ids, "mm", None) and (
+                    not self.cut or getattr(self, "keep", None) is not None):
+                keep_out = self.det.ids if not self.cut else self.det.ids[:self.keep]
+                if not promoted:  # (the next turn renders a </think> the tokens don't have: not a changed reply)
+                    self.gen.remember(self.affinity, self.ids, keep_out)
+                self.gen.remember_turn(self.ids, keep_out)
             self.done.set()
+            self.gen.engine.release(self.slot)
+            if keep_out is not None:
+                self.gen.engine.add_corpus(keep_out)
         return True
 
     def fail(self, ex):
@@ -2489,8 +2732,7 @@ async def complete(gen, ids, params, aff, thinking, tools, tchoice=None):
         if first is None:
             first = st
         no_calls = tchoice is not None and tchoice["mode"] == tool_choice.NONE
-        calls = tool_choice.filter_calls(tchoice, parse_tool_calls(parser.tool_text, tools)) \
-            if parser.tool_text and not no_calls else []
+        calls, raw_tool = tool_calls_or_text(parser, tools, tchoice, no_calls)
         empty = not calls and not parts["content"].strip() and st["finish"] == "stop"
         if not empty:
             if attempt:
@@ -2512,6 +2754,8 @@ async def complete(gen, ids, params, aff, thinking, tools, tchoice=None):
             raw = diag_dump("tool", unmark(parser.tool_text))
             print(f"WARNING empty reply: a tool call that does not parse ({st['completion_tokens']} tokens"
                   f"{', raw: ' + raw if raw else ''}); retry {attempt + 1}/{tries} follows", flush=True)
+    if raw_tool:  # the last try's tool text did not parse: returned as text, never an empty reply
+        parts["content"] += raw_tool
     if spent:
         # usage over all tries (review server F4): the client's prompt usage and the prefill are the first try's (the
         # retries come from the cache), tokens and decode time the sum, so the logged tok/s stays true
@@ -2733,6 +2977,82 @@ def content_parts(parts):
     return out
 
 
+def _parts_error(where, c, anthropic):
+    """The error of a content value (None: fine): a string, or a list of parts whose text fields are strings
+    (Anthropic: every block an object; OpenAI also takes null, and skips list items that are no object, as before)."""
+    if c is None and not anthropic:
+        return None
+    if isinstance(c, str):
+        return None
+    if not isinstance(c, list):
+        return f"{where} must be a string or a list of content {'blocks' if anthropic else 'parts'}"
+    for k, b in enumerate(c):
+        if not isinstance(b, dict):
+            if anthropic:
+                return f"{where}[{k}] must be an object"
+            continue  # (OpenAI parts that are no object are skipped, as before)
+        f = {"text": "text", "thinking": "thinking"}.get(b.get("type"))  # (other parts: their text is not read)
+        if f and f in b and not isinstance(b[f], str):
+            return f"{where}[{k}].{f} must be a string"
+        if b.get("type") == "tool_use" and b.get("input") and not isinstance(b["input"], dict):  # (falsy: {} as before)
+            return f"{where}[{k}].input must be an object"
+        if b.get("type") == "tool_use" and b.get("name") is not None and not isinstance(b["name"], str):
+            return f"{where}[{k}].name must be a string"
+        if b.get("type") == "tool_result" and b.get("content") is not None:
+            e = _parts_error(f"{where}[{k}].content", b["content"], False)
+            if e:
+                return e
+    return None
+
+
+def request_shape_error(body, anthropic=False):
+    """(param, message) for a request whose fields have the wrong JSON types (HTTP 400 invalid_request_error instead of
+    an exception in the message conversion or the template: a 500), None: fine. Checks only what the conversion reads;
+    values that worked before still do (review PR-500)."""
+    if not isinstance(body, dict):
+        return None, "the request body must be a JSON object"
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return "messages", "messages is required and must be a list of messages"
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            return "messages", f"messages[{i}] must be an object"
+        if not isinstance(m.get("role"), str):
+            return "messages", f"messages[{i}].role must be a string"
+        if anthropic or "content" in m:
+            e = _parts_error(f"messages[{i}].content", m.get("content"), anthropic)
+            if e:
+                return "messages", e
+        tc = m.get("tool_calls")
+        if not anthropic and tc is not None:
+            if not isinstance(tc, list):
+                return "messages", f"messages[{i}].tool_calls must be a list"
+            for k, c in enumerate(tc):
+                f = c.get("function", {}) if isinstance(c, dict) else None
+                if not isinstance(f, dict):
+                    return "messages", f"messages[{i}].tool_calls[{k}] must be an object with a function object"
+                if f.get("name") is not None and not isinstance(f["name"], str):
+                    return "messages", f"messages[{i}].tool_calls[{k}].function.name must be a string"
+                if f.get("arguments") is not None and not isinstance(f["arguments"], (str, dict)):
+                    return "messages", f"messages[{i}].tool_calls[{k}].function.arguments must be a string or an object"
+    tools = body.get("tools")
+    if tools is not None and not (isinstance(tools, list) and all(isinstance(t, dict) for t in tools)):
+        return "tools", "tools must be a list of objects"
+    ck = body.get("chat_template_kwargs")
+    if ck is not None and not isinstance(ck, dict):
+        return "chat_template_kwargs", "chat_template_kwargs must be an object"
+    clash = sorted(set(ck or ()) & {"messages", "tools", "add_generation_prompt"})
+    if clash:  # (the server sets these template variables itself)
+        return "chat_template_kwargs", f"chat_template_kwargs may not set {', '.join(clash)}"
+    if anthropic:
+        sy = body.get("system")
+        if sy is not None and not isinstance(sy, str):
+            e = _parts_error("system", sy, True)
+            if e:
+                return "system", e
+    return None
+
+
 def openai_messages(msgs):
     out = []
     for m in msgs:
@@ -2915,6 +3235,10 @@ def build_app(gen: Generator, args):
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
         body = await req.json()
+        bad = request_shape_error(body)
+        if bad:
+            return JSONResponse({"error": {"message": bad[1], "type": "invalid_request_error", "param": bad[0]}},
+                                status_code=400)
         bad = bad_param(body, "stop", ("max_completion_tokens", "max_tokens", "temperature", "top_p", "top_k", "min_p", "seed",
                                        "presence_penalty", "frequency_penalty"))
         if bad:
@@ -3029,8 +3353,9 @@ def build_app(gen: Generator, args):
                             if kind == "reasoning" and hide_rs:
                                 continue
                             yield chunk({"reasoning_content" if kind == "reasoning" else "content": t})
-                        calls = tool_choice.filter_calls(tchoice, parse_tool_calls(parser.tool_text, tools)) \
-                            if parser.tool_text and not no_calls else []
+                        calls, raw_tool = tool_calls_or_text(parser, tools, tchoice, no_calls)
+                        if raw_tool:
+                            yield chunk({"content": raw_tool})
                         if calls:
                             yield chunk({"tool_calls": tool_calls_out(calls)})
                         finish = "tool_calls" if calls else st["finish"]
@@ -3086,6 +3411,10 @@ def build_app(gen: Generator, args):
     @app.post("/v1/messages/count_tokens")
     async def count_tokens(req: Request):
         body = await req.json()
+        bad = request_shape_error(body, anthropic=True)
+        if bad:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": bad[1]}},
+                                status_code=400)
         try:
             kw = gen.effort_rules.client_effort(template_kwargs(body, args.think, args.reasoning_effort,
                                                                 anthropic=True))
@@ -3099,6 +3428,10 @@ def build_app(gen: Generator, args):
     @app.post("/v1/messages")
     async def messages(req: Request):
         body = await req.json()
+        bad = request_shape_error(body, anthropic=True)
+        if bad:
+            return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": bad[1]}},
+                                status_code=400)
         bad = bad_param(body, "stop_sequences", ("max_tokens", "temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"))
         if bad:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": bad[1]}}, status_code=400)
@@ -3203,10 +3536,12 @@ def build_app(gen: Generator, args):
                         for kind, t in parser.feed("", final=True, promote=st.get("promote_call", False)):
                             for x in emit(kind, t):
                                 yield x
+                        calls, raw_tool = tool_calls_or_text(parser, tools, tchoice, no_calls)
+                        if raw_tool:
+                            for x in emit("content", raw_tool):
+                                yield x
                         if state["kind"] is not None:
                             yield ev("content_block_stop", {"type": "content_block_stop", "index": state["idx"]})
-                        calls = tool_choice.filter_calls(tchoice, parse_tool_calls(parser.tool_text, tools)) \
-                            if parser.tool_text and not no_calls else []
                         ids_out = ["toolu_" + uuid.uuid4().hex[:24] for _ in calls]
                         REASONING.put(prev, seen["content"], ids_out, seen["reasoning"])
                         for c, tid in zip(calls, ids_out):
@@ -3272,6 +3607,9 @@ def resolve_model_args(args):
         args.split = sp if len([x for x in sp.split(",") if x]) in (0, len(args.devices.split(","))) else ""
     if args.prefill_chunk_idle is None:
         args.prefill_chunk_idle = d.get("prefill_chunk_idle", 0)
+    args.prefill_chunk_auto = args.prefill_chunk is None
+    if args.prefill_chunk is None:
+        args.prefill_chunk = 2048
     for k in ("drop_empty_turns", "merge_system"):
         v = getattr(args, k)
         setattr(args, k, bool(d[k]) if v is None else bool(v))
@@ -3364,9 +3702,10 @@ def parse_args(argv=None):
     ap.add_argument("--vision-device", default="", help="torch device of the encoder (default: last GPU)")
     ap.add_argument("--max-image-pixels", type=int, default=4 * 1024 * 1024,
                     help="larger images are downscaled (1 token per 32x32 pixels)")
-    ap.add_argument("--prefill-chunk", type=int, default=2048,
+    ap.add_argument("--prefill-chunk", type=int, default=None,
                     help="prompt chunk (tokens) between decode bursts of the running sequences "
-                         "(0: a prompt is prefilled at once, the others wait)")
+                         "(0: a prompt is prefilled at once, the others wait; default 2048, Flash-Next with passes bound "
+                         "by host-backed expert copies: --prefill-chunk-idle, its big batch)")
     ap.add_argument("--prefill-chunk-idle", type=int, default=None,
                     help="prompt chunk (tokens) while no other sequence decodes or waits (default per "
                          "model: Flash-Next 4096 = its big prefill batch, 27B 0 = --prefill-chunk)")
@@ -3385,17 +3724,27 @@ def parse_args(argv=None):
     ap.add_argument("--burst-wait", type=float, default=5.0,
                     help="ms: on an idle server, the first request of a burst waits until none has arrived for this long "
                          "(at most 30 ms) so the burst shares one prefill batch (0 = start at once)")
-    ap.add_argument("--preempt-max", type=int, default=1024,
+    ap.add_argument("--preempt-max", type=int, default=None,
                     help="a queued request with at most this many tokens to prefill (a tool turn "
                          "of a cached conversation) is started between the chunks of a long "
-                         "prefill in progress (0 = off)")
+                         "prefill in progress (0 = off; default 1024, Flash-Next with --long-share > 0: 8192)")
     ap.add_argument("--preempt-min", type=int, default=8192,
                     help="only a prefill with at least this many tokens left is cut in on, and "
-                         "at most once per this many tokens of its progress")
-    ap.add_argument("--main-bonus", type=float, default=200000,
-                    help="queue order: the main agent thread counts as this many tokens less prefill work "
-                         "(it goes first; a subagent passes it only after waiting main-bonus / prefill-aging "
-                         "seconds; 0 = no precedence)")
+                         "at most once per this many tokens of its progress (27B; Flash-Next with --long-share 0)")
+    ap.add_argument("--long-share", type=float, default=None,
+                    help="Flash-Next shared prefill batches: a request up to --preempt-max tokens joins the next batch "
+                         "at once and the longest prompt in flight keeps this share of the batch rows (default 0.5 where "
+                         "passes are bound by host-backed expert copies, else 0; 0 = the old rule: cut-ins up to 1024 "
+                         "tokens at most once per --preempt-min tokens of the long prompt)")
+    ap.add_argument("--fill-passes", type=int, default=0,
+                    help="Flash-Next shared prefill batches with --long-share > 0: 1 = the other prompts in flight take "
+                         "each batch first, oldest first, and the longest prompt fills the rest of every pass, keeping at "
+                         "least --long-share of its rows; 0 (default) = the per-pass credit rule (the long prompt leads "
+                         "whole batches while it is owed passes)")
+    ap.add_argument("--main-bonus", type=float, default=None, help=argparse.SUPPRESS)  # removed 11-12: accepted, ignored
+    ap.add_argument("--pause-wait", type=float, default=PAUSE_WAIT,
+                    help="a request that does not fit the KV pool pauses the most recently admitted decoding "
+                         "sequences only after waiting this many seconds (and never while one is paused already)")
     ap.add_argument("--backfill-wait", type=float, default=30,
                     help="a queued request that does not fit the KV pool lets smaller ones that fit start "
                          "first until it has waited this many seconds (0 = strict order: it blocks the queue)")
@@ -3420,8 +3769,8 @@ def parse_args(argv=None):
     ap.add_argument("--loop-guard-turns", type=int, default=env_int("QE_LOOP_GUARD_TURNS", 3),
                     help="cross-turn loop guard: after N turns that repeat earlier (reply, tool result) turns of a "
                          "conversation the next turn runs with --loop-guard-penalty on the repeated reply's tokens "
-                         "and no lookup drafts, again at 2N and 4N turns, then every 24 turns (0 = off); env "
-                         "QE_LOOP_GUARD_TURNS")
+                         "and no lookup drafts, again at 2N and 4N turns, then every 24 turns (0 = off, else 2 to 24); "
+                         "env QE_LOOP_GUARD_TURNS")
     ap.add_argument("--loop-guard-penalty", type=float,
                     default=env_float("QE_LOOP_GUARD_PENALTY", 1.5),
                     help="presence penalty of a guarded turn (2.0 from 2N repeated turns); env QE_LOOP_GUARD_PENALTY")
@@ -3451,6 +3800,16 @@ def parse_args(argv=None):
     ap.add_argument("--log-mb", type=float, default=env_float("QE_LOG_MB", 64.0),
                     help="size of the persistent log before it is rotated (3 old files are kept); env QE_LOG_MB")
     args = ap.parse_args(argv)
+    if args.loop_guard_turns > 0 and not 2 <= args.loop_guard_turns <= loop_guard.WINDOW:
+        # 1 flags every reply with a call (a reply that repeats nothing is a stretch of one), above the window nothing
+        # ever fires (review 2 L7). The flag is refused; the env value warns and keeps the default (as qe_env does)
+        if any(x == "--loop-guard-turns" or x.startswith("--loop-guard-turns=") for x in (argv or sys.argv[1:])):
+            ap.error(f"--loop-guard-turns {args.loop_guard_turns}: 0 (off) or 2 to {loop_guard.WINDOW}")
+        print(f"[env] warning: QE_LOOP_GUARD_TURNS={args.loop_guard_turns} is not 0 (off) or 2 to {loop_guard.WINDOW}, "
+              f"using the default 3", file=sys.stderr, flush=True)
+        args.loop_guard_turns = 3
+    if args.main_bonus is not None:  # (review M2: old command lines keep starting)
+        print("[sched] --main-bonus is ignored: no main-thread priority since 2026-11-12 (every conversation alike)", flush=True)
     resolve_model_args(args)
     if not args.template:
         args.template = os.path.join(args.model, "chat_template.jinja")
@@ -3556,7 +3915,7 @@ def main():
             import lsa_map
             path = lsa_map.resolve("auto", args.model)
             if path:
-                os.environ["QE_LSA"] = path
+                set_env("QE_LSA", path)  # (a fetch thread may still run: ENV_LOCK, review FX11-L1)
     elif getattr(args, "lsa", None) == "auto":
         print("[server] LSA: --lsa is for the 27B only; Flash-Next has its own sparse indexer (ignored)", flush=True)
     try:  # kill -USR1 <pid>: Python stacks of every thread (the native ones: gdb -p <pid>)

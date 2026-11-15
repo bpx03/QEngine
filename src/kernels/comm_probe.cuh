@@ -403,8 +403,8 @@ static void comm_select_decode(Comm& c, const int* devices, bool staged, bool pr
     c.dcal = cal;
     if (cal) {
         if (!c.pp_stages)  // (FLASH_PAR=pp: no calibration, the engine logs that at the end of the start-up)
-            fprintf(stderr, "[comm] decode collectives: auto, timed on real decode steps at the end of the start-up (P2P SM stores "
-                            "vs pinned host memory); the rule alone would pick %s (%s: %s)\n",
+            fprintf(stderr, "[comm] decode collectives: auto, measured on real decode steps at the end of the start-up (P2P SM stores "
+                            "vs pinned host memory; that measurement picks the path, until then %s, the rule's guess: %s: %s)\n",
                     x == kXferHost ? "host memory" : "P2P", d.why, rule.why);
         return;
     }

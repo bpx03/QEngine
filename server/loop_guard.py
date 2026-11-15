@@ -1,8 +1,9 @@
 """Cross-turn loop guard: a conversation whose last assistant turns repeat earlier turns that got the same results.
 
 Agents at long contexts sometimes repeat one turn forever: the identical tool call after the tool keeps returning
-the same error, or near-copy text replies, or a short cycle of a few calls (A A A B A A A B ..., Claude Code session
-92997599). Sampling within a reply does not help there: the loop is the model copying
+the same error, or a short cycle of a few calls (A A A B A A A B ..., Claude Code session 92997599,
+). Plain text replies that repeat are not caught in practice: a text turn needs a tool
+result after it, and a client sends one only after a call (the text rules below cover clients that do; review 2 L8). Sampling within a reply does not help there: the loop is the model copying
 its previous turns from the context. Tool calls whose arguments change each turn (probe69, probe70, ...) are not
 caught since 1.3.4: they look the same as a legitimate batch over ids.
 
@@ -25,15 +26,22 @@ Conservative on purpose:
     extraction, few-shot examples) has nothing to repeat;
   - a human message (not a tool result) does not reset a stretch of tool calls (the model looped straight past "stop
     looping" in session 92997599), but when it is the newest message the guarded turn only thinks first: no note, no
-    penalty (the human may well have asked to run the same thing again). A text reply a human answered is not stale;
+    penalty (the human may well have asked to run the same thing again). A text reply a human answered is not stale.
+    Harness blocks in a user message (<system-reminder>, <task-notification>) are not a human's words, the text around
+    them is;
   - unchanged results can be legitimate waiting (a long compile, CI pending, a 503), so a stretch is guarded with
     back-off, not on every turn (due()), for every period: at N, 2N, 4N turns, then every `window` turns of the
-    conversation; and when a human just spoke.
+    conversation; and when a human just spoke (not when the turn before had human text too: a client that adds text
+    after every result would otherwise be guarded on every turn; review 2 L2).
 
 The server then generates the next turn with reasoning on (also on a --think 0 server: the empty think block of the
-generation prompt is opened, so the rendered history and its cache stay the same; those tokens come on top of the
-client's max_tokens and its stop sequences start after them), a raised presence penalty whose counts start with the
-repeated reply's tokens, without lookup drafts, and with NOTE appended to the latest tool result."""
+generation prompt is opened, so the rendered history in front of it and its cache stay the same; those tokens come on
+top of the client's max_tokens and its stop sequences start after them; only with an engine that can force the close
+of <think>, Generator.can_force, else the budget could not be held), a raised presence penalty whose counts start with
+the repeated reply's tokens, without lookup drafts, and with NOTE appended to the latest tool result (not when the note
+would push the prompt over the context: then the turn goes without it). The client does not send the note back, so
+the next prompt differs from the guarded one from that tool result on: the next turn prefills that result and the
+guarded reply again (the cache holds up to the result before it; review L7)."""
 import collections
 import json
 import re
@@ -43,8 +51,14 @@ DIGITS = re.compile(r"\d+")
 TOKENS = re.compile(r"\w+|[^\w\s]")  # words and single punctuation marks: compact JSON has no whitespace to split on
 WINDOW = 24  # turns of history the detection looks at
 # tool-call arguments that only describe the call (Claude Code Bash "description"): the model rewords them while it
-# repeats the same command ("Decode branch targets with corrected imm*4" / "... with correct imm*4 scaling")
+# repeats the same command ("Decode branch targets with corrected imm*4" / "... with correct imm*4 scaling"). Only in a
+# shell call (one with a `command` argument) and Claude Code's subagent call (Task / Agent: a short label beside its
+# prompt): elsewhere a description is data (update_issue(id, description), review L3)
 COSMETIC_ARGS = frozenset({"description"})
+COSMETIC_TOOLS = frozenset({"Task", "Agent"})
+# harness text in a user message that no human typed (Claude Code): reminders and background-task notifications, as
+# whole blocks; what is left around them is the human's (review L4, loop_guard_fix_review L1)
+HARNESS_BLOCKS = re.compile(r"<(system-reminder|task-notification)>.*?</\1>", re.S)
 
 
 def _text(c):
@@ -80,13 +94,20 @@ def _reply_sig(m):
                 a = json.loads(a or "{}")
             except Exception:
                 pass
-        if isinstance(a, dict):
+        if isinstance(a, dict) and ("command" in a or f.get("name") in COSMETIC_TOOLS):
             a = {k: v for k, v in a.items() if k not in COSMETIC_ARGS}
         calls.append(f"{f.get('name')}:{json.dumps(a, sort_keys=True, ensure_ascii=False, default=str)}")
     return _norm(txt), " | ".join(calls)
 
 
 Turn = collections.namedtuple("Turn", "text calls human result tokens")
+
+
+def _is_human(text):
+    """A user message's text holds words of a human: something besides the harness blocks (HARNESS_BLOCKS); a block
+    left open (cut off) counts as harness text to its end."""
+    t = HARNESS_BLOCKS.sub("", text).strip()
+    return bool(t) and not t.startswith(("<system-reminder>", "<task-notification>"))
 
 
 def _similar(x, y, near, min_chars):
@@ -133,8 +154,7 @@ def turns_of(messages, window=None):
                 res.append(_text(c))
                 unknown = unknown or _has_non_text(c)
             elif r == "user":
-                t = _text(messages[j].get("content")).strip()
-                if t and not t.startswith("<system-reminder>"):
+                if _is_human(_text(messages[j].get("content"))):
                     human = True  # the human's words are not part of the result: the call's output is
             j += 1
         raw = " ".join(" | ".join(res).split())
@@ -157,11 +177,13 @@ def _same_turn(x, y, near, min_chars):
 
 def state(messages, near=0.92, min_chars=24, window=WINDOW):
     """{"turns": length of the repeated stretch at the end of the history (0: none, at most window), "distinct":
-    different replies in it, "human": a human message follows the last assistant turn, "total": assistant turns in the
-    history}. See the module doc."""
+    different replies in it, "human": a human message follows the last assistant turn, "human_prev": one followed the
+    turn before too (a client that adds text after every result, not a human stepping in), "total": assistant turns in
+    the history, "key": the stretch's different turns, order-free (the server's count for histories that stop growing,
+    due())}. See the module doc."""
     t = turns_of(messages, 2 * window)  # a turn looks `window` turns back, so that any period the window sees gets to `window`
-    out = {"turns": 0, "distinct": 0, "human": bool(t and t[-1].human),
-           "total": sum(m.get("role") == "assistant" for m in messages)}
+    out = {"turns": 0, "distinct": 0, "human": bool(t and t[-1].human), "human_prev": len(t) >= 2 and t[-2].human,
+           "total": sum(m.get("role") == "assistant" for m in messages), "key": None}
     if not t:
         return out
 
@@ -186,13 +208,16 @@ def state(messages, near=0.92, min_chars=24, window=WINDOW):
             distinct.append(x)
     out["turns"] = run + 1  # + the turn the run starts from (A A A: 3; A A A B A A A B: 5)
     out["distinct"] = len(distinct)
+    out["key"] = hash(frozenset((x.calls, x.result) for x in distinct))  # (the text around a call may change)
     return out
 
 
 def due(st, n, window=WINDOW):
     """A stretch of state() `st` is guarded on this turn (threshold n): at n, 2n, 4n ... turns; from `window` turns on,
-    where `turns` stops growing whatever the period, every `window` turns of the conversation. Stateless like the
-    detection. Unchanged polls and retries are often legitimate, so they must not get the guard on every turn."""
+    where `turns` stops growing whatever the period, every `window` turns of the conversation (st["total"]: the server
+    passes a count of its own for a history that stops growing, a client that keeps only its last turns: Generator.
+    loop_check). Stateless like the detection. Unchanged polls and retries are often legitimate, so they must not get the
+    guard on every turn."""
     k = st["turns"]
     if n <= 0 or k < n:
         return False

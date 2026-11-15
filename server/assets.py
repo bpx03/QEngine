@@ -17,7 +17,7 @@ import json
 import os
 import urllib.request
 
-from qe_env import env_int, env_str
+from qe_env import env_int, env_str, fetch_open, set_env
 
 DEFAULT_URL = "https://github.com/bpx03/QEngine/releases/latest/download"
 DEFAULT_DIR = "~/.cache/qengine/assets"
@@ -128,7 +128,7 @@ def _mb(n):
 def _get(url, dst, name, timeout):
     """Download url to dst (a temporary path) with a progress line every ~10 %; returns the byte count."""
     req = urllib.request.Request(url, headers={"User-Agent": "qengine-assets"})
-    with urllib.request.urlopen(req, timeout=timeout) as r, open(dst, "wb") as f:
+    with fetch_open(req, timeout) as r, open(dst, "wb") as f:  # (ENV_LOCK, review FX11-L1)
         total = int(r.headers.get("Content-Length") or 0)
         got, step = 0, 1
         while True:
@@ -205,7 +205,7 @@ def ensure(model_dir, env=None, cache=None, base=None, timeout=TIMEOUT):
     for name, var in list(want):
         path = os.path.join(cache, name)
         if os.path.exists(path) and name in sums and _sha256(path) == sums[name]:
-            env[var] = path
+            set_env(var, path, env)
             used[name] = path
             want.remove((name, var))
             _log(f"using cached {name} ({_mb(os.path.getsize(path))}) from {cache}")
@@ -229,7 +229,7 @@ def ensure(model_dir, env=None, cache=None, base=None, timeout=TIMEOUT):
              f"the files are used from the next start ({cache})")
     for name, var in want:
         if name in local:
-            env[var] = local[name]
+            set_env(var, local[name], env)  # (the thread may still run: ENV_LOCK, review FX11-L1)
             used[name] = local[name]
     return used
 

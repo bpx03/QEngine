@@ -19,6 +19,11 @@ struct SpecState {
 
 // MTP input: out[mi] = [rmsnorm(embed(tok[mi])) * (1+we) | rmsnorm(h[hrow + mi]) * (1+wh)]
 void set_image_table_spec(const bf16* table);  // see set_image_table (ops.cuh)
+// [q27-mtpkv-defer] ring of deferred MTP KV rows (model.h Worker::mkv_*): append rows 0..m-1 of a block step (ring grows
+// by *acc + 1), compact after a fill of the oldest m rows
+void mkv_append(bf16* rh, int* rt, int* ctr, const bf16* xn, const int* mtp_tok, const int* mtp_pos, const int* acc, int m,
+                int hidden, int cap, cudaStream_t st);
+void mkv_compact(bf16* rh, int* rt, int* ctr, int m, int hidden, cudaStream_t st);
 void mtp_prep(const bf16* table, const int* tok, const bf16* h, const int* hrow, const bf16* we,
               const bf16* wh, float eps, int m, int hidden, bf16* out, cudaStream_t st);
 
@@ -26,6 +31,8 @@ void mtp_prep(const bf16* table, const int* tok, const bf16* h, const int* hrow,
 // token: the tokens after it would enter the state), emit out[0..a],
 // MTP tokens = out[0..k], mtp_pos = pos.
 void spec_accept(const SpecState& s, int k, cudaStream_t st);
+// [q27-sib] tree step acceptance (ops.cuh sib_check / sib_fix)
+void spec_accept_tree(const SpecState& s, int k, int* sib, cudaStream_t st);
 // After the k+1-row MTP pass: drafts[0] = mtp_out[a]; next MTP step uses row a at pos+a+1.
 void spec_select(const SpecState& s, cudaStream_t st);
 // After a 1-row recursive MTP step: drafts[r] = mtp_out[0]; advance.

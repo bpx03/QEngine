@@ -179,6 +179,52 @@ def test_description_is_cosmetic():
     assert lg.streak(m) <= 1
 
 
+def test_description_is_data_outside_shell_calls():
+    # review L3: only a shell call's description is cosmetic; update_issue(description=...) with new texts is new work
+    def upd(d):
+        return {"role": "assistant", "content": "", "tool_calls": [{"id": "u", "type": "function", "function": {
+            "name": "update_issue", "arguments": {"id": 7, "description": d}}}]}
+    m = SYS + sum(([upd(f"text version {chr(97 + i) * 8}"), tool('{"ok":true}')] for i in range(4)), [])
+    assert lg.streak(m) <= 1
+    m = SYS + [upd("same"), tool('{"ok":true}')] * 3
+    assert lg.streak(m) == 3
+    # Claude Code's subagent call keeps its cosmetic label (review of rel136-server, finding 9)
+    def task(d):
+        return {"role": "assistant", "content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
+            "name": "Task", "arguments": {"description": d, "prompt": "find the bug", "subagent_type": "general"}}}]}
+    m = SYS + sum(([task(d), tool("no bug found")] for d in ("Find bug", "Find the bug", "Look for bug")), [])
+    assert lg.streak(m) == 3
+
+
+def test_harness_text_is_no_human():
+    # review L4 / loop guard fix review L1: reminder and task-notification blocks are no human's words, text around them is
+    for text, human in (("<system-reminder>\nfile changed\n</system-reminder>", False),
+                        ("<system-reminder>\nfile changed\n</system-reminder>\nplease run it again", True),
+                        ("<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n</task-notification>", False),
+                        ("<system-reminder> cut off, never closed", False),
+                        ("run it again", True), ("  ", False)):
+        m = SYS + [call("ps -p 4242"), tool("Exit code 1")] * 3 + [{"role": "user", "content": text}]
+        assert lg.state(m)["human"] is human, (text, lg.state(m))
+
+
+def test_human_prev_and_key():
+    # review 2 L2: text after every result marks the turn before too; review 2 L3: the stretch key does not depend on
+    # where a sliding window starts (order-free), and differs for another stretch
+    m = list(SYS)
+    for _ in range(4):
+        m += [call("ps -p 4242"), tool("Exit code 1"), {"role": "user", "content": "hook: lint ok"}]
+    st = lg.state(m)
+    assert st["human"] and st["human_prev"], st
+    st = lg.state(SYS + [call("ps -p 4242"), tool("Exit code 1")] * 3 + [{"role": "user", "content": "again"}])
+    assert st["human"] and not st["human_prev"], st
+    ab = [[call("cmd a"), tool("ra")], [call("cmd b"), tool("rb")]]
+    w1 = SYS + sum((ab[i % 2] for i in range(30)), [])
+    w2 = SYS + sum((ab[(i + 1) % 2] for i in range(30)), [])
+    k1, k2 = lg.state(w1)["key"], lg.state(w2)["key"]
+    assert k1 is not None and k1 == k2, (k1, k2)
+    assert lg.state(SYS + [call("cmd c"), tool("rc")] * 30)["key"] != k1
+
+
 def test_edit_test_chain_is_no_loop():
     m = list(SYS)
     for i in range(6):

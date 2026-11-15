@@ -1351,7 +1351,7 @@ __global__ void __launch_bounds__(1024) lsa_fallback_kernel(const bf16* __restri
 // row to finish (a ticket counter, no spin, no grid-wide wait) builds the exact list and cuts it. Grid
 // kLsaFbSplit x m; blocks of rows past the failure count exit at once. done[]: reset with fail[0] every call.
 constexpr int kLsaFbSplit = 8;
-__global__ void __launch_bounds__(1024) lsa_fallback_split_kernel(const bf16* __restrict__ iq, const int* pos,
+__global__ void __launch_bounds__(1024) lsa_fallback_split_kernel(int nsp, const bf16* __restrict__ iq, const int* pos,
                                                                    const int* closed, LsaLayer L, int V,
                                                                    const int* __restrict__ fail, int* __restrict__ done,
                                                                    float* __restrict__ S,
@@ -1359,17 +1359,17 @@ __global__ void __launch_bounds__(1024) lsa_fallback_split_kernel(const bf16* __
                                                                    int* __restrict__ lcount, unsigned* __restrict__ list,
                                                                    int* __restrict__ nlist) {
     __shared__ int s_last;
-    const int fi = blockIdx.x / kLsaFbSplit, sl = blockIdx.x % kLsaFbSplit;
+    const int fi = blockIdx.x / nsp, sl = blockIdx.x % nsp;
     if (fi >= min(fail[0], kLsaFailCap)) return;  // (block-uniform)
     const int i = fail[1 + fi], vis = min(V, lsa_vis(pos[0] + i, *closed));
     float* row = S + (size_t)fi * V;
-    const int per = (vis + kLsaFbSplit - 1) / kLsaFbSplit, b0 = sl * per, b1 = min(vis, b0 + per);
+    const int per = (vis + nsp - 1) / nsp, b0 = sl * per, b1 = min(vis, b0 + per);
     for (int b = b0 + threadIdx.x; b < b1; b += blockDim.x)
         row[b] = dot64(iq + (size_t)i * kLsaDim, L.cent + (size_t)b * kLsaDim);
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence();  // release: this block's scores visible before its ticket
-        const bool last = atomicAdd(done + fi, 1) == kLsaFbSplit - 1;
+        const bool last = atomicAdd(done + fi, 1) == nsp - 1;
         __threadfence();  // acquire, in the thread that read the ticket: the other slices' scores (then the barrier)
         s_last = last;
     }
@@ -1456,9 +1456,10 @@ void lsa_select(const bf16* iq, int m, int vmax, const int* pos, const int* clos
         // the exact fallback: decode (few rows) splits each failing row's scores over kLsaFbSplit SMs; prefill runs
         // the persistent kernel (many rows in parallel). QE_LSA_FB_SPLIT=0: the persistent kernel for decode too
         static const int split = env_int("QE_LSA_FB_SPLIT", 1);
+        static const int nsp = std::max(1, std::min(256, env_int("QE_LSA_FB_NSPLIT", kLsaFbSplit)));  // (bench: slices per row)
         if (split && m <= kLsaSampRows)
-            lsa_fallback_split_kernel<<<kLsaFbSplit * m, 1024, 0, st>>>(iq, pos, closed, L, V, fail, done, S, lists,
-                                                                        lcount, list, n);
+            lsa_fallback_split_kernel<<<nsp * m, 1024, 0, st>>>(nsp, iq, pos, closed, L, V, fail, done, S, lists,
+                                                                lcount, list, n);
         else
             lsa_fallback_kernel<<<kLsaFail, 1024, 0, st>>>(iq, pos, closed, L, V, fail, S, lists, lcount, list, n);
         return;

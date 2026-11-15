@@ -172,6 +172,32 @@ void mtp_prep(const bf16* table, const int* tok, const bf16* h, const int* hrow,
     mtp_prep_kernel<<<dim3(m, 2), kPrepThreads, 0, st>>>(table, tok, h, hrow, we, wh, eps, hidden, out);
 }
 void spec_accept(const SpecState& s, int k, cudaStream_t st) { accept_kernel<<<1, 1, 0, st>>>(s, k); }
+
+// [q27-sib] greedy acceptance of a tree step (sib[0] = 1, k = 7): the chain is rows 0..4 (4 drafts); at the first reject
+// a (< 3) the leaf at position a (row 5 + a, the selector's runner-up) is accepted when it is the target's token out[a];
+// its row's output out[5 + a] then follows as the bonus (moved to out[a + 1]; sib_fix moves the row's buffers).
+// sib[1] = the hit leaf or -1. Not a tree step: as accept_kernel.
+__global__ void accept_tree_kernel(SpecState s, int k, int* sib) {
+    const int n = *s.pos;
+    int a = 0;
+    if (!sib[0]) {
+        while (a < k && s.tokens[a + 1] == s.out[a] && s.out[a] != s.eos0 && s.out[a] != s.eos1) a++;
+    } else {
+        while (a < 4 && s.tokens[a + 1] == s.out[a] && s.out[a] != s.eos0 && s.out[a] != s.eos1) a++;
+        if (a < 3 && s.tokens[5 + a] == s.out[a] && s.out[a] != s.eos0 && s.out[a] != s.eos1) {
+            sib[1] = a;
+            s.out[a + 1] = s.out[5 + a];
+            a++;
+        }
+    }
+    s.emit[0] = a + 1;
+    for (int j = 0; j <= a; j++) s.emit[1 + j] = s.out[j];
+    for (int j = 0; j <= k; j++) s.mtp_tok[j] = s.out[j];
+    *s.acc = a;
+    *s.mtp_pos = n;
+    *s.hrow = 0;
+}
+void spec_accept_tree(const SpecState& s, int k, int* sib, cudaStream_t st) { accept_tree_kernel<<<1, 1, 0, st>>>(s, k, sib); }
 void spec_select(const SpecState& s, cudaStream_t st) { select_kernel<<<1, 1, 0, st>>>(s); }
 void spec_select_batch(const SpecBatch& b, cudaStream_t st) { if (b.n) select_batch_kernel<<<1, 32, 0, st>>>(b); }
 void spec_finish_batch(const SpecBatch& b, int k, cudaStream_t st) { if (b.n) finish_batch_kernel<<<1, 32, 0, st>>>(b, k); }
@@ -232,7 +258,10 @@ __device__ void lk_emit_dev(const LookupDev& d, int* __restrict__ out) {
     d.lk[0] = L;
     d.lk[31] = s;
     if (out) *out = L;  // beside the step's emitted tokens (one read-back)
-    for (int i = 0; i < L; i++) d.lk[1 + i] = d.hd[j + 1 + i];
+    for (int i = 0; i < L; i++) {
+        LKB_ASSERT(d.hd[j + 1 + i] >= 0 && d.hd[j + 1 + i] < kImgToken);  // debug builds: no image / host id reaches a draft (q27_pool_race review L2)
+        d.lk[1 + i] = d.hd[j + 1 + i];
+    }
 }
 __global__ void lk_emit_kernel(LookupDev d, int* __restrict__ out) {
     if (threadIdx.x == 0) lk_emit_dev(d, out);
@@ -312,4 +341,69 @@ void lookup_set_len_scan(const LookupDev& d, int n, cudaStream_t st) {
     lk_setlen_kernel<<<1, 1, 0, st>>>(d, n);
     lk_scan_kernel<<<16, 256, 0, st>>>(d);
     lk_emit_kernel<<<1, 32, 0, st>>>(d, nullptr);
+}
+
+// [q27-mtpkv-defer] the MTP KV fill of DFlash2 block steps, deferred: the step's rows 0..kv (hidden row j of the verify
+// pass, target token out[j] = mtp_tok[j], position *mtp_pos + j) are appended at the ring's end; the rows that stay are
+// the accepted ones (0..acc), so the ring grows by acc + 1 and the next step's rows follow at the next position
+__global__ void mkv_append_kernel(bf16* __restrict__ rh, int* __restrict__ rt, int* ctr, const bf16* __restrict__ xn,
+                                  const int* __restrict__ mtp_tok, const int* __restrict__ mtp_pos, const int* __restrict__ acc,
+                                  int m, int hidden, int cap) {
+    const int head = ctr[0];
+    // guards (review L1): never past the ring, rows must continue the positions of the ring (else flag, drop the rows)
+    if (head + m > cap || (head > 0 && *mtp_pos != ctr[1] + head)) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) ctr[3] = head + m > cap ? 1 : 2;
+        return;
+    }
+    for (int j = blockIdx.x; j < m; j += gridDim.x) {
+        const uint4* s = reinterpret_cast<const uint4*>(xn + (size_t)j * hidden);
+        uint4* d = reinterpret_cast<uint4*>(rh + (size_t)(head + j) * hidden);
+        for (int i = threadIdx.x; i < hidden / 8; i += blockDim.x) d[i] = s[i];
+        if (threadIdx.x == 0) rt[head + j] = mtp_tok[j];
+    }
+    __syncthreads();
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        if (head == 0) ctr[1] = *mtp_pos;
+        __threadfence();
+    }
+}
+__global__ void mkv_advance_kernel(int* ctr, const int* __restrict__ acc) {
+    if (!ctr[3]) ctr[0] += *acc + 1;  // (after a dropped append the count stays: catch-up reports and empties)
+}
+// after a fill of the oldest m rows: the rest moves to the front (at most kMkvCap - m rows), positions follow
+__global__ void mkv_compact_kernel(bf16* __restrict__ rh, int* __restrict__ rt, int* ctr, int m, int hidden) {
+    const int rest = max(0, ctr[0] - m);
+    for (int j = 0; j < rest; j++) {  // in order: row j + m -> j (one block; the rows overlap only forwards)
+        const uint4* s = reinterpret_cast<const uint4*>(rh + (size_t)(j + m) * hidden);
+        uint4* d = reinterpret_cast<uint4*>(rh + (size_t)j * hidden);
+        uint4 v[4];
+        const int n8 = hidden / 8;
+        for (int i0 = 0; i0 < n8; i0 += 4 * blockDim.x) {
+#pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int i = i0 + u * blockDim.x + threadIdx.x;
+                if (i < n8) v[u] = s[i];
+            }
+#pragma unroll
+            for (int u = 0; u < 4; u++) {
+                const int i = i0 + u * blockDim.x + threadIdx.x;
+                if (i < n8) d[i] = v[u];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) rt[j] = rt[j + m];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        ctr[0] = rest;
+        ctr[1] += m;
+    }
+}
+void mkv_append(bf16* rh, int* rt, int* ctr, const bf16* xn, const int* mtp_tok, const int* mtp_pos, const int* acc, int m,
+                int hidden, int cap, cudaStream_t st) {
+    mkv_append_kernel<<<m, 128, 0, st>>>(rh, rt, ctr, xn, mtp_tok, mtp_pos, acc, m, hidden, cap);
+    mkv_advance_kernel<<<1, 1, 0, st>>>(ctr, acc);
+}
+void mkv_compact(bf16* rh, int* rt, int* ctr, int m, int hidden, cudaStream_t st) {
+    mkv_compact_kernel<<<1, 256, 0, st>>>(rh, rt, ctr, m, hidden);
 }

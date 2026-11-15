@@ -63,12 +63,14 @@ void topk_local(const float* logits, int v, int m, int vocab_off, float* pairs, 
 // Plain sampling: tokens[mi] ~ p(row mi) from gathered candidates [ngpu][m][kTopK][2].
 // chain: the rows are consecutive positions of one sequence being verified (sample-then-match): for the penalty
 // row mi sees the tokens sampled at rows < mi as generated (they equal the drafts whenever row mi is used)
+// ext (chain): the rows' input tokens shifted by one (ext[j] = the draft row j + 1 verifies): the rows run in parallel
+// ([pen-par], QE_SAMPLE_PAR=0: the serial kernel); the emitted tokens are the same
 void sample_rows(const float* gathered, int ngpu, int m, SampleParams* p, int* tokens,
-                 cudaStream_t st, bool chain = false);
+                 cudaStream_t st, bool chain = false, const int* ext = nullptr);
 // batched rows of several sequences: row mi samples with base[rowslot[mi]], greedy (top candidate) when !on[slot];
 // rows of one slot are its verify rows (penalty: as sample_rows with chain)
 void sample_rows_slots(const float* gathered, int ngpu, int m, SampleParams* base, const int* rowslot,
-                       const int* on, int* tokens, cudaStream_t st);
+                       const int* on, int* tokens, cudaStream_t st, const int* ext = nullptr);
 // the largest per-thread stack (local memory) of the sampling kernels: the biggest frames of the library (800 B; up to
 // 2026-10-30 sample_rows_slots_kernel had 1056 B, above the context's default stack limit of 1024 B, which caused the
 // 1.3.1 OOM abort; the load-time reservation stays as a safety net; tests/kernel_stack_check.sh)

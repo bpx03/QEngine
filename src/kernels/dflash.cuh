@@ -52,11 +52,13 @@ size_t dfl_topk_chunk_floats(int v, int m);
 void dfl_topk_merge(const float* gathered, int ngpu, int m, float* unary, int* cand, cudaStream_t st);
 // codebook rows of the anchor and every candidate (host-mapped tables [V][256] bf16) -> device rows:
 // pc [1 + m * 16][256] predecessor rows (row 0: the anchor), sc [m * 16][256] successor rows
+// [q27-dfl-unary] unary[m][16] = exact bf16 dot of hid rows with the candidates' head rows w (local ids, < V)
+void dfl_unary_exact(const bf16* w, const bf16* hid, int m, int V, const int* cand, float* unary, cudaStream_t st);
 void dfl_cb_fetch(const bf16* pred_cb, const bf16* succ_cb, const int* anchor, const int* cand, int m, bf16* pc,
                   bf16* sc, int V, cudaStream_t st);  // ids clamped to [0, V)
 // sequential selector: per row j the candidate maximizing unary + sum_r P[pred][r] hp[j][r] S[c][r]; drafts -> tokens[1 + j]
 void dfl_select(const float* unary, const int* cand, const float* hp, const bf16* pc, const bf16* sc, int m, int* tokens,
-                int V, cudaStream_t st);  // a candidate id outside [0, V): the anchor instead
+                int V, cudaStream_t st, int* sib = nullptr, const int* pos = nullptr, float tw = 0.f);  // a candidate id outside [0, V): the anchor instead
 // TP: every card takes rank 0's drafts (allgather of tokens[0..7] as float bits, then row 0)
 void dfl_take_row0(const float* gathered, int* tokens, cudaStream_t st);
 // tok[0] = *src (the anchor), tok[1..7] = mask id

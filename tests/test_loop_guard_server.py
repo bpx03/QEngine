@@ -5,6 +5,8 @@ path, conversations the guard must leave alone. No GPU.
 
   python tests/test_loop_guard_server.py
 """
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -102,7 +104,17 @@ def main():
              R_TOOL,     # streamed messages: thinking block, tool call
              R_ANSWER,   # streamed messages: stops
              R_ANSWER,   # non-streamed messages: stops
-             R_PLAIN]    # --loop-guard-think 0 is checked at the prompt: a turn with no thinking opened
+             R_PLAIN,    # --loop-guard-think 0 is checked at the prompt: a turn with no thinking opened
+             R_PLAIN,    # no forced close (can_force off): no thinking opened, note only (review 2 L6)
+             R_PLAIN,    # client text after every result: back-off, not every turn (review 2 L2)
+             R_PLAIN,    # ... and a due turn of it gets note and penalty
+             R_SHORT,    # human text behind a reminder block: human (review 2 L1)
+             R_PLAIN,    # a task notification is no human (review L4)
+             R_SHORT,    # sliding window of 24 turns: fires once, then quiet (review 2 L3)
+             R_PLAIN,
+             R_PLAIN,
+             R_SHORT,    # the note would not fit the context: the turn goes without it (review L6)
+             R_LONGANS]  # the engine limit follows the answer cap once the thinking closes (review 2 L5)
     with open(script, "w") as f:
         for r in order:
             f.write(",".join(map(str, tok.encode(r, add_special_tokens=False).ids)) + "\n")
@@ -302,6 +314,95 @@ def main():
         gen.args.loop_guard_think = BUDGET
     assert prompt().endswith(EMPTY) and "server note" in prompt() and fin == "tool_calls" and not m.get("reasoning_content"), r
     print("  --loop-guard-think 0: the guarded turn stays without thinking")
+
+    # review 2 L6: an engine that cannot force the close of <think> gets no guard thinking (its budget would not hold)
+    gen.can_force = False
+    try:
+        r, m, fin = chat(hist(3), max_tokens=64)
+    finally:
+        gen.can_force = True
+    assert prompt().endswith(EMPTY) and "server note" in prompt() and not m.get("reasoning_content"), prompt()[-300:]
+    print("  no forced close: note, no thinking")
+
+    # review 2 L2: a client that adds text after every tool result is not a human stepping in on every turn
+    def chatty(k):
+        m = hist(k)
+        out = m[:2]
+        for i in range(2, len(m), 2):
+            out += [m[i], m[i + 1], {"role": "user", "content": "hook: lint passed"}]
+        return out
+    before = fires()
+    chat(chatty(4), max_tokens=64)  # 4 turns: not due; only a human just speaking would guard it
+    assert prompt().endswith(EMPTY) and fires() == before, prompt()[-200:]
+    chat(chatty(3), max_tokens=64)  # due: the full guard, as for a stretch without human text
+    assert "server note" in prompt() and fires() == before + 1 and gen.guards["recent"][-1]["presence"] > 0, prompt()[-300:]
+    before = fires()
+    print("  text after every result: back-off holds (4 turns quiet), a due turn gets note and penalty")
+
+    # review 2 L1 / L4: harness blocks are not a human's words, the text around them is (Anthropic: text blocks of one
+    # user message are joined)
+    def after(text_blocks):
+        h = hist_a(4)
+        h[-1]["content"] += [{"type": "text", "text": t} for t in text_blocks]
+        return h
+    a = c.post("/v1/messages", json={"model": name, "max_tokens": 64, "tools": TOOLS_A, "messages": after(
+        ["<system-reminder>\nThe user changed a.py\n</system-reminder>", "please run it again"])}).json()
+    assert prompt().endswith(OPEN) and "server note" not in prompt() and fires() == before + 1, (a, prompt()[-300:])
+    assert gen.guards["recent"][-1]["presence"] == 0.0
+    a = c.post("/v1/messages", json={"model": name, "max_tokens": 64, "tools": TOOLS_A, "messages": after(
+        ["<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n</task-notification>"])}).json()
+    assert prompt().endswith(EMPTY) and fires() == before + 1, (a, prompt()[-300:])  # 4 turns, no human: not due
+    print("  human text behind a reminder: human; a task notification: not")
+
+    # review 2 L3: a client that keeps only its last 24 turns sends the same count every turn: guarded once, then the
+    # back-off counts the server's turns (master: every request)
+    before = fires()
+    for want in (before + 1, before + 1, before + 1):
+        chat(hist(24), max_tokens=64)
+        assert fires() == want, (fires(), want)
+    print("  sliding window of 24 turns: guarded once in 3 requests")
+
+    # review L6: the note would push the prompt over the context: the guarded turn goes without it, no 400
+    h = hist(3)
+    ids, _ = gen.prompt(app.openai_messages(h), app.canonical_tools(TOOLS), {"enable_thinking": False}, None)
+    room = len(ids) + 2 + gen.args.mtp_k + 2  # the open think block is 2 tokens more; the note is ~80
+    gen.engine.slots[:] = [room] * len(slots)
+    try:
+        r = c.post("/v1/chat/completions", json={"model": name, "messages": h, "tools": TOOLS, "max_tokens": 4})
+    finally:
+        gen.engine.slots[:] = slots
+    assert r.status_code == 200 and "server note" not in prompt() and prompt().endswith(OPEN), (r.text, prompt()[-300:])
+    print("  note over the context: left out, the turn runs")
+
+    # review 2 L5: once the thinking closes the engine limit is the answer's (max_tokens), not the reasoning's room
+    lim, orig = [], gen.engine.set_limit
+    gen.engine.set_limit = lambda s, t: (lim.append(t), orig(s, t))
+    try:
+        r, m, fin = chat(hist(3), max_tokens=30)
+    finally:
+        gen.engine.set_limit = orig
+    assert fin == "length" and lim and lim[-1] <= 31, (fin, lim)
+    print(f"  engine limit after the close: {lim[-1]} (answer max_tokens 30)")
+
+    # review 2 L7: --loop-guard-turns outside 0 / 2..24 is refused at start
+    for bad in ("1", "25"):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                app.parse_args(["--model", MODEL, "--metrics-port", "0", "--loop-guard-turns", bad])
+            raise AssertionError(f"--loop-guard-turns {bad} accepted")
+        except SystemExit:
+            pass
+    for ok in ("0", "2", "24", "-1"):
+        app.parse_args(["--model", MODEL, "--metrics-port", "0", "--loop-guard-turns", ok])
+    os.environ["QE_LOOP_GUARD_TURNS"] = "1"  # the env value warns and keeps the default
+    try:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            a = app.parse_args(["--model", MODEL, "--metrics-port", "0"])
+    finally:
+        del os.environ["QE_LOOP_GUARD_TURNS"]
+    assert a.loop_guard_turns == 3 and "QE_LOOP_GUARD_TURNS=1" in err.getvalue(), err.getvalue()
+    print("  --loop-guard-turns 1 / 25 refused, 0 / 2 / 24 / -1 accepted")
 
     print(f"ok ({fires()} guarded turns)")
 

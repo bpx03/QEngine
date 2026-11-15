@@ -127,6 +127,10 @@ public:
     int* spec_io(int slot);
     void constrain(int slot, bool on);
     bool constrained(int slot) const { return seqs_.at(slot).constrained; }
+    // [tool-choice-ban] static token ban of a slot (tool_choice none: <tool_call>): ids[0, n) never chosen by the target
+    // head (greedy argmax, sampling, draft acceptance) in the slot's normal decode path; the slot keeps batching,
+    // run-ahead and its drafts. n = 0 clears it; the next start_begin and release clear it too. Call after start_begin.
+    void ban(int slot, const int* ids, int n);
     // logprobs: a constrained slot (constrain first; ends with it) keeps the target head's raw logits of its steps and its
     // prompt end, before the mask. logits_read: row of the last step in token order; false: bad row
     void logits_capture(int slot, bool on);
@@ -188,14 +192,14 @@ public:
     // a new sequence of n tokens can start now: a free slot, and the pool holds it next to the
     // running ones (each counted with 16K of room to grow; idle ones can be evicted)
     bool can_admit(int n);  // (a pool shrunk under VRAM pressure grows back first when the request needs it)
-    // make room for a new n-token sequence of value `prio` (the main thread): pause decoding sequences
-    // worth less (lowest prio, the most recently admitted first; never a prompt being prefilled, never
-    // one of the same or a higher prio), only as many as needed and only when that makes it fit (paused
-    // conversations count as out: they resume when room frees). true: the start fits now.
+    // make room for a new n-token sequence: pause decoding sequences in the pool's own order (the most
+    // recently admitted first, as room_or_pause; never a prompt being prefilled), only as many as needed
+    // and only when that makes it fit (paused conversations count as out: they resume when room frees).
+    // true: the start fits now. `prio` is ignored (user decision 2026-11-12: no priority; the C API keeps it).
     bool pause_for(int n, int prio);
-    // Eviction value of a slot's conversation (kept with its archive): 0 = finished (a subagent
-    // whose last reply had no tool call), 1 = normal, 2 = the main thread: evicted from the GPU
-    // last, never dropped from the RAM archive while anything else can go.
+    // Scheduling value of a slot's conversation (0 = finished subagent, 1 = normal, 2 = the main
+    // thread): logs and slot_info only; no eviction, archive, pin, snapshot or pause order reads it
+    // (user decision 2026-11-12: every conversation alike).
     void set_prio(int slot, int prio) { seqs_.at(slot).prio = prio; }
     // the reply may emit at most `tokens` more tokens (max_tokens): steps verify only the drafts
     // that fit, so the slot ends exactly at the returned reply and the next turn resumes from its
@@ -214,7 +218,6 @@ public:
         Seq& q = seqs_.at(slot);
         q.end = tokens >= 0 ? q.pos + tokens : 0;
     }
-    int prio(int slot) const { return seqs_.at(slot).prio; }
     // Prompt tokens that a start() of this prompt would resume from (live slot, snapshot,
     // archive or pinned prefix), without side effects: the scheduler's prefill-cost estimate.
     int probe_cached(const int* ids, int n) const;
@@ -289,8 +292,8 @@ private:
     struct KvArchive;
     enum Room { SQUEEZE, FLOOR, FREE };
     bool ensure_cap(int s, int need, const std::vector<int>& protect = {}, Room mode = SQUEEZE);
-    // decode steps: ensure_cap, else pause (preempt) active conversations - the lowest prio, the
-    // most recently admitted, the main thread last - until s fits; false: no room (s itself may
+    // decode steps: ensure_cap, else pause (preempt) active conversations - the most recently
+    // admitted first, every conversation alike - until s fits; false: no room (s itself may
     // be the one paused: Seq::paused)
     bool room_or_pause(int s, int need);
     bool pause_slot(int v);
@@ -318,11 +321,13 @@ private:
         int pos = 0, pending = -1, last_tok = 0;
         unsigned long long used = 0, affinity = 0;
         int k_avail = 0;            // drafts in the slot's device tokens for its next step
+        bool k_blk = false;         // [q27-bdfl] those drafts came from the DFlash2 block drafter
         bool active = false;        // in use by a generating request
         bool stale = false;         // device token/position invalid (queued step undone)
-        int prio = 1;               // eviction value (set_prio): 0 finished, 1 normal, 2 main thread
+        int prio = 1;               // scheduling value (set_prio): logs and slot_info only, no order reads it
         int hint = 0;               // end of the system part in its last prompt (0: none), archive_subs keeps a state there
         bool constrained = false;   // grammar mask on (constrain)
+        bool banned = false;        // [tool-choice-ban] static token ban on (ban)
         int end = 0;                // > 0: last position the reply may reach (set_limit)
         // stop sequences (watch_stops): the drafts of the next step for the caller, no step queued
         // ahead while a stop may start in the step in flight (set_no_ahead), and the undo of the
@@ -347,7 +352,7 @@ private:
         long long sk = -1;          // steering key of its KV / state (set_steering): never served to another key
         // draft statistics (draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
         long long ds[5] = {0, 0, 0, 0, 0};
-        double last_s = 0;          // last start / release, mono_s() (archive order: an active main)
+        double last_s = 0;          // last start / release, mono_s() (the archive's LRU order)
         void count_step(bool lookup, int drafted, int emitted) {
             const int acc = emitted > 1 ? emitted - 1 : 0;
             ds[0]++;
@@ -385,7 +390,7 @@ private:
     // batched steps are queued one ahead too while the set of sequences stays the same
     void launch_batch(int buf, bool ahead);  // ahead: queued behind the step in buffer buf ^ 1
     void finish_batch();
-    void finish_single();
+    void finish_single();  // (also catches up the deferred MTP KV rows: mkv_catch_up)
     void finish_for(int slot);  // undo only what a change to `slot` invalidates
     bool batch_live(int slot) const;
     std::vector<int> bslots_;
@@ -396,6 +401,11 @@ private:
     // lookup drafts in batched steps (QE_LKB): per slot the history length the cards hold for sure (-1: unknown,
     // full upload), dirty (an undone step may have appended past it), sticky lookup mode, misses since the last find
     int blkr_[2][kMaxSegs] = {};         // lookup rows of each sequence of the step in each buffer (0: MTP)
+    // [q27-bdfl] DFlash2 block drafts in batched steps (QE_DF_BATCH): the drafts each sequence of the step in each buffer
+    // made (block: kDflDrafts, else the MTP count)
+    int bkdn_[2][kMaxSegs] = {};
+    bool bblk_[2][kMaxSegs] = {};        // the sequence's drafts for that step came from the block drafter
+    int df_batch_ = 0;                   // QE_DF_BATCH: up to this many sequences in a batched step draft with the block
     std::vector<int> lkb_len_, lkb_miss_;
     std::vector<char> lkb_dirty_, lkb_mode_;
     std::vector<float> lkb_ema_;           // accepted lookup drafts per lookup step (EMA): sizes the slot's rows
@@ -444,6 +454,7 @@ private:
     bf16* img_table_ = nullptr;     // image embedding rows of the prompts being prefilled (mapped; one range per prefill)
     size_t img_cap_ = 0;            // rows
     void take_snapshot(const int* ids, int pos, int kind = 0, int replace = 0);
+    void snap_host_wait();  // [q27-snapasync] every card's snapshot copy in flight is in its host buffer
     std::vector<Snapshot> snaps_;
     // Pinned prefixes: QE_PREFIX_GB of host memory (default 8) outside the archive LRU
     size_t prefix_budget_ = 0, prefix_used_ = 0;
@@ -465,6 +476,7 @@ private:
         std::mutex mu;
         std::condition_variable cv;
         bool done = false, ok = false, cancel = false;
+        std::vector<uint64_t> hash;  // payload checksums of the file (set before done; empty: a file without them)
     };
     // Host memory of the archives: pinned slabs (cudaHostAlloc, pinned in the background at
     // startup up to the archive + prefix budget, QE_ARCHIVE_PINNED=0 disables) carved by a
@@ -520,7 +532,7 @@ private:
         std::shared_ptr<DiskState> disk;
         size_t data_off = 0;                // file offset of GPU 0's buffer
         unsigned long long used = 0, born = 0;  // born: tick when made (0: found on disk at start)
-        int prio = 1;                       // of the conversation when archived (Seq::prio)
+        int prio = 1;                       // of the conversation when archived (Seq::prio): logs only, no order reads it
         double last_s = 0;                  // the conversation's last use (Seq::last_s; restored from it: then), mono_s()
         int split = 0;                      // rows [0, split) live in the prefix named by toks[0, split)
         // pinned prefix (end of a system prompt / shared tools block): outside the LRU and the
@@ -554,14 +566,15 @@ private:
     struct ArchSub { int pos; std::vector<const char*> src; std::shared_ptr<Bufs> hold; bool whole; };  // whole: hold is its archive's buffer
     void stage_subs(std::vector<ArchSub>& subs);
     std::vector<ArchSub> archive_subs(const Seq& q, int n);
-    void drop_covered(long long sk, const int* toks, int n, unsigned long long born_after);
+    void drop_covered(long long sk, const int* toks, int n, unsigned long long born_after, bool keep_files = false);
+    static bool arch_present(const KvArchive& a);     // memory copy, or a file written / being written
+    static bool arch_file_ready(const KvArchive& a);  // its file is written
     bool bg_prepare(int slot);
     void bg_finish(bool all);
     void drop_archive(std::list<KvArchive>::iterator it);
-    bool ram_make_room(size_t need, int prio, size_t limit = (size_t)-1);
+    bool ram_make_room(size_t need, int prio, size_t limit = (size_t)-1);  // (prio: the writer's, for the log line only)
     bool ram_fits(size_t need, const qe_arch::Rank* older_than = nullptr);
-    qe_arch::Rank arch_rank(const KvArchive& a, double now) const;
-    double main_stale_s_ = 300;  // FLASH_MAIN_STALE_S: a main thread unused for this long is an ordinary conversation
+    qe_arch::Rank arch_rank(const KvArchive& a) const;
     static double mono_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     size_t ram_budget();  // archive_budget_ capped by the host's memory (host_mem.h)
     qe_hostmem::CapLog cap_log_;
@@ -584,10 +597,14 @@ private:
         std::vector<char> header;
         std::string path;
         std::shared_ptr<DiskState> st;
-        std::vector<std::string> covered;  // files this one supersedes
+        std::vector<std::pair<std::string, size_t>> covered;  // files this one supersedes (bytes)
+        size_t hash_off = 0;               // header offset of the checksums (the writer fills them)
+        int ns = 0;                        // delta-net states per section
+        std::vector<size_t> snb;           // their bytes per GPU
     };
     std::deque<DiskJob> disk_q_;
-    std::vector<std::string> covered_files_;  // of the archives drop_covered just dropped
+    std::vector<std::pair<std::string, size_t>> covered_files_;  // of the archives drop_covered just dropped (bytes)
+    std::atomic<size_t> disk_covered_{0};  // bytes of superseded files still on the drive (the writer deletes them)
     void disk_flush_covered();
     std::mutex disk_mu_;
     std::condition_variable disk_cv_;
@@ -638,6 +655,12 @@ private:
     bool buf_clamped_[2] = {false, false};
     bool buf_lk_[2] = {false, false};      // the step in each buffer was a lookup step
     bool buf_blk_[2] = {false, false};     // ... a DFlash2 block step (drafts from the block drafter)
+    // [q27-mtpkv-defer] deferred MTP KV rows of block steps (Worker::mkv_*): the slot whose rows are in the rings,
+    // rows of finished steps not yet filled (host count), steps in each buffer whose rows the count still lacks
+    int mkv_slot_ = -1, mkv_n_ = 0;
+    long long mkv_sync_ahead_ = 0;  // non-block steps queued ahead whose catch-up synced behind an in-flight block step
+    bool buf_mkv_[2] = {false, false};
+    void mkv_catch_up();  // fill every deferred row of mkv_slot_ (bound as cur_) before anything else reads its MTP cache
     // DFlash2 block drafter (QE_DRAFTER=auto|dflash2|mtp): single-sequence steps draft with it, batched
     // steps keep MTP. Context rings: a few per card, LRU over the slots that run block steps; gap: the slot advanced
     // without writing its ring from this position on (batched / MTP steps): rows past it dropped at its next block step
@@ -660,7 +683,9 @@ private:
     int dfl_cb_rows_ = 0;   // codebook rows (candidate ids are clamped below it)
     int dfl_req_ = 0;       // auto: the requested context it was loaded for (checked after the pool plan)  // req_ctx: the requested context (max_t)
   public:
-    long long df_steps_ = 0, df_tok_ = 0;  // block steps, their tokens (statistics)
+    // block steps and their tokens (statistics, qe_dfl_stats): one per sequence-step, so a batched step with two block-drafting
+    // sequences counts 2; df_tok_ / df_steps_ = tokens per sequence per block step
+    long long df_steps_ = 0, df_tok_ = 0;
     double dfl_bench(int iters);           // ms per drafter block on every card (development check)
   private:
     bool lk_on_ = false;                   // QE_LOOKUP: lookup drafts on the GPU (single-sequence steps)

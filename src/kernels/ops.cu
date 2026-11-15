@@ -1,3 +1,5 @@
+#include <atomic>
+#include <climits>
 #include "../env.h"
 #include <algorithm>
 #include <cfloat>
@@ -107,6 +109,149 @@ __global__ void rope_table_seg_kernel(const AttnSegs g, const float* __restrict_
     rope_table_dev(seq_view(c), c.pos, seg_row0(g, blockIdx.y), inv_freq, tab);
 }
 
+
+// QE_KVQ_EMU: quantise-dequantise one 256-wide K or V row (one value per thread, all 256 threads of the block call
+// it). Optional randomised Hadamard rotation (sign flip + FWHT / 16) before the group quantiser, rotated back after,
+// so the bf16 cache holds what a rotated 4-bit cache would give to the attention (dot products are invariant).
+// Group scales are rounded to fp16 as a real cache would store them. Quality gate only.
+__device__ __constant__ float kNf4[16] = {-1.f, -0.6961928f, -0.5250731f, -0.3949175f, -0.2844414f, -0.1847734f,
+                                          -0.0910500f, 0.f, 0.0795803f, 0.1609302f, 0.2461123f, 0.3379152f,
+                                          0.4407098f, 0.5626170f, 0.7229568f, 1.f};
+__device__ __forceinline__ float kvq_sign(int d) { return ((0x9E3779B9u * (unsigned)(d + 1)) >> 31) ? -1.f : 1.f; }
+__device__ void kvq_fwht(float* h, int d) {
+    for (int len = 1; len < 256; len <<= 1) {
+        __syncthreads();
+        const float a = h[d], b = h[d ^ len];
+        __syncthreads();
+        h[d] = (d & len) ? b - a : a + b;
+    }
+    __syncthreads();
+}
+__device__ float kvq_fake(float x, int d, int bits, int emu, float scale) {
+    if (bits == 0) return x;
+    if (bits == 8) {
+        if (!(scale > 0.f)) return x;  // (no calibrated scale: leave it)
+        const __nv_fp8_storage_t q = __nv_cvt_float_to_fp8(x / scale, __NV_SATFINITE, __NV_E4M3);
+        return __half2float(__nv_cvt_fp8_to_halfraw(q, __NV_E4M3)) * scale;
+    }
+    __shared__ float h[256];
+    const int g = 1 << min((emu >> 8) & 15, 8), rot = (emu >> 12) & 1, mode = (emu >> 13) & 7;
+    if (rot) {
+        __syncthreads();
+        h[d] = x * kvq_sign(d);
+        kvq_fwht(h, d);
+        x = h[d] * 0.0625f;
+    }
+    __syncthreads();
+    h[d] = x;
+    __syncthreads();
+    const int g0 = d & ~(g - 1);
+    float mx = -FLT_MAX, mn = FLT_MAX;
+    for (int i = 0; i < g; i++) {
+        mx = fmaxf(mx, h[g0 + i]);
+        mn = fminf(mn, h[g0 + i]);
+    }
+    const float am = fmaxf(mx, -mn);
+    float y;
+    if (mode == 1) {
+        const float s = __half2float(__float2half((mx - mn) / 15.f)), z = __half2float(__float2half(mn));
+        y = s > 0.f ? fminf(fmaxf(rintf((x - z) / s), 0.f), 15.f) * s + z : z;
+    } else if (mode == 2) {
+        const float s = __half2float(__float2half(am));
+        const float t = s > 0.f ? x / s : 0.f;
+        int bi = 0;
+        float bd = FLT_MAX;
+        for (int i = 0; i < 16; i++) {
+            const float e = fabsf(t - kNf4[i]);
+            if (e < bd) { bd = e; bi = i; }
+        }
+        y = kNf4[bi] * s;
+    } else if (mode == 4) {  // half-offset 16 levels, clip ratio with the least group error (1, 0.9, 0.8, 0.7)
+        __shared__ float er[256];
+        float best = 0.f, be = FLT_MAX;
+        for (int c = 0; c < 4; c++) {
+            const float s = __half2float(__float2half(am * (1.f - 0.1f * c) / 7.5f));
+            const float yy = s > 0.f ? (fminf(fmaxf(floorf(x / s), -8.f), 7.f) + 0.5f) * s : 0.f;
+            __syncthreads();
+            er[d] = (yy - x) * (yy - x);
+            __syncthreads();
+            float e = 0.f;
+            for (int i = 0; i < g; i++) e += er[g0 + i];
+            if (e < be) { be = e; best = yy; }
+        }
+        y = best;
+    } else if (mode == 3) {
+        const float s = __half2float(__float2half(am / 7.5f));
+        y = s > 0.f ? (fminf(fmaxf(floorf(x / s), -8.f), 7.f) + 0.5f) * s : 0.f;
+    } else {
+        const float s = __half2float(__float2half(am / 7.f));
+        y = s > 0.f ? fminf(fmaxf(rintf(x / s), -7.f), 7.f) * s : 0.f;
+    }
+    if (rot) {
+        __syncthreads();
+        h[d] = y;
+        kvq_fwht(h, d);
+        y = h[d] * 0.0625f * kvq_sign(d);
+    }
+    return y;
+}
+
+
+// 4-bit KV write (AttnShape::kv4): rotate the row (randomised Hadamard, the same signs as kvq_fake), quantise it in
+// groups of 32 dims (one warp: absmax over the warp, fp16 scale), pack the nibbles and the scale into the row.
+// K rows: each 4-dim unit u = dims 4u..4u+3 is 2 bytes {n(4u) | n(4u+2) << 4, n(4u+1) | n(4u+3) << 4} (the decode
+// kernel's K fragment takes dims (4t, 4t+1) and (4t+2, 4t+3) of a 16-dim chunk); V rows: byte i = n(2i) | n(2i+1) << 4.
+// All 256 threads of the block call it.
+__device__ float kv4_rotate(float x, int d) {
+    __shared__ float h[256];
+    __syncthreads();
+    h[d] = x * kvq_sign(d);
+    kvq_fwht(h, d);
+    return h[d] * 0.0625f;
+}
+__device__ float kv4_unrotate(float x, int d) {
+    __shared__ float h[256];
+    __syncthreads();
+    h[d] = x;
+    kvq_fwht(h, d);
+    return h[d] * 0.0625f * kvq_sign(d);
+}
+__device__ void kv4_store(float x, int d, uint8_t* __restrict__ row, bool krow) {
+    // kv4_27b L7: a non-finite input would reach every dim through the rotation and zero the whole row (no scale
+    // candidate has a finite error): it counts as 0 (NaN and +-inf alike: a clamp to a large value would dominate the
+    // rotated row, rel136 review L1); finite inputs are unchanged (the default numbers stay)
+    if (!isfinite(x)) x = 0.f;
+    x = kv4_rotate(x, d);
+    float am = fabsf(x);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    // 16 levels at half offsets, (n - 7.5) x scale; the scale is the one of absmax x {1, 0.9, 0.8, 0.7} / 7.5 with the
+    // least squared error over the group (KL 3.9e-3 vs 4.9e-3 for absmax alone)
+    __half sh = __float2half(0.f);
+    float be = FLT_MAX;
+    int n = 8;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const __half hc = __float2half(fminf(am * (1.f - 0.1f * c) / 7.5f, 65504.f));  // (saturating: no inf scale)
+        const float sc = __half2float(hc);
+        const int nc = sc > 0.f ? (int)fminf(fmaxf(floorf(x / sc), -8.f), 7.f) + 8 : 8;
+        const float e = ((float)nc - 7.5f) * sc - x;
+        float er = e * e;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) er += __shfl_xor_sync(0xffffffffu, er, o);
+        if (er < be) { be = er; sh = hc; n = nc; }
+    }
+    const int lane = d & 31;
+    if (krow) {
+        const int hi = __shfl_down_sync(0xffffffffu, n, 2);
+        if ((d & 3) < 2) row[(d >> 2) * 2 + (d & 1)] = (uint8_t)(n | (hi << 4));
+    } else {
+        const int hi = __shfl_down_sync(0xffffffffu, n, 1);
+        if (!(d & 1)) row[d >> 1] = (uint8_t)(n | (hi << 4));
+    }
+    if (lane == 0) reinterpret_cast<__half*>(row + 128)[d >> 5] = sh;
+}
+
 __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, int ld, const AttnShape& s,
                                               const SeqView& sv,
                                               const bf16* __restrict__ qn_w, const bf16* __restrict__ kn_w,
@@ -116,13 +261,21 @@ __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, in
     __shared__ float xs[256];
     const int mi = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const int p = pos[0] + mi;
+    // [q27-sib] a leaf row's RoPE position is its tree position (its K / V stays at slot p)
+    const int prope = (s.sib && s.sib[0] && mi >= 5) ? p - 4 : p;
     const float* row = proj + (size_t)mi * ld;
     const bool is_q = h < s.nq, is_k = !is_q && h < s.nq + s.nkv;
     if (!is_q && !is_k) {  // v: straight copy into the cache (kv-pos-split: owned positions only)
         const int j = h - s.nq - s.nkv;
         const PosMap pm = s.kv_pm[j];
         if (!pm_owned(pm, p)) return;
-        const float v = row[s.nq * 512 + s.nkv * 256 + j * 256 + d];
+        float v = row[s.nq * 512 + s.nkv * 256 + j * 256 + d];
+        if (s.kvemu && p >= s.kvsink) v = kvq_fake(v, d, (s.kvemu >> 4) & 15, s.kvemu, s.vs);
+        if (s.kv4) {
+            const size_t r4 = head_rows(s, j, sv.max_t) + (pm_rank(pm, p) - pm_rank(pm, sv.split));
+            kv4_store(v, d, (uint8_t*)vc + r4 * kKv4Row, false);
+            return;
+        }
         const size_t idx = (head_rows(s, j, sv.max_t) + (pm_rank(pm, p) - pm_rank(pm, sv.split))) * 256 + d;
         if (s.fp8)
             ((__nv_fp8_storage_t*)vc)[idx] = __nv_cvt_float_to_fp8(v / s.vs, __NV_SATFINITE, __NV_E4M3);
@@ -148,7 +301,7 @@ __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, in
             c = t.x;
             sn = t.y;
         } else {
-            const float ang = rope_angle(sv, p, fi, inv_freq);
+            const float ang = rope_angle(sv, prope, fi, inv_freq);
             c = cos((double)ang);
             sn = sin((double)ang);
         }
@@ -158,11 +311,17 @@ __device__ __forceinline__ void attn_prep_dev(const float* __restrict__ proj, in
         y = d < 32 ? (float)((xn * c - xs[d + 32] * sn) * qf) : (float)((xn * c + xs[d - 32] * sn) * qf);
     }
     if (is_q) {
+        if (s.kv4) y = kv4_rotate(y, d);  // q.k = (Rq).(Rk)
         q_out[((size_t)mi * s.nq + j) * 256 + d] = __float2bfloat16(y);
         return;
     }
     const PosMap pm = s.kv_pm[j];
     const size_t idx = (head_rows(s, j, sv.max_t) + (pm_rank(pm, p) - pm_rank(pm, sv.split))) * 256 + d;
+    if (s.kvemu && p >= s.kvsink) y = kvq_fake(y, d, s.kvemu & 15, s.kvemu, s.ks);
+    if (s.kv4) {
+        kv4_store(y, d, (uint8_t*)kc + (idx / 256) * kKv4Row, true);
+        return;
+    }
     if (s.fp8)
         ((__nv_fp8_storage_t*)kc)[idx] = __nv_cvt_float_to_fp8(y / s.ks, __NV_SATFINITE, __NV_E4M3);
     else
@@ -487,6 +646,7 @@ __device__ __forceinline__ void attn_combine_dev(const float* __restrict__ work,
     } else {
         v = num * (1.f / den);  // (num * inv_den, as before the split)
     }
+    if (s.kv4) v = kv4_unrotate(v, d);  // the 4-bit cache holds rotated V: sum p R v = R sum p v
     const float gate = proj[(size_t)mi * ld + h * 512 + 256 + d];
     v *= sigmoid(gate);
     out[((size_t)mi * no + (h - s.ob)) * 256 + d] = __float2bfloat16(v);
@@ -552,7 +712,8 @@ __device__ __forceinline__ void dn_convqk_dev(const float* __restrict__ proj, in
                                               const float* __restrict__ ab,
                                               const float* __restrict__ A,
                                               const float* __restrict__ dt_bias,
-                                              float* __restrict__ qk, float* __restrict__ gb) {
+                                              float* __restrict__ qk, float* __restrict__ gb,
+                                              const int* __restrict__ sib = nullptr) {
     __shared__ float red[8];
     const int b = blockIdx.x, t = threadIdx.x;
     const int nvb = (s.nv * 128 + 255) / 256;
@@ -581,9 +742,12 @@ __device__ __forceinline__ void dn_convqk_dev(const float* __restrict__ proj, in
     }
     const float w0 = __bfloat162float(w[c * 4 + 0]), w1 = __bfloat162float(w[c * 4 + 1]);
     const float w2 = __bfloat162float(w[c * 4 + 2]), w3 = __bfloat162float(w[c * 4 + 3]);
-    const int p0 = pos[0], p = p0 + mi;
+    // [q27-sib] leaf row mi >= 5: tree position p0 + mi - 4, its window = its ancestors (rows below it) and itself
+    const bool leaf = sib && sib[0] && mi >= 5;
+    const int p0 = pos[0], p = p0 + mi - (leaf ? 4 : 0);
     auto h = [&](int q) {
         if (q < 0) return 0.f;
+        if (q == p) return __bfloat162float(__float2bfloat16(proj[(size_t)(r0 + mi) * ld + c]));
         if (q >= p0) return __bfloat162float(__float2bfloat16(proj[(size_t)(r0 + q - p0) * ld + c]));
         return __bfloat162float(hist[(size_t)(q % kConvRing) * ch + c]);
     };
@@ -602,15 +766,16 @@ __device__ __forceinline__ void dn_convqk_dev(const float* __restrict__ proj, in
         else o[s.nk * 128 + b * 128 + (t - 128)] = y * rsqrtf(n2 + 1e-6f);
         __syncthreads();  // all reads of the ring (other blocks: none of these slots) done
     }
-    hist[(size_t)(p % kConvRing) * ch + c] = __float2bfloat16(proj[(size_t)row * ld + c]);
+    // (a leaf's input goes to a free ring slot p0 + mi + 3 (p0 + 8..10): sib_fix moves a hit leaf's to its position)
+    hist[(size_t)((leaf ? p0 + mi + 3 : p) % kConvRing) * ch + c] = __float2bfloat16(proj[(size_t)row * ld + c]);
 }
 
 __global__ void __launch_bounds__(256) dn_convqk_kernel(
     const float* __restrict__ proj, int ld, int ch, const bf16* __restrict__ w,
     bf16* __restrict__ hist, const int* __restrict__ pos, float* __restrict__ cv,
     DeltaShape s, const float* __restrict__ ab, const float* __restrict__ A,
-    const float* __restrict__ dt_bias, float* __restrict__ qk, float* __restrict__ gb) {
-    dn_convqk_dev(proj, ld, ch, w, hist, pos, blockIdx.y, 0, cv, s, ab, A, dt_bias, qk, gb);
+    const float* __restrict__ dt_bias, float* __restrict__ qk, float* __restrict__ gb, const int* __restrict__ sib) {
+    dn_convqk_dev(proj, ld, ch, w, hist, pos, blockIdx.y, 0, cv, s, ab, A, dt_bias, qk, gb, sib);
 }
 
 __global__ void __launch_bounds__(256) dn_convqk_seg_kernel(
@@ -1191,13 +1356,13 @@ __global__ void argmax_final_kernel(const float* __restrict__ pairs, int ngpu, i
     const int mi = threadIdx.x;
     if (mi >= m) return;
     float best = -FLT_MAX;
-    int idx = 0;
+    int idx = INT_MAX;  // (a -FLT_MAX pair, e.g. head4r's best INT4 candidate of a row without a finite exact value, can win; re-review N1)
     for (int g = 0; g < ngpu; g++) {
         const float v = pairs[(g * m + mi) * 2];
         const int i = __float_as_int(pairs[(g * m + mi) * 2 + 1]);
         if (v > best || (v == best && i < idx)) { best = v; idx = i; }
     }
-    tokens[mi] = idx;
+    tokens[mi] = idx == INT_MAX ? 0 : idx;
 }
 
 }  // namespace
@@ -1510,10 +1675,18 @@ __global__ void __launch_bounds__(128) dn_core2_seg_kernel(DnSegs g, const float
                     g.pn[z], g.pend[z]);
 }
 // QE_DN_CORE2 = lanes per value column (8, 4, 2; 1 = auto: 2 lanes for one sequence, 8 + the
-// pipelined dn_core3 for a batch; 0 = dn_core_dev, the default: neither won).
-// All bit identical.
+// pipelined dn_core3 for a batch; 0 = dn_core_dev: neither won). All bit identical.
+// Batched steps take dn_core4_seg first since [q27-dn-core3-pad] (QE_DN_CPT=0: this chain).
 static int g_dn_core2 = -1;
 void dn_core2_set(int lanes) { g_dn_core2 = lanes; }
+// (tests, rel136_fixes_review L2) the core variant the last dn_core_only / dn_core_seg call launched: 0 the reference kernel
+// (dn_core_kernel / dn_core_seg_kernel), 1 / 2 dn_core3 dense / padded, 2..6 the single-sequence dn_core4 CPT variant,
+// 12..15 the batched dn_core4_seg variant (10 + CPT code), 100 + lanes dn_core2. Host-side, set at launch (capture) time.
+static std::atomic<int> g_dn_ran{-1};
+int dn_core_ran() { return g_dn_ran.load(std::memory_order_relaxed); }
+static int g_dn_single_cpt = -1;  // [q27-dn-core4-1card] test override of the single-sequence CPT (-1: env / rule)
+void dn_single_cpt_set(int cpt) { g_dn_single_cpt = cpt; }
+static bool g_dn_core2_forced() { static const bool f = env_int("QE_DN_CORE2_SINGLE", 0) != 0; return f; }
 static int dn_core2_lanes(int nseg) {
     if (g_dn_core2 < 0) g_dn_core2 = env_int("QE_DN_CORE2", 0);
     return g_dn_core2 == 1 ? (nseg == 1 ? 2 : 8) : g_dn_core2;
@@ -1538,7 +1711,9 @@ static bool dn_core2(const float* cv, int ch, const DeltaShape& s, const float* 
     // (1 = spec and plain, 2 = spec only, 3 = plain only)
     static const int single = env_int("QE_DN_CORE2_SINGLE", 0);
     if (!single || (single == 2 && !write_all) || (single == 3 && write_all)) return false;
-    switch (dn_core2_lanes(1)) {
+    const int ln = dn_core2_lanes(1);
+    if (ln == 8 || ln == 4 || ln == 2) g_dn_ran.store(100 + ln, std::memory_order_relaxed);
+    switch (ln) {
     case 8: dn_core2_launch<8>(cv, ch, s, qk, gb, S, slot_floats, cur, m, write_all, o, slot_off, pn, pend, st); return true;
     case 4: dn_core2_launch<4>(cv, ch, s, qk, gb, S, slot_floats, cur, m, write_all, o, slot_off, pn, pend, st); return true;
     case 2: dn_core2_launch<2>(cv, ch, s, qk, gb, S, slot_floats, cur, m, write_all, o, slot_off, pn, pend, st); return true;
@@ -1551,7 +1726,9 @@ static bool dn_core2_seg(const DnSegs& g, const float* cv, int ch, const DeltaSh
     int mx = 1;
     for (int i = 0; i < g.n; i++) mx = std::max(mx, g.m[i]);
     if (mx > kPendRows) return false;
-    switch (dn_core2_lanes(g.n)) {
+    const int ln = dn_core2_lanes(g.n);
+    if (ln == 8 || ln == 4 || ln == 2) g_dn_ran.store(100 + ln, std::memory_order_relaxed);
+    switch (ln) {
     case 8: dn_core2_seg_kernel<8><<<dim3(s.nv, 8, g.n), 128, DnCore2<8>::smem(mx, dn_pcap(s)), st>>>(g, cv, ch, s, qk, gb, slot_floats, o); return true;
     case 4: dn_core2_seg_kernel<4><<<dim3(s.nv, 4, g.n), 128, DnCore2<4>::smem(mx, dn_pcap(s)), st>>>(g, cv, ch, s, qk, gb, slot_floats, o); return true;
     case 2: dn_core2_seg_kernel<2><<<dim3(s.nv, 2, g.n), 128, DnCore2<2>::smem(mx, dn_pcap(s)), st>>>(g, cv, ch, s, qk, gb, slot_floats, o); return true;
@@ -1572,17 +1749,24 @@ __device__ __forceinline__ void cpa4(float* sdst, const float* gsrc) {
 __device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cpa_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
 
+// KS: shared-memory stride of a lane's 16 k / q entries (16 dense; 20: [q27-dn-core3-pad] no 4-way bank conflict on the
+// 128-bit loads; same values, same order)
+template <int KS = 16>
 struct DnCore3 {
-    static constexpr int OWN = 256 + 16 + 4, PND = 128 + 16 + 4;  // as DnCore2<8>
+    static constexpr int KR = 8 * KS;
+    static constexpr int OWN = 2 * KR + 16 + 4, PND = KR + 16 + 4;  // (KS 16: as DnCore2<8>)
     __host__ __device__ static int buf_floats(int mx, int pcap) { return mx * OWN + pcap * PND; }
+    static __host__ __device__ constexpr int kx(int e) { return (e >> 4) * KS + (e & 15); }
 };
 
+template <int KS>
 __global__ void __launch_bounds__(128) dn_core3_kernel(DnSegs g, const float* __restrict__ cv, int ch,
                                                        DeltaShape s, const float* __restrict__ qk,
                                                        const float* __restrict__ gb, size_t slot_floats,
                                                        float* __restrict__ o, int mx, int ntiles) {
+    using C3 = DnCore3<KS>;
     extern __shared__ float dsm[];
-    const int bf = DnCore3::buf_floats(mx, dn_pcap(s));
+    const int bf = C3::buf_floats(mx, dn_pcap(s));
     const int t = threadIdx.x, col = t >> 3, j = t & 7;
     const int G = gridDim.x;
     const size_t qk_row = (size_t)2 * s.nk * 128;
@@ -1593,21 +1777,21 @@ __global__ void __launch_bounds__(128) dn_core3_kernel(DnSegs g, const float* __
         const int z = tz(tau), h = (tau >> 3) % s.nv, vb = tau & 7, kh = s.v2k[h];
         const int m = g.m[z], r0 = g.r0[z];
         float* own = B;
-        float* pnd = B + mx * DnCore3::OWN;
+        float* pnd = B + mx * C3::OWN;
         for (int mi = 0; mi < m; mi++) {
-            float* r = own + mi * DnCore3::OWN;
+            float* r = own + mi * C3::OWN;
             const float* qr = qk + (size_t)(r0 + mi) * qk_row + kh * 128;
-            cpa4(r + t, qr + s.nk * 128 + t);
-            cpa4(r + 128 + t, qr + t);
-            if (t < 16) cpa4(r + 256 + t, cv + (size_t)(r0 + mi) * ch + 2 * s.nk * 128 + h * 128 + vb * 16 + t);
-            else if (t < 18) cpa4(r + 256 + t, gb + (size_t)(r0 + mi) * 2 * s.nv + (t - 16) * s.nv + h);
+            cpa4(r + C3::kx(t), qr + s.nk * 128 + t);
+            cpa4(r + C3::KR + C3::kx(t), qr + t);
+            if (t < 16) cpa4(r + 2 * C3::KR + t, cv + (size_t)(r0 + mi) * ch + 2 * s.nk * 128 + h * 128 + vb * 16 + t);
+            else if (t < 18) cpa4(r + 2 * C3::KR + t, gb + (size_t)(r0 + mi) * 2 * s.nv + (t - 16) * s.nv + h);
         }
         for (int mi = 0; mi < np; mi++) {
-            float* r = pnd + mi * DnCore3::PND;
+            float* r = pnd + mi * C3::PND;
             const float* pr = g.pend[z] + (size_t)mi * prf;
-            cpa4(r + t, pr + kh * 128 + t);
-            if (t < 16) cpa4(r + 128 + t, pr + s.nk * 128 + h * 128 + vb * 16 + t);
-            else if (t < 18) cpa4(r + 128 + t, pr + s.nk * 128 + s.nv * 128 + (t - 16) * s.nv + h);
+            cpa4(r + C3::kx(t), pr + kh * 128 + t);
+            if (t < 16) cpa4(r + C3::KR + t, pr + s.nk * 128 + h * 128 + vb * 16 + t);
+            else if (t < 18) cpa4(r + C3::KR + t, pr + s.nk * 128 + s.nv * 128 + (t - 16) * s.nv + h);
         }
     };
     auto off_of = [&](int tau) {
@@ -1655,14 +1839,14 @@ __global__ void __launch_bounds__(128) dn_core3_kernel(DnSegs g, const float* __
             const bool write_all = !g.fin[z];
             const float* B = dsm + cb * bf;
             const float* own = B;
-            const float* pnd = B + mx * DnCore3::OWN;
+            const float* pnd = B + mx * C3::OWN;
             float* S = g.S[z];
             const size_t off = off_of(tau);
             auto step = [&](const float* kr, float v, float dec, float beta, const float* qr) {
                 float part = 0.f;
 #pragma unroll
                 for (int i = 0; i < 16; i += 4) {
-                    const float4 k4 = *reinterpret_cast<const float4*>(kr + j * 16 + i);
+                    const float4 k4 = *reinterpret_cast<const float4*>(kr + j * KS + i);
                     const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
 #pragma unroll
                     for (int e = 0; e < 4; e++) {
@@ -1677,10 +1861,10 @@ __global__ void __launch_bounds__(128) dn_core3_kernel(DnSegs g, const float* __
                 float po = 0.f;
 #pragma unroll
                 for (int i = 0; i < 16; i += 4) {
-                    const float4 k4 = *reinterpret_cast<const float4*>(kr + j * 16 + i);
+                    const float4 k4 = *reinterpret_cast<const float4*>(kr + j * KS + i);
                     const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
                     if (qr) {
-                        const float4 q4 = *reinterpret_cast<const float4*>(qr + j * 16 + i);
+                        const float4 q4 = *reinterpret_cast<const float4*>(qr + j * KS + i);
                         const float qq[4] = {q4.x, q4.y, q4.z, q4.w};
 #pragma unroll
                         for (int e = 0; e < 4; e++) {
@@ -1700,8 +1884,8 @@ __global__ void __launch_bounds__(128) dn_core3_kernel(DnSegs g, const float* __
             };
             if (np_c > 0) {
                 for (int mi = 0; mi < np_c; mi++) {
-                    const float* r = pnd + mi * DnCore3::PND;
-                    step(r, r[128 + col], r[144], r[145], nullptr);
+                    const float* r = pnd + mi * C3::PND;
+                    step(r, r[C3::KR + col], r[C3::KR + 16], r[C3::KR + 17], nullptr);
                 }
                 if (write_all && np_c >= dn_lazy_of(s, m)) {
                     float* dp = S + (size_t)(cur_c ^ 1) * slot_floats + off;
@@ -1711,8 +1895,8 @@ __global__ void __launch_bounds__(128) dn_core3_kernel(DnSegs g, const float* __
                 }
             }
             for (int mi = 0; mi < m; mi++) {
-                const float* r = own + mi * DnCore3::OWN;
-                const float po = step(r, r[256 + col], r[272], r[273], r + 128);
+                const float* r = own + mi * C3::OWN;
+                const float po = step(r, r[2 * C3::KR + col], r[2 * C3::KR + 16], r[2 * C3::KR + 17], r + C3::KR);
                 if (j == 0) o[((size_t)(r0 + mi) * s.nv + h) * 128 + vcol] = po;
             }
             if (!write_all) {
@@ -1736,19 +1920,23 @@ __global__ void __launch_bounds__(128) dn_core3_kernel(DnSegs g, const float* __
 // (CPT x fewer loads per FMA) and the CPT columns' chains and shuffles interleave (ILP). Each
 // column's arithmetic is exactly dn_core_dev's: bit identical. Block 128 threads = 16 groups =
 // 16 * CPT columns; grid (nv, 8 / CPT, nseg).
-template <int CPT>
+// KS: shared-memory stride of a lane's 16 k / q entries (16: dense; 20: [q27-dn-core4-occ] the 8 lanes of a column group
+// read 8 distinct 4-bank groups with their 128-bit loads instead of a 4-way conflict; same values, same order)
+template <int CPT, int KS = 16>
 struct DnCore4 {
     static constexpr int COLS = 16 * CPT;
-    static constexpr int OWN = 256 + COLS + 4, PND = 128 + COLS + 4;
+    static constexpr int KR = 8 * KS;  // one k (or q) row in shared memory
+    static constexpr int OWN = 2 * KR + COLS + 4, PND = KR + COLS + 4;
+    static __host__ __device__ constexpr int kx(int e) { return (e >> 4) * KS + (e & 15); }
     static size_t smem(int m, int pcap) { return (size_t)(m * OWN + pcap * PND) * 4; }
 };
 
-template <int CPT>
+template <int CPT, int KS = 16, bool TREE = false>
 __global__ void __launch_bounds__(128) dn_core4_seg_kernel(DnSegs g, const float* __restrict__ cv0, int ch,
                                                            DeltaShape s, const float* __restrict__ qk0,
                                                            const float* __restrict__ gb0, size_t slot_floats,
                                                            float* __restrict__ o0) {
-    using C = DnCore4<CPT>;
+    using C = DnCore4<CPT, KS>;
     constexpr int COLS = C::COLS;
     extern __shared__ float dsm[];
     const int z = blockIdx.z, r0 = g.r0[z], m = g.m[z];
@@ -1794,9 +1982,9 @@ __global__ void __launch_bounds__(128) dn_core4_seg_kernel(DnSegs g, const float
         for (int mi = 0; mi < kPendRows; mi++)
             if (mi < m) {
                 float* r = own + mi * C::OWN;
-                r[t] = a[mi];
-                r[128 + t] = b[mi];
-                if (xs) r[256 + t] = c[mi];  // v[COLS] | dec | beta
+                r[C::kx(t)] = a[mi];
+                r[C::KR + C::kx(t)] = b[mi];
+                if (xs) r[2 * C::KR + t] = c[mi];  // v[COLS] | dec | beta
             }
     }
     const int prf = dn_pend_row_floats(s);
@@ -1815,8 +2003,8 @@ __global__ void __launch_bounds__(128) dn_core4_seg_kernel(DnSegs g, const float
         for (int i = 0; i < kPendRows; i++)
             if (m0 + i < np) {
                 float* r = pnd + (m0 + i) * C::PND;
-                r[t] = a[i];
-                if (xs) r[128 + t] = c[i];
+                r[C::kx(t)] = a[i];
+                if (xs) r[C::KR + t] = c[i];
             }
     }
     __syncthreads();
@@ -1828,7 +2016,7 @@ __global__ void __launch_bounds__(128) dn_core4_seg_kernel(DnSegs g, const float
         for (int c = 0; c < CPT; c++) p[c] = 0.f;
 #pragma unroll
         for (int i = 0; i < 16; i += 4) {
-            const float4 k4 = *reinterpret_cast<const float4*>(kr + j * 16 + i);
+            const float4 k4 = *reinterpret_cast<const float4*>(kr + j * KS + i);
             const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
 #pragma unroll
             for (int e = 0; e < 4; e++)
@@ -1850,10 +2038,10 @@ __global__ void __launch_bounds__(128) dn_core4_seg_kernel(DnSegs g, const float
         }
 #pragma unroll
         for (int i = 0; i < 16; i += 4) {
-            const float4 k4 = *reinterpret_cast<const float4*>(kr + j * 16 + i);
+            const float4 k4 = *reinterpret_cast<const float4*>(kr + j * KS + i);
             const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
             if (qr) {
-                const float4 q4 = *reinterpret_cast<const float4*>(qr + j * 16 + i);
+                const float4 q4 = *reinterpret_cast<const float4*>(qr + j * KS + i);
                 const float qq[4] = {q4.x, q4.y, q4.z, q4.w};
 #pragma unroll
                 for (int e = 0; e < 4; e++)
@@ -1889,57 +2077,117 @@ __global__ void __launch_bounds__(128) dn_core4_seg_kernel(DnSegs g, const float
     if (np > 0) {
         for (int mi = 0; mi < np; mi++) {
             const float* r = pnd + mi * C::PND;
-            step(r, r + 128, nullptr, po);
+            step(r, r + C::KR, nullptr, po);
         }
         if (write_all && np >= dn_lazy_of(s, m)) store(cur ^ 1);
     }
-    for (int mi = 0; mi < m; mi++) {
-        const float* r = own + mi * C::OWN;
-        step(r, r + 256, r + 128, po);
-        if (j == 0)
+    if (TREE && g.sib && *g.sib && m == 8) {
+        // [q27-sib] tree step: leaf 5 + j right after its parent row j, on a copy of the state (no commit): its output is
+        // the one row j + 1 of a linear step holding the leaf token would give, bit for bit (the same step arithmetic)
+#pragma unroll 1
+        for (int x = 0; x < 8; x++) {
+            const int mi = x < 6 ? ((x & 1) ? 5 + (x >> 1) : (x >> 1)) : x - 3;  // 0 5 1 6 2 7 3 4 (review L3: no stack array)
+            const float* r = own + mi * C::OWN;
+            float sv[CPT][16];
+            if (mi >= 5)
 #pragma unroll
-            for (int c = 0; c < CPT; c++) o[((size_t)mi * s.nv + h) * 128 + vb * COLS + grp + 16 * c] = po[c];
+                for (int c = 0; c < CPT; c++)
+#pragma unroll
+                    for (int i = 0; i < 16; i++) sv[c][i] = st[c][i];
+            step(r, r + 2 * C::KR, r + C::KR, po);
+            if (j == 0)
+#pragma unroll
+                for (int c = 0; c < CPT; c++) o[((size_t)mi * s.nv + h) * 128 + vb * COLS + grp + 16 * c] = po[c];
+            if (mi >= 5)
+#pragma unroll
+                for (int c = 0; c < CPT; c++)
+#pragma unroll
+                    for (int i = 0; i < 16; i++) st[c][i] = sv[c][i];
+        }
+    } else {
+        for (int mi = 0; mi < m; mi++) {
+            const float* r = own + mi * C::OWN;
+            step(r, r + 2 * C::KR, r + C::KR, po);
+            if (j == 0)
+#pragma unroll
+                for (int c = 0; c < CPT; c++) o[((size_t)mi * s.nv + h) * 128 + vb * COLS + grp + 16 * c] = po[c];
+        }
     }
     if (!write_all) store((cur + m) % kStateSlots);
 }
 
+static int g_dn_cpt = -1;  // [q27-dn-core3-pad] tests: batched dn_core4_seg variant (0 off, 2 / 4 dense, 3 / 5 padded; -1 env)
+void dn_cpt_set(int v) { g_dn_cpt = v; }
+
 static bool dn_core4_seg(const DnSegs& g, const float* cv, int ch, const DeltaShape& s, const float* qk,
                          const float* gb, size_t slot_floats, float* o, cudaStream_t st) {
-    static const int cpt = env_int("QE_DN_CPT", 0);
-    if (cpt != 2 && cpt != 4) return false;
+    // [q27-dn-core3-pad] default 3: CPT 2 with padded k / q rows (48 layers, 1 card c = 4 x 8 rows 2861 -> 1243 us,
+    // c = 8 x 8 5264 -> 2159, c = 8 x 2 1923 -> 1634; TP3 c = 4 x 8 1231 -> 599; bit-identical to dn_core_seg_kernel).
+    // QE_DN_CPT=0: the previous chain (dn_core_seg_kernel), 2 / 4 dense CPT, 5 padded CPT 4
+    static const int cpt_env = env_int("QE_DN_CPT", 3);
+    const int cpt = g_dn_cpt >= 0 ? g_dn_cpt : cpt_env;  // (tests: dn_cpt_set)
+    if (cpt != 2 && cpt != 4 && cpt != 3 && cpt != 5) return false;
     int mx = 1;
     for (int i = 0; i < g.n; i++) mx = std::max(mx, g.m[i]);
     if (mx > kPendRows) return false;
+    const int pc = dn_pcap(s);
+    // [q27-dn-core3-pad] 3 / 5: CPT 2 / 4 with the padded k / q rows
+    const size_t sm = cpt == 2 ? DnCore4<2>::smem(mx, pc) : cpt == 4 ? DnCore4<4>::smem(mx, pc)
+                    : cpt == 3 ? DnCore4<2, 20>::smem(mx, pc) : DnCore4<4, 20>::smem(mx, pc);
+    if (sm > 48 * 1024) return false;
+    g_dn_ran.store(10 + cpt, std::memory_order_relaxed);
     if (cpt == 2)
-        dn_core4_seg_kernel<2><<<dim3(s.nv, 4, g.n), 128, DnCore4<2>::smem(mx, dn_pcap(s)), st>>>(g, cv, ch, s, qk, gb, slot_floats, o);
+        dn_core4_seg_kernel<2><<<dim3(s.nv, 4, g.n), 128, sm, st>>>(g, cv, ch, s, qk, gb, slot_floats, o);
+    else if (cpt == 4)
+        dn_core4_seg_kernel<4><<<dim3(s.nv, 2, g.n), 128, sm, st>>>(g, cv, ch, s, qk, gb, slot_floats, o);
+    else if (cpt == 3)
+        dn_core4_seg_kernel<2, 20><<<dim3(s.nv, 4, g.n), 128, sm, st>>>(g, cv, ch, s, qk, gb, slot_floats, o);
     else
-        dn_core4_seg_kernel<4><<<dim3(s.nv, 2, g.n), 128, DnCore4<4>::smem(mx, dn_pcap(s)), st>>>(g, cv, ch, s, qk, gb, slot_floats, o);
+        dn_core4_seg_kernel<4, 20><<<dim3(s.nv, 2, g.n), 128, sm, st>>>(g, cv, ch, s, qk, gb, slot_floats, o);
     return true;
 }
 
+static int g_dn_core3 = -1;  // [q27-dn-core3-pad] tests: 0 off (reference kernels), 1 dense rows, 2 padded, -1 env
+void dn_core3_set(int v) { g_dn_core3 = v; }
+
 static bool dn_core3_seg(const DnSegs& g, const float* cv, int ch, const DeltaShape& s, const float* qk,
                          const float* gb, size_t slot_floats, float* o, cudaStream_t st) {
-    static const int on = env_int("QE_DN_CORE3", 1);
+    static const int on0 = env_int("QE_DN_CORE3", 1);
+    const int on = g_dn_core3 >= 0 ? g_dn_core3 != 0 : on0;  // (tests: dn_core3_set)
     static int g_bps = 0;
     if (!on || g.n < 2) return false;
     int mx = 1;
     for (int i = 0; i < g.n; i++) mx = std::max(mx, g.m[i]);
     if (mx > kPendRows) return false;
-    const size_t smem = (size_t)2 * DnCore3::buf_floats(mx, dn_pcap(s)) * 4;
+    // [q27-dn-core3-pad] padded k / q rows (QE_DN_CORE3_PAD=0: dense, as before)
+    static const bool pad_env = env_int("QE_DN_CORE3_PAD", 1) != 0;
+    const bool pad_on = g_dn_core3 >= 1 ? g_dn_core3 == 2 : pad_env;
+    const size_t smem_pad = (size_t)2 * DnCore3<20>::buf_floats(mx, dn_pcap(s)) * 4;
+    const bool pad = pad_on && smem_pad <= 64 * 1024;  // (a larger lazy window: the dense rows)
+    const size_t smem = pad ? smem_pad : (size_t)2 * DnCore3<16>::buf_floats(mx, dn_pcap(s)) * 4;
+    // the 64 KB opt-in per device (review M1: set on the first GPU only before; every worker thread launches on its own)
+    static std::atomic<unsigned> opted{0};
     static int nsm = 0;
-    if (!nsm) {
-        int dev;
-        CUDA_CHECK(cudaGetDevice(&dev));
-        CUDA_CHECK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
-        CUDA_CHECK(cudaFuncSetAttribute(dn_core3_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+    int dev;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (!(opted.load() & (1u << dev))) {
+        int n;
+        CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
+        nsm = n;
+        CUDA_CHECK(cudaFuncSetAttribute(dn_core3_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+        CUDA_CHECK(cudaFuncSetAttribute(dn_core3_kernel<20>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+        opted.fetch_or(1u << dev);
     }
+    if (smem > 64 * 1024) return false;  // (review L1: the next kernel of the chain)
     int bps = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, dn_core3_kernel, 128, smem));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, pad ? dn_core3_kernel<20> : dn_core3_kernel<16>, 128, smem));
     if (env_set("QE_DN_CORE3_BPS")) bps = std::min(bps, env_int("QE_DN_CORE3_BPS", bps));
     g_bps = bps;
     const int ntiles = g.n * s.nv * 8;
     const int grid = std::min(ntiles, std::max(1, bps) * nsm);
-    dn_core3_kernel<<<grid, 128, smem, st>>>(g, cv, ch, s, qk, gb, slot_floats, o, mx, ntiles);
+    g_dn_ran.store(pad ? 2 : 1, std::memory_order_relaxed);
+    if (pad) dn_core3_kernel<20><<<grid, 128, smem, st>>>(g, cv, ch, s, qk, gb, slot_floats, o, mx, ntiles);
+    else dn_core3_kernel<16><<<grid, 128, smem, st>>>(g, cv, ch, s, qk, gb, slot_floats, o, mx, ntiles);
     return true;
 }
 
@@ -2023,10 +2271,11 @@ bool dn_fuse_on() {
 }
 void dn_convqk(const float* proj, int ld, int ch, const bf16* conv_w, bf16* hist, const int* pos,
                int m, float* cv, const DeltaShape& s, const float* ab, const float* A,
-               const float* dt_bias, float* qk, float* gb, cudaStream_t st) {
+               const float* dt_bias, float* qk, float* gb, cudaStream_t st, const int* sib) {
     const int nb = s.nk + (s.nv * 128 + 255) / 256 + 1;
     CHECK(m <= 13, "dn_convqk m=%d", m);
-    dn_convqk_kernel<<<dim3(nb, m), 256, 0, st>>>(proj, ld, ch, conv_w, hist, pos, cv, s, ab, A, dt_bias, qk, gb);
+    CHECK(!sib || m == 8, "dn_convqk: tree steps have 8 rows (%d)", m);
+    dn_convqk_kernel<<<dim3(nb, m), 256, 0, st>>>(proj, ld, ch, conv_w, hist, pos, cv, s, ab, A, dt_bias, qk, gb, sib);
 }
 void dn_convqk_seg(const DnSegs& g, const float* proj, int ld, int ch, const bf16* conv_w, float* cv,
                    const DeltaShape& s, const float* ab, const float* A, const float* dt_bias,
@@ -2040,8 +2289,60 @@ void dn_convqk_seg(const DnSegs& g, const float* proj, int ld, int ch, const bf1
 // recurrence only (q / k / decay / beta already computed)
 void dn_core_only(const float* conv_out, int ch, const DeltaShape& s, float* S, size_t slot_floats,
                   const int* cur, int m, bool write_all, const float* qk, const float* gb, float* o,
-                  cudaStream_t st, const int* pn, const float* pend) {
+                  cudaStream_t st, const int* pn, const float* pend, const int* sib) {
+    // [q27-dn-core4-1card] single-sequence verification (write_all): dn_core4, CPT value columns per thread group (bit
+    // identical to dn_core_kernel). 48 layers x 8 rows, core only: 1 card 1130 -> 575 us (CPT 4), TP2 540 -> 370 (4),
+    // TP3 407 -> 340 (2); padded rows below ([q27-dn-core4-occ]). QE_DN_SINGLE_CPT: 0 off (dn_core_kernel), 2 / 4 the
+    // unpadded CPT 2 / 4, 3 / 5 / 6 padded CPT 2 / 4 / 1
+    static const int scpt = env_int("QE_DN_SINGLE_CPT", -1);
+    const int sc = g_dn_single_cpt >= 0 ? g_dn_single_cpt : scpt;  // (tests force the reference: dn_single_cpt_set)
+    // [q27-dn-core4-occ] default: padded k / q rows (KS 20, no 4-way bank conflict on the 128-bit loads), CPT 4 at 24 heads
+    // (TP2) and CPT 2 otherwise; microbench 48 layers x 8 rows: 1 card 579 -> 490 us, TP2 375 -> 338, TP3 342 -> 281
+    // (bit-identical). QE_DN_SINGLE_CPT 2 / 4: the unpadded kernels (as before), 3 / 5 / 6: padded CPT 2 / 4 / 1
+    const int cpt = sc >= 0 ? sc : (s.nv > 16 && s.nv < 32) ? 5 : 3;
+    // [q27-dn-core4-occ] 3 / 5: CPT 2 / 4 with the padded shared-memory k / q rows (KS 20)
+    const int pc0 = pn ? dn_pcap(s) : 0;
+    const size_t sm4 = cpt == 2 ? DnCore4<2>::smem(m, pc0) : cpt == 4 ? DnCore4<4>::smem(m, pc0)
+                     : cpt == 3 ? DnCore4<2, 20>::smem(m, pc0) : cpt == 6 ? DnCore4<1, 20>::smem(m, pc0)
+                     : cpt == 5 ? DnCore4<4, 20>::smem(m, pc0) : (size_t)-1;  // (other values: not this kernel; review L4)
+    if (write_all && (cpt == 2 || cpt == 4 || cpt == 3 || cpt == 5 || cpt == 6) && m <= kPendRows && !g_dn_core2_forced() && sm4 <= 48 * 1024) {  // (review L3: larger lazy windows keep the old kernel)
+        DnSegs g{};
+        g.n = 1;
+        g.r0[0] = 0;
+        g.m[0] = m;
+        g.S[0] = S;
+        g.cur[0] = cur;
+        g.pn[0] = pn;
+        g.pend[0] = pend;
+        g.fin[0] = false;
+        const int pc = pn ? dn_pcap(s) : 0;  // (no pending rows: no room for them)
+        g_dn_ran.store(cpt, std::memory_order_relaxed);
+        g.sib = sib;
+        if (sib) {  // [q27-sib] tree steps: the padded default kernels only
+            CHECK(cpt == 3 || cpt == 5, "dn_core_only: tree steps need QE_DN_SINGLE_CPT 3 / 5 (%d)", cpt);
+            if (cpt == 3)
+                dn_core4_seg_kernel<2, 20, true><<<dim3(s.nv, 4, 1), 128, DnCore4<2, 20>::smem(m, pc), st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
+            else
+                dn_core4_seg_kernel<4, 20, true><<<dim3(s.nv, 2, 1), 128, DnCore4<4, 20>::smem(m, pc), st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
+            return;
+        }
+        if (cpt == 2)
+            dn_core4_seg_kernel<2><<<dim3(s.nv, 4, 1), 128, DnCore4<2>::smem(m, pc), st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
+        else if (cpt == 4)
+            dn_core4_seg_kernel<4><<<dim3(s.nv, 2, 1), 128, DnCore4<4>::smem(m, pc), st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
+        else if (cpt == 6)
+            dn_core4_seg_kernel<1, 20><<<dim3(s.nv, 8, 1), 128, DnCore4<1, 20>::smem(m, pc), st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
+        else if (cpt == 3)
+            dn_core4_seg_kernel<2, 20><<<dim3(s.nv, 4, 1), 128, DnCore4<2, 20>::smem(m, pc), st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
+        else {
+            CHECK(cpt == 5, "dn_core_only: variant %d", cpt);
+            dn_core4_seg_kernel<4, 20><<<dim3(s.nv, 2, 1), 128, DnCore4<4, 20>::smem(m, pc), st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
+        }
+        return;
+    }
+    CHECK(!sib, "dn_core_only: a tree step took another kernel");
     if (dn_core2(conv_out, ch, s, qk, gb, S, slot_floats, cur, m, write_all, o, 0, pn, pend, st)) return;
+    g_dn_ran.store(0, std::memory_order_relaxed);
     dn_core_kernel<<<dim3(s.nv, 8), 128, 0, st>>>(conv_out, ch, s, qk, gb, S, slot_floats, cur, m,
                                                   write_all, o, 0, pn, pend);
 }
@@ -2093,9 +2394,10 @@ void dn_qk_rows(const float* conv_out, int ch, const DeltaShape& s, const float*
 
 void dn_core_seg(const DnSegs& g, const float* conv_out, int ch, const DeltaShape& s,
                  const float* qk, const float* gb, size_t slot_floats, float* o, cudaStream_t st) {
-    if (dn_core2_lanes(g.n) && dn_core4_seg(g, conv_out, ch, s, qk, gb, slot_floats, o, st)) return;
+    if (dn_core4_seg(g, conv_out, ch, s, qk, gb, slot_floats, o, st)) return;  // (default since [q27-dn-core3-pad])
     if (dn_core2_lanes(g.n) && dn_core3_seg(g, conv_out, ch, s, qk, gb, slot_floats, o, st)) return;
     if (dn_core2_seg(g, conv_out, ch, s, qk, gb, slot_floats, o, st)) return;
+    g_dn_ran.store(0, std::memory_order_relaxed);
     dn_core_seg_kernel<<<dim3(s.nv, 8, g.n), 128, 0, st>>>(g, conv_out, ch, s, qk, gb, slot_floats, o);
 }
 
@@ -2184,4 +2486,67 @@ void argmax_local(const float* logits, int v, int m, int vocab_off, float* out_p
 
 void argmax_final(const float* pairs, int ngpu, int m, int* tokens, cudaStream_t st) {
     argmax_final_kernel<<<1, m > 32 ? 64 : 32, 0, st>>>(pairs, ngpu, m, tokens);  // thread per row (<= 64)
+}
+
+// ---- [q27-sib] sibling leaf rows of a single-sequence block step
+// tree steps run only where every kernel on their path has the tree form (review M1): the fp8 decode attention attn_dec8d
+// (QE_ATTN_DEC8 / QE_ATTN_DEC8D defaults, not QE_ATTN_CC) and the padded dn_core4 single-sequence kernels (CPT 2 / 4)
+bool attention_dec8d_fused();
+bool sib_kernels_ok(const DeltaShape& s) {
+    static const bool cc = env_int("QE_ATTN_CC", 0) != 0;
+    static const int scpt = env_int("QE_DN_SINGLE_CPT", -1);
+    const int sc = g_dn_single_cpt >= 0 ? g_dn_single_cpt : scpt;
+    const int cpt = sc >= 0 ? sc : (s.nv > 16 && s.nv < 32) ? 5 : 3;
+    return !cc && attention_dec8_enabled() && attention_dec8d_fused() && (cpt == 3 || cpt == 5) && !g_dn_core2_forced() &&
+           DnCore4<4, 20>::smem(8, dn_pcap(s)) <= 48 * 1024;
+}
+__global__ void sib_check_kernel(int* __restrict__ sib, const int* __restrict__ tokens, const int* __restrict__ pos) {
+    bool ok = sib[2] != 0 && sib[3] == *pos;
+    for (int i = 0; i < 8 && ok; i++) ok = sib[4 + i] == tokens[i];
+    sib[0] = ok ? 1 : 0;
+    sib[1] = -1;
+}
+void sib_check(int* sib, const int* tokens, const int* pos, cudaStream_t st) {
+    sib_check_kernel<<<1, 1, 0, st>>>(sib, tokens, pos);
+}
+
+// one block per job: 0 the final-norm row, 1 the drafter tap row, 2.. each DeltaNet layer (conv out / q k / gates rows,
+// the conv input ring slot), then each full-attention layer (K / V rows of every kv head)
+__global__ void __launch_bounds__(256) sib_fix_kernel(const SibFix f) {
+    const int j = f.sib[1];
+    if (j < 0) return;
+    const int src = 5 + j, dst = j + 1, t = threadIdx.x, b = blockIdx.x, p0 = *f.pos;
+    if (b == 0) {
+        for (int i = t; i < f.H; i += blockDim.x) f.xn[(size_t)dst * f.H + i] = f.xn[(size_t)src * f.H + i];
+    } else if (b == 1) {
+        for (int i = t; i < f.tapw; i += blockDim.x) f.tap[(size_t)dst * f.tapw + i] = f.tap[(size_t)src * f.tapw + i];
+    } else if (b < 2 + f.nl) {
+        const int l = b - 2;
+        for (int i = t; i < f.ch; i += blockDim.x) f.cv[l][(size_t)dst * f.ch + i] = f.cv[l][(size_t)src * f.ch + i];
+        for (int i = t; i < f.qkw; i += blockDim.x) f.qk[l][(size_t)dst * f.qkw + i] = f.qk[l][(size_t)src * f.qkw + i];
+        for (int i = t; i < f.gbw; i += blockDim.x) f.gb[l][(size_t)dst * f.gbw + i] = f.gb[l][(size_t)src * f.gbw + i];
+        const size_t hs = (size_t)((p0 + 8 + j) % kConvRing) * f.ch, hd = (size_t)((p0 + 1 + j) % kConvRing) * f.ch;
+        for (int i = t; i < f.ch; i += blockDim.x) f.hist[l][hd + i] = f.hist[l][hs + i];
+    } else {
+        const int l = b - 2 - f.nl;
+        for (int h = 0; h < f.nkv; h++) {
+            const size_t rs = (f.hrow[h] + (size_t)(p0 + src - f.split)) * 256, rd = (f.hrow[h] + (size_t)(p0 + dst - f.split)) * 256;
+            for (int i = t; i < 256; i += blockDim.x) {
+                f.kc[l][rd + i] = f.kc[l][rs + i];
+                f.vc[l][rd + i] = f.vc[l][rs + i];
+            }
+        }
+    }
+}
+void sib_fix(const SibFix& f, cudaStream_t st) {
+    sib_fix_kernel<<<2 + f.nl + f.nf, 256, 0, st>>>(f);
+}
+
+// kv4_27b L7 unit test: one 256-dim row through kv4_store (K or V layout) -> kKv4Row bytes
+__global__ void kv4_row_test_kernel(const float* __restrict__ x, int krow, uint8_t* __restrict__ out) {
+    kv4_store(x[threadIdx.x], threadIdx.x, out, krow != 0);
+}
+void kv4_row_test(const float* x, int krow, uint8_t* out) {
+    kv4_row_test_kernel<<<1, 256>>>(x, krow, out);
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
