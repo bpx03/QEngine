@@ -6437,17 +6437,21 @@ __global__ void k_possub(int* __restrict__ out, const int* __restrict__ pos, int
 }
 
 // k_dn_rec_d per segment (grid (vl, 16, nseg)): the slot's state, deferred-commit buffers and step counter
+// (1.3.6 keeps it in flash_batch.cuh; it lives here so the stand-alone unit tests can include it: batch.cuh needs flash.cu's
+// Worker helpers and is not self-contained)
 __global__ void __launch_bounds__(128) k_dn_rec_b(const float* __restrict__ cv, int ch, int kl, int vl, int k_first,
                                                   int v_first, const float* __restrict__ ab, const float* __restrict__ A,
                                                   const float* __restrict__ dtb, float* const* __restrict__ tS,
                                                   float* const* __restrict__ tp, const int* __restrict__ rslot,
                                                   const int* __restrict__ bpn, const unsigned* __restrict__ stepcs,
                                                   float* __restrict__ o, int rps) {
-    __shared__ float qs[128], ks[128];
+    // [qfn-gdn-bank] q / k rows padded: lane group (t & 15) reads its 8 entries at a 12-float stride (was 8: a 2-4-way
+    // shared-memory bank conflict on the 16 lane groups); same values, same order
+    __shared__ __align__(16) float qs[16 * 12], ks[16 * 12];
     __shared__ float red[32];
     const int hv = blockIdx.x, cg = blockIdx.y, sg = blockIdx.z, t = threadIdx.x;
     const int r0 = sg * rps, slot = rslot[r0];
-    const int col = cg * 8 + (t >> 4), kb = (t & 15) * 8;
+    const int col = cg * 8 + (t >> 4), kb = (t & 15) * 8, kbp = (t & 15) * 12;
     const int kh = (v_first + hv) / (LNV / LNK) - k_first;
     const unsigned par = stepcs[slot] & 1u;
     float* pend = tp[slot];
@@ -6480,8 +6484,8 @@ __global__ void __launch_bounds__(128) k_dn_rec_b(const float* __restrict__ cv, 
         const float* row = cv + (size_t)r * ch;
         const float q = row[kh * 128 + t], k = row[kl * 128 + kh * 128 + t];
         const float qq = block_sum<128>(q * q, red), kk = block_sum<128>(k * k, red);
-        qs[t] = q * rsqrtf(qq + 1e-6f) * rsqrtf(128.f);
-        ks[t] = k * rsqrtf(kk + 1e-6f);
+        qs[DNP(t)] = q * rsqrtf(qq + 1e-6f) * rsqrtf(128.f);
+        ks[DNP(t)] = k * rsqrtf(kk + 1e-6f);
         __syncthreads();
         const float b = ab[(size_t)r * dn_ab_ld(vl) + hv], a = ab[(size_t)r * dn_ab_ld(vl) + vl + hv];
         const float beta = sigm(b);
@@ -6492,20 +6496,20 @@ __global__ void __launch_bounds__(128) k_dn_rec_b(const float* __restrict__ cv, 
         {
             float* pw = pnew + ((size_t)rr * vl + hv) * DREC;
             if (cg == 0) {
-                pw[t] = ks[t];
+                pw[t] = ks[DNP(t)];
                 if (t == 0) { pw[256] = beta; pw[257] = decay; }
             }
             if ((t & 15) == 0) pw[128 + col] = v;
         }
         float mem = 0.f;
 #pragma unroll
-        for (int i = 0; i < 8; i++) { s[i] *= decay; mem += s[i] * ks[kb + i]; }
+        for (int i = 0; i < 8; i++) { s[i] *= decay; mem += s[i] * ks[kbp + i]; }
 #pragma unroll
         for (int off = 8; off > 0; off >>= 1) mem += __shfl_xor_sync(0xffffffffu, mem, off);
         const float delta = (v - mem) * beta;
         float out = 0.f;
 #pragma unroll
-        for (int i = 0; i < 8; i++) { s[i] += ks[kb + i] * delta; out += s[i] * qs[kb + i]; }
+        for (int i = 0; i < 8; i++) { s[i] += ks[kbp + i] * delta; out += s[i] * qs[kbp + i]; }
 #pragma unroll
         for (int off = 8; off > 0; off >>= 1) out += __shfl_xor_sync(0xffffffffu, out, off);
         if ((t & 15) == 0) o[((size_t)r * vl + hv) * 128 + col] = out;

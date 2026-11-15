@@ -3378,7 +3378,7 @@ void Worker::ec_init() {
     if (ec_on_) {
         std::vector<Layer*> kvl = ls;
         if (has_mtp_) kvl.push_back(&mtp_);
-        const size_t asz = (size_t)srows_ * NKv * kv_hb();
+        const size_t asz = (size_t)srows_ * NKV * kv_hb();
         const int per = (int)(asz / group_bytes_);
         for (Layer* L : kvl) {
             if (!L->full || !L->kc) continue;
