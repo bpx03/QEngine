@@ -584,7 +584,7 @@ inline std::vector<std::string> split_cmdline(const std::string& c) {
 inline PickOut pick_par(const PickIn& in) {
     PickOut o;
     const int n = in.n;
-    if (n > 4) { o.par = Par::PP; o.why = "TP runs on 2 to 4 cards only"; return o; }
+    if (n > 4) { o.par = Par::PP; o.why = "automatic TP selection is limited to 4 cards"; return o; }
     if (n < 2) { o.par = Par::TP; o.why = "one card"; return o; }
     // TP exchange costs of the probed path: host staging is latency-bound (3 cards: +0.244 ms per prompt token on the
     // real x16 link and about the same at 5.5 GB/s), the copy engine / P2P pay bytes beyond the fit's link speed

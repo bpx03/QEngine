@@ -1476,6 +1476,7 @@ void comm_test_spin(cudaStream_t st) {
 }
 
 Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
+    CHECK(ngpu >= 1 && ngpu <= kCommMaxRanks, "comm: %d ranks (1 to %d)", ngpu, kCommMaxRanks);
     Comm c;
     c.ngpu = ngpu;
     c.max_elems = max_elems;
@@ -1494,7 +1495,7 @@ Comm comm_create(int ngpu, int max_elems, int ll_hidden) {
 }
 
 bool comm_enable_p2p(Comm& c, const int* devices) {
-    if (!env_int("QE_P2P", 1) || c.ngpu < 2 || c.ngpu > 4) return false;
+    if (!env_int("QE_P2P", 1) || c.ngpu < 2 || c.ngpu > kCommMaxRanks) return false;
     // (two ranks on one card, a test of TP4 on 3 cards: their buffers are local to each other, no peer access needed)
     for (int i = 0; i < c.ngpu; i++)
         for (int j = 0; j < c.ngpu; j++) {
@@ -1682,7 +1683,7 @@ void allreduce_add(float* resid, const float* partial, int m, int h, const Comm&
     CHECK(!xh || (m <= kMaxBatchRows && h % 64 == 0), "allreduce xh %d %d", m, h);
     if (ll_idx >= 0 && m <= kMaxBatchRows) {
         CHECK(ll_idx < 1023 && h == c.ll_hidden && h <= 3 * kLLThreads * kLLMaxWords &&
-                  c.ngpu <= 4, "ll");
+                  c.ngpu <= kCommMaxRanks, "ll");
         static const int ll16 = env_int("QE_LL16", 1);  // min rows (0: off); one protocol for every row count keeps the norm bit-identical (MTP == greedy)
         // QE_AR_RSUM (default 1): the reduced sum is rounded to bf16 before the residual update (as
         // the prefill reduce-scatter does); this lets rows >= QE_AR_RS_MIN use the reduce-scatter +
@@ -1773,14 +1774,14 @@ static void allreduce_hc_staged(float* R, const float* inj, const float* partial
 // Pull variant of allreduce_rs_rows_kernel<HCW> (prefill-r4): SM stores into a peer's memory (P2P over PCIe) stall the
 // memory system of the sending card for every kernel next to them (W4A8 GEMM next to a 16-block store stream: 4.3x
 // slower; next to SM loads of the same bytes from the peer: +12 %; tools/mb/mb_gdn.cu), so the rows move by loads where
-// the probe allows it (c.pullm bit 4 i + j: rank i reads rank j's rows; else j stores them into i's memory, as before).
+// the probe allows it (c.pullm bit comm_pair_bit(reader, owner): the reader loads the owner's rows; else the owner stores them, as before).
 // Every card packs its rows (bf16) into its staging rows c.pstage (pulled pairs, local stores) or the owner's prs1
 // (pushed pairs), raises the RS flags; the owner of a row range reads the peers' rows of its range and sums them in the
 // fixed GPU order (the same values and order as the push path: bit-identical); the second exchange is the barrier that
 // keeps the next call's writes off rows a peer may still read. Full mode (!own_rows): the owner writes its sums into
 // its own prs2 rows (and stores them into pushed peers' prs2), every card reads the owners' sums after the second
 // exchange (the next call's sums are written only after its first exchange, i.e. after every peer finished this tail).
-__device__ __forceinline__ bool pull_pair(const Comm& c, int reader, int owner) { return (c.pullm >> (4 * reader + owner)) & 1u; }
+__device__ __forceinline__ bool pull_pair(const Comm& c, int reader, int owner) { return (c.pullm & (1u << comm_pair_bit(reader, owner))) != 0u; }
 __global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restrict__ R, const float* __restrict__ partial,
                                                                  int m, int h, Comm c, int rank, CommCounters ctr,
                                                                  const float* __restrict__ inj, bool own_rows, bool flat) {
@@ -1808,10 +1809,10 @@ __global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restric
     // with every peer's load issued before the sums (one row per block left 128 of 512 threads busy in its second pass
     // and one load pair in flight per thread); the same values and summation order per element (bit-identical)
     static constexpr int kU = 2;
-    if (flat && own_rows && c.ngpu <= 4 && (h & 3) == 0) {
+    if (flat && own_rows && c.ngpu <= kCommMaxRanks && (h & 3) == 0) {
         const long ne = (long)(oe - ob) * h4, stride = (long)gridDim.x * blockDim.x;
         for (long e0 = (long)blockIdx.x * blockDim.x + threadIdx.x; e0 < ne; e0 += stride * kU) {
-            uint2 pv[kU][4];
+            uint2 pv[kU][kCommMaxRanks];
 #pragma unroll
             for (int u = 0; u < kU; u++) {
                 const long e = e0 + u * stride;
@@ -1819,7 +1820,7 @@ __global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restric
                 const int r = ob + (int)(e / h4), i = (int)(e % h4);
                 const size_t idx = (size_t)r * h4 + i;
 #pragma unroll
-                for (int g = 0; g < 4; g++)
+                for (int g = 0; g < kCommMaxRanks; g++)
                     if (g < c.ngpu)
                         pv[u][g] = g == rank ? pack_bf16x4(p4[idx])
                                              : __ldcv(pull_pair(c, rank, g) ? c.pstage[g] + idx
@@ -1832,7 +1833,7 @@ __global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restric
                 const int r = ob + (int)(e / h4), i = (int)(e % h4);
                 float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
-                for (int g = 0; g < 4; g++)
+                for (int g = 0; g < kCommMaxRanks; g++)
                     if (g < c.ngpu) {
                         const float4 x = unpack_bf16x4(pv[u][g]);
                         v.x += x.x; v.y += x.y; v.z += x.z; v.w += x.w;
@@ -1853,16 +1854,16 @@ __global__ void __launch_bounds__(512) allreduce_hc_pull_kernel(float* __restric
         const float jj[4] = {inj[r * 4], inj[r * 4 + 1], inj[r * 4 + 2], inj[r * 4 + 3]};
         for (int i = threadIdx.x; i < h4; i += blockDim.x) {
             const size_t idx = (size_t)r * h4 + i;
-            uint2 pv[4];
+            uint2 pv[kCommMaxRanks];
 #pragma unroll
-            for (int g = 0; g < 4; g++)
+            for (int g = 0; g < kCommMaxRanks; g++)
                 if (g < c.ngpu)
                     pv[g] = g == rank ? pack_bf16x4(p4[idx])
                                       : __ldcv(pull_pair(c, rank, g) ? c.pstage[g] + idx
                                                                      : c.prs1[rank] + ((size_t)g * c.rs_own + (r - ob)) * h4 + i);
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
-            for (int g = 0; g < 4; g++)
+            for (int g = 0; g < kCommMaxRanks; g++)
                 if (g < c.ngpu) {
                     const float4 x = unpack_bf16x4(pv[g]);
                     v.x += x.x; v.y += x.y; v.z += x.z; v.w += x.w;
@@ -1914,7 +1915,7 @@ bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, i
         allreduce_hc_staged(R, inj, partial, m, h, c, rank, st, blocks, own_rows);
         return true;
     }
-    bool stg = c.pullm != 0 && c.ngpu <= 4;
+    bool stg = c.pullm != 0 && c.ngpu <= kCommMaxRanks;
     for (int g = 0; g < c.ngpu; g++) stg = stg && c.pstage[g] && c.prs2[g];
     if (stg) {
         static const bool flat = env_int("FLASH_AR_FLAT", 1);  // perf F.3 (0: one row per block in the pull phase)

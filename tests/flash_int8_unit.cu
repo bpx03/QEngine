@@ -450,6 +450,31 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
                 CUDA_CHECK(cudaMemcpy(halves.data(),slots.p,halves.size()*2,cudaMemcpyDeviceToHost));
                 for(size_t i=0;i<actual.size();++i) actual[i]=__half2float(halves[i])*16.f;
                 compare(actual,slot_expected,1e-2);
+                if (m == 65) {
+                    const int bounds[3] = {0, 64, m};
+                    Device<int> cuts(3);
+                    Device<__half> window(size_t(66) * H);
+                    CUDA_CHECK(cudaMemcpy(cuts.p, bounds, sizeof(bounds), cudaMemcpyHostToDevice));
+                    const __half sentinel = __float2half(123.f);
+                    std::vector<__half> guarded(size_t(66) * H, sentinel);
+                    for (int w = 0; w < 2; ++w) {
+                        CUDA_CHECK(cudaMemcpy(window.p, guarded.data(), guarded.size() * 2, cudaMemcpyHostToDevice));
+                        SlotBuf narrow{window.p + H, 64, nullptr};
+                        narrow.cut = cuts.p;
+                        narrow.p = w;
+                        if (tile == 1) k_moe_dn_q<Bits,1><<<dim3(H/16/4,nj),128>>>(jobs.p,count.p,act.p,narrow);
+                        else k_moe_dn_q<Bits,2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,act.p,narrow);
+                        CUDA_CHECK(cudaDeviceSynchronize());
+                        std::vector<__half> got(guarded.size());
+                        CUDA_CHECK(cudaMemcpy(got.data(), window.p, got.size() * 2, cudaMemcpyDeviceToHost));
+                        require(std::memcmp(got.data(), guarded.data(), H * 2) == 0 &&
+                                std::memcmp(got.data() + size_t(65) * H, guarded.data(), H * 2) == 0,
+                                "quantized prefill window overwrote its canaries");
+                        const size_t count = size_t(bounds[w + 1] - bounds[w]) * H;
+                        require(std::memcmp(got.data() + H, halves.data() + size_t(bounds[w]) * H, count * 2) == 0,
+                                "quantized prefill window differs from unsliced slot rows");
+                    }
+                }
                 if constexpr(BuildJobs) {  // rows are slot-ordered, the slot order is the router's atomic fill order: compare by token
                     std::vector<__half> ordered(halves.size());
                     for(int s=0;s<m;++s) std::copy_n(halves.data()+size_t(s)*H,H,ordered.data()+size_t(tokens[s])*H);

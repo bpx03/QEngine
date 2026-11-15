@@ -2665,7 +2665,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         };
         // PP x TP (FLASH_PAR=pptp, opt-in): mode B whose stages are TP groups; from here on it runs mode B's paths
         if (par == flash_pp::Par::PPTP) { pptp = true; par = flash_pp::Par::PP; }
-        if (par == flash_pp::Par::AUTO && kv_ram_mode() && ndev > kMaxTp) {  // (auto is pp on 5+ cards; checked here, before
+        if (par == flash_pp::Par::AUTO && kv_ram_mode() && ndev > 4) {  // (auto is pp on 5+ cards; checked here, before
             // anything is built: a late refusal tears down a half-built engine)
             fprintf(stderr, "qflash: FLASH_KV=ram is not supported by the pipeline stages, and on %d cards the parallel mode is "
                     "pp (pipeline stages): not started (use FLASH_KV=vram)\n", ndev);
@@ -2736,11 +2736,12 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     }
     const bool forced = par != flash_pp::Par::AUTO;
     const bool box = box_report_wanted(e->devs, pptp);  // (remote diagnosis: 4+ cards, PP x TP, FLASH_BOX_REPORT=1)
-    // TP runs on 2 to 4 cards (4 under auto: only with verified peer access, pick_par #12); mode A's TP decode on 2 or 3
+    // TP runs on 2 to 5 cards (4 under auto: only with verified peer access, pick_par #12; 5 only as FLASH_PAR=tp); mode
+    // A's TP decode on 2 or 3
     if (!forced && e->ng > kMaxTp) par = flash_pp::Par::PP;
     const int tp_max = par == flash_pp::Par::PP_PREFILL ? 3 : kMaxTp;
     if ((par == flash_pp::Par::PP && (e->ng < 2 || e->ng > 16)) || (par != flash_pp::Par::PP && (e->ng < 2 || e->ng > tp_max))) {
-        fprintf(stderr, "qflash: %s GPUs required (%d given)\n", par == flash_pp::Par::PP ? "2 to 16" : tp_max == 3 ? "2 or 3" : "2 to 4", e->ng);
+        fprintf(stderr, "qflash: %s GPUs required (%d given)\n", par == flash_pp::Par::PP ? "2 to 16" : tp_max == 3 ? "2 or 3" : "2 to 5", e->ng);
         delete e;
         return nullptr;
     }
@@ -2756,7 +2757,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     }
     // (FLASH_KV=ram needs TP. 4 cards under auto: refused here, before anything is built, when the driver already rules out
     // peer access; the data check can still end it at the pick)
-    if (!forced && e->ng == kMaxTp && kv_ram_mode() && !driver_peer_all(e->devs)) {
+    if (!forced && e->ng == 4 && kv_ram_mode() && !driver_peer_all(e->devs)) {
         fprintf(stderr, "qflash: FLASH_KV=ram is not supported by the pipeline stages, and on 4 cards without peer access between "
                 "all of them the parallel mode is pp (pipeline stages): not started (use FLASH_KV=vram, or FLASH_PAR=tp)\n");
         delete e;
@@ -3071,7 +3072,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
             in.cs = cs;
         }
-        if (!forced && e->ng == kMaxTp) {
+        if (!forced && e->ng == 4) {
             in.verified = !comm_built || e->comm.p2p_verified;  // (no comm: no peer access, pick_par says that first)
             if (!kv_ram_mode() && comm_built) {  // (the requested context: the fit below would shrink it, mode B keeps it)
                 const double need = flash_pp::tp_fixed_need(e->ng, std::clamp(env_int("FLASH_MAX_SEQS", 16), 1, 16), e->ctx);
@@ -3098,7 +3099,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             }
             if (par == flash_pp::Par::PP && !e->steer.empty() && e->ng <= 3) { par = flash_pp::Par::TP; why = "auto: steering vectors need TP"; }
             if (par == flash_pp::Par::TP && e->ng > kMaxTp) {
-                fprintf(stderr, "qflash: TP runs on 2 to 4 GPUs (%d given)\n", e->ng);
+                fprintf(stderr, "qflash: TP runs on 2 to 5 GPUs (%d given)\n", e->ng);
                 delete e;
                 return nullptr;
             }
@@ -3623,6 +3624,9 @@ void qe_destroy(void* p) {
     e->bump_go();  // wakes the sleeping rank workers (they see quit before they take a job)
     for (auto& t : e->pool) t.join();
     if (e->mon.joinable()) e->mon.join();
+    for (Worker* w : e->W) w->stop_ngram_stage();
+    if (e->pph)
+        for (Worker* w : e->pph->S) w->stop_ngram_stage();
     // GPU memory is released at process exit
 }
 

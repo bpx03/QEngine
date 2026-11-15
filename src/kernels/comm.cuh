@@ -11,7 +11,17 @@
 constexpr int kCommSlots = 4;
 constexpr int kAgWords = 8192;  // P2P small all-gather: values per sender and slot (allgather_small n <= 8192)
 constexpr int kCommBlocks = 8;  // more blocks polling host memory saturates PCIe reads
+// ranks a Comm can hold: flash.h::kMaxTp reuses it. Every per-rank array below is sized by it.
+constexpr int kCommMaxRanks = 5;
 
+// Bit index of the directed pair (reader reads the owner's rows). Ranks 0..3 retain their legacy bits.
+// Pairs involving rank 4 occupy bits 16..24.
+__host__ __device__ __forceinline__ unsigned comm_pair_bit(int reader, int owner) {
+    if (reader < 4 && owner < 4) return 4 * reader + owner;
+    if (reader < 4) return 16 + reader;
+    if (owner < 4) return 20 + owner;
+    return 24;
+}
 struct Comm {
     float* data = nullptr;      // host-mapped [ngpu][slots][max_elems]
     unsigned* flags = nullptr;  // host-mapped [ngpu][slots], one flag per GPU per slot
@@ -32,54 +42,56 @@ struct Comm {
     // LL16 value mapping of the rounded-sum protocols: value e of word w is w + hw e (coalesced loads/stores)
     // instead of 7 w + e; changes the order of the norm's sum of squares (same for every m)
     bool coal = true;
-    uint4* pll[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint4* pll[kCommMaxRanks] = {};
     // P2P small all-gather (allgather_small, QE_AG_LL): 8-byte words (value bits, 32-bit call tag) pushed into every
     // peer's [2 slots][ngpu senders][kAgWords] receive words, polled locally (no fence / flag round trip)
     // Invariant: the tag is the call's ctr.seq and the words are never cleared, so ctr.seq of the CommCounters used with
     // this Comm must never go back (a new CommCounters on an existing Comm needs pag zeroed first).
-    uint2* pag[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint2* pag[kCommMaxRanks] = {};
     // prefill reduce-scatter over P2P: rows sent to their owner [ngpu senders][rs_own][h] bf16 and
     // the owners' sums [rs_rows][h] bf16, both in the receiving GPU's memory
-    uint2* prs1[4] = {nullptr, nullptr, nullptr, nullptr};
-    uint2* prs2[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint2* prs1[kCommMaxRanks] = {};
+    uint2* prs2[kCommMaxRanks] = {};
     int rs_rows = 0, rs_own = 0;
     // barrier flags for collectives whose data go over P2P: [ngpu senders][kCommSlots] in each
     // receiving GPU's memory, written over the same P2P path as the data (ordered with it)
-    unsigned* pflags[4] = {nullptr, nullptr, nullptr, nullptr};
+    unsigned* pflags[kCommMaxRanks] = {};
     // owner-finished prefill all-reduce (OwnFin): every GPU's receive rows of the normed outputs,
     // [rs_rows][h] bf16, [rs_rows][h] int8 (W4A8 input layout) and [rs_rows][rec] scale records
-    uint2* pxn[4] = {nullptr, nullptr, nullptr, nullptr};
-    int8_t* pxq[4] = {nullptr, nullptr, nullptr, nullptr};
-    float* pxsc[4] = {nullptr, nullptr, nullptr, nullptr};
+    uint2* pxn[kCommMaxRanks] = {};
+    int8_t* pxq[kCommMaxRanks] = {};
+    float* pxsc[kCommMaxRanks] = {};
     int pxsc_row = 0;  // floats per row of pxsc (the G = 32 record size, the largest)
     // copy-engine prefill all-reduce (CeAr): flags written by the peers' copy streams,
     // [2 kinds: RS, AG][ngpu senders][kCeSlots] in each receiving GPU's memory, and the local bf16
     // staging rows [rs_rows][h] of the packed partials
-    unsigned* cfl[4] = {nullptr, nullptr, nullptr, nullptr};
-    int dev[4] = {0, 0, 0, 0};  // CUDA device of each rank
-    uint2* pstage[4] = {nullptr, nullptr, nullptr, nullptr};
+    unsigned* cfl[kCommMaxRanks] = {};
+    int dev[kCommMaxRanks] = {};  // CUDA device of each rank
+    uint2* pstage[kCommMaxRanks] = {};
     // prefill transfer path (comm_select_path: startup probe, FLASH_COMM / QE_COMM): kXferP2P SM loads / stores between the peers
     // memory, kXferCE copy-engine peer copies, kXferHost copies staged through pinned host memory (D2H, flag, H2D)
     int xfer = 0;
-    // P2P prefill collectives (xfer == kXferP2P), per directed pair: bit 4 i + j set = rank i READS rank j's rows from
-    // j's memory (SM loads, "pull"), else j stores them into i's memory ("push"). Pull keeps the sender's memory system
-    // free (SM stores over PCIe stall every kernel next to them); comm_select_path sets it from the probe.
+    // P2P prefill collectives (xfer == kXferP2P), per directed pair: bit comm_pair_bit(reader, owner) set = the reader
+    // READS the owner's rows from its memory (SM loads, "pull"), else the owner stores them into the reader's memory
+    // ("push"). Pull keeps the sender's memory system free (SM stores over PCIe stall every kernel next to them);
+    // comm_select_path sets it from the probe. Ranks 0..3 keep the legacy 4 * reader + owner bits; the fifth rank uses
+    // bits 16..24, so the mask still fits an unsigned and a legacy 4-rank mask compares equal.
     unsigned pullm = 0;
     // staged transfers (xfer != kXferP2P): flag words [2 kinds][ngpu senders] of each receiving rank (device memory of the
     // receiver for CE, host-mapped pinned memory for host staging), a device counter per rank, and for host staging
     // each rank's pinned send rows: [rs_rows][h] bf16 partials (hrs) and sums (hag), on the rank's NUMA node
-    unsigned* xfl[4] = {nullptr, nullptr, nullptr, nullptr};
-    unsigned* xcnt[4] = {nullptr, nullptr, nullptr, nullptr};
+    unsigned* xfl[kCommMaxRanks] = {};
+    unsigned* xcnt[kCommMaxRanks] = {};
     // CE: a device word per rank holding the call's sequence number, copied by the copy engine into the peers' flag
     // words after the rows (same stream: the flag lands after the data it covers)
-    unsigned* xsw[4] = {nullptr, nullptr, nullptr, nullptr};
-    uint2* hrs[4] = {nullptr, nullptr, nullptr, nullptr};
-    uint2* hag[4] = {nullptr, nullptr, nullptr, nullptr};
+    unsigned* xsw[kCommMaxRanks] = {};
+    uint2* hrs[kCommMaxRanks] = {};
+    uint2* hag[kCommMaxRanks] = {};
     // test only (FLASH_TEST_LINK_GBPS, CE path): slow-link emulation. Every staged peer copy is followed on its stream by
     // a spin until the card's egress "link" (one busy-until time per rank, shared by all its streams and peers) has
     // carried the copy's bytes at lemu ns per byte; the flag copy after it lands then. lreal: ns per byte of the real copy
     // (already elapsed when the spin starts). lemu 0: off.
-    unsigned long long* lbusy[4] = {nullptr, nullptr, nullptr, nullptr};
+    unsigned long long* lbusy[kCommMaxRanks] = {};
     float lemu = 0.f, lreal = 0.f;
     // decode collectives' path (comm_select_path, QE_DECODE_COMM): kXferP2P = the LL16 / all-gather words are SM stores
     // into the peers' memory (pll / pag); kXferHost = the no-peer host path (the QE_P2P=0 kernels: each rank writes its

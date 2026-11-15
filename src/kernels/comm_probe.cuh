@@ -830,7 +830,7 @@ int comm_select_path(Comm& c, const int* devices, const char* env, bool staged) 
                 const bool pl0 = pl;
                 if (want != "pull" && want != "push") pl = comm_check_pull(pl, b.bad_ld != 0, b.bad_st != 0);
                 moved += pl != pl0;
-                if (pl) pm |= 1u << (4 * j + i);
+                if (pl) pm |= 1u << comm_pair_bit(j, i);
                 if (probe) {
                     mn_p2p = std::min(mn_p2p, pl ? b.ld : b.sm);
                     const float t = pl ? b.tax_ld : b.tax_st;

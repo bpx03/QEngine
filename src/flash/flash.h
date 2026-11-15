@@ -1,5 +1,5 @@
 #pragma once
-// Qwen3.8-Flash-Next (qwen4_exp) decode engine for 2 or 3 GPUs: EP experts, TP GDN / QSA heads, QSA KV split by
+// Qwen3.8-Flash-Next (qwen4_exp) decode engine for 2 to 5 GPUs: EP experts, TP GDN / QSA heads, QSA KV split by
 // token position across the cards (each card owns `own` of every `period` positions), hyper-connection
 // residual 4 x 2560 replicated in fp32.
 #include "../gpu_others.h"
@@ -128,13 +128,13 @@ void set_host_link_gbps(double gbps);
 double host_link_gbps();
 long long oom_reserve_mb();  // FLASH_OOM_RESERVE_MB (64), 0 = off
 double yarn_factor();        // 0: off
-// ranks: 2, 3 or 4 (every split below divides: 24 QSA q heads, 48 DeltaNet value / 16 key heads, 512-position KV
-// ownership per period of 512 x ngpu positions), or 1: a pipeline stage (FLASH_PAR=pp / pp_prefill, pp_plan.h) that
-// holds whole layers [l0, l1) of the trunk; its collectives are local and its exchanges no-ops. PP x TP
-// (FLASH_PAR=pptp): a pipeline stage of 2 or 3 ranks, each holding its TP slice of the stage's layers [l0, l1).
-// tensor-parallel ranks at most: the comm layer's per-rank arrays (Comm::dev[4], pull mask 4 bits per rank) and the
-// QSA / row exchanges hold 4
-constexpr int kMaxTp = 4;
+// ranks: 1 (a pipeline stage, FLASH_PAR=pp / pp_prefill, pp_plan.h, whole layers [l0, l1) of the trunk; its
+// collectives are local and its exchanges no-ops), or 2 to kCommMaxRanks (5) tensor-parallel ranks. PP x TP
+// (FLASH_PAR=pptp): a pipeline stage of up to kMaxGroupTp ranks, each holding its TP slice of the stage's layers.
+// The QSA q heads (24) and DeltaNet heads (48 value / 16 key) no longer divide evenly at 5 ranks: the plan assigns
+// ranges by value (q_begin / q_end, v_begin / v_end) and every exchange slot is sized to q_capacity(), so the
+// slots have one stride; padding never participates in attention.
+constexpr int kMaxTp = kCommMaxRanks;
 static_assert(sizeof(((Comm*)nullptr)->dev) / sizeof(int) >= kMaxTp, "Comm holds kMaxTp ranks");
 // the C API's FLASH_PAR=pp start-up: device lookup drafts off in this process (not on the stages)
 extern std::atomic<bool> g_lookup_off;
@@ -157,6 +157,20 @@ struct Plan {
     int voc0 = 0, voc1 = 0; // lm_head rows
     int period = 1536, own0 = 0, own = 512;  // KV positions p with (p % period) in [own0, own0 + own)
 };
+// QSA q heads of rank g of n ranks: uneven ranges (24 heads over 5 ranks -> 4, 5, 5, 5, 5). q_owner inverts the
+// split (the rank that owns head h); q_capacity sizes the exchange slots uniformly (the largest range, 5 at n = 5),
+// so every peer's slot stride is the same and only real heads are copied, read or summed.
+__host__ __device__ inline constexpr int q_begin(int g, int n) { return NQ * g / n; }
+__host__ __device__ inline constexpr int q_end(int g, int n) { return NQ * (g + 1) / n; }
+__host__ __device__ inline constexpr int q_count(int g, int n) { return q_end(g, n) - q_begin(g, n); }
+__host__ __device__ inline constexpr int q_owner(int h, int n) { return ((h + 1) * n - 1) / NQ; }
+__host__ __device__ inline constexpr int q_capacity(int n) { return (NQ + n - 1) / n; }
+// DeltaNet: value heads [v_begin, v_end) of rank g and the key heads they use (LNV / LNK value heads per key head,
+// key heads shared at rank boundaries as they are at 3 ranks)
+__host__ __device__ inline constexpr int v_begin(int g, int n) { return LNV * g / n; }
+__host__ __device__ inline constexpr int v_end(int g, int n) { return LNV * (g + 1) / n; }
+__host__ __device__ inline constexpr int k_begin(int g, int n) { return v_begin(g, n) / (LNV / LNK); }
+__host__ __device__ inline constexpr int k_end(int g, int n) { return (v_end(g, n) - 1) / (LNV / LNK) + 1; }
 // weights: relative share of expert groups per card (e.g. 176,160,176)
 std::vector<Plan> make_plan(int ngpu, const std::vector<double>& group_weights);
 // pipeline stages: one 1-rank plan per stage, stage s holding trunk layers [bounds[s], bounds[s + 1]) (pp_plan.h);
@@ -204,9 +218,9 @@ constexpr int MAXJOB = 896;              // job lists: at least this (3 cards: >
                                          // a card with more local groups (2 cards: ~1283) sizes them by plan_groups
 constexpr int PF_SHJ = 64;               // prefill: rows per shared-expert job (the shared expert sees every row)
 constexpr int MAXJOB_PF = 3072;  // prefill jobs: (expert, 64-row chunk, local group) <= 896 + 2 x rows x 11 / 64 (4096 rows)
-struct MoeJob {            // device descriptor of one local expert group
-    const uint4* gq; const __half* gs;
-    const uint4* dq; const __half* ds;
+struct MoeJob {            // device descriptor of one local expert group (scales: __half for INT4, bf16 for W8)
+    const uint4* gq; const void* gs;
+    const uint4* dq; const void* ds;
 };
 // Dynamic expert cache (cold groups, see Worker::ec_*): the kernels resolve a cold local group ci (gmap index >= ndev)
 // through a device pointer table, entry = device slot address, or host-mapped address | 1 (served zero-copy over
@@ -484,6 +498,8 @@ public:
     void set_ngram(const NgramDev& n) { ngp_ = n; }
     // table not pinned (FLASH_NGRAM_PIN=0): the step's rows go through a mapped staging buffer filled by a host thread
     void start_ngram_stage(const HostTables* ht);
+    // Join before the table mappings or staging buffers can be released.
+    void stop_ngram_stage();
     // temperature <= 0: greedy; else sampled verification rows / first token (same seed on every card)
     void set_sampling(float temperature, float top_p, int top_k, float min_p, unsigned long long seed);
     // presence / frequency penalty of the bound slot (after set_sampling, which turns it off); its counts restart
@@ -878,9 +894,9 @@ private:
     // of a device ring two layers ahead; the prefill MoE of that layer reads them through pfs_tab_d_ (ring addresses)
     // sequence-parallel HC in prefill (hcsp_ok): each card runs the hyper-connection reads only on its own rows of
     // every chunk (the rows its all-reduce reduces) and all-gathers x / xh, instead of HC on all rows on every card
-    char* agdst_[3][4] = {};      // [x, xh, R][rank] batch-row arrays of every card
-    unsigned *agflags_ = nullptr, *agseq_ = nullptr, *agscnt_ = nullptr;  // [2 channels][4 senders], [2], [2][4]
-    unsigned* agpf_[4] = {};      // every card's agflags_
+    char* agdst_[3][kMaxTp] = {};      // [x, xh, R][rank] batch-row arrays of every card
+    unsigned *agflags_ = nullptr, *agseq_ = nullptr, *agscnt_ = nullptr;  // [2 channels][kMaxTp senders], [2], [2][2 kMaxTp]
+    unsigned* agpf_[kMaxTp] = {};      // every card's agflags_
     float *sp_hu_ = nullptr, *sp_hss_ = nullptr, *sp_rinv_ = nullptr;
     __half* sp_hh_ = nullptr;
     unsigned long long* sp_det_ = nullptr;
@@ -888,13 +904,13 @@ private:
     // ch: protocol channel (one per stream); rr: [2 * rank] row range of every card (needed by the host-staged path)
     void row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, const int* rr = nullptr, int rowb0 = 0);
     // staged prefill transfers (comm_.xfer != kXferP2P, comm_select_path): pinned host staging of the row all-gather
-    // ([x, xh, R] regions of AG_CAP own rows) and of the QSA exchanges ([4 peers][XROWS][XPER] for q and partials), the
+    // ([x, xh, R] regions of AG_CAP own rows) and of the QSA exchanges ([ngpu peers][XROWS][xper] for q and partials), the
     // host-mapped flag words, the device outbox of the staged exchanges, and the exchange counters of the batch
     static constexpr int AG_CAP = ARU_MAX / 2 + 2;
     char* hag_h_ = nullptr;
-    unsigned* hagf_ = nullptr;          // [2 channels][data, ack][4 senders]
-    char* hag_p_[4] = {};
-    unsigned* hagf_p_[4] = {};
+    unsigned* hagf_ = nullptr;          // [2 channels][data, ack][kMaxTp senders]
+    char* hag_p_[kMaxTp] = {};
+    unsigned* hagf_p_[kMaxTp] = {};
     float* xouti_ = nullptr;  // CE: device outbox of the indexer-key exchange
     int xi_k_ = 0;            // indexer exchanges of the batch so far (staged slot parity)
     float *xout_ = nullptr, *xoutc_ = nullptr;  // device outboxes of q / partials
@@ -903,9 +919,9 @@ private:
     // exchange s precedes its flag of s + 1 on its stream; the sender writes slot s again only after that flag)
     float* hx_ = nullptr;
     unsigned *xsw_ = nullptr, *agw_ = nullptr;  // CE: sequence-number words copied into the peers' flags after the rows
-    unsigned* hxf_ = nullptr;           // [q, partials, indexer][4 senders]
-    float* hx_p_[4] = {};
-    unsigned* hxf_p_[4] = {};
+    unsigned* hxf_ = nullptr;           // [q, partials, indexer][kMaxTp senders]
+    float* hx_p_[kMaxTp] = {};
+    unsigned* hxf_p_[kMaxTp] = {};
     unsigned* xdummy_ = nullptr;        // flag words the send kernels of a staged exchange raise (the copies follow)
     bool xstage_ = false;               // inside a prefill batch (counters aligned by k_xpar_align)
     int xq_k_ = 0, xc_k_ = 0;           // QSA exchanges of the batch so far
@@ -1259,11 +1275,11 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     // consumers poll a flag in every block, from host-mapped words that was a PCIe read per block (k_qsa_comb16 4.3 ms
     // per 512-row chunk, 3 cards without P2P)
     unsigned *xflagd_ = nullptr, *xqflagd_ = nullptr, *xiflagd_ = nullptr;
-    unsigned* xpcnt_ = nullptr;  // k_xpull block counters [q 4][partials 4][indexer 4]
+    unsigned* xpcnt_ = nullptr;  // k_xpull block counters [q, partials, indexer][kMaxTp]
     // no peer access, direct exchange: pull the peers' rows into the device slot, point x's own slot / flags there
     void xpull(Xchg& x, int kind, int mr, size_t rowb, size_t per);
     unsigned *xflags_ = nullptr, *xseq_ = nullptr, *xdone_ = nullptr, *xscnt_ = nullptr, *xqscnt_ = nullptr, *xiscnt_ = nullptr;
-    float* xpr_[4] = {};
+    float* xpr_[kMaxTp] = {};
     bool qsa_a_ = false;
     bool agq_on_ = false;     // MoE input quantized + routed on the owner, compact rows gathered
     bool moe_pre_ = false;    // this moe() call's rows are quantized and routed already (gsel_ / gw_ / gsh_ at the rows)
@@ -1275,9 +1291,9 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     float* qxb_ = nullptr;    // its fp32 projection rows [PFM][(NQ - local) x HD]
     float* xqrecv_ = nullptr;
     unsigned *xqflags_ = nullptr, *xqseq_ = nullptr, *xqdone_ = nullptr;
-    float* xqpr_[4] = {};
-    unsigned* xqpf_[4] = {};
-    unsigned* xpf_[4] = {};
+    float* xqpr_[kMaxTp] = {};
+    unsigned* xqpf_[kMaxTp] = {};
+    unsigned* xpf_[kMaxTp] = {};
     // decode collectives through host memory (comm_.dxfer == kXferHost, QE_DECODE_COMM): the decode / verify rows' QSA
     // q, partial and indexer exchanges (direct sends) land in pinned host-mapped slots + flags instead of the peers'
     // device memory, so no SM store crosses a peer link; prefill keeps the device slots (its own transfer path)
@@ -1294,8 +1310,8 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     }
     float *xrecvH_ = nullptr, *xqrecvH_ = nullptr, *xirecvH_ = nullptr;
     unsigned *xflagsH_ = nullptr, *xqflagsH_ = nullptr, *xiflagsH_ = nullptr;
-    float *xprH_[4] = {}, *xqprH_[4] = {}, *xiprH_[4] = {};
-    unsigned *xpfH_[4] = {}, *xqpfH_[4] = {}, *xipfH_[4] = {};
+    float *xprH_[kMaxTp] = {}, *xqprH_[kMaxTp] = {}, *xiprH_[kMaxTp] = {};
+    unsigned *xpfH_[kMaxTp] = {}, *xqpfH_[kMaxTp] = {}, *xipfH_[kMaxTp] = {};
     // ... and the device pull slots of those host slots (bpx03#21): k_xpull copies the peers' rows once into device
     // memory and raises device flags, as without peer access, so the attention blocks do not each poll host flags and
     // read the rows over PCIe (plain cudaMalloc, freed in free_dhost; QE_HOST_XPULL=0: off)
@@ -1380,8 +1396,8 @@ private:
     int spos_ = 0;            // position of the device-side speculative loop
     float* xirecv_ = nullptr;
     unsigned *xiflags_ = nullptr, *xiseq_ = nullptr, *xidone_ = nullptr;
-    float* xipr_[4] = {};
-    unsigned* xipf_[4] = {};
+    float* xipr_[kMaxTp] = {};
+    unsigned* xipf_[kMaxTp] = {};
     float* iscore_ = nullptr;
     bool idx_gk_ = false;     // block-selection keys in global memory (k_idx_local<true>): a card's blocks exceed smem
     int *isel_ = nullptr, *insel_ = nullptr;
@@ -1396,6 +1412,11 @@ private:
     int *motok_ = nullptr, *mposd_ = nullptr, *vtok_ = nullptr, *acc_ = nullptr, *dr_ = nullptr, *hist2_ = nullptr;
     int *em_ = nullptr, *em_h_ = nullptr;  // emitted tokens (host-mapped)
     NgramDev ngp_{};
+    std::atomic<bool> ng_stop_{false};
+    std::thread ng_thread_;
+    long long* ng_req_host_ = nullptr;
+    uint8_t* ng_stage_host_ = nullptr;
+    unsigned* ng_flags_host_ = nullptr;
     cudaEvent_t ev0_ = nullptr, ev1_ = nullptr;
     // batched prefill: all-reduces + residual updates on a second stream, overlapped with the next chunks' compute
     cudaStream_t cst_ = nullptr;

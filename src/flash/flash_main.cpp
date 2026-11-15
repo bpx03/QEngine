@@ -1,7 +1,8 @@
 #include "../env.h"
 #include <sys/mman.h>
 #include <cuda_profiler_api.h>
-// flash_run: load Qwen3.8-Flash-Next (qengine INT4 checkpoint) on 2 to 4 GPUs (TP; 4: opt-in), run a prompt and greedy decode.
+// flash_run: load Qwen3.8-Flash-Next (qengine INT4 or QFN INT8 checkpoint) on 2 to 5 GPUs (TP; 4 and 5: opt-in), run a
+// prompt and greedy decode.
 //   flash_run [--model DIR] [--dev 0,1,2] [--ctx 262144] [--w 176,160,176] --ids 1,2,3 [--gen 16] [--logits out.bin]
 //   (--w: expert-group weights per GPU, default 176,160,176 on 3 GPUs, equal on 2)
 #include <dirent.h>

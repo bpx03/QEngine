@@ -619,6 +619,15 @@ Build acceptance fixtures with `-DQE_BUILD_FLASH_INT8_TESTS=ON`: `flash_checkpoi
 headers; `flash_int8_unit` checks repacking, arithmetic and residency. `INT8_MODEL=<dir>` adds real-checkpoint rows.
 `Dockerfile.flash-int8` overlays the Flash binaries and fixtures on `--build-arg BASE_RUNTIME=<current image>`.
 
+Explicit `FLASH_PAR=tp` accepts up to five distinct GPUs. Five-rank TP partitions the 24 Q heads as
+`[4,5,5,5,5]` and the 48 DeltaNet value heads as `[9,10,9,10,10]`; exchange slots reserve the largest local range,
+but padding never contributes to attention. Automatic selection on five GPUs remains pipeline parallel;
+PP-prefill and PPTP retain their three-GPU limit.
+
+`flash_tp5_unit --ranks N [--small]` exercises the requested physical GPU count. Build the overlay with
+`--build-arg CUDA_ARCHS=86 --build-arg REVISION=<integrated commit>` and an explicitly supplied current
+`BASE_RUNTIME`; its `qe_build.txt` identifies the rebuilt Flash binaries.
+
 ### Qwen3.8-27B
 
 - INT4 weights repacked at load (a few seconds, no conversion) into tensor-core layouts; `lm_head` in INT8.
