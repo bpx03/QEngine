@@ -28,9 +28,7 @@ struct Json {
 
     static Json parse(const std::string& s) {
         size_t p = 0;
-        Json j = parse_value(s, p, 0);
-        ws(s, p);
-        if (p != s.size()) throw std::runtime_error("json: trailing data");
+        Json j = parse_value(s, p);
         return j;
     }
 
@@ -38,36 +36,40 @@ private:
     static void ws(const std::string& s, size_t& p) {
         while (p < s.size() && (s[p] == ' ' || s[p] == '\n' || s[p] == '\r' || s[p] == '\t')) p++;
     }
-    static char at(const std::string& s, size_t p) { return p < s.size() ? s[p] : '\0'; }
-    static Json parse_value(const std::string& s, size_t& p, int depth) {
-        if (depth > 64) throw std::runtime_error("json: nested too deep");
+    static Json parse_value(const std::string& s, size_t& p, int depth = 0) {
         ws(s, p);
         if (p >= s.size()) throw std::runtime_error("json: eof");
+        if (depth > 64) throw std::runtime_error("json: nested too deep");
         Json j;
-        const char c = s[p];
-        if (c == '{' || c == '[') {
-            const bool object = c == '{';
-            const char close = object ? '}' : ']';
-            j.type = object ? Obj : Arr;
-            ++p;
+        char c = s[p];
+        if (c == '{') {
+            j.type = Obj;
+            p++;
             ws(s, p);
-            if (at(s, p) == close) { ++p; return j; }
+            if (s[p] == '}') { p++; return j; }
             while (true) {
                 ws(s, p);
-                if (object) {
-                    std::string key = parse_string(s, p);
-                    ws(s, p);
-                    if (at(s, p) != ':') throw std::runtime_error("json: expected :");
-                    ++p;
-                    if (!j.obj.emplace(std::move(key), parse_value(s, p, depth + 1)).second)
-                        throw std::runtime_error("json: duplicate key");
-                } else {
-                    j.arr.push_back(parse_value(s, p, depth + 1));
-                }
+                std::string k = parse_string(s, p);
                 ws(s, p);
-                if (at(s, p) == close) { ++p; return j; }
-                if (at(s, p) != ',') throw std::runtime_error("json: expected comma or closing delimiter");
-                ++p;
+                if (s[p] != ':') throw std::runtime_error("json: expected :");
+                p++;
+                j.obj.emplace(std::move(k), parse_value(s, p, depth + 1));
+                ws(s, p);
+                if (s[p] == ',') { p++; continue; }
+                if (s[p] == '}') { p++; break; }
+                throw std::runtime_error("json: expected , or }");
+            }
+        } else if (c == '[') {
+            j.type = Arr;
+            p++;
+            ws(s, p);
+            if (s[p] == ']') { p++; return j; }
+            while (true) {
+                j.arr.push_back(parse_value(s, p, depth + 1));
+                ws(s, p);
+                if (s[p] == ',') { p++; continue; }
+                if (s[p] == ']') { p++; break; }
+                throw std::runtime_error("json: expected , or ]");
             }
         } else if (c == '"') {
             j.type = Str;
@@ -79,56 +81,155 @@ private:
         } else if (s.compare(p, 4, "null") == 0) {
             p += 4;
         } else {
-            const size_t begin = p;
-            if (at(s, p) == '-') ++p;
-            if (at(s, p) == '0') ++p;
-            else {
-                if (at(s, p) < '1' || at(s, p) > '9') throw std::runtime_error("json: expected number");
-                while (at(s, p) >= '0' && at(s, p) <= '9') ++p;
-            }
-            if (at(s, p) == '.') {
-                ++p;
-                if (at(s, p) < '0' || at(s, p) > '9') throw std::runtime_error("json: expected fraction");
-                while (at(s, p) >= '0' && at(s, p) <= '9') ++p;
-            }
-            if (at(s, p) == 'e' || at(s, p) == 'E') {
-                ++p;
-                if (at(s, p) == '+' || at(s, p) == '-') ++p;
-                if (at(s, p) < '0' || at(s, p) > '9') throw std::runtime_error("json: expected exponent");
-                while (at(s, p) >= '0' && at(s, p) <= '9') ++p;
-            }
             j.type = Num;
-            j.num = strtod(s.c_str() + begin, nullptr);
-            if (!std::isfinite(j.num)) throw std::runtime_error("json: number out of range");
+            char* end;
+            j.num = strtod(s.c_str() + p, &end);
+            p = end - s.c_str();
         }
         return j;
     }
     static std::string parse_string(const std::string& s, size_t& p) {
-        if (at(s, p) != '"') throw std::runtime_error("json: expected string");
-        ++p;
+        if (p >= s.size() || s[p] != '"') throw std::runtime_error("json: expected string");
+        p++;
         std::string out;
-        while (true) {
+        while (true) {  // every read bounded: an unterminated string is an error, not a read past the end
             if (p >= s.size()) throw std::runtime_error("json: unterminated string");
-            const unsigned char c = s[p++];
-            if (c == '"') return out;
-            if (c < 0x20) throw std::runtime_error("json: control character in string");
-            if (c != '\\') { out += char(c); continue; }
-            if (p >= s.size()) throw std::runtime_error("json: unterminated escape");
-            const char e = s[p++];
-            if (e == 'n') out += '\n';
-            else if (e == 't') out += '\t';
-            else if (e == 'r') out += '\r';
-            else if (e == 'b') out += '\b';
-            else if (e == 'f') out += '\f';
-            else if (e == '"' || e == '\\' || e == '/') out += e;
-            else if (e == 'u') {
-                for (int i = 0; i < 4; ++i) {
-                    const char h = at(s, p++);
-                    if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F')))
-                        throw std::runtime_error("json: invalid unicode escape");
+            if (s[p] == '"') break;
+            if (s[p] == '\\') {
+                if (++p >= s.size()) throw std::runtime_error("json: unterminated string");
+                char e = s[p];
+                if (e == 'n') out += '\n';
+                else if (e == 't') out += '\t';
+                else if (e == 'u') {
+                    if (p + 4 >= s.size()) throw std::runtime_error("json: unterminated string");
+                    out += '?';
+                    p += 4;
                 }
-                out += '?';  // Preserve the reader's existing Unicode escape representation.
-            } else throw std::runtime_error("json: invalid escape");
+                else out += e;
+                p++;
+            } else {
+                out += s[p++];
+            }
         }
+        p++;
+        return out;
+    }
+
+public:
+    // Strict reader for checkpoint manifests, used only by flash/checkpoint.h. Additive: Json::parse above
+    // keeps its historical lenient behaviour. Strict grammar: trailing data, duplicate keys, non-standard
+    // numbers (leading '+', ".5", "5.", NaN/Infinity from strtod's leniency), unknown escapes and control
+    // characters inside strings are all rejected.
+    struct Strict {
+        const std::string& s;
+        size_t p = 0;
+        explicit Strict(const std::string& text) : s(text) {}
+        void fail(const std::string& what) const {
+            throw std::runtime_error("json strict: " + what + " at offset " + std::to_string(p)
+                                     + " near: " + s.substr(p > 8 ? p - 8 : 0, 16));
+        }
+        char at() const { return p < s.size() ? s[p] : '\0'; }
+        void ws() { while (p < s.size() && (s[p] == ' ' || s[p] == '\n' || s[p] == '\r' || s[p] == '\t')) ++p; }
+        Json value(int depth) {
+            if (depth > 64) fail("nested too deep");
+            ws();
+            if (p >= s.size()) fail("eof");
+            Json j;
+            const char c = s[p];
+            if (c == '{') {
+                j.type = Json::Obj;
+                ++p;
+                ws();
+                if (at() == '}') { ++p; return j; }
+                while (true) {
+                    ws();
+                    const std::string key = string();
+                    ws();
+                    if (at() != ':') fail("expected :");
+                    ++p;
+                    if (!j.obj.emplace(key, value(depth + 1)).second) fail("duplicate key: " + key);
+                    ws();
+                    if (at() == '}') { ++p; return j; }
+                    if (at() != ',') fail("expected , or }");
+                    ++p;
+                }
+            }
+            if (c == '[') {
+                j.type = Json::Arr;
+                ++p;
+                ws();
+                if (at() == ']') { ++p; return j; }
+                while (true) {
+                    j.arr.push_back(value(depth + 1));
+                    ws();
+                    if (at() == ',') { ++p; continue; }
+                    if (at() == ']') { ++p; return j; }
+                    fail("expected , or ]");
+                }
+            }
+            if (c == '"') { j.type = Json::Str; j.str = string(); return j; }
+            if (s.compare(p, 4, "true") == 0) { j.type = Json::Bool; j.b = true; p += 4; return j; }
+            if (s.compare(p, 5, "false") == 0) { j.type = Json::Bool; p += 5; return j; }
+            if (s.compare(p, 4, "null") == 0) { p += 4; return j; }
+            j.type = Json::Num;
+            number(j);
+            return j;
+        }
+        void number(Json& j) {
+            const size_t begin = p;
+            if (at() == '-') ++p;
+            if (at() == '0') ++p;
+            else if (at() >= '1' && at() <= '9') { while (at() >= '0' && at() <= '9') ++p; }
+            else fail("expected number");
+            if (at() == '.') {
+                ++p;
+                if (at() < '0' || at() > '9') fail("expected fraction digits");
+                while (at() >= '0' && at() <= '9') ++p;
+            }
+            if (at() == 'e' || at() == 'E') {
+                ++p;
+                if (at() == '+' || at() == '-') ++p;
+                if (at() < '0' || at() > '9') fail("expected exponent digits");
+                while (at() >= '0' && at() <= '9') ++p;
+            }
+            j.num = std::strtod(s.c_str() + begin, nullptr);
+            if (!std::isfinite(j.num)) fail("number out of range");
+        }
+        std::string string() {
+            if (at() != '"') fail("expected string");
+            ++p;
+            std::string out;
+            while (true) {
+                if (p >= s.size()) fail("unterminated string");
+                const unsigned char c = s[p++];
+                if (c == '"') return out;
+                if (c < 0x20) fail("control character in string");
+                if (c != '\\') { out += char(c); continue; }
+                if (p >= s.size()) fail("unterminated escape");
+                const char e = s[p++];
+                if (e == 'n') out += '\n';
+                else if (e == 't') out += '\t';
+                else if (e == 'r') out += '\r';
+                else if (e == 'b') out += '\b';
+                else if (e == 'f') out += '\f';
+                else if (e == '"' || e == '\\' || e == '/') out += e;
+                else if (e == 'u') {
+                    for (int i = 0; i < 4; ++i) {
+                        const char h = at();
+                        ++p;
+                        if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F')))
+                            fail("invalid unicode escape");
+                    }
+                    out += '?';  // same representation as Json::parse; manifest fields never use escapes
+                } else fail("invalid escape");
+            }
+        }
+    };
+    static Json parse_strict(const std::string& s) {
+        Strict r(s);
+        Json j = r.value(0);
+        r.ws();
+        if (r.p != s.size()) r.fail("trailing data");
+        return j;
     }
 };
