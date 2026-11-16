@@ -31,6 +31,13 @@ long long meminfo_cached();
 // another user) and POSIX_FADV_DONTNEED (also the cached pages never faulted into this mapping); adds to *out
 void drop_file_cache(const std::string& path, void* p, size_t n, PageOut* out);
 
+// Guarded open for checkpoint files (review R3 F09): lstat must show a regular file — a symlink is
+// rejected outright when nofollow (the sandbox case), a FIFO or directory before any open() — then
+// O_RDONLY|O_CLOEXEC (|O_NOFOLLOW), then fstat re-checks the opened file is still regular. A blocking
+// special file can never turn into a stuck read, and the sandbox never follows a symlink. Throws
+// runtime_error with "missing"/"symbolic link"/"not a regular file"/"cannot open" and returns the fd.
+int open_regular_file(const std::string& path, bool nofollow);
+
 // mmap()s one or more .safetensors files and indexes tensors by name.
 class SafeTensors {
 public:

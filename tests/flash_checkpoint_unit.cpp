@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <sys/stat.h>  // F09 fixture: mkfifo
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -478,13 +479,13 @@ int main() {
         {
             const auto short_file=temp.path/"short.safetensors";
             { std::ofstream out(short_file,std::ios::binary); out<<"tiny"; }
-            rejects([&] { validate_file(short_file.string()); });
+            rejects([&] { validate_file(short_file.string(),false); });
             const auto long_header=temp.path/"long-header.safetensors";
             { std::ofstream out(long_header,std::ios::binary); uint64_t length=4096; out.write(reinterpret_cast<const char*>(&length),8); out<<"{}"; }
-            rejects([&] { validate_file(long_header.string()); });
+            rejects([&] { validate_file(long_header.string(),false); });
             const auto truncated=temp.path/"truncated.safetensors";
             matrix_file(truncated); fs::resize_file(truncated,fs::file_size(truncated)-1);
-            rejects([&] { validate_file(truncated.string()); });
+            rejects([&] { validate_file(truncated.string(),false); });
             const auto dup_key=temp.path/"dup-key.safetensors";
             { // strict header parsing: a duplicate key cannot smuggle a second tensor past the inventory
               std::string header="{\"a.weight_packed\":{\"dtype\":\"I32\",\"shape\":[16,32],\"data_offsets\":[0,2048]},"
@@ -494,7 +495,7 @@ int main() {
               out.write(reinterpret_cast<const char*>(&length),8); out.write(header.data(),header.size());
               std::vector<char> payload(2048,0); out.write(payload.data(),payload.size());
             }
-            rejects([&] { validate_file(dup_key.string()); });
+            rejects([&] { validate_file(dup_key.string(),false); });
         }
         auto records=inventory();
         const InventorySpec spec{48,512,2560,640,24,256,2,16,128,48,128,640,4,1};
@@ -668,6 +669,24 @@ int main() {
           fs::rename(d/"model_mtp.safetensors",d/"moved-mtp.safetensors");
           fs::create_symlink("moved-mtp.safetensors",d/"model_mtp.safetensors");
           rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+        }
+        { // F09: every checkpoint file is opened through the guarded open (lstat S_ISREG, O_NOFOLLOW,
+          // fstat) — a substituted directory or FIFO at a manifest-recorded name is a clean rejection;
+          // the recorded MTP path used to go straight to an ifstream, which blocked forever on a FIFO.
+            const auto md=temp.path/"mtp-dir"; build_checkpoint(md,BuildOptions{});
+            fs::remove(md/"model_mtp.safetensors"); fs::create_directories(md/"model_mtp.safetensors");
+            rejects([&]{ Checkpoint ck; ck.open(md.string(),true,""); });
+            const auto sd=temp.path/"shard-dir"; const auto sfix=build_checkpoint(sd,BuildOptions{});
+            fs::remove(sd/sfix.shards[0]); fs::create_directories(sd/sfix.shards[0]);
+            rejects([&]{ Checkpoint ck; ck.open(sd.string(),true,""); });
+            const auto cd=temp.path/"config-dir2"; const auto cfix=build_checkpoint(cd,BuildOptions{});
+            fs::remove(cd/"config.json"); fs::create_directories(cd/"config.json");
+            rejects([&]{ Checkpoint ck; ck.open(cd.string(),false,""); });
+            (void)cfix;
+            const auto ff=temp.path/"mtp-fifo"; build_checkpoint(ff,BuildOptions{});
+            fs::remove(ff/"model_mtp.safetensors");
+            require(::mkfifo((ff/"model_mtp.safetensors").string().c_str(),0644)==0,"mkfifo fixture failed");
+            rejects([&]{ Checkpoint ck; ck.open(ff.string(),true,""); });  // must reject, never block
         }
         { setenv("FLASH_NGRAM","bf16",1);
           rejects([&]{ Checkpoint ck; ck.open(base.string(),true,""); });

@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -80,23 +82,26 @@ inline void require_no_symlink(const std::string& path, const std::string& conte
     if (!ec && type == std::filesystem::file_type::symlink)
         fail(context, "path", "regular file (the sandbox never follows symlinks)", "symbolic link: " + path);
 }
-inline std::string read_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error(path + ": cannot open file");
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-}
-// stat the file first: it must exist, be a regular file (S_ISREG) and fit the bound before any read.
 inline std::string read_bounded_file(const std::string& path, uint64_t max_bytes, const std::string& context) {
-    std::error_code ec;
-    const auto st = std::filesystem::status(path, ec);
-    if (ec || st.type() == std::filesystem::file_type::not_found)
-        fail(context, "file", "existing regular file", "missing");
-    if (st.type() != std::filesystem::file_type::regular)
-        fail(context, "file", "regular file", "not a regular file");
-    const uint64_t bytes=std::filesystem::file_size(path,ec);
-    if(ec || bytes>max_bytes)
-        fail(context, "file size", "at most " + std::to_string(max_bytes) + " bytes", std::to_string(bytes));
-    return read_file(path);
+    // F09: same guarded open as the safetensors files: the type/regular check happens before a single
+    // byte is read, so a FIFO or directory at a manifest-recorded name fails cleanly instead of blocking.
+    const int fd = open_regular_file(path, true);
+    struct stat st;
+    const int rc = fstat(fd, &st);
+    if (rc != 0 || st.st_size < 0 || (uint64_t)st.st_size > max_bytes) {
+        const std::string actual = rc ? "unreadable" : std::to_string((long long)st.st_size);
+        ::close(fd);
+        fail(context, "file size", "at most " + std::to_string(max_bytes) + " bytes", actual);
+    }
+    std::string bytes((size_t)st.st_size, '\0');
+    size_t off = 0;
+    while (off < bytes.size()) {
+        const ssize_t n = ::pread(fd, bytes.data() + off, bytes.size() - off, (off_t)off);
+        if (n <= 0) { ::close(fd); throw std::runtime_error(path + ": cannot read file"); }
+        off += (size_t)n;
+    }
+    ::close(fd);
+    return bytes;
 }
 inline Json parse_json(const std::string& bytes, const std::string& context) {
     try { return Json::parse_strict(bytes); }
@@ -152,34 +157,41 @@ inline long long stored_shape_last_dim(const std::string& path, const Json& entr
         offsets.arr[1].i() <= offsets.arr[0].i() || (offsets.arr[1].i()-offsets.arr[0].i()) % 8 != 0)
         fail(path,".weight_shape","I64 data offsets with a whole number of int64s","malformed companion");
     const long long count = (offsets.arr[1].i()-offsets.arr[0].i())/8;
-    std::ifstream in(path,std::ios::binary);
-    if (!in) throw std::runtime_error(path+": cannot open safetensors file");
+    // F09: guarded open (never a blocking open on a special file); the scan route is not sandbox-gated,
+    // so symlinks keep their legacy allowance but the regular-file check still applies via fstat.
+    const int fd = open_regular_file(path,false);
     uint64_t header = 0;
-    if (!in.read((char*)&header,8)) fail(path,".weight_shape","readable stored shape","file shorter than 8 bytes");
-    const uint64_t off = 8 + header + (uint64_t)offsets.arr[0].i() + (uint64_t)(count-1)*8;
+    if (::pread(fd,(char*)&header,8,0)!=8) { ::close(fd); fail(path,".weight_shape","readable stored shape","file shorter than 8 bytes"); }
+    const off_t off = (off_t)(8 + header + (uint64_t)offsets.arr[0].i() + (uint64_t)(count-1)*8);
     int64_t last = 0;
-    if (!in.seekg((std::streamoff)off) || !in.read((char*)&last,8))
-        fail(path,".weight_shape","readable stored shape","truncated payload");
+    const ssize_t got = ::pread(fd,(char*)&last,8,off);
+    ::close(fd);
+    if (got != 8) fail(path,".weight_shape","readable stored shape","truncated payload");
     return last;
 }
 // Validate structure before the legacy mmap reader accesses any header or payload byte. The safetensors
 // header is parsed with the strict reader as well: a duplicate key could otherwise hide an extra tensor.
-inline Json validate_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) throw std::runtime_error(path + ": cannot open safetensors file");
-    const auto end = in.tellg();
-    if (end < 8) fail(path, "file size", "at least 8 bytes", std::to_string((long long)end));
-    const uint64_t size = (uint64_t)end;
-    in.seekg(0);
-    unsigned char prefix[8];
-    in.read((char*)prefix, 8);
+// F09: the file goes through the guarded open_regular_file (lstat must show S_ISREG, O_NOFOLLOW for the
+// sandboxed case, then fstat) — a substituted FIFO or directory is a clean rejection, never a blocking
+// or following first open.
+inline Json validate_file(const std::string& path, bool nofollow) {
+    const int fd = open_regular_file(path, nofollow);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 8) { ::close(fd); fail(path, "file size", "at least 8 bytes", "unreadable or shorter"); }
+    const uint64_t size = (uint64_t)st.st_size;
     uint64_t header = 0;
-    for (int i = 0; i < 8; ++i) header |= (uint64_t)prefix[i] << (8 * i);
-    if (header == 0 || header > size - 8 || header > (64ull << 20))
+    if (::pread(fd, (char*)&header, 8, 0) != 8 || header == 0 || header > size - 8 || header > (64ull << 20)) {
+        ::close(fd);
         fail(path, "header length", "1..min(file size-8,64MiB)", std::to_string(header));
+    }
     std::string bytes((size_t)header, '\0');
-    in.read(bytes.data(), (std::streamsize)header);
-    if (!in) throw std::runtime_error(path + ": truncated safetensors header");
+    size_t off = 0;
+    while (off < header) {
+        const ssize_t n = ::pread(fd, bytes.data() + off, header - off, (off_t)(8 + off));
+        if (n <= 0) { ::close(fd); throw std::runtime_error(path + ": truncated safetensors header"); }
+        off += (size_t)n;
+    }
+    ::close(fd);
     const Json j = parse_json(bytes,path);
     if (j.type != Json::Obj) fail(path, "header", "JSON object", "other JSON type");
     std::vector<std::pair<uint64_t,uint64_t>> ranges;
@@ -210,7 +222,7 @@ inline Json validate_file(const std::string& path) {
     if (next != size - 8 - header) fail(path, "payload bytes", std::to_string(next), std::to_string(size - 8 - header));
     return j;
 }
-inline void open_file(SafeTensors& st, const std::string& path) { validate_file(path); st.open(path); }
+inline void open_file(SafeTensors& st, const std::string& path) { validate_file(path,false); st.open(path); }
 inline void validate_recipe(const Json& recipe, const std::string& context) {
     const auto format = text(recipe, "format", context);
     if (format != "symmetric INT8") fail(context, "recipe.format", "symmetric INT8", format);
@@ -448,7 +460,7 @@ struct Checkpoint {
             std::sort(files.begin(),files.end());
             if (files.empty()) throw std::runtime_error(directory+": no body safetensors files");
             for (const auto& f:files) {
-                const auto j=validate_file(f);
+                const auto j=validate_file(f,false);  // directory-scan route: legacy symlink allowance, regular-file check applies
                 for(const auto& t:j.obj) if(t.first.size()>14 && t.first.compare(t.first.size()-14,14,".weight_packed")==0) {
                     const auto base=t.first.substr(0,t.first.size()-14);
                     // The .weight_shape companion alone does NOT decide the format: compressed-tensors
@@ -554,7 +566,7 @@ struct Checkpoint {
             require_no_symlink(shard,shard);  // sandboxed manifest name: reject a substituted symlink
             if(std::filesystem::file_size(shard)>(uintmax_t)limit)
                 fail(shard,"shard size","at most "+std::to_string(limit)+" bytes",std::to_string(std::filesystem::file_size(shard)));
-            shard_headers.push_back(validate_file(shard));
+            shard_headers.push_back(validate_file(shard,true));  // sandboxed manifest name: O_NOFOLLOW
         }
         std::map<std::string,std::set<std::string>> expected_per_shard;
         for(const auto& [tensor,shard_file]:tensor_shard) expected_per_shard[shard_file].insert(tensor);
@@ -569,7 +581,7 @@ struct Checkpoint {
         }
         if(want_mtp) {
             auto expected=expected_per_shard[mtp_record_name];
-            const auto header=validate_file(resolved.mtp);
+            const auto header=validate_file(resolved.mtp, mtp_override.empty());  // recorded name: O_NOFOLLOW
             for(const auto& t:header.obj) if(t.first!="__metadata__") {
                 if(!expected.erase(t.first)) fail(path,t.first,"manifest-listed MTP tensor","unlisted or misplaced output");
             }
@@ -634,7 +646,7 @@ struct Checkpoint {
         ngram_path=resolved.ngram;
         if(std::filesystem::file_size(ngram_path)!=(uintmax_t)n.size_bytes)
             fail(ngram_path,"size_bytes",std::to_string(n.size_bytes),std::to_string(std::filesystem::file_size(ngram_path)));
-        const auto ngram_header=validate_file(ngram_path);
+        const auto ngram_header=validate_file(ngram_path, j["outputs"].has("ngram"));  // recorded table: O_NOFOLLOW
         if(ngram_header.obj.size()-(ngram_header.has("__metadata__")?1:0)!=128)
             fail(ngram_path,"tensor inventory","exactly 128 shards","unexpected shard count");
         ngram.open(ngram_path); validate_ngram_tensors(ngram,n,ngram_path);

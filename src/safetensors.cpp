@@ -7,11 +7,27 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+
+int open_regular_file(const std::string& path, bool nofollow) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0)
+        throw std::runtime_error(path + ": missing file (" + std::strerror(errno) + ")");
+    if (nofollow && S_ISLNK(st.st_mode))
+        throw std::runtime_error(path + ": symbolic link (the sandbox never follows symlinks)");
+    if (!S_ISLNK(st.st_mode) && !S_ISREG(st.st_mode))
+        throw std::runtime_error(path + ": not a regular file");  // FIFO, dir, socket, device: refuse before opening
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0));
+    if (fd < 0) throw std::runtime_error(path + ": cannot open (" + std::strerror(errno) + ")");
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) return fd;
+    ::close(fd);
+    throw std::runtime_error(path + ": not a regular file");  // swapped to a special file between lstat and open
+}
 
 void SafeTensors::open(const std::string& path, const std::set<std::string>* only, bool shadow) {
     int fd = ::open(path.c_str(), O_RDONLY);
