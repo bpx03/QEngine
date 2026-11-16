@@ -897,6 +897,27 @@ def test_plan_shards_rejects_tensor_larger_than_cap():
         raise AssertionError("plan_shards accepted a tensor larger than the shard cap")
 
 
+def test_plan_shards_rejects_oversized_deferred_tensors():
+    # the deferred PLE/n-gram-adjacent set rides the final shard as one block: an entry over the cap
+    # must be refused naming the tensor, and so must a deferred set whose total exceeds the cap
+    oversize = [("model.language_model.layers.1.ple.ple_embedding.huge.weight", None, None, 200000)]
+    try:
+        quant.plan_shards(oversize, 100000)
+    except ValueError as error:
+        assert "ple_embedding.huge.weight" in str(error), str(error)
+        assert "--max-shard-bytes" in str(error), str(error)
+    else:
+        raise AssertionError("plan_shards deferred a tensor larger than the shard cap")
+    together = [("model.language_model.layers.1.ple.ple_embedding.a.weight", None, None, 60000),
+                ("model.language_model.layers.1.ple.ple_embedding.b.weight", None, None, 60000)]
+    try:  # each entry fits; the shared final shard would not
+        quant.plan_shards(together, 100000)
+    except ValueError as error:
+        assert "final shard" in str(error) and "--max-shard-bytes" in str(error), str(error)
+    else:
+        raise AssertionError("plan_shards deferred a set larger than the shard cap")
+
+
 def test_duplicate_key_manifest_rejected():
     # the C++ loader parses the manifest strictly (Json::parse_strict rejects duplicate keys);
     # --check must refuse the same file instead of letting json.load silently keep one value
@@ -991,6 +1012,7 @@ def main():
     test_constants_cannot_drift_from_checkpoint_h()
     test_manifest_runtime_flag_contract()
     test_plan_shards_rejects_tensor_larger_than_cap()
+    test_plan_shards_rejects_oversized_deferred_tensors()
     test_duplicate_key_manifest_rejected()
     test_symlinked_manifest_files_rejected()
     test_empty_shard_rejected()

@@ -622,6 +622,17 @@ def plan_shards(plan, max_bytes):
         cur_bytes += gbytes
     if deferred:
         dbytes = sum(e[3] for e in deferred)
+        # the deferred set rides the final shard as one block: the cap applies to it like to any
+        # shard, so an oversized entry (or an oversized set) is refused at plan time instead of
+        # emitting a shard both readers reject
+        if dbytes > limit:
+            over = [e for e in deferred if e[3] > limit]
+            if over:
+                raise ValueError(f"tensor {over[0][0]} serializes to {over[0][3]} bytes, which exceeds "
+                                 f"--max-shard-bytes {max_bytes}; a single tensor must fit one shard")
+            raise ValueError(f"deferred PLE/n-gram-adjacent tensors together need {dbytes} bytes, which "
+                             f"exceeds --max-shard-bytes {max_bytes}; they share the final shard and "
+                             f"are never split across shards")
         if cur and cur_bytes + dbytes > limit:
             shards.append(cur)
             cur = []
