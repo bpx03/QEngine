@@ -83,7 +83,7 @@ Json SafeTensors::open_strict_validated(const std::string& path, bool nofollow, 
         ++safetensors_header_parses();
         if (j.type != Json::Obj) throw std::runtime_error(path + ": header is not a JSON object");
         // structural validation against the mapped bytes: supported dtype, bounded shape, and
-        // contiguous, non-overlapping, exactly-covering payload (the pre-F10 validate-file checks)
+        // contiguous, non-overlapping, exactly-covering payload (the previous file-validation checks)
         std::vector<std::pair<uint64_t, uint64_t>> ranges;
         for (const auto& e : j.obj) {
             if (e.first == "__metadata__") continue;

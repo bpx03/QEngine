@@ -39,8 +39,8 @@ inline constexpr int kLayerCount = 48;                  // language-model layers
 inline constexpr long long kNgramRowsPerShard = 2500012; // pinned QFN n-gram rows per 128-shard table
 // Upper bound for the manifest file itself: a 409-record v2 manifest is ~1 MB, 16 MiB is generous.
 inline constexpr uint64_t kMaxManifestBytes = 16ull << 20;
-// Engine-side shapes of the preserved tensors Worker::load reads in fixed-size regions (pr2/src/flash/
-// flash.h mirrors these constants; the converter preserves the upstream tensors untouched):
+// Engine-side shapes of preserved tensors read in fixed-size regions by Worker::load
+// (flash.h mirrors these constants; the converter preserves the upstream tensors untouched):
 inline constexpr int kHcLowRank = 320;              // hyper-connection low-rank width (LOWRANK)
 inline constexpr int kIndexerHeads = 4;             // indexer key heads; the projection adds one query head (IDX_NH)
 inline constexpr int kIndexerHeadDim = 128;         // indexer head dimension (IDX_HD)
@@ -75,7 +75,7 @@ inline std::string sandbox_file(const std::string& directory, const std::string&
     return joined.string();
 }
 inline bool is_file(const std::string& path) { return std::filesystem::is_regular_file(path); }
-// Sandbox symlink gate (review R2 + R3 F11): EVERY component of a sandbox-resolved manifest path below
+// Sandbox symlink gate: EVERY component of a sandbox-resolved manifest path below
 // the checkpoint root must be a non-symlink. Checking only the final component left names like
 // "sub/shard.safetensors" escapable through an intermediate directory replaced by a symlink to an
 // outside directory. Missing components pass through so the established "missing" diagnostics stay;
@@ -102,7 +102,7 @@ inline void require_no_symlink(const std::string& root, const std::string& path,
     }
 }
 inline std::string read_bounded_file(const std::string& path, uint64_t max_bytes, const std::string& context) {
-    // F09: same guarded open as the safetensors files: the type/regular check happens before a single
+    // Same guarded open as the safetensors files: the type/regular check happens before a single
     // byte is read, so a FIFO or directory at a manifest-recorded name fails cleanly instead of blocking.
     const int fd = open_regular_file(path, true);
     struct stat st;
@@ -176,7 +176,7 @@ inline long long stored_shape_last_dim(const std::string& path, const Json& entr
         offsets.arr[1].i() <= offsets.arr[0].i() || (offsets.arr[1].i()-offsets.arr[0].i()) % 8 != 0)
         fail(path,".weight_shape","I64 data offsets with a whole number of int64s","malformed companion");
     const long long count = (offsets.arr[1].i()-offsets.arr[0].i())/8;
-    // F09: guarded open (never a blocking open on a special file); the scan route is not sandbox-gated,
+    // Guarded open (never a blocking open on a special file); the scan route is not sandbox-gated,
     // so symlinks keep their legacy allowance but the regular-file check still applies via fstat.
     const int fd = open_regular_file(path,false);
     uint64_t header = 0;
@@ -188,7 +188,7 @@ inline long long stored_shape_last_dim(const std::string& path, const Json& entr
     if (got != 8) fail(path,".weight_shape","readable stored shape","truncated payload");
     return last;
 }
-// F10: safetensors files reach the loader only through SafeTensors::open_strict_validated — one guarded
+// Safetensors files reach the loader only through SafeTensors::open_strict_validated — one guarded
 // open per file, strict header parse from the mapped bytes exactly once, payload validated against
 // those same bytes and the tensor table indexed from THAT parsed object (returned for manifest
 // cross-checks). The former validate-then-reopen pair (ifstream strict parse + permissive
@@ -293,7 +293,7 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     }
     const auto mtp_name=sandbox_file(directory,text(outputs,"mtp",directory),directory+": outputs.mtp");
     if (seen.count(mtp_name)) fail(directory,"outputs","body/MTP files distinct",mtp_name);
-    // UNIFIED n-gram rule (review R2-4): a recorded self-contained outputs.ngram ALWAYS wins; a
+    // N-gram precedence: a recorded self-contained outputs.ngram ALWAYS wins; a
     // supplied override/env is then reported as IGNORED by Checkpoint::open, never followed. External
     // checkpoints (no recorded name) resolve the argument and FLASH_NGRAM_PATH identically: relative
     // values resolve against the model directory, absolute paths are allowed.
@@ -395,8 +395,8 @@ inline void validate_inventory(const std::vector<Converted>& converted, const In
     take("mtp.fc_hidden",{s.hidden,s.hidden});
     if (!actual.empty()) fail(context,actual.begin()->first,"no unexpected converted matrices","extra record");
 }
-// F02: the engine consumers read FIXED-SIZE regions straight out of the mapping for every preserved
-// tensor below (Worker::load in pr2/src/flash/flash.cu, the load_w16/load_w8/bf_dev call sites) — dtype,
+// Runtime consumers read FIXED-SIZE regions straight out of the mapping for every preserved
+// tensor below (Worker::load, the load_w16/load_w8/bf_dev call sites) — dtype,
 // shape and exact byte extent are therefore pinned at open: a mistyped or truncated tensor must fail
 // there, not overread at load. Names the text engine never reads (the preserved visual tower, extra
 // layer norms) and the mixers' absent block_inject_weight stay optional.
@@ -493,7 +493,7 @@ struct Checkpoint {
             std::sort(files.begin(),files.end());
             if (files.empty()) throw std::runtime_error(directory+": no body safetensors files");
             for (const auto& f:files) {
-                // F10: one guarded open per file; the format detector inspects the very object the
+                // One guarded open per file; the format detector inspects the very object the
                 // tensors were indexed from (strict parse of the mapped header, no second open)
                 const auto j=body.open_strict_validated(f,false);  // scan route: legacy symlink allowance
                 for(const auto& t:j.obj) if(t.first.size()>14 && t.first.compare(t.first.size()-14,14,".weight_packed")==0) {
@@ -503,7 +503,7 @@ struct Checkpoint {
                     // 4 codes per I32 (K == width*4 -> needs the manifest), INT4 packs 8 nibbles per I32
                     // (K == width*8 -> normal INT4 no-manifest route). Anything else is a broken file.
                     if(j.has(base+".weight_scale") && j.has(base+".weight_shape")) {
-                        // F07: the discriminator only makes sense for a rank>=1 I32-packed matrix with a
+                        // The discriminator only makes sense for a rank>=1 I32-packed matrix with a
                         // rank>=1 .weight_shape companion. A scalar packed entry (shape []) used to reach
                         // arr.back() on the empty shape vector (undefined behaviour); the guard rejects
                         // the degenerate trio cleanly before any file byte or dimension is inspected.
@@ -540,7 +540,7 @@ struct Checkpoint {
         }
         require_no_symlink(directory,path,path);  // the manifest itself is a sandboxed name: never a symlink
         has_manifest=true; format=WeightFormat::Int8;
-        // R2-6: an mtp_override must be a BYTE-COMPATIBLE replacement of the recorded MTP inventory:
+        // An mtp_override must be a BYTE-COMPATIBLE replacement of the recorded MTP inventory:
         // the header-vs-manifest matching below rejects a replacement with missing, extra or altered
         // tensors, so an override can relocate the file but never change what it contains.
         const auto j=parse_json(read_bounded_file(path,kMaxManifestBytes,path),path);
@@ -598,7 +598,7 @@ struct Checkpoint {
         std::vector<Json> shard_headers;
         for(const auto& shard:resolved.body) {
             require_no_symlink(directory,shard,shard);  // sandboxed manifest name: reject a substituted symlink
-            // F10: single guarded open per shard — the cap is checked against the fstat'ed size before
+            // Single guarded open per shard — the cap is checked against the fstat'ed size before
             // mapping, the header is parsed strictly once from the mapped bytes and the tensors below
             // are indexed from that same parse (no reopen, no second parse, no window in between)
             shard_headers.push_back(body.open_strict_validated(shard,true,(uint64_t)limit));

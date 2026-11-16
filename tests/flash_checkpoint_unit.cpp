@@ -6,7 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
-#include <sys/stat.h>  // F09 fixture: mkfifo
+#include <sys/stat.h>  // mkfifo fixture
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -583,7 +583,7 @@ int main() {
             const auto legacy8=temp.path/"int8-nomanifest"; fs::create_directories(legacy8);
             matrix_file(legacy8/"model.safetensors");  // packed + scale + weight_shape without a manifest
             rejects([&]{ Checkpoint ck; ck.open(legacy8.string(),false,""); });  // width*4 == stored K: INT8
-            { // R2-1: compressed-tensors INT4 stores .weight_shape too — width*8 == stored K must open as INT4
+            { // Compressed-tensors INT4 stores .weight_shape too — width*8 == stored K must open as INT4
             const auto legacy4=temp.path/"int4-shaped"; fs::create_directories(legacy4);
             int4_shaped_file(legacy4/"model-00001-of-00001.safetensors");
             { Checkpoint ck; ck.open(legacy4.string(),false,"");
@@ -591,7 +591,7 @@ int main() {
             const auto odd=temp.path/"int4-odd-shape"; fs::create_directories(odd);
             int4_shaped_file(odd/"model-00001-of-00001.safetensors",128,96);  // width 16: 64 != 96 and 128 != 96
             rejects([&]{ Checkpoint ck; ck.open(odd.string(),false,""); });  // neither x4 nor x8: clear error
-            { // F07: a scalar I32 .weight_packed (shape []) with companions used to reach arr.back() on
+            { // A scalar I32 .weight_packed (shape []) with companions used to reach arr.back() on
               // the empty shape vector (crash); it must now be refused cleanly before any dimension read
             const auto scalar8=temp.path/"int8-scalar-packed"; fs::create_directories(scalar8);
             std::string scalar_header="{\"a.weight_packed\":{\"dtype\":\"I32\",\"shape\":[],\"data_offsets\":[0,4]},"
@@ -618,7 +618,7 @@ int main() {
             require(ck.body.has("model.language_model.layers.47.mlp.experts.gate_up_proj.weight_packed"),"body shard tensor missing");
             require(ck.mtp.has("mtp.fc_embedding.weight_packed"),"MTP tensor missing");
         }
-        { // F10: one guarded open parses each safetensors header exactly once — the pre-F10 loader
+        { // One guarded open parses each safetensors header exactly once — the previous loader
           // strict-validated the bytes, then SafeTensors::open REOPENED the path and reparsed it
           // permissively: double work plus a swap/symlink window between the two opens
             const auto d=temp.path/"single-parse"; const auto fix=build_checkpoint(d,BuildOptions{});
@@ -627,7 +627,7 @@ int main() {
             require(safetensors_header_parses()-before==fix.shards.size()+2,
                     "checkpoint open did not parse each safetensors header exactly once");
         }
-        { // F02: an engine-required preserved tensor with a bad shape is refused at open — before the fix
+        { // An engine-required preserved tensor with a bad shape is refused at open — before the fix
           // this opened and Worker::load memcpy'd its fixed RW-sized region from a 2-byte tensor
             auto o=BuildOptions{}; o.hc_shrink=true; const auto d=temp.path/"hc-shrunk";
             build_checkpoint(d,o); rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
@@ -685,20 +685,20 @@ int main() {
           require(manifest_text.find("ngram_int8.safetensors")==std::string::npos,
                   "external manifest recorded an n-gram path");
         }
-        { // R2-4 UNIFIED RULE: a self-contained checkpoint IGNORES override/env, recorded wins
+        { // A self-contained checkpoint ignores override/env; the recorded path wins
             setenv("FLASH_NGRAM_PATH",(temp.path/"decoy-table.safetensors").string().c_str(),1);
             Checkpoint ck; ck.open(base.string(),true,"");
             unsetenv("FLASH_NGRAM_PATH");
             require(ck.ngram_path==(base/"ngram_int8.safetensors").string(),"a configured override must not beat outputs.ngram");
         }
-        { // R2-4: external mode resolves FLASH_NGRAM_PATH relative to the model directory, like the argument
+        { // External mode resolves FLASH_NGRAM_PATH relative to the model directory, like the argument
             const auto d=temp.path/"external-rel"; auto o=BuildOptions{}; o.external_ngram=true; const auto ext=build_checkpoint(d,o);
             setenv("FLASH_NGRAM_PATH","external-ngram.safetensors",1);
             Checkpoint ck; ck.open(d.string(),true,"");
             unsetenv("FLASH_NGRAM_PATH");
             require(ck.ngram_path==ext.external_table,"relative FLASH_NGRAM_PATH must resolve against the model directory");
         }
-        { // F05: a relative checkpoint directory: every manifest-recorded path joins with the directory
+        { // A relative checkpoint directory: every manifest-recorded path joins with the directory
           // exactly once (the config and the recorded MTP path used to be re-resolved against it again,
           // doubling the directory and rejecting every relative-path open)
             const auto save=fs::current_path();
@@ -739,7 +739,7 @@ int main() {
           fs::create_symlink("moved-mtp.safetensors",d/"model_mtp.safetensors");
           rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
         }
-        { // F09: every checkpoint file is opened through the guarded open (lstat S_ISREG, O_NOFOLLOW,
+        { // Every checkpoint file is opened through the guarded open (lstat S_ISREG, O_NOFOLLOW,
           // fstat) — a substituted directory or FIFO at a manifest-recorded name is a clean rejection;
           // the recorded MTP path used to go straight to an ifstream, which blocked forever on a FIFO.
             const auto md=temp.path/"mtp-dir"; build_checkpoint(md,BuildOptions{});
@@ -757,7 +757,7 @@ int main() {
             require(::mkfifo((ff/"model_mtp.safetensors").string().c_str(),0644)==0,"mkfifo fixture failed");
             rejects([&]{ Checkpoint ck; ck.open(ff.string(),true,""); });  // must reject, never block
         }
-        { // F11: an intermediate directory component replaced by a symlink to an OUTSIDE directory must
+        { // An intermediate directory component replaced by a symlink to an OUTSIDE directory must
           // not smuggle the shard through (the gate used to inspect only the final component); a real
           // subdirectory with the same manifest rewrite keeps working
             auto reroute=[&](const fs::path& dir,const std::string& shard){  // record "sub/<shard>" everywhere
