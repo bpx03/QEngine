@@ -669,8 +669,9 @@ weights. Selected matrices use `.weight_packed` (offset-binary INT8 codes), `.we
 and `.weight_shape` (I64). The manifest schema is `qfn-int8-v2`: it maps every tensor to its shard, records the
 source digest (and repo/revision only when actually given), and keeps the table identity plus `sha256`. With the
 opt-in `--external-ngram` the table stays outside the output and the manifest records identity only; mount it by
-setting `FLASH_NGRAM_PATH` (absolute or checkpoint-directory-relative), which overrides the recorded
-`outputs.ngram` at load time. Format selection never depends on `config.json`. Existing upstream mixed INT4/W8 checkpoints remain supported.
+setting `FLASH_NGRAM_PATH` (absolute or checkpoint-directory-relative) or an explicit override — these apply to
+external checkpoints; a checkpoint recorded as self-contained always opens its recorded `outputs.ngram`, and a
+configured override is reported as ignored. Format selection never depends on `config.json`. Existing upstream mixed INT4/W8 checkpoints remain supported.
 
 Selected matrices: routed and shared experts, DeltaNet projections, QSA q/k/v/o, PLE key/value and MTP attention,
 experts and fc_embedding/fc_hidden. Other tensors remain byte-identical. `--check <dir> [--src <bf16 dir>]`

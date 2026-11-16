@@ -14,14 +14,18 @@ The converter (`tools/quant_int8.py`) and the loader (`src/flash/checkpoint.h`) 
 - **External mode (opt-in).** Conversion with `--external-ngram` records no path at all: the manifest keeps the
   table identity (`width_bytes=162`, `shards=128`, `size_bytes`, `rows_per_shard`, layout, keys) plus a `sha256`
   re-verified by `--check`. At runtime the external table comes from `FLASH_NGRAM_PATH` (absolute or
-  checkpoint-directory-relative; takes precedence over `outputs.ngram`); `--check` uses `--external-ngram PATH`
-  or `QENGINE_INT8_NGRAM_PATH`.
-- **Source digest.** `source.index_sha256` always records the source (index-file bytes, else a digest over sorted
-  `(filename, size)`); `source.repo`/`revision` exist only when `--source-repo/--source-revision` were given.
-  An unlisted source is never a rejection.
+  checkpoint-directory-relative) or an explicit override; the argument and the environment variable resolve
+  identically. Checkpoints recorded as self-contained always open their recorded `outputs.ngram` — a configured
+  override is reported as ignored, never followed; `--check` uses `--external-ngram PATH` or `QENGINE_INT8_NGRAM_PATH`.
+- **Source digest.** `source.index_sha256` is a traceability record of the source (index-file bytes, else a digest
+  over sorted `(filename, size)`); integrity comes from `--check --src`, not from the digest. `source.repo`/
+  `revision` exist only when `--source-repo/--source-revision` were given. An unlisted source is never a rejection.
 - **Hardening.** All manifest paths are sandboxed relative paths; `config.json` is size- and type-gated before
   parsing; the manifest is parsed with a strict JSON grammar; NaN/Inf in any source matrix aborts conversion.
-  INT8 detection is by `.weight_shape` presence. Format selection never depends on `config.json`.
+  INT8 vs INT4 detection is by stored logical shape against the packed width (`width*4==K` INT8, `width*8==K`
+  INT4), not by `.weight_shape` presence alone — compressed-tensors INT4 carries the same companion. An
+  `mtp_override` must be a byte-compatible replacement of the recorded MTP inventory: the header-vs-manifest match
+  rejects extra, missing or altered tensors. Format selection never depends on `config.json`.
 
 ## Prefill tail-ownership review (2026-11-08)
 
