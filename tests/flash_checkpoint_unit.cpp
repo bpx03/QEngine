@@ -479,13 +479,14 @@ int main() {
         {
             const auto short_file=temp.path/"short.safetensors";
             { std::ofstream out(short_file,std::ios::binary); out<<"tiny"; }
-            rejects([&] { validate_file(short_file.string(),false); });
+            auto strict_open=[&](const std::string& p){ SafeTensors st; st.open_strict_validated(p,false); };
+            rejects([&] { strict_open(short_file.string()); });
             const auto long_header=temp.path/"long-header.safetensors";
             { std::ofstream out(long_header,std::ios::binary); uint64_t length=4096; out.write(reinterpret_cast<const char*>(&length),8); out<<"{}"; }
-            rejects([&] { validate_file(long_header.string(),false); });
+            rejects([&] { strict_open(long_header.string()); });
             const auto truncated=temp.path/"truncated.safetensors";
             matrix_file(truncated); fs::resize_file(truncated,fs::file_size(truncated)-1);
-            rejects([&] { validate_file(truncated.string(),false); });
+            rejects([&] { strict_open(truncated.string()); });
             const auto dup_key=temp.path/"dup-key.safetensors";
             { // strict header parsing: a duplicate key cannot smuggle a second tensor past the inventory
               std::string header="{\"a.weight_packed\":{\"dtype\":\"I32\",\"shape\":[16,32],\"data_offsets\":[0,2048]},"
@@ -495,7 +496,7 @@ int main() {
               out.write(reinterpret_cast<const char*>(&length),8); out.write(header.data(),header.size());
               std::vector<char> payload(2048,0); out.write(payload.data(),payload.size());
             }
-            rejects([&] { validate_file(dup_key.string(),false); });
+            rejects([&] { strict_open(dup_key.string()); });
         }
         auto records=inventory();
         const InventorySpec spec{48,512,2560,640,24,256,2,16,128,48,128,640,4,1};
@@ -564,6 +565,15 @@ int main() {
             require(ck.ngram.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_127"),"ngram table not opened");
             require(ck.body.has("model.language_model.layers.47.mlp.experts.gate_up_proj.weight_packed"),"body shard tensor missing");
             require(ck.mtp.has("mtp.fc_embedding.weight_packed"),"MTP tensor missing");
+        }
+        { // F10: one guarded open parses each safetensors header exactly once — the pre-F10 loader
+          // strict-validated the bytes, then SafeTensors::open REOPENED the path and reparsed it
+          // permissively: double work plus a swap/symlink window between the two opens
+            const auto d=temp.path/"single-parse"; const auto fix=build_checkpoint(d,BuildOptions{});
+            const auto before=safetensors_header_parses();
+            Checkpoint ck; ck.open(d.string(),true,"");
+            require(safetensors_header_parses()-before==fix.shards.size()+2,
+                    "checkpoint open did not parse each safetensors header exactly once");
         }
         { auto o=BuildOptions{}; o.source_identity=true; const auto d=temp.path/"source-id";
           build_checkpoint(d,o); open_checkpoint(d,o); }
