@@ -4,9 +4,10 @@
 The 27B route preserves the pinned upstream converter: symmetric INT8, group 128, with BF16 MTP passthrough.
 The QFN route converts the explicitly selected attention, shared-expert, fused-expert, PLE, and MTP matrices;
 all other source tensors are preserved. Its 128 n-gram tables are excluded from the body; by default the
-existing INT8 table is materialized INSIDE the output (hard link, full copy fallback) so the checkpoint is
-self-contained. --external-ngram keeps it outside: the manifest then records only table identity plus a
-sha256 digest, and --check takes the table path via --external-ngram PATH or QENGINE_INT8_NGRAM_PATH.
+existing INT8 table is materialized INSIDE the output as an independent full copy (--link-ngram hard links
+it instead) so the checkpoint is self-contained. --external-ngram keeps it outside: the manifest then
+records only table identity plus a sha256 digest, and --check takes the table path via --external-ngram
+PATH or QENGINE_INT8_NGRAM_PATH.
 The QFN body is written as shards (model-00001-of-000NN.safetensors, each <= --max-shard-bytes, default
 20 GiB, grouped per transformer layer; PLE/n-gram-adjacent tensors go to the final shard); every manifest
 tensor names its shard. The manifest records a sha256 digest of the source index (or of the sorted source
@@ -42,6 +43,7 @@ import os
 import filecmp
 import re
 import shutil
+import stat
 import struct
 import sys
 import time
@@ -186,7 +188,15 @@ def quant_int8(w, search=0, dev="cpu", name="tensor"):
 
     def q_err(ratio):
         s = (amax * ratio / 127.0).to(torch.bfloat16).float()
-        s = torch.where(s > 0, s, torch.ones_like(s))
+        # A positive absmax whose BF16 scale underflows to zero is NOT a zero group: floor such
+        # scales at the smallest positive BF16, 2**-133 (bit pattern 0x0001, subnormal; the
+        # smallest POSITIVE NORMAL 2**-126 = 0x0080 would still round tiny groups to code 0), so
+        # they keep a nonzero code instead of collapsing silently to all-zero. The recipe's
+        # scale-1 fallback stays reserved for true-zero groups (manifest recipe string unchanged).
+        # Any future C++ RTN mirror of this converter must reuse the 0x0001 floor bit-for-bit to
+        # stay bit-compatible with checkpoints produced here.
+        s = torch.where(s > 0, s,
+                        torch.where(amax > 0, torch.full_like(s, 2.0 ** -133), torch.ones_like(s)))
         q = torch.round(wf / s).clamp_(-127, 127)
         return q, s, ((q * s - wf) ** 2).sum(-1, keepdim=True)
 
@@ -363,24 +373,35 @@ def validate_ngram_file(path, full_model, expected_rows=None):
             "keys": [prefix + str(i) for i in range(128)]}
 
 
-def materialize_ngram(table_path, out):
-    """Self-contained default: place the table next to the weights. Hard link when the filesystem
-    allows it (zero-copy), full byte-identical copy across filesystems (shortcut: if the source is
-    later removed, the checkpoint keeps its own copy — that is the point)."""
+def materialize_ngram(table_path, out, link=False):
+    """Self-contained default: place the table next to the weights as an independent, byte-identical
+    copy. A hard link would share the file with the source table, so a later write through the
+    source name would mutate the DEPLOYED checkpoint; copying is therefore the default and
+    --link-ngram opts back into the zero-copy hard link (falling back to a full copy across
+    filesystems, where the shortcut is impossible)."""
     dst = os.path.join(out, NGRAM_OUT_NAME)
     if os.path.lexists(dst):
         os.remove(dst)
-    try:
-        os.link(table_path, dst)
-        return dst
-    except OSError:
-        pass
+    if link:
+        try:
+            os.link(table_path, dst)
+            return dst
+        except OSError:
+            pass  # different filesystems: the hard link is impossible, copy below
+    total = os.path.getsize(table_path)
     # copy across filesystems lands on <name>.part first: os.replace publishes the table atomically
     # once all bytes are written, so an interrupted 52 GiB copy can never leave a half-written table
     # under the final name; a .part that remains in an output dir is itself a --check rejection
     part = dst + ".part"
+    log(f"n-gram: copying {total} bytes to {dst} (--link-ngram hard links instead)")
+    t0 = time.time()
     try:
-        shutil.copy2(table_path, part)
+        with open(table_path, "rb") as fin, open(part, "wb") as fout:
+            done = 0
+            while chunk := fin.read(1 << 30):
+                fout.write(chunk)
+                done += len(chunk)
+                log(f"n-gram: {done / (1 << 30):.1f}/{total / (1 << 30):.1f} GiB copied")
         os.replace(part, dst)
     except BaseException:
         try:
@@ -388,6 +409,7 @@ def materialize_ngram(table_path, out):
         except OSError:
             pass
         raise
+    log(f"n-gram: copied {total} bytes in {time.time() - t0:.0f}s")
     return dst
 
 
@@ -413,13 +435,23 @@ def strict_json_object(pairs):
     return dict(pairs)
 
 
-def sandbox_regular_file(path):
+def sandbox_regular_file(path, root):
     """Symlink gate for sandboxed checkpoint paths, mirroring require_no_symlink in
-    src/flash/checkpoint.h: a manifest-named file replaced by a symlink is rejected, never followed.
-    Operator-supplied absolute inputs (--external-ngram / QENGINE_INT8_NGRAM_PATH) keep their
-    documented allowance and are not gated."""
-    if os.path.islink(path):
-        raise ValueError(f"{path}: symbolic link rejected inside the sandbox (must be a regular file)")
+    src/flash/checkpoint.h: lstat EVERY component from the checkpoint root downward, so neither a
+    manifest-named file nor an intermediate directory may be a symlink; any symlink component is
+    rejected, never followed (a symlinked directory would otherwise smuggle outside files into the
+    sandbox while the final component looks like a regular file). Operator-supplied absolute inputs
+    (--external-ngram / QENGINE_INT8_NGRAM_PATH) keep their documented allowance and are not gated.
+    Missing components end the walk; callers report missing files with their own message."""
+    walk = os.path.abspath(root)
+    for part in os.path.relpath(os.path.abspath(path), walk).split(os.sep):
+        walk = os.path.join(walk, part)
+        try:
+            mode = os.lstat(walk).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"{walk}: symbolic link rejected inside the sandbox (must be a regular file)")
 
 
 def configured_dims(text, names):
@@ -622,6 +654,17 @@ def plan_shards(plan, max_bytes):
         cur_bytes += gbytes
     if deferred:
         dbytes = sum(e[3] for e in deferred)
+        # the deferred set rides the final shard as one block: the cap applies to it like to any
+        # shard, so an oversized entry (or an oversized set) is refused at plan time instead of
+        # emitting a shard both readers reject
+        if dbytes > limit:
+            over = [e for e in deferred if e[3] > limit]
+            if over:
+                raise ValueError(f"tensor {over[0][0]} serializes to {over[0][3]} bytes, which exceeds "
+                                 f"--max-shard-bytes {max_bytes}; a single tensor must fit one shard")
+            raise ValueError(f"deferred PLE/n-gram-adjacent tensors together need {dbytes} bytes, which "
+                             f"exceeds --max-shard-bytes {max_bytes}; they share the final shard and "
+                             f"are never split across shards")
         if cur and cur_bytes + dbytes > limit:
             shards.append(cur)
             cur = []
@@ -782,7 +825,7 @@ def cmd_make_qfn(a, cfg):
             shutil.copy2(path, os.path.join(a.out, name))
 
     if a.external_ngram is None:
-        materialize_ngram(a.ngram_from, a.out)
+        materialize_ngram(a.ngram_from, a.out, link=a.link_ngram)
     else:
         log(f"external n-gram: table stays at {os.path.abspath(a.ngram_from)}; manifest records identity only")
     ngram["sha256"] = sha256_file(a.ngram_from)
@@ -1066,7 +1109,7 @@ def check_qfn(a, manifest_path, manifest):
     outputs_by_file = {}
     for filename in body + [outputs["mtp"]]:
         path = os.path.join(a.check, filename)
-        sandbox_regular_file(path)
+        sandbox_regular_file(path, a.check)
         if not os.path.isfile(path):
             raise ValueError(f"{path}: missing output file")
         if os.path.getsize(path) > min(limit, MAX_SHARD_BYTES):
@@ -1089,7 +1132,7 @@ def check_qfn(a, manifest_path, manifest):
         if a.external_ngram is not None:
             raise ValueError("checkpoint is self-contained; --external-ngram is not applicable")
         table_path = os.path.join(a.check, outputs["ngram"])
-        sandbox_regular_file(table_path)
+        sandbox_regular_file(table_path, a.check)
         if not os.path.isfile(table_path):
             raise ValueError(f"{table_path}: self-contained n-gram table is missing next to the weights")
     else:
@@ -1108,13 +1151,34 @@ def check_qfn(a, manifest_path, manifest):
     if actual_digest != identity["sha256"]:
         raise ValueError(f"n-gram table sha256 {actual_digest} differs from the manifest {identity['sha256']}")
 
-    sandbox_regular_file(os.path.join(a.check, str(outputs["config"])))
+    sandbox_regular_file(os.path.join(a.check, str(outputs["config"])), a.check)
     cfg_out = model_config(a.check)
     if family(cfg_out) != "qwen4_exp":
         raise ValueError("output config family differs from the manifest")
     for name in ("generation_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
         if not os.path.isfile(os.path.join(a.check, name)):
             raise ValueError(f"required asset missing from output: {name}")
+
+    # converted outputs must carry the exact packed/scale/shape dtype+shape the record implies; this
+    # contract is source-independent, so the structural check (without --src) verifies it too
+    manifest_tensors = manifest.get("tensors", {})
+    records_by_output = {}
+    for record in manifest_tensors.get("converted", []):
+        logical, recorded = record.get("shape"), record.get("outputs") or {}
+        if (not isinstance(logical, list) or not logical or
+                not all(isinstance(dim, int) and dim > 0 for dim in logical) or
+                not all(isinstance(recorded.get(k), str) for k in ("packed", "scale", "shape"))):
+            raise ValueError(f"converted record for {record.get('source_key')!r} carries no usable "
+                             "shape/outputs to verify the tensor headers against")
+        records_by_output[recorded["packed"]] = ("I32", logical[:-1] + [logical[-1] // 4])
+        records_by_output[recorded["scale"]] = ("BF16", logical[:-1] + [logical[-1] // 128])
+        records_by_output[recorded["shape"]] = ("I64", [len(logical)])
+    for name, (dtype, shape) in records_by_output.items():
+        if name not in mapping:
+            raise ValueError(f"{name}: a converted output mapped to no shard")
+        actual_shape, actual_dtype = tensor_info(outputs_by_file[mapping[name]], name)
+        if actual_dtype != dtype or list(actual_shape) != list(shape):
+            raise ValueError(f"{name}: header {actual_dtype} {list(actual_shape)}, expected {dtype} {list(shape)}")
 
     if not a.src:
         log(f"QFN structural check passed: {len(body)} body shards, "
@@ -1138,7 +1202,6 @@ def check_qfn(a, manifest_path, manifest):
         raise ValueError(f"pinned QFN requires {NGRAM_ROWS_PER_SHARD} n-gram rows")
     src = Src(a.src)
     dims, source_keys, table_names, descriptors, headers, full_model = inspect_qfn_source(src, src_cfg)
-    manifest_tensors = manifest.get("tensors", {})
     converted_records = {d.get("source_key"): d for d in manifest_tensors.get("converted", [])}
     expected_converted = {d["source"] for d in descriptors}
     targets = sorted({d["base"] for d in descriptors})
@@ -1166,17 +1229,6 @@ def check_qfn(a, manifest_path, manifest):
     if (outputs["mtp"], outputs["config"], outputs["manifest"]) != (
             "model_mtp.safetensors", "config.json", "qfn-int8-manifest.json"):
         raise ValueError("manifest output file inventory differs")
-    # converted outputs must carry the exact packed/scale/shape dtype+shape the record implies
-    records_by_output = {}
-    for record in manifest_tensors.get("converted", []):
-        logical = record["shape"]
-        records_by_output[record["outputs"]["packed"]] = ("I32", logical[:-1] + [logical[-1] // 4])
-        records_by_output[record["outputs"]["scale"]] = ("BF16", logical[:-1] + [logical[-1] // 128])
-        records_by_output[record["outputs"]["shape"]] = ("I64", [len(logical)])
-    for name, (dtype, shape) in records_by_output.items():
-        actual_shape, actual_dtype = tensor_info(outputs_by_file[mapping[name]], name)
-        if actual_dtype != dtype or list(actual_shape) != list(shape):
-            raise ValueError(f"{name}: header {actual_dtype} {list(actual_shape)}, expected {dtype} {list(shape)}")
     report = {}
     for desc in descriptors:
         source_name, base = desc["source"], desc["base"]
@@ -1244,7 +1296,7 @@ def cmd_check(a):
     if os.path.isfile(manifest_path) and a.kv_from not in (None, ""):
         raise ValueError("QFN check does not accept --kv-from")
     if os.path.isfile(manifest_path):
-        sandbox_regular_file(manifest_path)
+        sandbox_regular_file(manifest_path, a.check)
         with open(manifest_path) as f:
             manifest = json.load(f, object_pairs_hook=strict_json_object)
         return check_qfn(a, manifest_path, manifest)
@@ -1282,6 +1334,10 @@ def main():
     ap.add_argument("--external-ngram", nargs="?", const="", default=None, metavar="PATH",
                     help="conversion: record table identity only, keep it outside the output; "
                          "--check: external table path (or set QENGINE_INT8_NGRAM_PATH)")
+    ap.add_argument("--link-ngram", action="store_true",
+                    help="self-contained conversion: hard link the n-gram table into the output "
+                         "instead of the default independent copy (zero-copy, but a later write "
+                         "through the source table path would mutate the deployed checkpoint)")
     ap.add_argument("--source-repo", default=None, help="record the ACTUAL source repository in the manifest")
     ap.add_argument("--source-revision", default=None, help="record the ACTUAL source revision in the manifest")
     ap.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES,

@@ -48,7 +48,7 @@ def cli(*args, ok=True, env=None):
 
 
 def make_args(**kw):
-    base = dict(src=None, out="", kv_from="", ngram_from=None, external_ngram=None,
+    base = dict(src=None, out="", kv_from="", ngram_from=None, external_ngram=None, link_ngram=False,
                 source_repo=None, source_revision=None, max_shard_bytes=quant.MAX_SHARD_BYTES,
                 search=0, dev="cpu", check="", n=8)
     base.update(kw)
@@ -257,6 +257,27 @@ def test_quantization_invariant():
     expect_error(lambda: quant.quant_int8(torch.tensor([[float("inf")] + [0.0] * 127] * 2,
                                                        dtype=torch.bfloat16), name="x.mlp.weight"),
                  contains="x.mlp.weight")
+
+
+def test_subnormal_scale_floor():
+    # a group whose absmax is positive but whose absmax/127 underflows BF16 to 0 must keep nonzero
+    # codes (the scale is floored at the smallest positive BF16, 2**-133); only true-zero groups
+    # take the recipe's scale-1 fallback
+    tiny = torch.full((1, 128), 2.0 ** -133, dtype=torch.bfloat16)
+    assert tiny.view(torch.uint16).reshape(-1)[0].item() == 0x0001  # smallest positive BF16 (subnormal)
+    assert (tiny.float() / 127.0).to(torch.bfloat16).float().abs().max().item() == 0.0  # scale underflows
+    q, s = quant.quant_int8(tiny)
+    assert float(s.reshape(-1)[0]) == 2.0 ** -133
+    assert q.reshape(-1).min().item() == 1 and q.reshape(-1).max().item() == 1  # constant group -> code 1
+    zero = torch.zeros((1, 256), dtype=torch.bfloat16)
+    q0, s0 = quant.quant_int8(zero)
+    assert torch.equal(s0, torch.ones((1, 2), dtype=torch.bfloat16))  # true-zero group: recipe scale 1, unchanged
+    assert q0.abs().max().item() == 0
+    mixed = torch.zeros((2, 128), dtype=torch.bfloat16)
+    mixed[0] = tiny[0]
+    qm, sm = quant.quant_int8(mixed)
+    assert qm[0].abs().min().item() == 1 and qm[1].abs().max().item() == 0
+    assert float(sm[0]) == 2.0 ** -133 and float(sm[1]) == 1.0
 
 
 def test_rank3_and_bounded_writer():
@@ -482,6 +503,24 @@ def test_external_ngram_identity_and_check():
             "--kv-from", "", "--external-ngram", ngram, ok=False)
 
 
+def test_ngram_copied_by_default_hardlinked_on_request():
+    # self-contained packaging defaults to an independent copy: a hard link would let a later write
+    # through the source table name mutate the deployed checkpoint, so the shortcut is opt-in
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "copied")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        table = os.path.join(out, "ngram_int8.safetensors")
+        assert os.stat(table).st_nlink == 1, "default packaging must copy the table, not share it"
+        assert quant.sha256_file(table) == quant.sha256_file(ngram)
+        assert os.stat(ngram).st_nlink == 1, "conversion must not link the source table itself"
+        cli("--check", out)
+        linked = os.path.join(temp, "linked")
+        cli("--src", src, "--out", linked, "--ngram-from", ngram, "--kv-from", "", "--link-ngram")
+        assert os.stat(os.path.join(linked, "ngram_int8.safetensors")).st_nlink == 2, "--link-ngram must hard link"
+        cli("--check", linked)
+
+
 def test_sandbox_relative_rejects():
     for bad in ("", "/abs/x.safetensors", "../x", "a/../../x", "C:/evil.safetensors",
                 "c:\\evil.safetensors", "\\\\server\\share\\x", "~x", "x\0y"):
@@ -572,6 +611,47 @@ def read_safetensors_header(path):
         length = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(length))
     return header, length
+
+
+def rewrite_safetensors_dtype(path, name, new_dtype):
+    """Byte-preserving header rewrite: only the dtype tag changes, payload and offsets stay intact."""
+    with open(path, "rb") as f:
+        length = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(length))
+        payload = f.read()
+    header[name]["dtype"] = new_dtype
+    blob = json.dumps(header, separators=(",", ":")).encode()
+    blob += b" " * (-len(blob) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)) + blob + payload)
+
+
+def test_structural_check_verifies_converted_tensor_contracts():
+    # the structural --check (no --src) must verify converted tensors' header dtype/shape against
+    # the manifest records: a lying header or a lying record fails even without the source
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "contract")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        cli("--check", out)  # the untouched fixture passes the strict structural check
+        manifest, mapping = output_mapping(out)
+        record = manifest["tensors"]["converted"][0]
+        packed = record["outputs"]["packed"]
+        shard = os.path.join(out, mapping[packed])
+        rewrite_safetensors_dtype(shard, packed, "F32")  # same payload length, corrupted header dtype
+        result = cli("--check", out, ok=False)
+        assert f"{packed}: header F32" in result.stdout + result.stderr, result.stdout + result.stderr
+        rewrite_safetensors_dtype(shard, packed, "I32")
+        cli("--check", out)  # the restored header passes again
+        # a manifest record lying about the logical shape fails the same source-independent check
+        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+            manifest = json.load(f)
+        record = manifest["tensors"]["converted"][0]
+        record["shape"] = [record["shape"][0], record["shape"][1] * 128]
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(manifest, f)
+        result = cli("--check", out, ok=False)
+        assert "expected I32" in result.stdout + result.stderr, result.stdout + result.stderr
 
 
 def test_byte_layout_against_manifest():
@@ -856,6 +936,27 @@ def test_plan_shards_rejects_tensor_larger_than_cap():
         raise AssertionError("plan_shards accepted a tensor larger than the shard cap")
 
 
+def test_plan_shards_rejects_oversized_deferred_tensors():
+    # the deferred PLE/n-gram-adjacent set rides the final shard as one block: an entry over the cap
+    # must be refused naming the tensor, and so must a deferred set whose total exceeds the cap
+    oversize = [("model.language_model.layers.1.ple.ple_embedding.huge.weight", None, None, 200000)]
+    try:
+        quant.plan_shards(oversize, 100000)
+    except ValueError as error:
+        assert "ple_embedding.huge.weight" in str(error), str(error)
+        assert "--max-shard-bytes" in str(error), str(error)
+    else:
+        raise AssertionError("plan_shards deferred a tensor larger than the shard cap")
+    together = [("model.language_model.layers.1.ple.ple_embedding.a.weight", None, None, 60000),
+                ("model.language_model.layers.1.ple.ple_embedding.b.weight", None, None, 60000)]
+    try:  # each entry fits; the shared final shard would not
+        quant.plan_shards(together, 100000)
+    except ValueError as error:
+        assert "final shard" in str(error) and "--max-shard-bytes" in str(error), str(error)
+    else:
+        raise AssertionError("plan_shards deferred a set larger than the shard cap")
+
+
 def test_duplicate_key_manifest_rejected():
     # the C++ loader parses the manifest strictly (Json::parse_strict rejects duplicate keys);
     # --check must refuse the same file instead of letting json.load silently keep one value
@@ -901,6 +1002,44 @@ def test_symlinked_manifest_files_rejected():
         cli("--check", out)  # the restored checkpoint passes again
 
 
+def test_intermediate_symlink_escape_rejected():
+    # the gate lstats every component below the checkpoint root: a manifest-named path that runs
+    # through a symlinked directory must be rejected even though the final component is a regular
+    # file (without the per-component walk it would smuggle files from outside the sandbox in)
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp, sharded=True)
+        out = os.path.join(temp, "escaping")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", "--max-shard-bytes", 1068000)
+        manifest, _ = output_mapping(out)
+        victim = manifest["outputs"]["body"][0]
+        moved = f"sub/{victim}"
+        outside = os.path.join(temp, "outside")
+        os.makedirs(outside)
+        os.rename(os.path.join(out, victim), os.path.join(outside, victim))
+        os.symlink(outside, os.path.join(out, "sub"))
+
+        def relocate(obj, old, new):  # every manifest reference to the shard goes through "sub"
+            if isinstance(obj, str):
+                return new if obj == old else obj
+            if isinstance(obj, dict):
+                return {key: relocate(value, old, new) for key, value in obj.items()}
+            if isinstance(obj, list):
+                return [relocate(value, old, new) for value in obj]
+            return obj
+
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(relocate(manifest, victim, moved), f)
+        result = cli("--check", out, ok=False)
+        assert "symbolic link rejected" in result.stdout + result.stderr, result.stdout + result.stderr
+        os.unlink(os.path.join(out, "sub"))
+        os.rename(os.path.join(outside, victim), os.path.join(out, victim))
+        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+            manifest = json.load(f)
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(relocate(manifest, moved, victim), f)
+        cli("--check", out)  # the restored checkpoint passes again
+
+
 def test_empty_shard_rejected():
     # the C++ reader fails a shard that maps zero tensors; --check must not pass one
     with tempfile.TemporaryDirectory() as temp:
@@ -936,10 +1075,12 @@ def main():
     test_config_derived_qfn_projection_shapes()
     test_hand_computed_group()
     test_quantization_invariant()
+    test_subnormal_scale_floor()
     test_rank3_and_bounded_writer()
     test_qfn_self_converted_sharded_and_single_file()
     test_sharding_bounds_and_naming()
     test_external_ngram_identity_and_check()
+    test_ngram_copied_by_default_hardlinked_on_request()
     test_sandbox_relative_rejects()
     test_source_digest_and_honest_identity()
     test_legacy_manifest_clean_break()
@@ -950,9 +1091,12 @@ def main():
     test_constants_cannot_drift_from_checkpoint_h()
     test_manifest_runtime_flag_contract()
     test_plan_shards_rejects_tensor_larger_than_cap()
+    test_plan_shards_rejects_oversized_deferred_tensors()
     test_duplicate_key_manifest_rejected()
     test_symlinked_manifest_files_rejected()
+    test_intermediate_symlink_escape_rejected()
     test_empty_shard_rejected()
+    test_structural_check_verifies_converted_tensor_contracts()
     print("test_quant_int8: ALL PASS")
 
 
