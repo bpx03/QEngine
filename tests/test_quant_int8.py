@@ -259,6 +259,27 @@ def test_quantization_invariant():
                  contains="x.mlp.weight")
 
 
+def test_subnormal_scale_floor():
+    # a group whose absmax is positive but whose absmax/127 underflows BF16 to 0 must keep nonzero
+    # codes (the scale is floored at the smallest positive BF16, 2**-133); only true-zero groups
+    # take the recipe's scale-1 fallback
+    tiny = torch.full((1, 128), 2.0 ** -133, dtype=torch.bfloat16)
+    assert tiny.view(torch.uint16).reshape(-1)[0].item() == 0x0001  # smallest positive BF16 (subnormal)
+    assert (tiny.float() / 127.0).to(torch.bfloat16).float().abs().max().item() == 0.0  # scale underflows
+    q, s = quant.quant_int8(tiny)
+    assert float(s.reshape(-1)[0]) == 2.0 ** -133
+    assert q.reshape(-1).min().item() == 1 and q.reshape(-1).max().item() == 1  # constant group -> code 1
+    zero = torch.zeros((1, 256), dtype=torch.bfloat16)
+    q0, s0 = quant.quant_int8(zero)
+    assert torch.equal(s0, torch.ones((1, 2), dtype=torch.bfloat16))  # true-zero group: recipe scale 1, unchanged
+    assert q0.abs().max().item() == 0
+    mixed = torch.zeros((2, 128), dtype=torch.bfloat16)
+    mixed[0] = tiny[0]
+    qm, sm = quant.quant_int8(mixed)
+    assert qm[0].abs().min().item() == 1 and qm[1].abs().max().item() == 0
+    assert float(sm[0]) == 2.0 ** -133 and float(sm[1]) == 1.0
+
+
 def test_rank3_and_bounded_writer():
     for shape in ((3, 4, 256), (3, 5, 128), (1, 1, 128)):
         w = rand_bf16(shape, sum(shape))
@@ -998,6 +1019,7 @@ def main():
     test_config_derived_qfn_projection_shapes()
     test_hand_computed_group()
     test_quantization_invariant()
+    test_subnormal_scale_floor()
     test_rank3_and_bounded_writer()
     test_qfn_self_converted_sharded_and_single_file()
     test_sharding_bounds_and_naming()

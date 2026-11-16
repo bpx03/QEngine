@@ -186,7 +186,15 @@ def quant_int8(w, search=0, dev="cpu", name="tensor"):
 
     def q_err(ratio):
         s = (amax * ratio / 127.0).to(torch.bfloat16).float()
-        s = torch.where(s > 0, s, torch.ones_like(s))
+        # A positive absmax whose BF16 scale underflows to zero is NOT a zero group: floor such
+        # scales at the smallest positive BF16, 2**-133 (bit pattern 0x0001, subnormal; the
+        # smallest POSITIVE NORMAL 2**-126 = 0x0080 would still round tiny groups to code 0), so
+        # they keep a nonzero code instead of collapsing silently to all-zero. The recipe's
+        # scale-1 fallback stays reserved for true-zero groups (manifest recipe string unchanged).
+        # Any future C++ RTN mirror of this converter must reuse the 0x0001 floor bit-for-bit to
+        # stay bit-compatible with checkpoints produced here.
+        s = torch.where(s > 0, s,
+                        torch.where(amax > 0, torch.full_like(s, 2.0 ** -133), torch.ones_like(s)))
         q = torch.round(wf / s).clamp_(-127, 127)
         return q, s, ((q * s - wf) ** 2).sum(-1, keepdim=True)
 
