@@ -136,3 +136,8 @@ foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_o
   endif()
 endforeach()
 
+option(QE_BUILD_FLASH_INT8_TESTS "Build Flash INT8 unit tests" OFF)
+if(QE_BUILD_FLASH_INT8_TESTS)
+  add_executable(flash_checkpoint_unit tests/flash_checkpoint_unit.cpp src/safetensors.cpp)
+  target_include_directories(flash_checkpoint_unit PRIVATE src)
+endif()

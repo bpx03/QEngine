@@ -1,0 +1,20 @@
+# the tree is built inside Linux containers: keep LF everywhere
+# text=auto: normalize to LF in the index, check out as-is
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.so binary
+*.o binary
+*.a binary
+*.bin binary
+*.gguf binary
+*.safetensors binary
+*.pyc binary
+*.nsys-rep binary
+*.ncu-rep binary
+*.sqlite binary
