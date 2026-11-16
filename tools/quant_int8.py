@@ -868,9 +868,9 @@ def cmd_make_qfn(a, cfg):
         "shard_limit_bytes": a.max_shard_bytes,
         "tensors": {"converted": converted, "preserved": preserved, "excluded": excluded},
         "ngram": ngram,
-        "runtime_supported": True,
-        "runtime_support_reason": ("executed by the flash INT8 W8 runtime on branches split/int8-runtime+; "
-                                   "upstream release pending")
+        "runtime_supported": False,
+        "runtime_support_reason": ("no runtime in this repository executes INT8 W8 checkpoints yet; "
+                                   "the runtime is proposed separately")
     }
     with open(os.path.join(a.out, "qfn-int8-manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
