@@ -352,7 +352,7 @@ static CheckpointFixture build_checkpoint(const fs::path& dir,const BuildOptions
             +",\"rows_per_shard\":"+std::to_string(rows)+",\"width_bytes\":162,\"shards\":128,"
             "\"layout\":\"U8 [rows,162]: 160 signed INT8 values then one FP16 scale\",\"keys\":["+keys+"]"
             +(o.ngram_no_sha?"" : ",\"sha256\":\""+std::string(64,'a')+"\"")+",\"equivalence_verified\":false},"
-            "\"runtime_supported\":false,\"runtime_support_reason\":\"fixture\"}";
+            "\"runtime_supported\":true,\"runtime_support_reason\":\"fixture\"}";
         std::ofstream out(dir/"qfn-int8-manifest.json"); out<<manifest;
     }
     if(o.drop_shard) fs::remove(dir/fixture.shards[0]);
@@ -384,7 +384,7 @@ int main() {
         validate_recipe(recipe,"fixture");
         for(const char* bad : {R"({"format":"symmetric INT4","group_size":128,"scale_dtype":"BF16","zero_point":0})",R"({"format":"symmetric INT8","group_size":64,"scale_dtype":"BF16","zero_point":0})",R"({"format":"symmetric INT8","group_size":128,"scale_dtype":"F16","zero_point":0})",R"({"format":"symmetric INT8","group_size":128,"scale_dtype":"BF16","zero_point":128})"})
             rejects([&] { validate_recipe(Json::parse(bad),"fixture"); });
-        Json manifest=Json::parse(R"({"schema":"qfn-int8-v2","format_version":1,"family":"qwen4_exp","outputs":{"body":["model-00001-of-00001.safetensors"],"mtp":"model_mtp.safetensors","config":"config.json"},"runtime_supported":false,"equivalence_verified":false})");
+        Json manifest=Json::parse(R"({"schema":"qfn-int8-v2","format_version":1,"family":"qwen4_exp","outputs":{"body":["model-00001-of-00001.safetensors"],"mtp":"model_mtp.safetensors","config":"config.json"},"runtime_supported":true,"equivalence_verified":false})");
         manifest.obj["recipe"]=recipe;
         validate_manifest_top(manifest,"historical metadata");
         { auto legacy=manifest; legacy.obj.erase("schema"); rejects([&]{ validate_manifest_top(legacy,"legacy"); }); }
@@ -580,6 +580,28 @@ int main() {
         { // manifest present but not a regular file
             const auto d=temp.path/"manifest-dir"; fs::create_directories(d/"qfn-int8-manifest.json");
             rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+        }
+        { // sandbox symlink gate: a manifest-named regular file replaced by a symlink is rejected,
+          // never followed (otherwise the lexical sandbox would be escapable with one ln -s)
+            const auto d=temp.path/"symlink-shard"; const auto fixture=build_checkpoint(d,BuildOptions{});
+            fs::rename(d/fixture.shards[0],d/"moved-shard.safetensors");
+            fs::create_symlink("moved-shard.safetensors",d/fixture.shards[0]);
+            rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+        }
+        { const auto d=temp.path/"symlink-ngram"; build_checkpoint(d,BuildOptions{});
+          fs::rename(d/"ngram_int8.safetensors",d/"moved-table.safetensors");
+          fs::create_symlink("moved-table.safetensors",d/"ngram_int8.safetensors");
+          rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+        }
+        { const auto d=temp.path/"symlink-manifest"; build_checkpoint(d,BuildOptions{});
+          fs::rename(d/"qfn-int8-manifest.json",d/"moved-manifest.json");
+          fs::create_symlink("moved-manifest.json",d/"qfn-int8-manifest.json");
+          rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+        }
+        { const auto d=temp.path/"symlink-mtp"; build_checkpoint(d,BuildOptions{});
+          fs::rename(d/"model_mtp.safetensors",d/"moved-mtp.safetensors");
+          fs::create_symlink("moved-mtp.safetensors",d/"model_mtp.safetensors");
+          rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
         }
         { setenv("FLASH_NGRAM","bf16",1);
           rejects([&]{ Checkpoint ck; ck.open(base.string(),true,""); });

@@ -58,6 +58,19 @@ inline std::string sandbox_file(const std::string& directory, const std::string&
     return joined.string();
 }
 inline bool is_file(const std::string& path) { return std::filesystem::is_regular_file(path); }
+// Sandbox symlink gate: is_regular_file/status/ifstream all FOLLOW symlinks, so the lexical sandbox
+// above would be escapable if a manifest-named file were replaced by a symlink. Every sandbox-resolved
+// manifest path — the manifest itself, the body shards, and the recorded MTP/config/self-contained
+// n-gram names — must pass this check before its first open. Scope: operator-supplied absolute inputs
+// (FLASH_NGRAM_PATH, the explicit n-gram/MTP override arguments) keep their documented absolute
+// allowance and are deliberately NOT symlink-gated; only paths resolved through the sandbox are.
+// A missing file passes here unchanged so the established "missing" diagnostics stay as they were.
+inline void require_no_symlink(const std::string& path, const std::string& context) {
+    std::error_code ec;
+    const auto type = std::filesystem::symlink_status(path, ec).type();
+    if (!ec && type == std::filesystem::file_type::symlink)
+        fail(context, "path", "regular file (the sandbox never follows symlinks)", "symbolic link: " + path);
+}
 inline std::string read_file(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error(path + ": cannot open file");
@@ -268,14 +281,17 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     }
     const auto mtp_name=sandbox_file(directory,text(outputs,"mtp",directory),directory+": outputs.mtp");
     if (seen.count(mtp_name)) fail(directory,"outputs","body/MTP files distinct",mtp_name);
-    if (outputs.has("ngram"))
+    if (outputs.has("ngram")) {
         result.ngram = sandbox_file(directory,text(outputs,"ngram",directory),directory+": outputs.ngram");
+        require_no_symlink(result.ngram, directory+": outputs.ngram");  // sandboxed name: never followed
+    }
     else if (!ngram_override.empty())
         result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute is allowed here
     else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
         result.ngram = env;
     else fail(directory,"outputs.ngram","self-contained table or FLASH_NGRAM_PATH / explicit override","external table not configured");
     result.mtp = want_mtp ? resolve_path(directory,mtp_override.empty()?mtp_name:mtp_override) : std::string{};
+    if (want_mtp && mtp_override.empty()) require_no_symlink(result.mtp, directory+": outputs.mtp");  // recorded name only; overrides unchanged
     if (want_mtp && !mtp_override.empty() && std::find(result.body.begin(),result.body.end(),result.mtp) != result.body.end())
         fail(directory,"outputs","separate body/MTP paths",result.mtp);
     if(!is_file(result.ngram)) throw std::runtime_error(result.ngram+": missing INT8 ngram dependency");
@@ -418,6 +434,7 @@ struct Checkpoint {
             }
             return;
         }
+        require_no_symlink(path,path);  // the manifest itself is a sandboxed name: never a symlink
         has_manifest=true; format=WeightFormat::Int8;
         const auto j=parse_json(read_file(path),path);
         validate_manifest_top(j,path); validate_recipe(field(j,"recipe",path),path);
@@ -472,6 +489,7 @@ struct Checkpoint {
         // enforce the size cap, then match every shard header against the manifest mapping exactly
         std::vector<Json> shard_headers;
         for(const auto& shard:resolved.body) {
+            require_no_symlink(shard,shard);  // sandboxed manifest name: reject a substituted symlink
             if(std::filesystem::file_size(shard)>(uintmax_t)limit)
                 fail(shard,"shard size","at most "+std::to_string(limit)+" bytes",std::to_string(std::filesystem::file_size(shard)));
             shard_headers.push_back(validate_file(shard));
@@ -497,6 +515,7 @@ struct Checkpoint {
             mtp.open(resolved.mtp);
         }
         const auto config_path=resolve_path(directory,sandbox_file(directory,text(j["outputs"],"config",path),path+": outputs.config"));
+        require_no_symlink(config_path,config_path);  // sandboxed manifest name
         const auto config=parse_json(read_bounded_file(config_path,4u<<20,config_path),config_path);
         const auto& text_config=config.has("text_config")?config["text_config"]:config;
         { // required keys: never skip a missing one; the error lists everything that is absent
