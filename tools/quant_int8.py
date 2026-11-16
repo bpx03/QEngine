@@ -306,7 +306,9 @@ def sha256_file(path, chunk=1 << 22):
 def source_digest(src):
     """Deterministic integrity record for the source checkpoint: the raw bytes of its
     model.safetensors.index.json when the reader used one, else a digest over the sorted
-    (filename, size) inventory of the source weight files."""
+    (filename, size) inventory of the source weight files. The weight_files form is BEST-EFFORT:
+    it records only names and sizes, so size-preserving edits inside a weight file are invisible
+    to it (the index_json form hashes raw bytes and has no such blind spot)."""
     ix = os.path.join(src.d, "model.safetensors.index.json")
     if os.path.exists(ix) and not os.path.exists(os.path.join(src.d, "model.safetensors")):
         return "index_json", sha256_file(ix)
@@ -365,8 +367,22 @@ def materialize_ngram(table_path, out):
         os.remove(dst)
     try:
         os.link(table_path, dst)
+        return dst
     except OSError:
-        shutil.copy2(table_path, dst)
+        pass
+    # copy across filesystems lands on <name>.part first: os.replace publishes the table atomically
+    # once all bytes are written, so an interrupted 52 GiB copy can never leave a half-written table
+    # under the final name; a .part that remains in an output dir is itself a --check rejection
+    part = dst + ".part"
+    try:
+        shutil.copy2(table_path, part)
+        os.replace(part, dst)
+    except BaseException:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        raise
     return dst
 
 
@@ -379,6 +395,26 @@ def sandbox_relative(name):
         return False
     parts = re.split(r"[/\\]", name)
     return ".." not in parts and "\0" not in name
+
+
+def strict_json_object(pairs):
+    """object_pairs_hook rejecting duplicate keys. The C++ reader parses the manifest with
+    Json::parse_strict, so --check must refuse the same malformed input, never read it leniently."""
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate JSON key {key!r} in manifest (the strict C++ loader rejects it too)")
+        seen.add(key)
+    return dict(pairs)
+
+
+def sandbox_regular_file(path):
+    """Symlink gate for sandboxed checkpoint paths, mirroring require_no_symlink in
+    src/flash/checkpoint.h: a manifest-named file replaced by a symlink is rejected, never followed.
+    Operator-supplied absolute inputs (--external-ngram / QENGINE_INT8_NGRAM_PATH) keep their
+    documented allowance and are not gated."""
+    if os.path.islink(path):
+        raise ValueError(f"{path}: symbolic link rejected inside the sandbox (must be a regular file)")
 
 
 def configured_dims(text, names):
@@ -573,14 +609,10 @@ def plan_shards(plan, max_bytes):
         if cur and cur_bytes + gbytes > limit:
             shards.append(cur)
             cur, cur_bytes = [], 0
-        if gbytes > limit:  # single tensor larger than the cap: alone in its own shard
-            if len(group) > 1:
-                raise ValueError(f"tensor group {key} exceeds the shard cap")
-            if cur:
-                shards.append(cur)
-                cur, cur_bytes = [], 0
-            shards.append(group)
-            continue
+        if gbytes > limit:  # single tensor larger than the cap: both readers reject an oversized
+                            # shard, so refuse at plan time instead of emitting unreadable output
+            raise ValueError(f"tensor {group[0][0]} serializes to {gbytes} bytes, which exceeds "
+                             f"--max-shard-bytes {max_bytes}; a single tensor must fit one shard")
         cur.extend(group)
         cur_bytes += gbytes
     if deferred:
@@ -769,6 +801,10 @@ def cmd_make_qfn(a, cfg):
     if a.external_ngram is None:
         outputs["ngram"] = NGRAM_OUT_NAME
     source = {"index_sha256_kind": kind, "index_sha256": digest}
+    if kind == "weight_files":
+        # honest labeling: the inventory digest is best-effort, not a content hash (see source_digest)
+        source["index_sha256_note"] = ("best-effort: digest over the sorted (filename, size) inventory; "
+                                       "size-preserving edits of a weight file are invisible to it")
     if a.source_repo is not None or a.source_revision is not None:
         if a.source_repo is None or a.source_revision is None:
             raise ValueError("--source-repo and --source-revision must be given together")
@@ -784,8 +820,9 @@ def cmd_make_qfn(a, cfg):
         "shard_limit_bytes": a.max_shard_bytes,
         "tensors": {"converted": converted, "preserved": preserved, "excluded": excluded},
         "ngram": ngram,
-        "runtime_supported": False,
-        "runtime_support_reason": "Current QFN engine does not support INT8 expert weights; checkpoint is not executable by current QEngine."
+        "runtime_supported": True,
+        "runtime_support_reason": ("executed by the flash INT8 W8 runtime on branches split/int8-runtime+; "
+                                   "upstream release pending")
     }
     with open(os.path.join(a.out, "qfn-int8-manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
@@ -793,7 +830,7 @@ def cmd_make_qfn(a, cfg):
         f.write("QFN INT8 symmetric group-128 weights, sharded body, "
                 + ("self-contained n-gram table." if a.external_ngram is None
                    else "external n-gram table (identity + sha256 only in the manifest).")
-                + " Current QEngine does not support INT8 QFN experts; this checkpoint is not executable by the current engine.\n")
+                + " Executed by the flash INT8 W8 runtime on branches split/int8-runtime+; upstream release pending.\n")
     log(f"QFN: {len(converted)} matrices in {len(files)} body shards, {len(excluded)} n-gram source tensors excluded; "
         f"{'self-contained' if a.external_ngram is None else 'external'} n-gram; {time.time() - t0:.0f}s")
 
@@ -995,8 +1032,8 @@ def check_qfn(a, manifest_path, manifest):
     recipe = manifest.get("recipe", {})
     if int(recipe.get("search", -1)) != a.search or recipe.get("group_size") != 128:
         raise ValueError("--search/group_size does not match QFN manifest")
-    if manifest.get("runtime_supported") is not False:
-        raise ValueError("QFN manifest must state runtime_supported=false")
+    if manifest.get("runtime_supported") is not True:
+        raise ValueError("QFN manifest must state runtime_supported=true (the flash INT8 W8 runtime executes v2)")
     if not isinstance(manifest.get("source"), dict):
         raise ValueError("manifest is missing the source integrity record")
     source = manifest["source"]
@@ -1028,6 +1065,7 @@ def check_qfn(a, manifest_path, manifest):
     outputs_by_file = {}
     for filename in body + [outputs["mtp"]]:
         path = os.path.join(a.check, filename)
+        sandbox_regular_file(path)
         if not os.path.isfile(path):
             raise ValueError(f"{path}: missing output file")
         if os.path.getsize(path) > min(limit, MAX_SHARD_BYTES):
@@ -1036,6 +1074,8 @@ def check_qfn(a, manifest_path, manifest):
     for filename in body + [outputs["mtp"]]:
         reader = outputs_by_file[filename]
         claimed = {name for name, shard in mapping.items() if shard == filename}
+        if filename in body and not claimed:  # parity with the C++ reader: an empty shard is never readable
+            raise ValueError(f"{filename}: shard maps zero tensors")
         if set(reader.keys()) != claimed:
             missing = sorted(claimed - set(reader.keys()))[:3]
             extra = sorted(set(reader.keys()) - claimed)[:3]
@@ -1048,6 +1088,7 @@ def check_qfn(a, manifest_path, manifest):
         if a.external_ngram is not None:
             raise ValueError("checkpoint is self-contained; --external-ngram is not applicable")
         table_path = os.path.join(a.check, outputs["ngram"])
+        sandbox_regular_file(table_path)
         if not os.path.isfile(table_path):
             raise ValueError(f"{table_path}: self-contained n-gram table is missing next to the weights")
     else:
@@ -1066,6 +1107,7 @@ def check_qfn(a, manifest_path, manifest):
     if actual_digest != identity["sha256"]:
         raise ValueError(f"n-gram table sha256 {actual_digest} differs from the manifest {identity['sha256']}")
 
+    sandbox_regular_file(os.path.join(a.check, str(outputs["config"])))
     cfg_out = model_config(a.check)
     if family(cfg_out) != "qwen4_exp":
         raise ValueError("output config family differs from the manifest")
@@ -1200,8 +1242,9 @@ def cmd_check(a):
     if os.path.isfile(manifest_path) and a.kv_from not in (None, ""):
         raise ValueError("QFN check does not accept --kv-from")
     if os.path.isfile(manifest_path):
+        sandbox_regular_file(manifest_path)
         with open(manifest_path) as f:
-            manifest = json.load(f)
+            manifest = json.load(f, object_pairs_hook=strict_json_object)
         return check_qfn(a, manifest_path, manifest)
     if not a.src:
         raise ValueError("27B check requires --src")
@@ -1257,6 +1300,7 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (ValueError, RuntimeError) as error:  # operator-facing failures print one clean line
+    except (ValueError, RuntimeError, OSError) as error:  # one clean line, never a traceback:
+        # OSError covers PermissionError / FileNotFoundError when the filesystem refuses the operation
         print(f"quant_int8: {error}", file=sys.stderr)
         sys.exit(1)

@@ -5,6 +5,7 @@ QFN fixtures use the v2 schema: sharded body, self-contained n-gram table by def
 checkpoint directory to additionally run the byte-layout check against real safetensors bytes."""
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -388,7 +389,8 @@ def test_qfn_self_converted_sharded_and_single_file():
         assert not os.path.isabs(manifest["outputs"]["ngram"])
         assert "path" not in manifest["ngram"]
         assert manifest["ngram"]["sha256"] == quant.sha256_file(copied)
-        assert manifest["runtime_supported"] is False
+        assert manifest["runtime_supported"] is True
+        assert "flash INT8 W8 runtime" in manifest["runtime_support_reason"]
         assert len(manifest["tensors"]["excluded"]) == 128
         assert len(manifest["tensors"]["converted"]) == 25
         assert "repo" not in manifest["source"] and "revision" not in manifest["source"]
@@ -498,6 +500,7 @@ def test_source_digest_and_honest_identity():
         assert manifest["source"]["repo"] == "acme/fork"
         assert manifest["source"]["revision"] == "abcdef0123"
         assert manifest["source"]["index_sha256_kind"] == "index_json"
+        assert "index_sha256_note" not in manifest["source"]  # exact content digest needs no caveat
         assert manifest["source"]["index_sha256"] == quant.sha256_file(
             os.path.join(src, "model.safetensors.index.json"))
         cli("--src", src, "--check", out)
@@ -507,6 +510,8 @@ def test_source_digest_and_honest_identity():
         cli("--src", single_src, "--out", single_out, "--ngram-from", single_ngram, "--kv-from", "")
         manifest, _ = output_mapping(single_out)
         assert manifest["source"]["index_sha256_kind"] == "weight_files"
+        assert "best-effort" in manifest["source"]["index_sha256_note"]
+        assert "size-preserving" in manifest["source"]["index_sha256_note"]
         assert "repo" not in manifest["source"]
         cli("--src", single_src, "--check", single_out)
         # half-recorded identity is refused at conversion
@@ -790,6 +795,107 @@ def test_qfn_cli_check_corruption_and_early_failures():
             "--kv-from", os.path.join(temp, "nonempty-kv"), ok=False)
 
 
+def test_constants_cannot_drift_from_checkpoint_h():
+    # the maintainer's point, applied to constants: the python mirrors in tools/quant_int8.py are
+    # comments-only copies of src/flash/checkpoint.h, so parse the header and pin them for real
+    with open(os.path.join(ROOT, "src", "flash", "checkpoint.h")) as f:
+        header = f.read()
+    schema = re.search(r'inline const std::string kManifestSchema = "([^"]+)"', header)
+    limit = re.search(r"inline constexpr uint64_t kMaxShardBytes = (\d+)ull << (\d+);", header)
+    multipliers = re.search(r"inline constexpr std::array<int, \d+> kMtpFcEmbeddingKMultipliers\{([^}]*)\}", header)
+    assert schema and limit and multipliers, "constant declarations moved out of the expected shape in checkpoint.h"
+    assert schema.group(1) == quant.MANIFEST_SCHEMA
+    assert int(limit.group(1)) << int(limit.group(2)) == quant.MAX_SHARD_BYTES
+    assert tuple(int(part) for part in multipliers.group(1).split(",")) == quant.MTP_FC_EMBEDDING_K_MULTIPLIERS
+
+
+def test_plan_shards_rejects_tensor_larger_than_cap():
+    # a single tensor that exceeds --max-shard-bytes would become a lone shard BOTH readers reject:
+    # the converter must refuse it at plan time, naming the tensor
+    plan = [("model.language_model.embed_tokens.weight", None, None, 200000),
+            ("model.language_model.norm.weight", None, None, 10)]
+    try:
+        quant.plan_shards(plan, 100000)
+    except ValueError as error:
+        assert "model.language_model.embed_tokens.weight" in str(error), str(error)
+        assert "--max-shard-bytes" in str(error), str(error)
+    else:
+        raise AssertionError("plan_shards accepted a tensor larger than the shard cap")
+
+
+def test_duplicate_key_manifest_rejected():
+    # the C++ loader parses the manifest strictly (Json::parse_strict rejects duplicate keys);
+    # --check must refuse the same file instead of letting json.load silently keep one value
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "dupkey")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        path = os.path.join(out, "qfn-int8-manifest.json")
+        with open(path) as f:
+            raw = f.read()
+        assert raw.count('"format_version": 1') == 1
+        with open(path, "w") as f:
+            f.write(raw.replace('"format_version": 1', '"format_version": 1,\n      "format_version": 1', 1))
+        result = cli("--check", out, ok=False)
+        assert "duplicate JSON key" in result.stdout + result.stderr
+        with open(path, "w") as f:
+            f.write(raw)
+        cli("--check", out)  # the untouched manifest checks clean again
+
+
+def test_symlinked_manifest_files_rejected():
+    # the sandbox is lexical; both readers must reject a manifest-named regular file that was
+    # replaced by a symlink to somewhere else instead of following it
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp, sharded=True)
+        out = os.path.join(temp, "symlinked")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        manifest, _ = output_mapping(out)
+        assert len(manifest["outputs"]["body"]) > 1, "fixture must produce multiple shards"
+        for name in (manifest["outputs"]["body"][0], manifest["outputs"]["mtp"],
+                     "ngram_int8.safetensors", "qfn-int8-manifest.json", "config.json"):
+            path = os.path.join(out, name)
+            real = path + ".real"
+            os.rename(path, real)
+            os.symlink(os.path.basename(real), path)
+            try:
+                result = cli("--check", out, ok=False)
+                assert "symbolic link rejected" in result.stdout + result.stderr, f"{name}: wrong failure"
+            finally:
+                os.unlink(path)
+                os.rename(real, path)
+        cli("--check", out)  # the restored checkpoint passes again
+
+
+def test_empty_shard_rejected():
+    # the C++ reader fails a shard that maps zero tensors; --check must not pass one
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp, sharded=True)
+        out = os.path.join(temp, "emptied")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        manifest, mapping = output_mapping(out)
+        shards = manifest["outputs"]["body"]
+        victim, other = shards[-1], shards[0]
+        merged = load_file(os.path.join(out, other))
+        merged.update(load_file(os.path.join(out, victim)))
+        save_file(merged, os.path.join(out, other))
+        with open(os.path.join(out, victim), "wb") as f:  # valid safetensors with an empty header
+            f.write(len(b"{}      ").to_bytes(8, "little") + b"{}      ")
+        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+            manifest = json.load(f)
+        for record in manifest["tensors"]["converted"]:
+            if record["file"] == victim:
+                record["file"] = other
+        preserved = manifest["tensors"]["preserved"]["body"]
+        for name in preserved:
+            if preserved[name] == victim:
+                preserved[name] = other
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+        result = cli("--check", out, ok=False)
+        assert "maps zero tensors" in result.stdout + result.stderr, result.stdout + result.stderr
+
+
 def main():
     test_config_derived_qfn_projection_shapes()
     test_hand_computed_group()
@@ -805,6 +911,11 @@ def main():
     test_byte_layout_against_manifest()
     test_27b_compatibility_and_family_precedence()
     test_qfn_cli_check_corruption_and_early_failures()
+    test_constants_cannot_drift_from_checkpoint_h()
+    test_plan_shards_rejects_tensor_larger_than_cap()
+    test_duplicate_key_manifest_rejected()
+    test_symlinked_manifest_files_rejected()
+    test_empty_shard_rejected()
     print("test_quant_int8: ALL PASS")
 
 
