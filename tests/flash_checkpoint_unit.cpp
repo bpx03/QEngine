@@ -615,6 +615,21 @@ int main() {
             unsetenv("FLASH_NGRAM_PATH");
             require(ck.ngram_path==ext.external_table,"relative FLASH_NGRAM_PATH must resolve against the model directory");
         }
+        { // F05: a relative checkpoint directory: every manifest-recorded path joins with the directory
+          // exactly once (the config and the recorded MTP path used to be re-resolved against it again,
+          // doubling the directory and rejecting every relative-path open)
+            const auto save=fs::current_path();
+            fs::current_path(temp.path);
+            build_checkpoint("rel-ckpt",BuildOptions{});
+            bool opened_mtp=false, opened_plain=false;
+            try { Checkpoint ck; ck.open("rel-ckpt",true,""); opened_mtp=ck.has_manifest; }
+            catch(const std::exception& e) { fprintf(stderr,"rel-ckpt want_mtp: %s\n",e.what()); }
+            try { Checkpoint ck; ck.open("rel-ckpt",false,""); opened_plain=ck.has_manifest; }
+            catch(const std::exception& e) { fprintf(stderr,"rel-ckpt no mtp: %s\n",e.what()); }
+            fs::current_path(save);
+            require(opened_mtp,"relative checkpoint dir with want_mtp did not open");
+            require(opened_plain,"relative checkpoint dir without want_mtp did not open");
+        }
         { // manifest present but not a regular file
             const auto d=temp.path/"manifest-dir"; fs::create_directories(d/"qfn-int8-manifest.json");
             rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });

@@ -324,7 +324,10 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
         result.ngram = resolve_path(directory,env);             // same resolution as the argument
     else fail(directory,"outputs.ngram","self-contained table or FLASH_NGRAM_PATH / explicit override","external table not configured");
-    result.mtp = want_mtp ? resolve_path(directory,mtp_override.empty()?mtp_name:mtp_override) : std::string{};
+    // sandbox_file already joined the recorded MTP name with the checkpoint directory: wrapping the
+    // result in resolve_path a second time doubled a RELATIVE checkpoint dir
+    // (models/int8/models/int8/mtp.safetensors). Only operator-supplied overrides join again.
+    result.mtp = want_mtp ? (mtp_override.empty() ? mtp_name : resolve_path(directory,mtp_override)) : std::string{};
     if (want_mtp && mtp_override.empty()) require_no_symlink(result.mtp, directory+": outputs.mtp");  // recorded name only; overrides unchanged
     if (want_mtp && !mtp_override.empty() && std::find(result.body.begin(),result.body.end(),result.mtp) != result.body.end())
         fail(directory,"outputs","separate body/MTP paths",result.mtp);
@@ -561,7 +564,9 @@ struct Checkpoint {
             if(!expected.empty()) fail(path,*expected.begin(),"MTP output tensor","missing header");
             mtp.open(resolved.mtp);
         }
-        const auto config_path=resolve_path(directory,sandbox_file(directory,text(j["outputs"],"config",path),path+": outputs.config"));
+        // recorded manifest paths are already sandbox-joined: resolving the joined value against the
+        // directory again doubled a relative checkpoint dir (models/int8/models/int8/config.json)
+        const auto config_path=sandbox_file(directory,text(j["outputs"],"config",path),path+": outputs.config");
         require_no_symlink(config_path,config_path);  // sandboxed manifest name
         const auto config=parse_json(read_bounded_file(config_path,4u<<20,config_path),config_path);
         const auto& text_config=config.has("text_config")?config["text_config"]:config;
