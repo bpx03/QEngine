@@ -537,6 +537,19 @@ int main() {
             const auto odd=temp.path/"int4-odd-shape"; fs::create_directories(odd);
             int4_shaped_file(odd/"model-00001-of-00001.safetensors",128,96);  // width 16: 64 != 96 and 128 != 96
             rejects([&]{ Checkpoint ck; ck.open(odd.string(),false,""); });  // neither x4 nor x8: clear error
+            { // F07: a scalar I32 .weight_packed (shape []) with companions used to reach arr.back() on
+              // the empty shape vector (crash); it must now be refused cleanly before any dimension read
+            const auto scalar8=temp.path/"int8-scalar-packed"; fs::create_directories(scalar8);
+            std::string scalar_header="{\"a.weight_packed\":{\"dtype\":\"I32\",\"shape\":[],\"data_offsets\":[0,4]},"
+                "\"a.weight_scale\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[4,6]},"
+                "\"a.weight_shape\":{\"dtype\":\"I64\",\"shape\":[1],\"data_offsets\":[6,14]}}";
+            while(scalar_header.size()%8) scalar_header+=' ';
+            { std::ofstream out(scalar8/"model.safetensors",std::ios::binary); const uint64_t len=scalar_header.size();
+              out.write(reinterpret_cast<const char*>(&len),8); out.write(scalar_header.data(),scalar_header.size());
+              std::vector<char> payload(6,0); out.write(payload.data(),payload.size());
+              const int64_t stored=128; out.write(reinterpret_cast<const char*>(&stored),8); }
+            rejects([&]{ Checkpoint ck; ck.open(scalar8.string(),false,""); });
+            }
             }
         }
 

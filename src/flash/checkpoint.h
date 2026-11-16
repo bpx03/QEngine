@@ -456,6 +456,18 @@ struct Checkpoint {
                     // 4 codes per I32 (K == width*4 -> needs the manifest), INT4 packs 8 nibbles per I32
                     // (K == width*8 -> normal INT4 no-manifest route). Anything else is a broken file.
                     if(j.has(base+".weight_scale") && j.has(base+".weight_shape")) {
+                        // F07: the discriminator only makes sense for a rank>=1 I32-packed matrix with a
+                        // rank>=1 .weight_shape companion. A scalar packed entry (shape []) used to reach
+                        // arr.back() on the empty shape vector (undefined behaviour); the guard rejects
+                        // the degenerate trio cleanly before any file byte or dimension is inspected.
+                        const auto& packed=j[t.first];
+                        const auto& stored=j[base+".weight_shape"];
+                        const long long packed_rank=(long long)packed["shape"].arr.size();
+                        const long long stored_rank=(long long)stored["shape"].arr.size();
+                        if(packed["dtype"].str!="I32" || packed_rank<1 || stored_rank<1)
+                            fail(f,base,"rank>=1 I32 .weight_packed with a rank>=1 .weight_shape companion",
+                                 packed["dtype"].str+" packed rank "+std::to_string(packed_rank)+
+                                 ", companion rank "+std::to_string(stored_rank));
                         const long long k = stored_shape_last_dim(f,j[base+".weight_shape"]);
                         const long long width = j[t.first]["shape"].arr.back().i();
                         if (width*4 == k)
