@@ -3,11 +3,19 @@
 
 The 27B route preserves the pinned upstream converter: symmetric INT8, group 128, with BF16 MTP passthrough.
 The QFN route converts the explicitly selected attention, shared-expert, fused-expert, PLE, and MTP matrices;
-all other source tensors are preserved. Its 128 n-gram tables are excluded and refer to --ngram-from instead.
+all other source tensors are preserved. Its 128 n-gram tables are excluded from the body; by default the
+existing INT8 table is materialized INSIDE the output (hard link, full copy fallback) so the checkpoint is
+self-contained. --external-ngram keeps it outside: the manifest then records only table identity plus a
+sha256 digest, and --check takes the table path via --external-ngram PATH or QENGINE_INT8_NGRAM_PATH.
+The QFN body is written as shards (model-00001-of-000NN.safetensors, each <= --max-shard-bytes, default
+20 GiB, grouped per transformer layer; PLE/n-gram-adjacent tensors go to the final shard); every manifest
+tensor names its shard. The manifest records a sha256 digest of the source index (or of the sorted source
+weight-file inventory) plus optional --source-repo/--source-revision describing what was ACTUALLY converted.
 The Flash-Next engine (src/flash/) loads QFN output; the 27B engine (libqengine) reads INT4 weights only.
 
 RTN uses BF16(absmax / 127), nearest-even rounding, and clamp [-127, 127]. --search N searches N clip ratios in
-[0.80, 1], with ratio 1 always included. No calibration data or GPU required.
+[0.80, 1], with ratio 1 always included. NaN or Inf anywhere in a quantized matrix is a hard error naming the
+tensor. No calibration data or GPU required.
 For QFN, --dev cuda uses every visible GPU with bounded row-block concurrency; --dev cuda:0 selects one GPU.
 
 For 27B, --kv-from defaults to the upstream INT4 checkpoint and supplies KV scales/config/tokenizer when present.
@@ -17,11 +25,18 @@ Usage:
   python tools/quant_int8.py --src models/Qwen3.8-27B-BF16 --out models/Qwen3.8-27B-INT8
   python tools/quant_int8.py --src models/Qwen3.8-Flash-Next-BF16 --out models/Qwen3.8-Flash-Next-INT8 \
       --ngram-from models/Qwen3.8-Flash-Next-QE-INT4/ngram_int8.safetensors --kv-from ''
-  python tools/quant_int8.py --check models/Qwen3.8-Flash-Next-INT8 --src models/Qwen3.8-Flash-Next-BF16
+  python tools/quant_int8.py --src models/Qwen3.8-Flash-Next-BF16 --out models/Qwen3.8-Flash-Next-INT8 \
+      --ngram-from .../ngram_int8.safetensors --kv-from '' --external-ngram \
+      --source-repo acme/fork --source-revision 0123456789abcdef
+  python tools/quant_int8.py --check models/Qwen3.8-Flash-Next-INT8                 # structural check
+  python tools/quant_int8.py --check models/Qwen3.8-Flash-Next-INT8 \
+      --src models/Qwen3.8-Flash-Next-BF16                                          # + RTN/source reproduction
+  python tools/quant_int8.py --check ... --external-ngram /srv/tables/ngram_int8.safetensors
 Writes safetensors tensor-by-tensor using .part files and atomic rename.
 """
 import argparse
 import copy
+import hashlib
 import json
 import os
 import filecmp
@@ -38,6 +53,12 @@ from safetensors import safe_open
 
 torch.set_grad_enabled(False)
 LM = "model.language_model."
+# Constants shared with src/flash/checkpoint.h (keep both sides in sync; the C++ constants are the spec).
+MAX_SHARD_BYTES = 20 << 30  # mirror of kMaxShardBytes in src/flash/checkpoint.h
+MTP_FC_EMBEDDING_K_MULTIPLIERS = (1, 2)  # mirror of kMtpFcEmbeddingKMultipliers in src/flash/checkpoint.h
+MANIFEST_SCHEMA = "qfn-int8-v2"  # mirror of kManifestSchema in src/flash/checkpoint.h
+NGRAM_OUT_NAME = "ngram_int8.safetensors"
+HEADER_MARGIN = 8 << 20  # safetensors header/padding headroom kept below every shard byte cap
 QUANT = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
          "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
          "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
@@ -144,7 +165,7 @@ def qfn_descriptor(name):
     return {"source": name, "base": base, "file": "model_mtp.safetensors" if part == "mtp" else "model.safetensors",
             "part": part}
 
-def quant_int8(w, search=0, dev="cpu"):
+def quant_int8(w, search=0, dev="cpu", name="tensor"):
     """[..., N, K] -> int8 codes and BF16 scales grouped over K in 128-wide blocks."""
     if w.ndim < 2:
         raise ValueError(f"INT8 matrix needs rank >= 2, got {tuple(w.shape)}")
@@ -153,6 +174,10 @@ def quant_int8(w, search=0, dev="cpu"):
     if K % 128:
         raise ValueError(f"K must be divisible by 128, got shape {shape}")
     wf = w.to(dev, torch.float32).reshape(-1, N, K // 128, 128)
+    finite = torch.isfinite(wf)
+    if not bool(finite.all()):
+        # never let NaN/Inf poison the scale: absmax(NaN) would silently fall back to scale 1
+        raise ValueError(f"{name}: contains NaN or Inf values; refusing to quantize")
     amax = wf.abs().amax(-1, keepdim=True)
 
     def q_err(ratio):
@@ -268,6 +293,29 @@ def tensor_info(src, name):
     return tuple(sl.get_shape()), sl.get_dtype()
 
 
+def sha256_file(path, chunk=1 << 22):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk)
+            if not block:
+                return h.hexdigest()
+            h.update(block)
+
+
+def source_digest(src):
+    """Deterministic integrity record for the source checkpoint: the raw bytes of its
+    model.safetensors.index.json when the reader used one, else a digest over the sorted
+    (filename, size) inventory of the source weight files."""
+    ix = os.path.join(src.d, "model.safetensors.index.json")
+    if os.path.exists(ix) and not os.path.exists(os.path.join(src.d, "model.safetensors")):
+        return "index_json", sha256_file(ix)
+    h = hashlib.sha256()
+    for name in sorted(set(src.where.values())):
+        h.update(f"{name}\0{os.path.getsize(os.path.join(src.d, name))}\n".encode())
+    return "weight_files", h.hexdigest()
+
+
 def qfn_table_names(src):
     prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_"
     expected = {prefix + str(i) + ".weight" for i in range(128)}
@@ -278,6 +326,7 @@ def qfn_table_names(src):
 
 
 def validate_ngram_file(path, full_model, expected_rows=None):
+    """Header-only identity validation of an INT8 n-gram table (128 U8 [rows,162] shards)."""
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise ValueError(f"external n-gram table does not exist: {path}")
@@ -301,11 +350,35 @@ def validate_ngram_file(path, full_model, expected_rows=None):
             raise ValueError(f"external n-gram rows {rows}, expected 2500012 for pinned QFN")
         if expected_rows is not None and rows != expected_rows:
             raise ValueError(f"external n-gram rows {rows}, expected {expected_rows}")
-    return {"path": path, "size_bytes": os.path.getsize(path), "rows_per_shard": rows,
+    return {"size_bytes": os.path.getsize(path), "rows_per_shard": rows,
             "width_bytes": 162, "shards": 128,
             "layout": "U8 [rows,162]: 160 signed INT8 values then one FP16 scale",
-            "keys": [prefix + str(i) for i in range(128)],
-            "equivalence_verified": False}
+            "keys": [prefix + str(i) for i in range(128)]}
+
+
+def materialize_ngram(table_path, out):
+    """Self-contained default: place the table next to the weights. Hard link when the filesystem
+    allows it (zero-copy), full byte-identical copy across filesystems (shortcut: if the source is
+    later removed, the checkpoint keeps its own copy — that is the point)."""
+    dst = os.path.join(out, NGRAM_OUT_NAME)
+    if os.path.lexists(dst):
+        os.remove(dst)
+    try:
+        os.link(table_path, dst)
+    except OSError:
+        shutil.copy2(table_path, dst)
+    return dst
+
+
+def sandbox_relative(name):
+    """Manifest path fields are relative to the checkpoint directory: never absolute, never a drive/UNC
+    root, never '..'."""
+    if not name or os.path.isabs(name) or name.startswith("~") or name.startswith("\\\\"):
+        return False
+    if len(name) >= 2 and name[0].isalpha() and name[1] == ":":  # Windows drive root (POSIX sees it as relative)
+        return False
+    parts = re.split(r"[/\\]", name)
+    return ".." not in parts and "\0" not in name
 
 
 def configured_dims(text, names):
@@ -394,8 +467,10 @@ def validate_qfn_matrix(desc, shape, dtype, dims, cfg):
         shared = int(text.get("shared_expert_intermediate_size") or intermediate)
         expected = (hidden, shared)
     elif name.endswith("mtp.fc_embedding.weight"):
-        if n != hidden or k not in (hidden, 2 * hidden):
-            raise ValueError(f"{name}: shape {shape} incompatible with hidden_size {hidden}")
+        if n != hidden or k not in tuple(m * hidden for m in MTP_FC_EMBEDDING_K_MULTIPLIERS):
+            raise ValueError(f"{name}: shape {shape} incompatible with hidden_size {hidden} "
+                             f"(K multiplier must be one of {MTP_FC_EMBEDDING_K_MULTIPLIERS}; "
+                             f"shared rule with kMtpFcEmbeddingKMultipliers in src/flash/checkpoint.h)")
         return
     elif name.endswith("mtp.fc_hidden.weight"):
         expected = (hidden, hidden)
@@ -434,9 +509,10 @@ def add_tensor_plan(plan, name, dtype, shape):
 
 
 def qfn_plans(source_keys, descriptors, headers):
+    """Per-part tensor plans; the body plan is a flat list, sharded later by plan_shards()."""
     plans, source_for_output, packed_for_name = {}, {}, {}
     desc_by_source = {d["source"]: d for d in descriptors}
-    for part, filename in (("body", "model.safetensors"), ("mtp", "model_mtp.safetensors")):
+    for part in ("body", "mtp"):
         plan = []
         keys = [k for k in source_keys if (k.startswith("mtp.") == (part == "mtp"))]
         for key in sorted(keys):
@@ -462,8 +538,66 @@ def qfn_plans(source_keys, descriptors, headers):
                 if [p[0] for p in plan[i:i + 3]] != [
                     entry[0], entry[0][:-len("_packed")] + "_scale", entry[0][:-len("_packed")] + "_shape"]:
                     raise ValueError(f"non-adjacent QFN quantization outputs for {entry[0]}")
-        plans[filename] = plan
+        plans[part] = plan
     return plans, source_for_output, packed_for_name
+
+
+def body_group(name):
+    """Shard grouping key: one group per transformer layer; everything else one group per tensor.
+    PLE/n-gram-adjacent tensors are deferred by plan_shards into the final shard."""
+    layer = re.match(r"^model\.language_model\.layers\.(\d+)\.", name)
+    return ("layer", int(layer.group(1))) if layer else ("tensor", name)
+
+
+def plan_shards(plan, max_bytes):
+    """Group entries per layer, pack groups into shards <= max_bytes without splitting a group,
+    then append n-gram-adjacent tensors to the final shard. Returns [entry, ...] per shard."""
+    # header headroom scales down for tiny caps so --max-shard-bytes stays testable;
+    # the default 20 GiB cap always keeps the full 8 MiB margin
+    limit = max_bytes - min(HEADER_MARGIN, max(8192, max_bytes // 16))
+    if limit <= 0:
+        raise ValueError(f"--max-shard-bytes {max_bytes} leaves no room for the safetensors header")
+    groups, deferred = {}, []
+    for entry in plan:
+        if "ple_embedding." in entry[0]:  # PLE metadata lives next to the n-gram table
+            deferred.append(entry)
+            continue
+        groups.setdefault(body_group(entry[0]), []).append(entry)
+    shards, cur, cur_bytes = [], [], 0
+    for key in sorted(groups, key=lambda g: (g[0] != "layer", g)):
+        group = groups[key]
+        gbytes = sum(e[3] for e in group)
+        if gbytes > limit and len(group) > 1:
+            raise ValueError(f"layer group {key} needs {gbytes} bytes, over --max-shard-bytes {max_bytes}; "
+                             f"a layer is never split across shards")
+        if cur and cur_bytes + gbytes > limit:
+            shards.append(cur)
+            cur, cur_bytes = [], 0
+        if gbytes > limit:  # single tensor larger than the cap: alone in its own shard
+            if len(group) > 1:
+                raise ValueError(f"tensor group {key} exceeds the shard cap")
+            if cur:
+                shards.append(cur)
+                cur, cur_bytes = [], 0
+            shards.append(group)
+            continue
+        cur.extend(group)
+        cur_bytes += gbytes
+    if deferred:
+        dbytes = sum(e[3] for e in deferred)
+        if cur and cur_bytes + dbytes > limit:
+            shards.append(cur)
+            cur = []
+        cur.extend(deferred)
+    if cur:
+        shards.append(cur)
+    for shard in shards:
+        shard.sort(key=lambda item: item[0])
+    return [shard for shard in shards] or [[]]
+
+
+def shard_names(count):
+    return [f"model-{i + 1:05d}-of-{count:05d}.safetensors" for i in range(count)]
 
 
 def validate_qfn_source(src, cfg, ngram_path, out):
@@ -503,7 +637,7 @@ def write_quant_tensor(writer, src, desc, shape, search, dev, block_rows=256):
             scales[r0:r1] = scale
 
     def quantize(block, device):
-        q, scale = quant_int8(block, search, device)
+        q, scale = quant_int8(block, search, device, source)
         return pack_int8(q), scale
 
     if len(devices) == 1:
@@ -552,13 +686,25 @@ def cmd_make_qfn(a, cfg):
         raise ValueError("QFN route does not import KV scales from the 27B checkpoint; omit --kv-from")
     if not a.ngram_from:
         raise ValueError("QFN requires --ngram-from with the existing INT8 table")
+    if a.external_ngram not in (None, ""):
+        raise ValueError("--external-ngram takes no PATH during conversion; it only takes a path with --check")
+    if a.max_shard_bytes <= 0:
+        raise ValueError("--max-shard-bytes must be positive")
     src = Src(a.src)
     dims, source_keys, excluded, descriptors, headers, ngram = validate_qfn_source(
         src, cfg, a.ngram_from, a.out)
     plans, source_for_output, packed_for_name = qfn_plans(source_keys, descriptors, headers)
+    body_shards = plan_shards(plans["body"], a.max_shard_bytes)
+    files = shard_names(len(body_shards))
+    plans_out = list(zip(files, body_shards)) + [("model_mtp.safetensors", plans["mtp"])]
+    # every output tensor names the shard it lives in
+    tensor_file = {}
+    for filename, plan in plans_out:
+        for entry in plan:
+            tensor_file[entry[0]] = filename
     t0 = time.time()
-    for filename in ("model.safetensors", "model_mtp.safetensors"):
-        plan = plans[filename]
+    for filename, plan in plans_out:
+        plan = list(plan)
         writer = Writer(os.path.join(a.out, filename), plan,
                         {"format": "pt", "qengine": f"quant_int8.py symmetric g128 search={a.search}"})
         while writer.i < len(plan):
@@ -580,8 +726,7 @@ def cmd_make_qfn(a, cfg):
     q.update({"format": "pack-quantized", "quant_method": "compressed-tensors",
               "quantization_status": "compressed", "target_modules": targets})
     q["config_groups"] = {"group_0": {
-        "targets": targets, "input_activations": None, "output_activations": None,
-        "format": "pack-quantized",
+        "targets": targets, "input_activations": None, "output_activations": None, "format": "pack-quantized",
         "weights": {"num_bits": 8, "type": "int", "symmetric": True, "strategy": "group",
                     "group_size": 128, "dynamic": False, "actorder": None,
                     "observer": "minmax" if a.search <= 1 else "mse",
@@ -599,40 +744,63 @@ def cmd_make_qfn(a, cfg):
         if os.path.isfile(path):
             shutil.copy2(path, os.path.join(a.out, name))
 
+    if a.external_ngram is None:
+        materialize_ngram(a.ngram_from, a.out)
+    else:
+        log(f"external n-gram: table stays at {os.path.abspath(a.ngram_from)}; manifest records identity only")
+    ngram["sha256"] = sha256_file(a.ngram_from)
+    ngram["equivalence_verified"] = False
+    kind, digest = source_digest(src)
+
     converted = []
     converted_names = {d["source"] for d in descriptors}
     for desc in descriptors:
-        converted.append({"source_key": desc["source"], "base": desc["base"], "file": desc["file"],
+        converted.append({"source_key": desc["source"], "base": desc["base"],
+                          "file": tensor_file[desc["base"] + ".weight_packed"],
                           "shape": list(headers[desc["source"]][0]), "dtype": headers[desc["source"]][1],
                           "outputs": {"packed": desc["base"] + ".weight_packed",
                                       "scale": desc["base"] + ".weight_scale",
                                       "shape": desc["base"] + ".weight_shape"}})
-    preserved = {"body": sorted(n for n in source_keys if not n.startswith("mtp.") and n not in converted_names),
+    preserved = {"body": {n: tensor_file[n] for n in source_keys
+                          if not n.startswith("mtp.") and n not in converted_names},
                  "mtp": sorted(n for n in source_keys if n.startswith("mtp.") and n not in converted_names)}
+    outputs = {"body": files, "mtp": "model_mtp.safetensors",
+               "config": "config.json", "manifest": "qfn-int8-manifest.json"}
+    if a.external_ngram is None:
+        outputs["ngram"] = NGRAM_OUT_NAME
+    source = {"index_sha256_kind": kind, "index_sha256": digest}
+    if a.source_repo is not None or a.source_revision is not None:
+        if a.source_repo is None or a.source_revision is None:
+            raise ValueError("--source-repo and --source-revision must be given together")
+        source["repo"], source["revision"] = a.source_repo, a.source_revision
     manifest = {
+        "schema": MANIFEST_SCHEMA,
         "format_version": 1, "family": "qwen4_exp",
-        "source": {"repo": "orcarouter/Qwen3.8-Flash-Next-Uncensored",
-                   "revision": "da29941aee972c7eeab497e05a292c569da1f1d6"},
+        "source": source,
         "recipe": {"format": "symmetric INT8", "group_size": 128, "rounding": "nearest-even",
                    "scale_dtype": "BF16", "zero_point": 0, "search": a.search,
                    "algorithm": "RTN; per-group BF16 absmax/127; zero groups use scale 1"},
-        "outputs": {"body": "model.safetensors", "mtp": "model_mtp.safetensors",
-                    "config": "config.json", "manifest": "qfn-int8-manifest.json"},
+        "outputs": outputs,
+        "shard_limit_bytes": a.max_shard_bytes,
         "tensors": {"converted": converted, "preserved": preserved, "excluded": excluded},
-        "ngram_external": ngram,
+        "ngram": ngram,
         "runtime_supported": False,
         "runtime_support_reason": "Current QFN engine does not support INT8 expert weights; checkpoint is not executable by current QEngine."
     }
     with open(os.path.join(a.out, "qfn-int8-manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     with open(os.path.join(a.out, "QENGINE_INT8.md"), "w") as f:
-        f.write("QFN INT8 symmetric group-128 weights. Current QEngine does not support INT8 QFN experts; "
-                "this checkpoint is not executable by the current engine.\n")
-    log(f"QFN: {len(converted)} matrices, {len(excluded)} n-gram source tensors excluded; "
-        f"runtime unsupported; {time.time() - t0:.0f}s")
+        f.write("QFN INT8 symmetric group-128 weights, sharded body, "
+                + ("self-contained n-gram table." if a.external_ngram is None
+                   else "external n-gram table (identity + sha256 only in the manifest).")
+                + " Current QEngine does not support INT8 QFN experts; this checkpoint is not executable by the current engine.\n")
+    log(f"QFN: {len(converted)} matrices in {len(files)} body shards, {len(excluded)} n-gram source tensors excluded; "
+        f"{'self-contained' if a.external_ngram is None else 'external'} n-gram; {time.time() - t0:.0f}s")
 
 
 def cmd_make(a):
+    if not a.src:
+        raise ValueError("--src is required for conversion")
     cfg = model_config(a.src)
     model_family = family(cfg)
     if model_family == "qwen4_exp":
@@ -698,7 +866,7 @@ def cmd_make_27b(a, src_cfg):
             base = name.rsplit(".", 1)[0]
             if base not in pending:
                 wt = src.get(base + ".weight")
-                q, s = quant_int8(wt, a.search, a.dev)
+                q, s = quant_int8(wt, a.search, a.dev, name=base + ".weight")
                 pending = {base: (pack_int8(q), s, torch.tensor(list(wt.shape), dtype=torch.int64))}
                 nq += 1
             pk, sc, sh = pending[base]
@@ -781,34 +949,150 @@ def assert_tensor_equal(src_a, src_b, name, shape, dtype):
             raise ValueError(f"passthrough differs: {name} at {index}")
 
 
-def check_qfn(a, manifest):
-    src_cfg = model_config(a.src)
-    if (family(src_cfg) != "qwen4_exp" or src_cfg.get("quantization_config") or
-            manifest.get("family") != "qwen4_exp"):
-        raise ValueError("QFN manifest/source family mismatch or source is already quantized")
+def expected_shard_inventory(manifest):
+    """tensor -> shard file from the manifest mapping; rejects duplicates and unknown shards."""
+    tensors = manifest.get("tensors", {})
+    body = manifest.get("outputs", {}).get("body")
+    if not isinstance(body, list) or not body or not all(isinstance(n, str) and n for n in body):
+        raise ValueError("outputs.body must be a nonempty list of shard files")
+    if len(set(body)) != len(body):
+        raise ValueError("outputs.body lists a shard twice")
+    if not isinstance(tensors.get("preserved"), dict) or not isinstance(tensors.get("preserved", {}).get("body"), dict):
+        raise ValueError("tensors.preserved.body must be a tensor -> shard mapping")
+    preserved_mtp = tensors["preserved"].get("mtp", [])
+    if not isinstance(preserved_mtp, list) or not all(isinstance(n, str) and n for n in preserved_mtp):
+        raise ValueError("tensors.preserved.mtp must be a list of tensor names")
+    mapping = {}
+    def put(name, shard):
+        if name in mapping:
+            raise ValueError(f"{name}: recorded in more than one shard")
+        mapping[name] = shard
+    for name, shard in tensors["preserved"]["body"].items():
+        if shard not in body:
+            raise ValueError(f"{name}: shard {shard} is not an output body shard")
+        put(name, shard)
+    for name in preserved_mtp:
+        put(name, manifest.get("outputs", {}).get("mtp"))
+    for record in tensors.get("converted", []):
+        outputs = record.get("outputs", {})
+        for suffix in (".weight_packed", ".weight_scale", ".weight_shape"):
+            name = record.get("base", "") + suffix
+            if record.get("file") not in body and record.get("file") != "model_mtp.safetensors":
+                raise ValueError(f"{name}: shard {record.get('file')} is not an output file")
+            put(name, record.get("file"))
+    return mapping, body
+
+
+def check_qfn(a, manifest_path, manifest):
+    # Clean break, no compat reader: pre-sharding checkpoints are re-converted, never half-validated.
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        raise ValueError(f"{manifest_path}: schema updated, reconvert with the current tools/quant_int8.py "
+                         f"(manifest schema {manifest.get('schema')!r}, expected {MANIFEST_SCHEMA!r})")
     if manifest.get("format_version") != 1:
-        raise ValueError("unsupported QFN manifest format")
-    source_info = manifest.get("source", {})
-    if (source_info.get("repo") != "orcarouter/Qwen3.8-Flash-Next-Uncensored" or
-            source_info.get("revision") != "da29941aee972c7eeab497e05a292c569da1f1d6"):
-        raise ValueError("unexpected pinned source in manifest")
+        raise ValueError("unsupported QFN manifest format_version")
+    if manifest.get("family") != "qwen4_exp":
+        raise ValueError("QFN manifest family mismatch")
     recipe = manifest.get("recipe", {})
     if int(recipe.get("search", -1)) != a.search or recipe.get("group_size") != 128:
         raise ValueError("--search/group_size does not match QFN manifest")
     if manifest.get("runtime_supported") is not False:
         raise ValueError("QFN manifest must state runtime_supported=false")
-    ngram_info = manifest.get("ngram_external", {})
+    if not isinstance(manifest.get("source"), dict):
+        raise ValueError("manifest is missing the source integrity record")
+    source = manifest["source"]
+    if (source.get("index_sha256_kind") not in ("index_json", "weight_files") or
+            not re.fullmatch(r"[0-9a-f]{64}", str(source.get("index_sha256", "")))):
+        raise ValueError("manifest source index digest is missing or malformed")
+    # source honesty: repo/revision exist only when recorded; an unlisted source is never a rejection
+    if bool("repo" in source) != bool("revision" in source):
+        raise ValueError("manifest source repo/revision must be recorded together")
+
+    outputs = manifest["outputs"]
+    for key in ("body", "mtp", "config"):
+        values = outputs[key] if key == "body" else [outputs.get(key)]
+        for value in values:
+            if not sandbox_relative(str(value)):
+                raise ValueError(f"outputs.{key} entry {value!r} is not a sandboxed relative path")
+    if len(set(outputs["body"]) | {outputs["mtp"]}) != len(outputs["body"]) + 1:
+        raise ValueError("body shards and the MTP file must be distinct")
+    limit = manifest.get("shard_limit_bytes", 0)
+    if not isinstance(limit, int) or limit <= 0 or limit > MAX_SHARD_BYTES:
+        raise ValueError(f"shard_limit_bytes {limit} is not within 1..{MAX_SHARD_BYTES}")
+    mapping, body = expected_shard_inventory(manifest)
+    if outputs.get("ngram") is not None and not sandbox_relative(outputs["ngram"]):
+        raise ValueError(f"outputs.ngram {outputs['ngram']!r} is not a sandboxed relative path")
+    if any(name.endswith(".part") for name in os.listdir(a.check)):
+        raise ValueError("incomplete .part file remains in output")
+
+    # every shard readable, within the cap, and its header keys exactly the tensors it claims
+    outputs_by_file = {}
+    for filename in body + [outputs["mtp"]]:
+        path = os.path.join(a.check, filename)
+        if not os.path.isfile(path):
+            raise ValueError(f"{path}: missing output file")
+        if os.path.getsize(path) > min(limit, MAX_SHARD_BYTES):
+            raise ValueError(f"{path}: {os.path.getsize(path)} bytes exceeds the shard limit {limit}")
+        outputs_by_file[filename] = Src(a.check, filename)
+    for filename in body + [outputs["mtp"]]:
+        reader = outputs_by_file[filename]
+        claimed = {name for name, shard in mapping.items() if shard == filename}
+        if set(reader.keys()) != claimed:
+            missing = sorted(claimed - set(reader.keys()))[:3]
+            extra = sorted(set(reader.keys()) - claimed)[:3]
+            raise ValueError(f"{filename}: header inventory differs from manifest (missing {missing}, extra {extra})")
+
+    # n-gram: identity + sha256 re-verification, self-contained or external
+    identity = manifest.get("ngram", {})
+    self_contained = outputs.get("ngram") is not None
+    if self_contained:
+        if a.external_ngram is not None:
+            raise ValueError("checkpoint is self-contained; --external-ngram is not applicable")
+        table_path = os.path.join(a.check, outputs["ngram"])
+        if not os.path.isfile(table_path):
+            raise ValueError(f"{table_path}: self-contained n-gram table is missing next to the weights")
+    else:
+        table_path = a.external_ngram or os.environ.get("QENGINE_INT8_NGRAM_PATH", "")
+        if not table_path:
+            raise ValueError("external n-gram checkpoint: pass the table path with --external-ngram PATH "
+                             "or set QENGINE_INT8_NGRAM_PATH")
+        table_path = os.path.abspath(table_path)
+    if not re.fullmatch(r"[0-9a-f]{64}", str(identity.get("sha256", ""))):
+        raise ValueError("manifest n-gram sha256 digest is missing or malformed")
+    ngram = validate_ngram_file(table_path, False, identity.get("rows_per_shard"))
+    if (ngram["size_bytes"] != identity.get("size_bytes") or ngram["keys"] != identity.get("keys") or
+            ngram["layout"] != identity.get("layout") or identity.get("equivalence_verified") is not False):
+        raise ValueError("n-gram table identity differs from the manifest record")
+    actual_digest = sha256_file(table_path)
+    if actual_digest != identity["sha256"]:
+        raise ValueError(f"n-gram table sha256 {actual_digest} differs from the manifest {identity['sha256']}")
+
+    cfg_out = model_config(a.check)
+    if family(cfg_out) != "qwen4_exp":
+        raise ValueError("output config family differs from the manifest")
+    for name in ("generation_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        if not os.path.isfile(os.path.join(a.check, name)):
+            raise ValueError(f"required asset missing from output: {name}")
+
+    if not a.src:
+        log(f"QFN structural check passed: {len(body)} body shards, "
+            f"{len(manifest['tensors']['converted'])} matrices, "
+            f"{'self-contained' if self_contained else 'external'} n-gram "
+            f"(sha256 {identity['sha256'][:12]}..., re-hashed {ngram['size_bytes']} bytes); "
+            "pass --src for source/RTN reproduction")
+        return
+
+    src_cfg = model_config(a.src)
+    if (family(src_cfg) != "qwen4_exp" or src_cfg.get("quantization_config") or
+            manifest.get("family") != "qwen4_exp"):
+        raise ValueError("QFN manifest/source family mismatch or source is already quantized")
+    kind, digest = source_digest(Src(a.src))
+    if digest != source["index_sha256"]:
+        raise ValueError("source index digest differs from the manifest: this checkpoint was not made from --src")
+    ngram_src = validate_ngram_file(table_path, False, None)
     source_dims = qfn_dims(src_cfg)
     full_source = source_dims == (2560, 48, 512, 640)
-    ngram = validate_ngram_file(ngram_info.get("path", ""), full_source,
-                                2500012 if full_source else ngram_info.get("rows_per_shard"))
-    if (not os.path.isabs(ngram_info.get("path", "")) or
-            ngram["size_bytes"] != ngram_info.get("size_bytes") or
-            ngram["keys"] != ngram_info.get("keys") or ngram["layout"] != ngram_info.get("layout") or
-            ngram_info.get("equivalence_verified") is not False):
-        raise ValueError("external n-gram dependency differs from manifest")
-    if os.path.exists(os.path.join(a.check, "ngram_int8.safetensors")):
-        raise ValueError("n-gram table must remain an external dependency, not be copied into output")
+    if full_source and ngram_src["rows_per_shard"] != 2500012:
+        raise ValueError("pinned QFN requires 2500012 n-gram rows")
     src = Src(a.src)
     dims, source_keys, table_names, descriptors, headers, full_model = inspect_qfn_source(src, src_cfg)
     manifest_tensors = manifest.get("tensors", {})
@@ -824,40 +1108,37 @@ def check_qfn(a, manifest):
         expected_outputs = {"packed": desc["base"] + ".weight_packed",
                             "scale": desc["base"] + ".weight_scale",
                             "shape": desc["base"] + ".weight_shape"}
-        if (record.get("base") != desc["base"] or record.get("file") != desc["file"] or
+        if (record.get("base") != desc["base"] or record.get("file") not in outputs_by_file or
                 record.get("shape") != list(shape) or record.get("dtype") != dtype or
                 record.get("outputs") != expected_outputs):
             raise ValueError(f"manifest descriptor differs for {desc['source']}")
     expected_preserved = {
-        "body": sorted(n for n in source_keys if not n.startswith("mtp.") and n not in expected_converted),
+        "body": {n: mapping[n] for n in source_keys
+                 if not n.startswith("mtp.") and n not in expected_converted},
         "mtp": sorted(n for n in source_keys if n.startswith("mtp.") and n not in expected_converted)}
     if manifest_tensors.get("preserved") != expected_preserved:
         raise ValueError("manifest passthrough inventory does not match source")
-    cfg_out = model_config(a.check)
-    if (family(cfg_out) != "qwen4_exp" or
-            cfg_out.get("quantization_config", {}).get("target_modules") != targets):
-        raise ValueError("output config family or descriptive quantization targets differ")
-    if manifest.get("outputs") != {"body": "model.safetensors", "mtp": "model_mtp.safetensors",
-                                   "config": "config.json", "manifest": "qfn-int8-manifest.json"}:
+    if (cfg_out.get("quantization_config", {}).get("target_modules") != targets):
+        raise ValueError("output config descriptive quantization targets differ")
+    if (outputs["mtp"], outputs["config"], outputs["manifest"]) != (
+            "model_mtp.safetensors", "config.json", "qfn-int8-manifest.json"):
         raise ValueError("manifest output file inventory differs")
-    plans, _, _ = qfn_plans(source_keys, descriptors, headers)
-    outputs = {"model.safetensors": Src(a.check),
-               "model_mtp.safetensors": Src(a.check, "model_mtp.safetensors")}
-    for filename, plan in plans.items():
-        output = outputs[filename]
-        expected = {entry[0]: entry[1:3] for entry in plan}
-        if set(output.keys()) != set(expected):
-            raise ValueError(f"{filename}: output key inventory differs from plan")
-        for name, (dtype, shape) in expected.items():
-            actual_shape, actual_dtype = tensor_info(output, name)
-            if actual_dtype != dtype or list(actual_shape) != list(shape):
-                raise ValueError(f"{filename}:{name}: header {actual_dtype} {actual_shape}, expected {dtype} {shape}")
-
+    # converted outputs must carry the exact packed/scale/shape dtype+shape the record implies
+    records_by_output = {}
+    for record in manifest_tensors.get("converted", []):
+        logical = record["shape"]
+        records_by_output[record["outputs"]["packed"]] = ("I32", logical[:-1] + [logical[-1] // 4])
+        records_by_output[record["outputs"]["scale"]] = ("BF16", logical[:-1] + [logical[-1] // 128])
+        records_by_output[record["outputs"]["shape"]] = ("I64", [len(logical)])
+    for name, (dtype, shape) in records_by_output.items():
+        actual_shape, actual_dtype = tensor_info(outputs_by_file[mapping[name]], name)
+        if actual_dtype != dtype or list(actual_shape) != list(shape):
+            raise ValueError(f"{name}: header {actual_dtype} {list(actual_shape)}, expected {dtype} {list(shape)}")
     report = {}
     for desc in descriptors:
         source_name, base = desc["source"], desc["base"]
         shape, _ = headers[source_name]
-        output = outputs[desc["file"]]
+        output = outputs_by_file[converted_records[source_name]["file"]]
         packed_name, scale_name, shape_name = (base + ".weight_packed", base + ".weight_scale",
                                                 base + ".weight_shape")
         stored_shape = tuple(int(x) for x in output.get(shape_name).tolist())
@@ -874,7 +1155,7 @@ def check_qfn(a, manifest):
                 packed = output.block(packed_name, index)
                 scales = output.block(scale_name, index)
                 codes = packed.contiguous().view(torch.uint8).reshape(r1 - r0, k).to(torch.int16) - 128
-                expected_q, expected_s = quant_int8(original, a.search)
+                expected_q, expected_s = quant_int8(original, a.search, name=source_name)
                 if not torch.equal(codes, expected_q.to(torch.int16)) or not torch.equal(scales, expected_s):
                     raise ValueError(f"{base}: RTN/search reproduction differs at expert={expert}, rows={r0}:{r1}")
                 if int(codes.abs().max()) > 127:
@@ -892,15 +1173,14 @@ def check_qfn(a, manifest):
         if name in converted:
             continue
         shape, dtype = headers[name]
-        output = outputs["model_mtp.safetensors" if name.startswith("mtp.") else "model.safetensors"]
+        output = outputs_by_file[mapping[name] if name in mapping else
+                                 ("model_mtp.safetensors" if name.startswith("mtp.") else body[0])]
         assert_tensor_equal(src, output, name, shape, dtype)
     for key, (error_sq, source_sq, blocks) in sorted(report.items()):
         rel = (error_sq / source_sq) ** 0.5 if source_sq else 0.0
         log(f"{key}: {blocks} blocks, relative L2 error={rel:.6g}")
     if full_model and (len(descriptors), len(table_names)) != (409, 128):
         raise ValueError("full QFN verification inventory must be 398 body + 11 MTP matrices and 128 excluded tables")
-    if any(name.endswith(".part") for name in os.listdir(a.check)):
-        raise ValueError("incomplete .part file remains in output")
     assets = ("generation_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
               "preprocessor_config.json", "processor_config.json", "video_preprocessor_config.json", "LICENSE",
               "vocab.json", "merges.txt")
@@ -911,7 +1191,8 @@ def check_qfn(a, manifest):
                                        not filecmp.cmp(source, output, shallow=False)):
             raise ValueError(f"source asset missing or content differs: {name}")
     log(f"QFN check passed: {sum(d['part'] == 'body' for d in descriptors)} body + "
-        f"{sum(d['part'] == 'mtp' for d in descriptors)} MTP matrices; {len(table_names)} external n-gram shards")
+        f"{sum(d['part'] == 'mtp' for d in descriptors)} MTP matrices; {len(table_names)} n-gram shards "
+        f"({'self-contained' if self_contained else 'external'})")
 
 
 def cmd_check(a):
@@ -921,7 +1202,9 @@ def cmd_check(a):
     if os.path.isfile(manifest_path):
         with open(manifest_path) as f:
             manifest = json.load(f)
-        return check_qfn(a, manifest)
+        return check_qfn(a, manifest_path, manifest)
+    if not a.src:
+        raise ValueError("27B check requires --src")
     return cmd_check_27b(a)
 
 
@@ -937,7 +1220,7 @@ def cmd_check_27b(a):
         deq = (u.float().view(N, K // 128, 128) * sc.view(N, K // 128, 1)).view(N, K)
         w = src.get(b + ".weight").float()
         rel = ((deq - w).norm() / w.norm()).item()
-        q, s = quant_int8(src.get(b + ".weight"), a.search)
+        q, s = quant_int8(src.get(b + ".weight"), a.search, name=b + ".weight")
         same = torch.equal(q.to(torch.int16), u) and torch.equal(s.float(), sc)
         log(f"{b}: rel err {rel:.2e}, max |q| {u.abs().max().item()}, repro {'exact' if same else 'DIFFERS'}")
     ks = [n for n in out.keys() if n.endswith("k_scale")]
@@ -946,15 +1229,22 @@ def cmd_check_27b(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", default="models/Qwen3.8-27B-BF16", help="BF16 checkpoint (sharded or single)")
+    ap.add_argument("--src", default=None, help="BF16 checkpoint (sharded or single); with --check enables source reproduction")
     ap.add_argument("--out", default="")
     ap.add_argument("--kv-from", default=None,
                     help="27B checkpoint supplying KV scales/config/tokenizer; omitted uses the upstream default")
-    ap.add_argument("--ngram-from", default=None, help="QFN external INT8 n-gram table (required for QFN)")
+    ap.add_argument("--ngram-from", default=None, help="QFN existing INT8 n-gram table (required for QFN)")
+    ap.add_argument("--external-ngram", nargs="?", const="", default=None, metavar="PATH",
+                    help="conversion: record table identity only, keep it outside the output; "
+                         "--check: external table path (or set QENGINE_INT8_NGRAM_PATH)")
+    ap.add_argument("--source-repo", default=None, help="record the ACTUAL source repository in the manifest")
+    ap.add_argument("--source-revision", default=None, help="record the ACTUAL source revision in the manifest")
+    ap.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES,
+                    help=f"body shard cap in bytes (default {MAX_SHARD_BYTES} = 20 GiB)")
     ap.add_argument("--search", type=int, default=0, help="per-group clip-ratio candidates (0/1: plain RTN)")
     ap.add_argument("--dev", default="cpu")
-    ap.add_argument("--check", default="", help="verify an output dir against --src")
-    ap.add_argument("--n", type=int, default=8, help="matrices sampled by --check")
+    ap.add_argument("--check", default="", help="verify an output dir; --src additionally checks source reproduction")
+    ap.add_argument("--n", type=int, default=8, help="matrices sampled by the 27B --check")
     a = ap.parse_args()
     if a.check:
         cmd_check(a)
@@ -965,4 +1255,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (ValueError, RuntimeError) as error:  # operator-facing failures print one clean line
+        print(f"quant_int8: {error}", file=sys.stderr)
+        sys.exit(1)

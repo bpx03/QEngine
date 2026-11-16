@@ -1,6 +1,11 @@
-"""Standalone CPU checks for QFN/27B INT8 checkpoint conversion. Run: python3 tests/test_quant_int8.py"""
+"""Standalone CPU checks for QFN/27B INT8 checkpoint conversion. Run: python3 tests/test_quant_int8.py
+
+QFN fixtures use the v2 schema: sharded body, self-contained n-gram table by default (external with
+--external-ngram), source digest, manifest tensor->shard mapping. Set QENGINE_INT8_REFERENCE to a real
+checkpoint directory to additionally run the byte-layout check against real safetensors bytes."""
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,44 +29,29 @@ def rand_bf16(shape, seed):
     return torch.randn(shape, generator=generator, dtype=torch.float32).to(torch.bfloat16)
 
 
-def expect_error(fn):
+def expect_error(fn, contains=""):
     try:
         fn()
-    except (ValueError, RuntimeError):
+    except (ValueError, RuntimeError) as error:
+        assert not contains or contains in str(error), f"expected {contains!r} in {error}"
         return
     raise AssertionError("expected conversion/check failure")
 
 
-def cli(*args, ok=True):
+def cli(*args, ok=True, env=None):
+    environ = dict(os.environ, **(env or {}))
     result = subprocess.run([sys.executable, SCRIPT, *map(str, args)], cwd=ROOT,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=environ)
     assert (result.returncode == 0) == ok, result.stdout + result.stderr
     return result
 
 
-def reference_int8(w, search=0):
-    shape = tuple(w.shape)
-    n, k = shape[-2:]
-    x = w.float().reshape(-1, n, k // 128, 128)
-    maximum = x.abs().amax(dim=-1, keepdim=True)
-    best_q = None
-    best_s = None
-    best_error = None
-    for i in range(max(1, search)):
-        ratio = 1.0 if i == 0 else 1.0 - 0.20 * i / max(1, search - 1)
-        scale = (maximum * ratio / 127.0).to(torch.bfloat16).float()
-        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-        codes = torch.round(x / scale).clamp(-127, 127)
-        error = ((codes * scale - x) ** 2).sum(dim=-1, keepdim=True)
-        if best_error is None:
-            best_q, best_s, best_error = codes, scale, error
-        else:
-            choose = error < best_error
-            best_q = torch.where(choose, codes, best_q)
-            best_s = torch.where(choose, scale, best_s)
-            best_error = torch.where(choose, error, best_error)
-    return (best_q.reshape(shape).to(torch.int8),
-            best_s.reshape(*shape[:-1], k // 128).to(torch.bfloat16))
+def make_args(**kw):
+    base = dict(src=None, out="", kv_from="", ngram_from=None, external_ngram=None,
+                source_repo=None, source_revision=None, max_shard_bytes=quant.MAX_SHARD_BYTES,
+                search=0, dev="cpu", check="", n=8)
+    base.update(kw)
+    return SimpleNamespace(**base)
 
 
 def qfn_tensors():
@@ -89,7 +79,7 @@ def qfn_tensors():
         t[mtp + f"mlp.shared_expert.{p}.weight"] = rand_bf16((128, 256), 50 + i)
     t[mtp + "mlp.shared_expert.down_proj.weight"] = rand_bf16((256, 128), 52)
     t[mtp + "mlp.experts.gate_up_proj"] = rand_bf16((3, 256, 256), 53)
-    t[mtp + "mlp.experts.down_proj"] = rand_bf16((3, 256, 128), 54)
+    t[mtp + "mlp.experts.down_proj"] = rand_bf16((3, 256, 128), 54)  # [E, hidden, moe_intermediate] per text_config
     t["mtp.fc_embedding.weight"] = rand_bf16((256, 512), 55)
     t["mtp.fc_hidden.weight"] = rand_bf16((256, 256), 56)
     t.update({
@@ -146,7 +136,13 @@ def test_config_derived_qfn_projection_shapes():
     text["layer_types"][1] = "linear_attention"
     desc = quant.qfn_descriptor(body + "1.self_attn.q_proj.weight")
     expect_error(lambda: quant.validate_qfn_matrix(desc, (256, 256), "BF16", dims, cfg))
-
+    # shared kMtpFcEmbeddingKMultipliers rule: [hidden, hidden] and [hidden, 2*hidden] are the
+    # accepted mtp.fc_embedding shapes; anything else must fail (both multipliers, never wider)
+    for k in (256, 512):
+        quant.validate_qfn_matrix(quant.qfn_descriptor("mtp.fc_embedding.weight"), (256, k), "BF16", dims, cfg)
+    for k in (128, 768):
+        expect_error(lambda k=k: quant.validate_qfn_matrix(
+            quant.qfn_descriptor("mtp.fc_embedding.weight"), (256, k), "BF16", dims, cfg))
 
 
 def qfn_table_names():
@@ -199,36 +195,76 @@ def qfn_fixture(root, sharded=False, bad_k=False):
     return src, ngram, data
 
 
-def test_2d_reference_and_search():
-    w = torch.zeros((2, 256), dtype=torch.bfloat16)
-    w[0, :128] = torch.linspace(-2, 3, 128).to(torch.bfloat16)
-    w[0, 0] = -40
-    w[0, 128:] = 0
-    w[1, :128] = torch.linspace(-1, 1, 128).to(torch.bfloat16)
-    w[1, 128:] = torch.linspace(-4, 2, 128).to(torch.bfloat16)
-    q, s = quant.quant_int8(w)
-    rq, rs = reference_int8(w)
-    assert torch.equal(q, rq) and torch.equal(s, rs)
-    packed = quant.pack_int8(torch.tensor([[-127, -1, 0, 1] + [0] * 124], dtype=torch.int8))
-    raw = packed.contiguous().view(torch.uint8).reshape(-1)
-    assert raw[:4].tolist() == [1, 127, 128, 129]
-    baseline_q, baseline_s = quant.quant_int8(w, 1)
-    search_q, search_s = quant.quant_int8(w, 9)
-    base_error = ((baseline_q.float().view(2, 2, 128) * baseline_s.float().unsqueeze(-1) -
-                   w.float().view(2, 2, 128)) ** 2).sum(-1)
-    search_error = ((search_q.float().view(2, 2, 128) * search_s.float().unsqueeze(-1) -
-                     w.float().view(2, 2, 128)) ** 2).sum(-1)
-    assert torch.all(search_error <= base_error + 1e-7)
+# ---------------------------------------------------------------- quantization correctness
+
+def test_hand_computed_group():
+    # One 128-value group with 32 hand-computed values (rest zero). absmax is 254 so the BF16 scale is
+    # exactly 254/127 = 2.0; every code below is the nearest-even round of value/2 (halves go to even).
+    values = [254, -254, 253, -253, 5, -5, 3, -3, 1, -1, 2, -2,
+              127, -127, 126, -126, 4, -4, 7, -7, 6, -6, 125, -125,
+              0, 0, 252, -252, 9, -9, 11, -11]
+    assert len(values) == 32
+    expected = [127, -127, 126, -126, 2, -2, 2, -2, 0, 0, 1, -1,
+                64, -64, 63, -63, 2, -2, 4, -4, 3, -3, 62, -62,
+                0, 0, 126, -126, 4, -4, 6, -6]
+    w = torch.zeros((1, 128))
+    w[0, :32] = torch.tensor(values, dtype=torch.float32).to(torch.bfloat16).float()
+    q, s = quant.quant_int8(w.to(torch.bfloat16))
+    assert float(s.reshape(-1)[0]) == 2.0
+    assert s.reshape(-1)[0].view(torch.uint16).item() == 0x4000  # BF16 bit pattern of 2.0
+    assert q[0, :32].tolist() == expected
+    assert q[0, 32:].abs().max().item() == 0
+    packed = quant.pack_int8(q)
+    raw = packed.contiguous().view(torch.uint8).reshape(-1)[:32]
+    assert raw.tolist() == [c + 128 for c in expected]  # compressed-tensors offset-0 u8 = code + 128
+    # scale/offset invariant for the hand-computed rows: symmetric zero-point is the constant 0
+    for value, code in zip(values, expected):
+        assert abs(code * 2.0 - value) <= 1.0  # |dequant - w| <= scale/2
+
+
+def test_quantization_invariant():
+    # |dequant - w| <= scale/2 for every group: random inputs, all-zero groups, huge values,
+    # rank-3 expert tensors, and adversarial rows pinned to group boundaries.
+    cases = []
+    for seed, shape in enumerate([(2, 256), (4, 384), (3, 5, 256), (1, 1, 128)]):
+        cases.append((rand_bf16(shape, 200 + seed), f"random{seed}"))
+    zeros = torch.zeros((3, 256), dtype=torch.bfloat16)
+    cases.append((zeros, "zeros"))
+    huge = torch.full((2, 128), 3.0e38, dtype=torch.bfloat16)  # near BF16 max
+    cases.append((huge, "huge"))
+    adversarial = torch.zeros((4, 256), dtype=torch.bfloat16)
+    adversarial[0, :128] = 63.5           # every group member equals absmax -> code 127
+    adversarial[1, :128] = -63.5
+    adversarial[2, 0] = 4.0
+    adversarial[2, 1:128] = 0.0           # single nonzero: scale from one entry
+    adversarial[3, :128] = torch.linspace(-1.0, 1.0, 128).to(torch.bfloat16)
+    cases.append((adversarial, "adversarial"))
+    for w, label in cases:
+        q, s = quant.quant_int8(w)
+        shape = tuple(w.shape)
+        k = shape[-1]
+        groups = (*shape[:-1], k // 128)
+        x = w.float().reshape(*groups, 128)
+        deq = q.float().reshape(*groups, 128) * s.float().unsqueeze(-1)
+        error = (deq - x).abs()
+        bound = s.float().unsqueeze(-1) / 2.0
+        # BF16 scale rounding keeps the bound within a 2^-9 relative margin
+        assert bool((error <= bound * (1.0 + 1e-2) + 1e-30).all()), f"{label}: dequant error exceeds scale/2"
+    expect_error(lambda: quant.quant_int8(torch.full((2, 128), float("nan"), dtype=torch.bfloat16),
+                                           name="layer.weight"),
+                 contains="layer.weight")
+    expect_error(lambda: quant.quant_int8(torch.tensor([[float("inf")] + [0.0] * 127] * 2,
+                                                       dtype=torch.bfloat16), name="x.mlp.weight"),
+                 contains="x.mlp.weight")
 
 
 def test_rank3_and_bounded_writer():
     for shape in ((3, 4, 256), (3, 5, 128), (1, 1, 128)):
         w = rand_bf16(shape, sum(shape))
         q, scales = quant.quant_int8(w, 5)
-        rq, rs = reference_int8(w, 5)
-        assert torch.equal(q, rq) and torch.equal(scales, rs)
-        unpacked = quant.pack_int8(q).contiguous().view(torch.uint8).reshape(shape)
-        assert torch.equal(unpacked.to(torch.int16) - 128, q.to(torch.int16))
+        for expert in range(shape[0]):
+            eq, es = quant.quant_int8(w[expert], 5)  # rank-3 must equal per-expert rank-2
+            assert torch.equal(q[expert], eq) and torch.equal(scales[expert], es)
         assert tuple(scales.shape) == (*shape[:-1], shape[-1] // 128)
     with tempfile.TemporaryDirectory() as temp:
         source = os.path.join(temp, "source.safetensors")
@@ -270,25 +306,58 @@ def test_rank3_and_bounded_writer():
         raise AssertionError("K=192 was accepted")
 
 
-def check_qfn_passthrough(out_dir, source_data, excluded):
+# ---------------------------------------------------------------- QFN conversion (v2 schema)
+
+def output_mapping(out):
+    with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+        manifest = json.load(f)
+    mapping = {}
+    for name, shard in manifest["tensors"]["preserved"]["body"].items():
+        mapping[name] = shard
+    for name in manifest["tensors"]["preserved"]["mtp"]:
+        mapping[name] = manifest["outputs"]["mtp"]
+    for record in manifest["tensors"]["converted"]:
+        for suffix in (".weight_packed", ".weight_scale", ".weight_shape"):
+            mapping[record["base"] + suffix] = record["file"]
+    return manifest, mapping
+
+
+def load_all_outputs(out, files=None):
+    with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+        manifest = json.load(f)
+    tensors = {}
+    for filename in (files or (manifest["outputs"]["body"] + [manifest["outputs"]["mtp"]])):
+        for name, tensor in load_file(os.path.join(out, filename)).items():
+            assert name not in tensors, f"{name} present in two output files"
+            tensors[name] = tensor
+    return tensors
+
+
+def check_qfn_passthrough(out, source_data, excluded):
     converted = {name for name in source_data if quant.qfn_descriptor(name)}
-    with safe_open(os.path.join(out_dir, "model.safetensors"), "pt") as body, \
-            safe_open(os.path.join(out_dir, "model_mtp.safetensors"), "pt") as mtp:
-        body_keys, mtp_keys = set(body.keys()), set(mtp.keys())
-        assert not any(name in body_keys or name in mtp_keys for name in excluded)
-        assert not any(key.startswith("mtp.") for key in body_keys)
-        assert all(key.startswith("mtp.") for key in mtp_keys)
-        assert "model.visual.patch_embed.proj.weight" in body_keys
-        assert "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets" in body_keys
-        assert "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes" in body_keys
-        for name, tensor in source_data.items():
-            if name in excluded or name in converted:
-                continue
-            target = mtp if name.startswith("mtp.") else body
-            assert torch.equal(tensor, target.get_tensor(name)), name
+    manifest, mapping = output_mapping(out)
+    tensors = load_all_outputs(out)
+    body, mtp = set(), set()
+    for name, shard in mapping.items():
+        (mtp if shard == "model_mtp.safetensors" else body).add(name)
+    assert not any(name in body or name in mtp for name in excluded)
+    assert not any(key.startswith("mtp.") for key in body)
+    assert all(key.startswith("mtp.") for key in mtp)
+    assert "model.visual.patch_embed.proj.weight" in body
+    assert "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets" in body
+    assert "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes" in body
+    assert set(tensors) == set(mapping), "manifest mapping does not cover every output tensor exactly once"
+    for name, tensor in source_data.items():
+        if name in excluded or name in converted:
+            continue
+        assert torch.equal(tensor, tensors[name]), name
+    for name in converted:
+        base = name[:-len(".weight")] if name.endswith(".weight") else name
+        assert base + ".weight_packed" in tensors and base + ".weight_scale" in tensors
+        assert tuple(tensors[base + ".weight_shape"].tolist()) == tuple(source_data[name].shape)
 
 
-def test_qfn_indexed_filtering_and_single_file():
+def test_qfn_self_converted_sharded_and_single_file():
     with tempfile.TemporaryDirectory() as temp:
         src, ngram, source_data = qfn_fixture(temp, sharded=True)
         out = os.path.join(temp, "indexed-output")
@@ -305,21 +374,26 @@ def test_qfn_indexed_filtering_and_single_file():
             return original_block(self, name, index)
         quant.safe_open, quant.Src.get, quant.Src.block = guarded_open, guarded_get, guarded_block
         try:
-            quant.cmd_make(SimpleNamespace(src=src, out=out, kv_from="", ngram_from=ngram,
-                                           search=0, dev="cpu"))
+            quant.cmd_make(make_args(src=src, out=out, ngram_from=ngram))
         finally:
             quant.safe_open, quant.Src.get, quant.Src.block = original_open, original_get, original_block
         excluded = qfn_table_names()
         check_qfn_passthrough(out, source_data, excluded)
-        assert not os.path.exists(os.path.join(out, "ngram_int8.safetensors"))
-        assert not os.path.islink(os.path.join(out, "ngram_int8.safetensors"))
-        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
-            manifest = json.load(f)
+        manifest, mapping = output_mapping(out)
+        # self-contained n-gram is the default: table materialized next to the weights, relative name only
+        assert manifest["schema"] == "qfn-int8-v2"
+        assert manifest["outputs"]["ngram"] == "ngram_int8.safetensors"
+        copied = os.path.join(out, "ngram_int8.safetensors")
+        assert os.path.isfile(copied) and os.path.getsize(copied) == os.path.getsize(ngram)
+        assert not os.path.isabs(manifest["outputs"]["ngram"])
+        assert "path" not in manifest["ngram"]
+        assert manifest["ngram"]["sha256"] == quant.sha256_file(copied)
         assert manifest["runtime_supported"] is False
-        assert manifest["ngram_external"]["path"] == os.path.abspath(ngram)
-        assert manifest["ngram_external"]["equivalence_verified"] is False
         assert len(manifest["tensors"]["excluded"]) == 128
         assert len(manifest["tensors"]["converted"]) == 25
+        assert "repo" not in manifest["source"] and "revision" not in manifest["source"]
+        assert len(manifest["outputs"]["body"]) >= 1
+        assert all(quant.sandbox_relative(n) for n in manifest["outputs"]["body"])
 
         single_src = os.path.join(temp, "single-source")
         os.makedirs(single_src)
@@ -331,53 +405,222 @@ def test_qfn_indexed_filtering_and_single_file():
         single_out = os.path.join(temp, "single-output")
         cli("--src", single_src, "--out", single_out, "--ngram-from", ngram,
             "--kv-from", "", "--search", 0, "--dev", "cpu")
-        for filename in ("model.safetensors", "model_mtp.safetensors"):
-            left, right = (load_file(os.path.join(folder, filename)) for folder in (out, single_out))
-            assert left.keys() == right.keys()
-            assert all(torch.equal(left[k], right[k]) for k in left)
+        left, right = load_all_outputs(out), load_all_outputs(single_out)
+        assert left.keys() == right.keys()
+        assert all(torch.equal(left[k], right[k]) for k in left)
 
 
-def test_qfn_cli_check_corruption_and_early_failures():
+def test_sharding_bounds_and_naming():
     with tempfile.TemporaryDirectory() as temp:
-        src, ngram, source_data = qfn_fixture(temp)
-        out = os.path.join(temp, "qfn-output")
-        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", "--search", 0)
-        check_qfn_passthrough(out, source_data, qfn_table_names())
-        cli("--src", src, "--check", out, "--search", 0)
-        model_path = os.path.join(out, "model.safetensors")
-        original = {name: tensor.clone() for name, tensor in load_file(model_path).items()}
-        converted_name = next(name for name in original if name.endswith(".weight_packed"))
-        corrupted = {name: tensor.clone() for name, tensor in original.items()}
-        bytes_view = corrupted[converted_name].contiguous().view(torch.uint8).reshape(-1)
-        bytes_view[0] = bytes_view[0] ^ 1
-        save_file(corrupted, model_path)
-        cli("--src", src, "--check", out, "--search", 0, ok=False)
-        corrupted = {name: tensor.clone() for name, tensor in original.items()}
-        scale_name = converted_name[:-len("_packed")] + "_scale"
-        corrupted[scale_name].reshape(-1)[0] += 1
-        save_file(corrupted, model_path)
-        cli("--src", src, "--check", out, "--search", 0, ok=False)
-        restored = model_path + ".restore"
-        save_file(original, restored)
-        os.replace(restored, model_path)
-        cli("--src", src, "--check", out, "--search", 0)
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "sharded")
+        # layer0 alone is ~1,000,240 plan bytes; with the header margin this cap fits layer0
+        # but not layer0 + the next (2 KiB) group, forcing exactly the split we want to test
+        cap = 1068000
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "",
+            "--max-shard-bytes", cap)
+        manifest, mapping = output_mapping(out)
+        shards = manifest["outputs"]["body"]
+        assert len(shards) > 1, "small cap must produce multiple shards"
+        assert shards == [f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors"
+                          for i in range(len(shards))], "shard naming scheme changed"
+        assert manifest["shard_limit_bytes"] == cap
+        for shard in shards:
+            assert os.path.getsize(os.path.join(out, shard)) <= cap, f"{shard} exceeds the cap"
+        # every tensor in exactly one shard and the layer grouping keeps a layer intact
+        per_shard = {}
+        for name, shard in mapping.items():
+            per_shard.setdefault(shard, set()).add(name)
+        assert set(per_shard) == set(shards) | {manifest["outputs"]["mtp"]}, "a shard carries no manifest tensors"
+        layer0 = {n for n in mapping if n.startswith("model.language_model.layers.0.")}
+        shards_of_layer0 = {mapping[n] for n in layer0}
+        assert len(shards_of_layer0) == 1, "a layer was split across shards"
+        # PLE/n-gram-adjacent preserved tensors ride the final shard
+        for name in mapping:
+            if "ple_embedding." in name:
+                assert mapping[name] == shards[-1], f"{name} not on the final shard"
+        cli("--src", src, "--check", out)  # structural check without --src
+        cli("--check", out, "--src", src)  # deep check with --src
+        cli("--src", src, "--out", os.path.join(temp, "bad-cap"), "--ngram-from", ngram,
+            "--kv-from", "", "--max-shard-bytes", 64, ok=False)
 
-        bad_k_src, valid_table, _ = qfn_fixture(os.path.join(temp, "bad-k"), bad_k=True)
-        bad_k_out = os.path.join(temp, "bad-k-output")
-        cli("--src", bad_k_src, "--out", bad_k_out, "--ngram-from", valid_table, "--kv-from", "", ok=False)
-        assert not os.path.exists(os.path.join(bad_k_out, "model.safetensors"))
-        no_table_out = os.path.join(temp, "missing-table-output")
-        cli("--src", src, "--out", no_table_out, "--kv-from", "", ok=False)
-        assert not os.path.exists(os.path.join(no_table_out, "model.safetensors"))
-        bad_table = external_table(os.path.join(temp, "bad-layout.safetensors"), width=160)
-        bad_table_out = os.path.join(temp, "bad-table-output")
-        cli("--src", src, "--out", bad_table_out, "--ngram-from", bad_table,
-            "--kv-from", "", ok=False)
-        assert not os.path.exists(os.path.join(bad_table_out, "model.safetensors"))
-        kv_out = os.path.join(temp, "kv-rejected-output")
-        cli("--src", src, "--out", kv_out, "--ngram-from", valid_table,
-            "--kv-from", os.path.join(temp, "nonempty-kv"), ok=False)
-        assert not os.path.exists(os.path.join(kv_out, "model.safetensors"))
+
+def test_external_ngram_identity_and_check():
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "external")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", "--external-ngram")
+        manifest, _ = output_mapping(out)
+        assert "ngram" not in manifest["outputs"]
+        assert not os.path.exists(os.path.join(out, "ngram_int8.safetensors"))
+        assert not os.path.islink(os.path.join(out, "ngram_int8.safetensors"))
+        identity = manifest["ngram"]
+        assert identity["sha256"] == quant.sha256_file(ngram)
+        assert identity["width_bytes"] == 162 and identity["shards"] == 128
+        assert identity["equivalence_verified"] is False
+        cli("--src", src, "--check", out, "--external-ngram", ngram)
+        cli("--src", src, "--check", out, env={"QENGINE_INT8_NGRAM_PATH": ngram})
+        cli("--src", src, "--check", out, ok=False)  # external checkpoint, no table path configured
+        cli("--src", src, "--check", out, "--external-ngram", os.path.join(temp, "missing.safetensors"), ok=False)
+        # tampering the external table breaks the recorded sha256
+        tampered = external_table(os.path.join(temp, "tampered.safetensors"), rows=2)
+        with safe_open(tampered, "pt") as f:
+            tensors = {k: f.get_tensor(k) for k in f.keys()}
+        first = sorted(tensors)[0]
+        view = tensors[first].view(-1)
+        view[0] = 7
+        save_file(tensors, tampered)
+        cli("--src", src, "--check", out, "--external-ngram", tampered, ok=False)
+        # self-contained checkpoints refuse --external-ngram at check time
+        self_out = os.path.join(temp, "self")
+        cli("--src", src, "--out", self_out, "--ngram-from", ngram, "--kv-from", "")
+        cli("--src", src, "--check", self_out, "--external-ngram", ngram, ok=False)
+        # conversion --external-ngram takes no path
+        cli("--src", src, "--out", os.path.join(temp, "bad-external"), "--ngram-from", ngram,
+            "--kv-from", "", "--external-ngram", ngram, ok=False)
+
+
+def test_sandbox_relative_rejects():
+    for bad in ("", "/abs/x.safetensors", "../x", "a/../../x", "C:/evil.safetensors",
+                "c:\\evil.safetensors", "\\\\server\\share\\x", "~x", "x\0y"):
+        assert not quant.sandbox_relative(bad), bad
+    for good in ("model-00001-of-00002.safetensors", "sub/dir/table.safetensors", "ngram_int8.safetensors"):
+        assert quant.sandbox_relative(good), good
+
+
+def test_source_digest_and_honest_identity():
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp, sharded=True)  # indexed source -> index_json digest
+        out = os.path.join(temp, "sourced")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "",
+            "--source-repo", "acme/fork", "--source-revision", "abcdef0123")
+        manifest, _ = output_mapping(out)
+        assert manifest["source"]["repo"] == "acme/fork"
+        assert manifest["source"]["revision"] == "abcdef0123"
+        assert manifest["source"]["index_sha256_kind"] == "index_json"
+        assert manifest["source"]["index_sha256"] == quant.sha256_file(
+            os.path.join(src, "model.safetensors.index.json"))
+        cli("--src", src, "--check", out)
+        # an unlisted source is never rejected: --check does not consult any pin
+        single_src, single_ngram, single_data = qfn_fixture(os.path.join(temp, "single"))
+        single_out = os.path.join(temp, "single-sourced")
+        cli("--src", single_src, "--out", single_out, "--ngram-from", single_ngram, "--kv-from", "")
+        manifest, _ = output_mapping(single_out)
+        assert manifest["source"]["index_sha256_kind"] == "weight_files"
+        assert "repo" not in manifest["source"]
+        cli("--src", single_src, "--check", single_out)
+        # half-recorded identity is refused at conversion
+        cli("--src", single_src, "--out", os.path.join(temp, "half"), "--ngram-from", single_ngram,
+            "--kv-from", "", "--source-repo", "acme/fork", ok=False)
+        # a rewritten source body changes the recorded digest -> --check --src fails
+        corrupt_src = os.path.join(temp, "corrupt")
+        os.makedirs(corrupt_src)
+        for name in os.listdir(single_src):
+            path = os.path.join(single_src, name)
+            if os.path.isfile(path):
+                with open(path, "rb") as inp, open(os.path.join(corrupt_src, name), "wb") as dst:
+                    dst.write(inp.read())
+        with open(os.path.join(corrupt_src, "model.safetensors"), "ab") as f:
+            f.write(b"x")  # same tensors, different file size: the recorded inventory digest no longer matches
+        cli("--src", corrupt_src, "--check", out, ok=False)
+        cli("--src", corrupt_src, "--check", single_out, ok=False)
+
+
+def test_legacy_manifest_clean_break():
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "legacy")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        manifest_path = os.path.join(out, "qfn-int8-manifest.json")
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        # rewrite the manifest the way the pre-sharding converter wrote it
+        manifest.pop("schema")
+        manifest["outputs"]["body"] = "model.safetensors"
+        manifest["outputs"]["ngram"] = ngram  # old absolute external path style
+        manifest["source"] = {"repo": "orcarouter/Qwen3.8-Flash-Next-Uncensored",
+                              "revision": "da29941aee972c7eeab497e05a292c569da1f1d6"}
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f)
+        result = cli("--check", out, ok=False)
+        assert "schema updated, reconvert" in result.stdout + result.stderr
+
+
+def test_nan_in_source_refuses_conversion():
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, data = qfn_fixture(temp)
+        poisoned = dict(data)
+        key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        poisoned[key] = data[key].clone()
+        poisoned[key][0, 0] = float("nan")
+        os.remove(os.path.join(src, "model.safetensors"))
+        save_file(poisoned, os.path.join(src, "model.safetensors"))
+        out = os.path.join(temp, "nan-output")
+        result = cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", ok=False)
+        text = result.stdout + result.stderr
+        assert key in text and "NaN" in text, text
+        assert not os.path.exists(os.path.join(out, "model-00001-of-00001.safetensors"))
+
+
+def read_safetensors_header(path):
+    with open(path, "rb") as f:
+        length = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(length))
+    return header, length
+
+
+def test_byte_layout_against_manifest():
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "layout")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        manifest, mapping = output_mapping(out)
+        record = manifest["tensors"]["converted"][0]
+        for name, expect_dtype, expect_shape in (
+                (record["outputs"]["packed"], "I32", record["shape"][:-1] + [record["shape"][-1] // 4]),
+                (record["outputs"]["scale"], "BF16", record["shape"][:-1] + [record["shape"][-1] // 128]),
+                (record["outputs"]["shape"], "I64", [len(record["shape"])])):
+            shard = os.path.join(out, mapping[name])
+            header, header_len = read_safetensors_header(shard)
+            entry = header[name]
+            assert entry["dtype"] == expect_dtype, name
+            assert entry["shape"] == expect_shape, name
+            begin, end = entry["data_offsets"]
+            size = {"I32": 4, "BF16": 2, "I64": 8}[expect_dtype]
+            product = 1
+            for dim in expect_shape:
+                product *= dim
+            assert end - begin == product * size, name
+            payload_end = max(v["data_offsets"][1] for k, v in header.items() if k != "__metadata__")
+            assert payload_end <= os.path.getsize(shard) - 8, name
+            assert begin >= 0 and end <= payload_end, name
+    real = os.environ.get("QENGINE_INT8_REFERENCE")
+    if not real:
+        return
+    with open(os.path.join(real, "qfn-int8-manifest.json")) as f:
+        manifest = json.load(f)
+    body = manifest["outputs"]["body"]
+    body = [body] if isinstance(body, str) else body
+    record = manifest["tensors"]["converted"][0]
+    header, _ = read_safetensors_header(os.path.join(real, body[0]))
+    for suffix, dtype in ((".weight_packed", "I32"), (".weight_scale", "BF16"), (".weight_shape", "I64")):
+        name = record["base"] + suffix
+        if name not in header:
+            for candidate in body:
+                header, _ = read_safetensors_header(os.path.join(real, candidate))
+                if name in header:
+                    break
+        entry = header[name]
+        shape = record["shape"]
+        assert entry["dtype"] == dtype
+        if suffix == ".weight_shape":
+            assert entry["shape"] == [len(shape)]
+        elif suffix == ".weight_packed":
+            assert entry["shape"] == shape[:-1] + [shape[-1] // 4]
+        else:
+            assert entry["shape"] == shape[:-1] + [shape[-1] // 128]
+        begin, end = entry["data_offsets"]
+        assert begin <= end
 
 
 def write_checkpoint(directory, tensors, config, indexed=False, assets=None):
@@ -430,11 +673,23 @@ def test_27b_compatibility_and_family_precedence():
             assert len([key for key in model if key.endswith(".weight_packed")]) == 10
             for name in names:
                 base = name[:-len(".weight")]
-                q, scale = reference_int8(weights[name])
+                q, scale = quant.quant_int8(weights[name], name=name)
                 unpacked = model[base + ".weight_packed"].contiguous().view(torch.uint8).reshape(2, 128)
                 assert torch.equal(unpacked.to(torch.int16) - 128, q.to(torch.int16))
                 assert torch.equal(model[base + ".weight_scale"], scale)
                 assert tuple(model[base + ".weight_shape"].tolist()) == (2, 128)
+                deq = (unpacked.to(torch.int16) - 128).float().view(2, 1, 128) * scale.float().view(2, 1, 1)
+                err = (deq - weights[name].float().view(2, 1, 128)).abs()
+                bound = scale.float().view(2, 1, 1) / 2 * (1.0 + 1e-2) + 1e-30
+                if not bool((err <= bound).all()):
+                    idx = int(err.argmax())
+                    flat_q = (unpacked.to(torch.int16) - 128).flatten()
+                    raise AssertionError(
+                        f"{name}: err={err.flatten()[idx]:.6g} bound={bound.flatten()[idx // 128]:.6g} "
+                        f"w={weights[name].float().flatten()[idx]:.6g} q={int(flat_q[idx])} "
+                        f"s={float(scale.float().flatten()[idx // 128]):.6g} "
+                        f"deq={float(deq.flatten()[idx]):.6g} "
+                        f"recheck={float(flat_q[idx]) * float(scale.float().flatten()[idx // 128]):.6g}")
             assert torch.equal(model["fixture.scalar"], weights["fixture.scalar"])
             assert torch.equal(model[layer + "self_attn.k_scale"], kv_tensors[layer + "self_attn.k_scale"])
             assert torch.equal(model[layer + "self_attn.v_scale"], kv_tensors[layer + "self_attn.v_scale"])
@@ -451,7 +706,7 @@ def test_27b_compatibility_and_family_precedence():
         real_exists = quant.os.path.exists
         def hide_default_reference(path):
             return False if os.path.abspath(path) == default_reference else real_exists(path)
-        fallback_args = SimpleNamespace(src=single, out=fallback_out, kv_from=None, search=0, dev="cpu")
+        fallback_args = make_args(src=single, out=fallback_out, kv_from=None)
         quant.os.path.exists = hide_default_reference
         try:
             quant.cmd_make_27b(fallback_args, src_config)
@@ -472,13 +727,84 @@ def test_27b_compatibility_and_family_precedence():
         assert not os.path.exists(os.path.join(rejected, "model.safetensors"))
 
 
+def test_qfn_cli_check_corruption_and_early_failures():
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, source_data = qfn_fixture(temp)
+        out = os.path.join(temp, "qfn-output")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", "--search", 0)
+        check_qfn_passthrough(out, source_data, qfn_table_names())
+        cli("--check", out)
+        cli("--src", src, "--check", out, "--search", 0)
+        manifest, mapping = output_mapping(out)
+        converted_name = next(name for name in mapping if name.endswith(".weight_packed")
+                              and not name.startswith("mtp."))
+        shard_file = os.path.join(out, mapping[converted_name])
+        original = {name: tensor.clone() for name, tensor in load_file(shard_file).items()}
+        corrupted = {name: tensor.clone() for name, tensor in original.items()}
+        bytes_view = corrupted[converted_name].contiguous().view(torch.uint8).reshape(-1)
+        bytes_view[0] = bytes_view[0] ^ 1
+        save_file(corrupted, shard_file)
+        cli("--src", src, "--check", out, "--search", 0, ok=False)
+        corrupted = {name: tensor.clone() for name, tensor in original.items()}
+        scale_name = converted_name[:-len("_packed")] + "_scale"
+        corrupted[scale_name].reshape(-1)[0] += 1
+        save_file(corrupted, shard_file)
+        cli("--src", src, "--check", out, "--search", 0, ok=False)
+        # renaming a manifest mapping target: the shard no longer matches the manifest inventory
+        save_file(original, shard_file)
+        cli("--src", src, "--check", out, "--search", 0)
+        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+            manifest = json.load(f)
+        record = manifest["tensors"]["converted"][0]
+        other = [s for s in manifest["outputs"]["body"] if s != record["file"]]
+        if other:
+            record["file"] = other[0]  # tensor claimed by the wrong shard
+            with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+                json.dump(manifest, f)
+            cli("--check", out, ok=False)
+            record["file"] = mapping[record["outputs"]["packed"]]
+            with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+                json.dump(manifest, f)
+            cli("--check", out)
+        # absolute manifest path rejected by --check
+        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+            manifest = json.load(f)
+        manifest["outputs"]["body"][0] = os.path.join(out, manifest["outputs"]["body"][0])
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(manifest, f)
+        cli("--check", out, ok=False)
+
+        bad_k_src, valid_table, _ = qfn_fixture(os.path.join(temp, "bad-k"), bad_k=True)
+        bad_k_out = os.path.join(temp, "bad-k-output")
+        cli("--src", bad_k_src, "--out", bad_k_out, "--ngram-from", valid_table, "--kv-from", "", ok=False)
+        if os.path.isdir(bad_k_out):
+            assert not any(name.endswith(".safetensors") for name in os.listdir(bad_k_out))
+        no_table_out = os.path.join(temp, "missing-table-output")
+        cli("--src", src, "--out", no_table_out, "--kv-from", "", ok=False)
+        bad_table = external_table(os.path.join(temp, "bad-layout.safetensors"), width=160)
+        bad_table_out = os.path.join(temp, "bad-table-output")
+        cli("--src", src, "--out", bad_table_out, "--ngram-from", bad_table,
+            "--kv-from", "", ok=False)
+        kv_out = os.path.join(temp, "kv-rejected-output")
+        cli("--src", src, "--out", kv_out, "--ngram-from", valid_table,
+            "--kv-from", os.path.join(temp, "nonempty-kv"), ok=False)
+
+
 def main():
-    test_2d_reference_and_search()
-    test_rank3_and_bounded_writer()
-    test_qfn_indexed_filtering_and_single_file()
-    test_qfn_cli_check_corruption_and_early_failures()
-    test_27b_compatibility_and_family_precedence()
     test_config_derived_qfn_projection_shapes()
+    test_hand_computed_group()
+    test_quantization_invariant()
+    test_rank3_and_bounded_writer()
+    test_qfn_self_converted_sharded_and_single_file()
+    test_sharding_bounds_and_naming()
+    test_external_ngram_identity_and_check()
+    test_sandbox_relative_rejects()
+    test_source_digest_and_honest_identity()
+    test_legacy_manifest_clean_break()
+    test_nan_in_source_refuses_conversion()
+    test_byte_layout_against_manifest()
+    test_27b_compatibility_and_family_precedence()
+    test_qfn_cli_check_corruption_and_early_failures()
     print("test_quant_int8: ALL PASS")
 
 
