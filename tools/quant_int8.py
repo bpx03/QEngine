@@ -4,9 +4,10 @@
 The 27B route preserves the pinned upstream converter: symmetric INT8, group 128, with BF16 MTP passthrough.
 The QFN route converts the explicitly selected attention, shared-expert, fused-expert, PLE, and MTP matrices;
 all other source tensors are preserved. Its 128 n-gram tables are excluded from the body; by default the
-existing INT8 table is materialized INSIDE the output (hard link, full copy fallback) so the checkpoint is
-self-contained. --external-ngram keeps it outside: the manifest then records only table identity plus a
-sha256 digest, and --check takes the table path via --external-ngram PATH or QENGINE_INT8_NGRAM_PATH.
+existing INT8 table is materialized INSIDE the output as an independent full copy (--link-ngram hard links
+it instead) so the checkpoint is self-contained. --external-ngram keeps it outside: the manifest then
+records only table identity plus a sha256 digest, and --check takes the table path via --external-ngram
+PATH or QENGINE_INT8_NGRAM_PATH.
 The QFN body is written as shards (model-00001-of-000NN.safetensors, each <= --max-shard-bytes, default
 20 GiB, grouped per transformer layer; PLE/n-gram-adjacent tensors go to the final shard); every manifest
 tensor names its shard. The manifest records a sha256 digest of the source index (or of the sorted source
@@ -372,24 +373,35 @@ def validate_ngram_file(path, full_model, expected_rows=None):
             "keys": [prefix + str(i) for i in range(128)]}
 
 
-def materialize_ngram(table_path, out):
-    """Self-contained default: place the table next to the weights. Hard link when the filesystem
-    allows it (zero-copy), full byte-identical copy across filesystems (shortcut: if the source is
-    later removed, the checkpoint keeps its own copy — that is the point)."""
+def materialize_ngram(table_path, out, link=False):
+    """Self-contained default: place the table next to the weights as an independent, byte-identical
+    copy. A hard link would share the file with the source table, so a later write through the
+    source name would mutate the DEPLOYED checkpoint; copying is therefore the default and
+    --link-ngram opts back into the zero-copy hard link (falling back to a full copy across
+    filesystems, where the shortcut is impossible)."""
     dst = os.path.join(out, NGRAM_OUT_NAME)
     if os.path.lexists(dst):
         os.remove(dst)
-    try:
-        os.link(table_path, dst)
-        return dst
-    except OSError:
-        pass
+    if link:
+        try:
+            os.link(table_path, dst)
+            return dst
+        except OSError:
+            pass  # different filesystems: the hard link is impossible, copy below
+    total = os.path.getsize(table_path)
     # copy across filesystems lands on <name>.part first: os.replace publishes the table atomically
     # once all bytes are written, so an interrupted 52 GiB copy can never leave a half-written table
     # under the final name; a .part that remains in an output dir is itself a --check rejection
     part = dst + ".part"
+    log(f"n-gram: copying {total} bytes to {dst} (--link-ngram hard links instead)")
+    t0 = time.time()
     try:
-        shutil.copy2(table_path, part)
+        with open(table_path, "rb") as fin, open(part, "wb") as fout:
+            done = 0
+            while chunk := fin.read(1 << 30):
+                fout.write(chunk)
+                done += len(chunk)
+                log(f"n-gram: {done / (1 << 30):.1f}/{total / (1 << 30):.1f} GiB copied")
         os.replace(part, dst)
     except BaseException:
         try:
@@ -397,6 +409,7 @@ def materialize_ngram(table_path, out):
         except OSError:
             pass
         raise
+    log(f"n-gram: copied {total} bytes in {time.time() - t0:.0f}s")
     return dst
 
 
@@ -812,7 +825,7 @@ def cmd_make_qfn(a, cfg):
             shutil.copy2(path, os.path.join(a.out, name))
 
     if a.external_ngram is None:
-        materialize_ngram(a.ngram_from, a.out)
+        materialize_ngram(a.ngram_from, a.out, link=a.link_ngram)
     else:
         log(f"external n-gram: table stays at {os.path.abspath(a.ngram_from)}; manifest records identity only")
     ngram["sha256"] = sha256_file(a.ngram_from)
@@ -1321,6 +1334,10 @@ def main():
     ap.add_argument("--external-ngram", nargs="?", const="", default=None, metavar="PATH",
                     help="conversion: record table identity only, keep it outside the output; "
                          "--check: external table path (or set QENGINE_INT8_NGRAM_PATH)")
+    ap.add_argument("--link-ngram", action="store_true",
+                    help="self-contained conversion: hard link the n-gram table into the output "
+                         "instead of the default independent copy (zero-copy, but a later write "
+                         "through the source table path would mutate the deployed checkpoint)")
     ap.add_argument("--source-repo", default=None, help="record the ACTUAL source repository in the manifest")
     ap.add_argument("--source-revision", default=None, help="record the ACTUAL source revision in the manifest")
     ap.add_argument("--max-shard-bytes", type=int, default=MAX_SHARD_BYTES,

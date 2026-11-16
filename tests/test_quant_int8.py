@@ -48,7 +48,7 @@ def cli(*args, ok=True, env=None):
 
 
 def make_args(**kw):
-    base = dict(src=None, out="", kv_from="", ngram_from=None, external_ngram=None,
+    base = dict(src=None, out="", kv_from="", ngram_from=None, external_ngram=None, link_ngram=False,
                 source_repo=None, source_revision=None, max_shard_bytes=quant.MAX_SHARD_BYTES,
                 search=0, dev="cpu", check="", n=8)
     base.update(kw)
@@ -501,6 +501,24 @@ def test_external_ngram_identity_and_check():
         # conversion --external-ngram takes no path
         cli("--src", src, "--out", os.path.join(temp, "bad-external"), "--ngram-from", ngram,
             "--kv-from", "", "--external-ngram", ngram, ok=False)
+
+
+def test_ngram_copied_by_default_hardlinked_on_request():
+    # self-contained packaging defaults to an independent copy: a hard link would let a later write
+    # through the source table name mutate the deployed checkpoint, so the shortcut is opt-in
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "copied")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        table = os.path.join(out, "ngram_int8.safetensors")
+        assert os.stat(table).st_nlink == 1, "default packaging must copy the table, not share it"
+        assert quant.sha256_file(table) == quant.sha256_file(ngram)
+        assert os.stat(ngram).st_nlink == 1, "conversion must not link the source table itself"
+        cli("--check", out)
+        linked = os.path.join(temp, "linked")
+        cli("--src", src, "--out", linked, "--ngram-from", ngram, "--kv-from", "", "--link-ngram")
+        assert os.stat(os.path.join(linked, "ngram_int8.safetensors")).st_nlink == 2, "--link-ngram must hard link"
+        cli("--check", linked)
 
 
 def test_sandbox_relative_rejects():
@@ -1062,6 +1080,7 @@ def main():
     test_qfn_self_converted_sharded_and_single_file()
     test_sharding_bounds_and_naming()
     test_external_ngram_identity_and_check()
+    test_ngram_copied_by_default_hardlinked_on_request()
     test_sandbox_relative_rejects()
     test_source_digest_and_honest_identity()
     test_legacy_manifest_clean_break()
