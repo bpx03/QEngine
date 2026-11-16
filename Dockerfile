@@ -172,3 +172,45 @@ LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"
+
+# ---------------------------------------------------- flash-overlay: additive Flash-Next INT8 (W8) overlay
+# Rebuilds only the Flash engine (libqflash.so + flash_run) and drops it over an already-running QEngine
+# runtime image, so the vision stack, python server and model mounts of the base image stay untouched.
+# The INT4 runtime keeps working: the format is chosen per checkpoint by the manifest / header check in
+# src/flash/checkpoint.h, not by the image.
+#
+#   docker build -f Dockerfile --target flash-overlay \
+#       --build-arg BASE_RUNTIME=qengine:qfn-base-local --build-arg REVISION=$(git rev-parse HEAD) \
+#       -t qengine:flash-int8 .
+#
+# The model is still not baked in: mount the INT8 checkpoint and point QE_MODEL at it.
+ARG BASE_RUNTIME
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS flash-build
+ARG CUDA_ARCHS=86
+ARG REVISION=unknown
+RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY CMakeLists.txt VERSION ./
+COPY src ./src
+COPY tests ./tests
+# same flags as the main image (sm_86, Release, distro GCC 13); build Flash and its acceptance tests, no libqengine
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DQE_BUILD_FLASH_INT8_TESTS=ON \
+      "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" "-DQE_GIT_HASH=${REVISION}" \
+    && cmake --build build --target qflash flash_run flash_checkpoint_unit flash_int8_unit -j 3
+# the runtime binds libqflash.so through ctypes and calls the same qe_* contract as libqengine: the
+# overlay is only usable if that entry-point surface is there (a missing symbol means the server starts
+# and dies on the first request)
+RUN test -f build/libqflash.so -a -f build/flash_run -a -f build/flash_checkpoint_unit -a -f build/flash_int8_unit \
+    && for s in qe_create qe_destroy qe_max_context qe_start3 qe_spec_step qe_vocab; do \
+         nm -D --defined-only build/libqflash.so | grep -q " $s$" \
+             || { echo "libqflash.so does not export $s"; exit 1; }; \
+       done
+
+FROM ${BASE_RUNTIME} AS flash-overlay
+COPY --from=flash-build /src/build/libqflash.so /app/build/libqflash.so
+COPY --from=flash-build /src/build/flash_run /app/build/flash_run
+COPY --from=flash-build /src/build/flash_checkpoint_unit /app/build/flash_checkpoint_unit
+COPY --from=flash-build /src/build/flash_int8_unit /app/build/flash_int8_unit
+COPY --from=flash-build /src/build/qe_build.txt /app/build/qe_build.txt

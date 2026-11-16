@@ -139,3 +139,10 @@ foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_o
   endif()
 endforeach()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/flash_int8_unit.cu)  # GPU unit: builds with the tree, runs in a GPU window (not ctest)
+  add_executable(flash_int8_unit tests/flash_int8_unit.cu src/build_id.cpp $<TARGET_OBJECTS:qkernels>)
+  target_include_directories(flash_int8_unit PRIVATE src)
+  target_link_libraries(flash_int8_unit PRIVATE CUDA::cudart CUDA::cuda_driver)
+  target_include_directories(flash_int8_unit PRIVATE ${CMAKE_BINARY_DIR}/gen)
+  add_dependencies(flash_int8_unit qe_build_id)
+endif()

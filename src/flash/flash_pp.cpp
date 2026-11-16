@@ -1564,7 +1564,7 @@ bool pp_p2p_ok(int a, int b) {
 std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vector<int>& bounds, int ctx, const SafeTensors& st,
                                            const HostTables& ht, const SafeTensors* mst, const std::vector<std::vector<int>>& cold,
                                            const std::vector<float>& prior, const std::vector<int>& draft_ids, const NgramDev& ngd,
-                                           const std::vector<const Worker*>& views, int max_seqs) {
+                                           WeightFormat format, const std::vector<const Worker*>& views, int max_seqs) {
     const int n = (int)devs.size();
     std::vector<Plan> plans = make_stage_plans(bounds);
     for (Plan& p : plans) p.max_seqs = max_seqs;
@@ -1598,7 +1598,7 @@ std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vec
                 CUDA_CHECK(cudaSetDevice(devs[s]));
                 Comm c1 = comm_create(1, ARU_MAX * H, H);  // a stage's collectives are local (no peers)
                 c1.dev[0] = devs[s];
-                S[s] = new Worker(plans[s], devs[s], c1, ctx);
+                S[s] = new Worker(plans[s], devs[s], c1, ctx, format);
                 S[s]->set_cold(cold);
                 S[s]->set_expert_prior(prior);
                 S[s]->set_draft_vocab(draft_ids);
@@ -1680,7 +1680,7 @@ std::vector<int> pptp_bounds(const std::vector<std::vector<int>>& groups, long l
 std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups, const std::vector<int>& bounds, int ctx,
                                     const SafeTensors& st, const HostTables& ht, const SafeTensors* mst,
                                     const std::vector<std::vector<int>>& cold, const std::vector<float>& prior,
-                                    const std::vector<int>& draft_ids, const NgramDev& ngd, int max_seqs) {
+                                    const std::vector<int>& draft_ids, const NgramDev& ngd, WeightFormat format, int max_seqs) {
     const int n = (int)groups.size();
     std::vector<int> tps;
     for (auto& g : groups) tps.push_back((int)g.size());
@@ -1743,7 +1743,7 @@ std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups,
             for (size_t j = 0; j < mine.size(); j++) {
                 const int i = mine[j], s = stg[i];
                 CUDA_CHECK(cudaSetDevice(d));
-                W[i] = new Worker(plans[i], d, comm[s], ctx);
+                W[i] = new Worker(plans[i], d, comm[s], ctx, format);
                 W[i]->set_cold(cold);
                 W[i]->set_expert_prior(prior);
                 W[i]->set_draft_vocab(draft_ids);

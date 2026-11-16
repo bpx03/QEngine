@@ -436,9 +436,14 @@ void Worker::ple_b(Layer& L, int li, int m, int rps) {
     flush_y(m);
     float* key = gates_;
     float* val = proj_;
+    if (L.ple_key8.q) {
+        gemv_w8_rows(L.ple_key8, pler_, H, key, RW, m, st_);
+        gemv_w8_rows(L.ple_val8, pler_, H, val, H, m, st_);
+    } else {
     xh_pack(pler_, H, H, m, pleh_, H, st_);
     gemv_w4h(L.ple_key, pleh_, H, key, RW, m, st_);
     gemv_w4h(L.ple_val, pleh_, H, val, H, m, st_);
+    }
     float* gv = proj2_;
     float* gvn = yd_;
     k_ple_gate<<<dim3(HC, m), 256, 0, st_>>>(key, val, R_, L.ple_nk, L.ple_nq, L.ple_nc, gv, gvn);

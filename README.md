@@ -660,6 +660,33 @@ from 455 to 580 tok/s on 3 cards and from 233 to 332 tok/s on 2 cards (October 3
 because short-request throughput is about 12 % lower (the indexer keys and block cache take VRAM from the experts).
 Details: [docs/advanced.md](docs/advanced.md#kv-cache-in-host-ram-flash-next).
 
+#### QFN INT8 (W8) checkpoints
+
+`tools/quant_int8.py --src <bf16 dir> --out <dir> --ngram-from <table> --kv-from ''` writes sharded body files
+(`model-00001-of-000NN.safetensors`, ≤ 20 GiB each, layer-grouped), `model_mtp.safetensors`,
+`qfn-int8-manifest.json` and — by default — the n-gram table itself (`ngram_int8.safetensors`) next to the
+weights. Selected matrices use `.weight_packed` (offset-binary INT8 codes), `.weight_scale` (BF16, group 128)
+and `.weight_shape` (I64). The manifest schema is `qfn-int8-v2`: it maps every tensor to its shard, records the
+source digest (and repo/revision only when actually given), and keeps the table identity plus `sha256`. With the
+opt-in `--external-ngram` the table stays outside the output and the manifest records identity only; mount it by
+setting `FLASH_NGRAM_PATH` (absolute or checkpoint-directory-relative), which overrides the recorded
+`outputs.ngram` at load time. Format selection never depends on `config.json`. Existing upstream mixed INT4/W8 checkpoints remain supported.
+
+Selected matrices: routed and shared experts, DeltaNet projections, QSA q/k/v/o, PLE key/value and MTP attention,
+experts and fc_embedding/fc_hidden. Other tensors remain byte-identical. `--check <dir> [--src <bf16 dir>]`
+re-verifies shards, the n-gram identity and (with `--src`) re-quantized codes and scales.
+The shared `lm_head.weight` stays BF16 on disk; full and balanced-draft heads use the existing runtime W8 loader.
+
+Native W8 uses lossless repacking into the existing W8 layout. INT8 expert groups use BF16 scales and FP32
+tensor-core accumulation per 128-k group; INT4 keeps its existing arithmetic. Residency, cold staging and borrowed
+prefill storage use the selected format's group size. No quality or throughput equivalence is claimed.
+
+Build acceptance fixtures with `-DQE_BUILD_FLASH_INT8_TESTS=ON`: `flash_checkpoint_unit` validates manifests and
+headers; `flash_int8_unit` checks repacking, arithmetic and residency. `INT8_MODEL=<dir>` adds real-checkpoint rows.
+Build the overlay with `docker build -f Dockerfile --target flash-overlay --build-arg BASE_RUNTIME=<current image>
+--build-arg CUDA_ARCHS=86 --build-arg REVISION=<integrated commit>`; its `qe_build.txt` identifies the rebuilt
+Flash binaries. The INT4 runtime keeps working: the format is chosen per checkpoint, not by the image.
+
 ### Qwen3.8-27B
 
 - INT4 weights repacked at load (a few seconds, no conversion) into tensor-core layouts.
@@ -836,6 +863,8 @@ request of that server, short ones too, so run a separate server for long docume
 - **Pinned system prompts**: the KV and state at the end of each agent kind's system prompt and tools are kept apart
   from the archive (`FLASH_PREFIX_GB` / `QE_PREFIX_GB`, 8 GB), so a new agent of that kind starts after its system
   prompt even when the archive is full.
+- The archive grows its pinned slabs only between engine jobs: the coordinating thread drains every participating GPU
+  before `cudaHostRegister`, so slab growth can pause dispatch but never races running kernels.
 - There is no disk cache by default. With `--disk-cache DIR` (both models, 200 GB at most, `--disk-cache-gb`) conversations
   are also written to files and survive a restart: a conversation that returns is read back instead of recomputed. Flash-Next
   has it since 1.3.5.3, experimental; details in
