@@ -574,6 +574,47 @@ def read_safetensors_header(path):
     return header, length
 
 
+def rewrite_safetensors_dtype(path, name, new_dtype):
+    """Byte-preserving header rewrite: only the dtype tag changes, payload and offsets stay intact."""
+    with open(path, "rb") as f:
+        length = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(length))
+        payload = f.read()
+    header[name]["dtype"] = new_dtype
+    blob = json.dumps(header, separators=(",", ":")).encode()
+    blob += b" " * (-len(blob) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)) + blob + payload)
+
+
+def test_structural_check_verifies_converted_tensor_contracts():
+    # the structural --check (no --src) must verify converted tensors' header dtype/shape against
+    # the manifest records: a lying header or a lying record fails even without the source
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "contract")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        cli("--check", out)  # the untouched fixture passes the strict structural check
+        manifest, mapping = output_mapping(out)
+        record = manifest["tensors"]["converted"][0]
+        packed = record["outputs"]["packed"]
+        shard = os.path.join(out, mapping[packed])
+        rewrite_safetensors_dtype(shard, packed, "F32")  # same payload length, corrupted header dtype
+        result = cli("--check", out, ok=False)
+        assert f"{packed}: header F32" in result.stdout + result.stderr, result.stdout + result.stderr
+        rewrite_safetensors_dtype(shard, packed, "I32")
+        cli("--check", out)  # the restored header passes again
+        # a manifest record lying about the logical shape fails the same source-independent check
+        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+            manifest = json.load(f)
+        record = manifest["tensors"]["converted"][0]
+        record["shape"] = [record["shape"][0], record["shape"][1] * 128]
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(manifest, f)
+        result = cli("--check", out, ok=False)
+        assert "expected I32" in result.stdout + result.stderr, result.stdout + result.stderr
+
+
 def test_byte_layout_against_manifest():
     with tempfile.TemporaryDirectory() as temp:
         src, ngram, _ = qfn_fixture(temp)
@@ -953,6 +994,7 @@ def main():
     test_duplicate_key_manifest_rejected()
     test_symlinked_manifest_files_rejected()
     test_empty_shard_rejected()
+    test_structural_check_verifies_converted_tensor_contracts()
     print("test_quant_int8: ALL PASS")
 
 

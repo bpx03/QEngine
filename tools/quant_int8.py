@@ -1116,6 +1116,27 @@ def check_qfn(a, manifest_path, manifest):
         if not os.path.isfile(os.path.join(a.check, name)):
             raise ValueError(f"required asset missing from output: {name}")
 
+    # converted outputs must carry the exact packed/scale/shape dtype+shape the record implies; this
+    # contract is source-independent, so the structural check (without --src) verifies it too
+    manifest_tensors = manifest.get("tensors", {})
+    records_by_output = {}
+    for record in manifest_tensors.get("converted", []):
+        logical, recorded = record.get("shape"), record.get("outputs") or {}
+        if (not isinstance(logical, list) or not logical or
+                not all(isinstance(dim, int) and dim > 0 for dim in logical) or
+                not all(isinstance(recorded.get(k), str) for k in ("packed", "scale", "shape"))):
+            raise ValueError(f"converted record for {record.get('source_key')!r} carries no usable "
+                             "shape/outputs to verify the tensor headers against")
+        records_by_output[recorded["packed"]] = ("I32", logical[:-1] + [logical[-1] // 4])
+        records_by_output[recorded["scale"]] = ("BF16", logical[:-1] + [logical[-1] // 128])
+        records_by_output[recorded["shape"]] = ("I64", [len(logical)])
+    for name, (dtype, shape) in records_by_output.items():
+        if name not in mapping:
+            raise ValueError(f"{name}: a converted output mapped to no shard")
+        actual_shape, actual_dtype = tensor_info(outputs_by_file[mapping[name]], name)
+        if actual_dtype != dtype or list(actual_shape) != list(shape):
+            raise ValueError(f"{name}: header {actual_dtype} {list(actual_shape)}, expected {dtype} {list(shape)}")
+
     if not a.src:
         log(f"QFN structural check passed: {len(body)} body shards, "
             f"{len(manifest['tensors']['converted'])} matrices, "
@@ -1138,7 +1159,6 @@ def check_qfn(a, manifest_path, manifest):
         raise ValueError(f"pinned QFN requires {NGRAM_ROWS_PER_SHARD} n-gram rows")
     src = Src(a.src)
     dims, source_keys, table_names, descriptors, headers, full_model = inspect_qfn_source(src, src_cfg)
-    manifest_tensors = manifest.get("tensors", {})
     converted_records = {d.get("source_key"): d for d in manifest_tensors.get("converted", [])}
     expected_converted = {d["source"] for d in descriptors}
     targets = sorted({d["base"] for d in descriptors})
@@ -1166,17 +1186,6 @@ def check_qfn(a, manifest_path, manifest):
     if (outputs["mtp"], outputs["config"], outputs["manifest"]) != (
             "model_mtp.safetensors", "config.json", "qfn-int8-manifest.json"):
         raise ValueError("manifest output file inventory differs")
-    # converted outputs must carry the exact packed/scale/shape dtype+shape the record implies
-    records_by_output = {}
-    for record in manifest_tensors.get("converted", []):
-        logical = record["shape"]
-        records_by_output[record["outputs"]["packed"]] = ("I32", logical[:-1] + [logical[-1] // 4])
-        records_by_output[record["outputs"]["scale"]] = ("BF16", logical[:-1] + [logical[-1] // 128])
-        records_by_output[record["outputs"]["shape"]] = ("I64", [len(logical)])
-    for name, (dtype, shape) in records_by_output.items():
-        actual_shape, actual_dtype = tensor_info(outputs_by_file[mapping[name]], name)
-        if actual_dtype != dtype or list(actual_shape) != list(shape):
-            raise ValueError(f"{name}: header {actual_dtype} {list(actual_shape)}, expected {dtype} {list(shape)}")
     report = {}
     for desc in descriptors:
         source_name, base = desc["source"], desc["base"]
