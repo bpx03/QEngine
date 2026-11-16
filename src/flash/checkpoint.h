@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -29,6 +30,14 @@ inline constexpr uint64_t kMaxShardBytes = 20ull << 30;
 // [hidden, hidden] (inputs fed separately) and [hidden, 2*hidden] (fused). tools/quant_int8.py mirrors
 // this as MTP_FC_EMBEDDING_K_MULTIPLIERS; converter-side validation must stay aligned with this list.
 inline constexpr std::array<int, 2> kMtpFcEmbeddingKMultipliers{1, 2};
+// Fixed architecture inventory, shared with tools/quant_int8.py (the converter mirrors these names;
+// tests/test_quant_int8.py parses this header to prove the mirrors cannot drift):
+inline constexpr int kBodyMatrices = 398;               // converted body matrices of a full QFN checkpoint
+inline constexpr int kMtpMatrices = 11;                 // converted MTP matrices
+inline constexpr int kLayerCount = 48;                  // language-model layers
+inline constexpr long long kNgramRowsPerShard = 2500012; // pinned QFN n-gram rows per 128-shard table
+// Upper bound for the manifest file itself: a 409-record v2 manifest is ~1 MB, 16 MiB is generous.
+inline constexpr uint64_t kMaxManifestBytes = 16ull << 20;
 inline void fail(const std::string& context, const std::string& key, const std::string& expected,
                  const std::string& actual) {
     throw std::runtime_error(context + ": " + key + ": expected " + expected + ", actual " + actual);
@@ -131,6 +140,27 @@ inline std::vector<long long> shape_array(const Json& j, const std::string& cont
         shape.push_back(d.i());
     }
     return shape;
+}
+// Last stored dimension of a .weight_shape companion. The header JSON only records the offsets: the
+// companion is a 1-D I64 vector whose element count comes from (end-start)/8, so the last element —
+// the stored logical K — is read without trusting the header's shape list.
+inline long long stored_shape_last_dim(const std::string& path, const Json& entry) {
+    if (text(entry,"dtype",path) != "I64") fail(path,".weight_shape","I64 logical shape",text(entry,"dtype",path));
+    const auto& offsets = field(entry,"data_offsets",path);
+    if (offsets.type != Json::Arr || offsets.arr.size() != 2 ||
+        offsets.arr[0].type != Json::Num || offsets.arr[1].type != Json::Num ||
+        offsets.arr[1].i() <= offsets.arr[0].i() || (offsets.arr[1].i()-offsets.arr[0].i()) % 8 != 0)
+        fail(path,".weight_shape","I64 data offsets with a whole number of int64s","malformed companion");
+    const long long count = (offsets.arr[1].i()-offsets.arr[0].i())/8;
+    std::ifstream in(path,std::ios::binary);
+    if (!in) throw std::runtime_error(path+": cannot open safetensors file");
+    uint64_t header = 0;
+    if (!in.read((char*)&header,8)) fail(path,".weight_shape","readable stored shape","file shorter than 8 bytes");
+    const uint64_t off = 8 + header + (uint64_t)offsets.arr[0].i() + (uint64_t)(count-1)*8;
+    int64_t last = 0;
+    if (!in.seekg((std::streamoff)off) || !in.read((char*)&last,8))
+        fail(path,".weight_shape","readable stored shape","truncated payload");
+    return last;
 }
 // Validate structure before the legacy mmap reader accesses any header or payload byte. The safetensors
 // header is parsed with the strict reader as well: a duplicate key could otherwise hide an extra tensor.
@@ -281,14 +311,18 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     }
     const auto mtp_name=sandbox_file(directory,text(outputs,"mtp",directory),directory+": outputs.mtp");
     if (seen.count(mtp_name)) fail(directory,"outputs","body/MTP files distinct",mtp_name);
+    // UNIFIED n-gram rule (review R2-4): a recorded self-contained outputs.ngram ALWAYS wins; a
+    // supplied override/env is then reported as IGNORED by Checkpoint::open, never followed. External
+    // checkpoints (no recorded name) resolve the argument and FLASH_NGRAM_PATH identically: relative
+    // values resolve against the model directory, absolute paths are allowed.
     if (outputs.has("ngram")) {
         result.ngram = sandbox_file(directory,text(outputs,"ngram",directory),directory+": outputs.ngram");
         require_no_symlink(result.ngram, directory+": outputs.ngram");  // sandboxed name: never followed
     }
     else if (!ngram_override.empty())
-        result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute is allowed here
+        result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute or checkpoint-relative
     else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
-        result.ngram = env;
+        result.ngram = resolve_path(directory,env);             // same resolution as the argument
     else fail(directory,"outputs.ngram","self-contained table or FLASH_NGRAM_PATH / explicit override","external table not configured");
     result.mtp = want_mtp ? resolve_path(directory,mtp_override.empty()?mtp_name:mtp_override) : std::string{};
     if (want_mtp && mtp_override.empty()) require_no_symlink(result.mtp, directory+": outputs.mtp");  // recorded name only; overrides unchanged
@@ -414,10 +448,19 @@ struct Checkpoint {
                 const auto j=validate_file(f);
                 for(const auto& t:j.obj) if(t.first.size()>14 && t.first.compare(t.first.size()-14,14,".weight_packed")==0) {
                     const auto base=t.first.substr(0,t.first.size()-14);
-                    // INT8 detection: the .weight_shape companion, not a scale-width heuristic (which
-                    // also matches INT4 group-256 checkpoints)
-                    if(j.has(base+".weight_scale") && j.has(base+".weight_shape"))
-                        throw std::runtime_error(f+": packed INT8 checkpoint requires qfn-int8-manifest.json");
+                    // The .weight_shape companion alone does NOT decide the format: compressed-tensors
+                    // INT4 stores one too. The stored logical K against the packed width does: INT8 packs
+                    // 4 codes per I32 (K == width*4 -> needs the manifest), INT4 packs 8 nibbles per I32
+                    // (K == width*8 -> normal INT4 no-manifest route). Anything else is a broken file.
+                    if(j.has(base+".weight_scale") && j.has(base+".weight_shape")) {
+                        const long long k = stored_shape_last_dim(f,j[base+".weight_shape"]);
+                        const long long width = j[t.first]["shape"].arr.back().i();
+                        if (width*4 == k)
+                            throw std::runtime_error(f+": packed INT8 checkpoint requires qfn-int8-manifest.json");
+                        if (width*8 != k)
+                            fail(f,base+".weight_shape","packed width x4 (INT8) or x8 (INT4) matching stored K "+std::to_string(k),
+                                 std::to_string(width)+"-wide packing");
+                    }
                 }
                 body.open(f);
             }
@@ -436,18 +479,22 @@ struct Checkpoint {
         }
         require_no_symlink(path,path);  // the manifest itself is a sandboxed name: never a symlink
         has_manifest=true; format=WeightFormat::Int8;
-        const auto j=parse_json(read_file(path),path);
+        // R2-6: an mtp_override must be a BYTE-COMPATIBLE replacement of the recorded MTP inventory:
+        // the header-vs-manifest matching below rejects a replacement with missing, extra or altered
+        // tensors, so an override can relocate the file but never change what it contains.
+        const auto j=parse_json(read_bounded_file(path,kMaxManifestBytes,path),path);
         validate_manifest_top(j,path); validate_recipe(field(j,"recipe",path),path);
         const auto& records=field(field(j,"tensors",path),"converted",path);
         if(records.type!=Json::Arr) fail(path,"tensors.converted","array","other JSON type");
         for(const auto& r:records.arr) converted.push_back(parse_converted(r,path));
         const size_t mtp_count=(size_t)std::count_if(converted.begin(),converted.end(),[](const auto& c){return c.source_key.rfind("mtp.",0)==0;});
-        if(converted.size()-mtp_count!=398 || mtp_count!=11)
-            fail(path,"converted inventory","398 body + 11 MTP",std::to_string(converted.size()-mtp_count)+" body + "+std::to_string(mtp_count)+" MTP");
+        if(converted.size()-mtp_count!=(size_t)kBodyMatrices || mtp_count!=(size_t)kMtpMatrices)
+            fail(path,"converted inventory",std::to_string(kBodyMatrices)+" body + "+std::to_string(kMtpMatrices)+" MTP",
+                 std::to_string(converted.size()-mtp_count)+" body + "+std::to_string(mtp_count)+" MTP");
         const auto resolved=resolve_outputs(j,directory,want_mtp,mtp_override,ngram_override);
         const std::string mtp_record_name=text(j["outputs"],"mtp",path);
         // Source honesty: repo/revision are recorded only when the converter was told what was ACTUALLY
-        // converted; an unlisted or absent source is never a rejection, the index digest is the integrity record.
+        // converted; an unlisted or absent source is never a rejection, the index digest is the traceability record.
         {
             const auto& source=field(j,"source",path);
             if (source.has("repo") != source.has("revision"))
@@ -526,7 +573,7 @@ struct Checkpoint {
                 if(!text_config.has(key)) missing += (missing.empty()?"":", ")+std::string(key);
             if(!missing.empty()) fail(path,"config","all required text_config keys","missing: "+missing);
         }
-        for(const auto& expected: {std::pair<const char*,long long>{"hidden_size",2560},{"num_hidden_layers",48},
+        for(const auto& expected: {std::pair<const char*,long long>{"hidden_size",2560},{"num_hidden_layers",kLayerCount},
                 {"num_attention_heads",24},{"head_dim",256},{"num_key_value_heads",2},{"linear_num_key_heads",16},
                 {"linear_key_head_dim",128},{"linear_num_value_heads",48},{"linear_value_head_dim",128},
                 {"num_experts",512},{"moe_intermediate_size",640},{"hc_count",4}}) {
@@ -537,8 +584,9 @@ struct Checkpoint {
         for(const auto& shard:resolved.body) body.open(shard);
         {
             const auto& types=field(text_config,"layer_types",path);
-            if(types.type!=Json::Arr || types.arr.size()!=48) fail(path,"config.layer_types","48 entries","invalid count/type");
-            for(int i=0;i<48;++i) {
+            if(types.type!=Json::Arr || types.arr.size()!=(size_t)kLayerCount)
+                fail(path,"config.layer_types",std::to_string(kLayerCount)+" entries","invalid count/type");
+            for(int i=0;i<kLayerCount;++i) {
                 const auto key="model.language_model.layers."+std::to_string(i)+".self_attn.q_proj.weight_packed";
                 const auto expected=body.has(key)?"full_attention":"linear_attention";
                 if(types[i].type!=Json::Str || types[i].str!=expected)
@@ -546,7 +594,7 @@ struct Checkpoint {
             }
         }
         // Architecture is fixed; fixtures exercise pure helpers, never a runtime bypass.
-        validate_inventory({48,512,2560,640,24,256,2,16,128,48,128,640,4,1});
+        validate_inventory({kLayerCount,512,2560,640,24,256,2,16,128,48,128,640,4,1});
         for(const auto& c:converted) {
             const bool is_mtp=c.source_key.rfind("mtp.",0)==0;
             if(!is_mtp || want_mtp) validate_int8_tensor(is_mtp?mtp:body,c.base,c.shape,c.file);
@@ -555,7 +603,7 @@ struct Checkpoint {
         if(mode && std::string(mode)=="bf16") throw std::runtime_error(path+": FLASH_NGRAM=bf16 conflicts with the INT8 ngram table");
         const auto& identity=field(j,"ngram",path);
         const auto n=parse_ngram_identity(identity,path);
-        if(n.rows_per_shard!=2500012) fail(path,"ngram.rows_per_shard","2500012",std::to_string(n.rows_per_shard));
+        if(n.rows_per_shard!=kNgramRowsPerShard) fail(path,"ngram.rows_per_shard",std::to_string(kNgramRowsPerShard),std::to_string(n.rows_per_shard));
         const auto& external_keys=field(identity,"keys",path);
         if(external_keys.type!=Json::Arr || external_keys.arr.size()!=128)
             fail(path,"ngram.keys","128 shard names","invalid inventory");
@@ -595,9 +643,20 @@ struct Checkpoint {
         }
         if((total+127)/128!=n.rows_per_shard)
             fail(path,"PLE padded row total",std::to_string(128LL*n.rows_per_shard),std::to_string((total+127)/128*128));
-        fprintf(stderr,"[flash] validated manifest: 398 body + 11 MTP native INT8 matrices in %zu shards; MTP %s; %s ngram %lld rows plus %lld padding rows, %lld bytes\n",
-            resolved.body.size(),want_mtp?"headers validated":"not requested",
-            j["outputs"].has("ngram")?"self-contained":"external",total,128LL*n.rows_per_shard-total,n.size_bytes);
+        // UNIFIED RULE reporting: a self-contained checkpoint IGNORES any override/env — say so on
+        // one line each instead of leaving the operator guessing; the summary states the ACTUAL source.
+        if (j["outputs"].has("ngram")) {
+            if (!ngram_override.empty())
+                fprintf(stderr,"[flash] WARNING: ngram override %s IGNORED — checkpoint is self-contained (outputs.ngram)\n",
+                    ngram_override.c_str());
+            if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
+                fprintf(stderr,"[flash] WARNING: ngram override %s IGNORED — checkpoint is self-contained (outputs.ngram)\n",env);
+        }
+        const std::string ngram_src = j["outputs"].has("ngram") ? std::string("self-contained ngram")
+                                                                : "external ngram (override): "+resolved.ngram;
+        fprintf(stderr,"[flash] validated manifest: %d body + %d MTP native INT8 matrices in %zu shards; MTP %s; %s — %lld rows plus %lld padding rows, %lld bytes\n",
+            kBodyMatrices,kMtpMatrices,resolved.body.size(),want_mtp?"headers validated":"not requested",
+            ngram_src.c_str(),total,128LL*n.rows_per_shard-total,n.size_bytes);
     }
 };
 } // namespace flash

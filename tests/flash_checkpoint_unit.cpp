@@ -43,6 +43,22 @@ static void matrix_file(const fs::path& path,const std::string& packed_dtype="I3
     const int64_t shape[2]={16,logical_k}; out.write(reinterpret_cast<const char*>(shape),16);
     if(mixed) { const std::array<char,4096> bf16{}; out.write(bf16.data(),bf16.size()); }
 }
+// compressed-tensors-style INT4 companion files: I32-packed width = K/8 (8 nibbles per word), a BF16
+// scale and an I64 .weight_shape storing the logical shape. stored_k lets fixtures write a stored
+// logical K that contradicts the packing (the ambiguous case must fail clearly).
+static void int4_shaped_file(const fs::path& path,long long logical_k=128,long long stored_k=0) {
+    if(!stored_k) stored_k=logical_k;
+    const long long width=logical_k/8;
+    const int packed_bytes=(int)(16*width*4), scale_bytes=32, shape_begin=packed_bytes+scale_bytes;
+    std::string header="{\"a.weight_packed\":{\"dtype\":\"I32\",\"shape\":[16,"+std::to_string(width)+"],\"data_offsets\":[0,"+std::to_string(packed_bytes)+"]},"
+        "\"a.weight_scale\":{\"dtype\":\"BF16\",\"shape\":[16,1],\"data_offsets\":["+std::to_string(packed_bytes)+","+std::to_string(shape_begin)+"]},"
+        "\"a.weight_shape\":{\"dtype\":\"I64\",\"shape\":[2],\"data_offsets\":["+std::to_string(shape_begin)+","+std::to_string(shape_begin+16)+"]}}";
+    while(header.size()%8) header+=' ';
+    std::ofstream out(path,std::ios::binary); const uint64_t length=header.size();
+    out.write(reinterpret_cast<const char*>(&length),8); out.write(header.data(),header.size());
+    std::vector<char> payload(shape_begin,0); out.write(payload.data(),payload.size());
+    const int64_t shape[2]={16,stored_k}; out.write(reinterpret_cast<const char*>(shape),16);
+}
 static Converted converted(const std::string& base,const std::vector<long long>& shape,bool mtp=false) {
     Converted c; c.base=base; c.source_key=base+(base.find(".experts.")==std::string::npos?".weight":"");
     c.file=mtp?"model_mtp.safetensors":"model.safetensors"; c.shape=shape; return c;
@@ -512,7 +528,16 @@ int main() {
               require(!ck.has_manifest && ck.format==WeightFormat::Int4,"INT4 directory route changed"); }
             const auto legacy8=temp.path/"int8-nomanifest"; fs::create_directories(legacy8);
             matrix_file(legacy8/"model.safetensors");  // packed + scale + weight_shape without a manifest
-            rejects([&]{ Checkpoint ck; ck.open(legacy8.string(),false,""); });
+            rejects([&]{ Checkpoint ck; ck.open(legacy8.string(),false,""); });  // width*4 == stored K: INT8
+            { // R2-1: compressed-tensors INT4 stores .weight_shape too — width*8 == stored K must open as INT4
+            const auto legacy4=temp.path/"int4-shaped"; fs::create_directories(legacy4);
+            int4_shaped_file(legacy4/"model-00001-of-00001.safetensors");
+            { Checkpoint ck; ck.open(legacy4.string(),false,"");
+              require(!ck.has_manifest && ck.format==WeightFormat::Int4,"INT4 with .weight_shape companion rejected"); }
+            const auto odd=temp.path/"int4-odd-shape"; fs::create_directories(odd);
+            int4_shaped_file(odd/"model-00001-of-00001.safetensors",128,96);  // width 16: 64 != 96 and 128 != 96
+            rejects([&]{ Checkpoint ck; ck.open(odd.string(),false,""); });  // neither x4 nor x8: clear error
+            }
         }
 
         { // ---- Checkpoint::open fixtures (complete v2 checkpoints; sparse files) ----
@@ -576,6 +601,19 @@ int main() {
           std::string manifest_text; { std::ifstream in(d/"qfn-int8-manifest.json"); manifest_text.assign(std::istreambuf_iterator<char>(in),{}); }
           require(manifest_text.find("ngram_int8.safetensors")==std::string::npos,
                   "external manifest recorded an n-gram path");
+        }
+        { // R2-4 UNIFIED RULE: a self-contained checkpoint IGNORES override/env, recorded wins
+            setenv("FLASH_NGRAM_PATH",(temp.path/"decoy-table.safetensors").string().c_str(),1);
+            Checkpoint ck; ck.open(base.string(),true,"");
+            unsetenv("FLASH_NGRAM_PATH");
+            require(ck.ngram_path==(base/"ngram_int8.safetensors").string(),"a configured override must not beat outputs.ngram");
+        }
+        { // R2-4: external mode resolves FLASH_NGRAM_PATH relative to the model directory, like the argument
+            const auto d=temp.path/"external-rel"; auto o=BuildOptions{}; o.external_ngram=true; const auto ext=build_checkpoint(d,o);
+            setenv("FLASH_NGRAM_PATH","external-ngram.safetensors",1);
+            Checkpoint ck; ck.open(d.string(),true,"");
+            unsetenv("FLASH_NGRAM_PATH");
+            require(ck.ngram_path==ext.external_table,"relative FLASH_NGRAM_PATH must resolve against the model directory");
         }
         { // manifest present but not a regular file
             const auto d=temp.path/"manifest-dir"; fs::create_directories(d/"qfn-int8-manifest.json");
