@@ -42,6 +42,7 @@ import os
 import filecmp
 import re
 import shutil
+import stat
 import struct
 import sys
 import time
@@ -421,13 +422,23 @@ def strict_json_object(pairs):
     return dict(pairs)
 
 
-def sandbox_regular_file(path):
+def sandbox_regular_file(path, root):
     """Symlink gate for sandboxed checkpoint paths, mirroring require_no_symlink in
-    src/flash/checkpoint.h: a manifest-named file replaced by a symlink is rejected, never followed.
-    Operator-supplied absolute inputs (--external-ngram / QENGINE_INT8_NGRAM_PATH) keep their
-    documented allowance and are not gated."""
-    if os.path.islink(path):
-        raise ValueError(f"{path}: symbolic link rejected inside the sandbox (must be a regular file)")
+    src/flash/checkpoint.h: lstat EVERY component from the checkpoint root downward, so neither a
+    manifest-named file nor an intermediate directory may be a symlink; any symlink component is
+    rejected, never followed (a symlinked directory would otherwise smuggle outside files into the
+    sandbox while the final component looks like a regular file). Operator-supplied absolute inputs
+    (--external-ngram / QENGINE_INT8_NGRAM_PATH) keep their documented allowance and are not gated.
+    Missing components end the walk; callers report missing files with their own message."""
+    walk = os.path.abspath(root)
+    for part in os.path.relpath(os.path.abspath(path), walk).split(os.sep):
+        walk = os.path.join(walk, part)
+        try:
+            mode = os.lstat(walk).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"{walk}: symbolic link rejected inside the sandbox (must be a regular file)")
 
 
 def configured_dims(text, names):
@@ -1085,7 +1096,7 @@ def check_qfn(a, manifest_path, manifest):
     outputs_by_file = {}
     for filename in body + [outputs["mtp"]]:
         path = os.path.join(a.check, filename)
-        sandbox_regular_file(path)
+        sandbox_regular_file(path, a.check)
         if not os.path.isfile(path):
             raise ValueError(f"{path}: missing output file")
         if os.path.getsize(path) > min(limit, MAX_SHARD_BYTES):
@@ -1108,7 +1119,7 @@ def check_qfn(a, manifest_path, manifest):
         if a.external_ngram is not None:
             raise ValueError("checkpoint is self-contained; --external-ngram is not applicable")
         table_path = os.path.join(a.check, outputs["ngram"])
-        sandbox_regular_file(table_path)
+        sandbox_regular_file(table_path, a.check)
         if not os.path.isfile(table_path):
             raise ValueError(f"{table_path}: self-contained n-gram table is missing next to the weights")
     else:
@@ -1127,7 +1138,7 @@ def check_qfn(a, manifest_path, manifest):
     if actual_digest != identity["sha256"]:
         raise ValueError(f"n-gram table sha256 {actual_digest} differs from the manifest {identity['sha256']}")
 
-    sandbox_regular_file(os.path.join(a.check, str(outputs["config"])))
+    sandbox_regular_file(os.path.join(a.check, str(outputs["config"])), a.check)
     cfg_out = model_config(a.check)
     if family(cfg_out) != "qwen4_exp":
         raise ValueError("output config family differs from the manifest")
@@ -1272,7 +1283,7 @@ def cmd_check(a):
     if os.path.isfile(manifest_path) and a.kv_from not in (None, ""):
         raise ValueError("QFN check does not accept --kv-from")
     if os.path.isfile(manifest_path):
-        sandbox_regular_file(manifest_path)
+        sandbox_regular_file(manifest_path, a.check)
         with open(manifest_path) as f:
             manifest = json.load(f, object_pairs_hook=strict_json_object)
         return check_qfn(a, manifest_path, manifest)

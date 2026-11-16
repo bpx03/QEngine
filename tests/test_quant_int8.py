@@ -984,6 +984,44 @@ def test_symlinked_manifest_files_rejected():
         cli("--check", out)  # the restored checkpoint passes again
 
 
+def test_intermediate_symlink_escape_rejected():
+    # the gate lstats every component below the checkpoint root: a manifest-named path that runs
+    # through a symlinked directory must be rejected even though the final component is a regular
+    # file (without the per-component walk it would smuggle files from outside the sandbox in)
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp, sharded=True)
+        out = os.path.join(temp, "escaping")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", "--max-shard-bytes", 1068000)
+        manifest, _ = output_mapping(out)
+        victim = manifest["outputs"]["body"][0]
+        moved = f"sub/{victim}"
+        outside = os.path.join(temp, "outside")
+        os.makedirs(outside)
+        os.rename(os.path.join(out, victim), os.path.join(outside, victim))
+        os.symlink(outside, os.path.join(out, "sub"))
+
+        def relocate(obj, old, new):  # every manifest reference to the shard goes through "sub"
+            if isinstance(obj, str):
+                return new if obj == old else obj
+            if isinstance(obj, dict):
+                return {key: relocate(value, old, new) for key, value in obj.items()}
+            if isinstance(obj, list):
+                return [relocate(value, old, new) for value in obj]
+            return obj
+
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(relocate(manifest, victim, moved), f)
+        result = cli("--check", out, ok=False)
+        assert "symbolic link rejected" in result.stdout + result.stderr, result.stdout + result.stderr
+        os.unlink(os.path.join(out, "sub"))
+        os.rename(os.path.join(outside, victim), os.path.join(out, victim))
+        with open(os.path.join(out, "qfn-int8-manifest.json")) as f:
+            manifest = json.load(f)
+        with open(os.path.join(out, "qfn-int8-manifest.json"), "w") as f:
+            json.dump(relocate(manifest, moved, victim), f)
+        cli("--check", out)  # the restored checkpoint passes again
+
+
 def test_empty_shard_rejected():
     # the C++ reader fails a shard that maps zero tensors; --check must not pass one
     with tempfile.TemporaryDirectory() as temp:
@@ -1037,6 +1075,7 @@ def main():
     test_plan_shards_rejects_oversized_deferred_tensors()
     test_duplicate_key_manifest_rejected()
     test_symlinked_manifest_files_rejected()
+    test_intermediate_symlink_escape_rejected()
     test_empty_shard_rejected()
     test_structural_check_verifies_converted_tensor_contracts()
     print("test_quant_int8: ALL PASS")
