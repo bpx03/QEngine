@@ -125,6 +125,8 @@ struct BuildOptions {
     bool ngram_no_sha = false;         // ngram identity without sha256
     long long ngram_rows = 2500012;    // table rows (also the manifest rows_per_shard)
     bool drop_ngram_file = false;      // ngram table file deleted after the build
+    bool hc_shrink = false;            // layer 0 attn hc_norm.weight shrunk to BF16 [1] (engine overread fixture)
+    bool optional_shrink = false;      // a preserved name outside the engine table shrunk (must still open)
 };
 static std::vector<MatrixDef> fixture_matrices(long long fc_k) {
     std::vector<MatrixDef> out;
@@ -194,6 +196,34 @@ static CheckpointFixture build_checkpoint(const fs::path& dir,const BuildOptions
         std::vector<int64_t> dims(s.begin(),s.end());
         list.push_back({m.base+".weight_shape","I64",shape_rank,i64_payload(dims)});
     };
+    // engine-required preserved tensors (mirror of flash/checkpoint.h validate_preserved): hyper-
+    // connection mixers, routers, indexer/norms per layer family, PLE norms and the shared head
+    auto hc_preserved=[&](const std::string& pre,std::vector<TensorEntry>& list,bool inject,bool shrink){
+        list.push_back({pre+"hc_norm.weight","BF16",shrink?std::vector<long long>{1}:std::vector<long long>{10240},{}});
+        list.push_back({pre+"input_mix_weight_down.weight","BF16",{320,10240},{}});
+        list.push_back({pre+"input_mix_weight_up.weight","BF16",{10240,320},{}});
+        if(inject) list.push_back({pre+"block_inject_weight.weight","BF16",{4,10240},{}});
+    };
+    auto layer_preserved=[&](const std::string& pre,std::vector<TensorEntry>& list,bool full,bool shrink){
+        hc_preserved(pre+"attn_hyper_connection.",list,true,shrink);
+        hc_preserved(pre+"mlp_hyper_connection.",list,true,false);
+        list.push_back({pre+"mlp.gate.weight","BF16",{512,2560},{}});
+        list.push_back({pre+"mlp.shared_expert_gate.weight","BF16",{1,2560},{}});
+        if(full){
+            list.push_back({pre+"self_attn.q_norm.weight","BF16",{256},{}});
+            list.push_back({pre+"self_attn.k_norm.weight","BF16",{256},{}});
+            list.push_back({pre+"self_attn.indexer.index_qk_proj.weight","BF16",{640,2560},{}});
+            list.push_back({pre+"self_attn.indexer.q_layernorm.weight","BF16",{128},{}});
+            list.push_back({pre+"self_attn.indexer.k_layernorm.weight","BF16",{128},{}});
+        } else {
+            list.push_back({pre+"linear_attn.A_log","BF16",{48},{}});
+            list.push_back({pre+"linear_attn.dt_bias","BF16",{48},{}});
+            list.push_back({pre+"linear_attn.conv1d.weight","BF16",{10240,1,4},{}});
+            list.push_back({pre+"linear_attn.norm.weight","BF16",{128},{}});
+            list.push_back({pre+"linear_attn.in_proj_a.weight","BF16",{48,2560},{}});
+            list.push_back({pre+"linear_attn.in_proj_b.weight","BF16",{48,2560},{}});
+        }
+    };
     // group body tensors per layer in order; embed tokens and PLE metadata form the trailing groups
     // (n-gram-adjacent tensors ride the final shard, like the converter)
     std::vector<std::vector<TensorEntry>> groups;
@@ -206,14 +236,36 @@ static CheckpointFixture build_checkpoint(const fs::path& dir,const BuildOptions
             if(pos==std::string::npos||std::stoi(m.base.substr(pos+7))!=layer) continue;
             push_matrix(m,groups.back());
         }
+        layer_preserved("model.language_model.layers."+std::to_string(layer)+".",groups.back(),
+                        layer%4==3,o.hc_shrink&&layer==0);
+        if(layer==1) {
+            const std::string pl="model.language_model.layers.1.ple.";
+            groups.back().push_back({pl+"norm_key.weight","BF16",{10240},{}});
+            groups.back().push_back({pl+"norm_query.weight","BF16",{10240},{}});
+            groups.back().push_back({pl+"norm_conv.weight","BF16",{10240},{}});
+            groups.back().push_back({pl+"conv1d.weight","BF16",{10240,1,4},{}});
+        }
     }
-    groups.emplace_back(std::vector<TensorEntry>{{"model.language_model.embed_tokens.weight","BF16",{4,2560},{}}});
+    groups.emplace_back(std::vector<TensorEntry>{
+        {"model.language_model.embed_tokens.weight","BF16",{248320,2560},{}},
+        {"lm_head.weight","BF16",{248320,2560},{}}});
+    groups.emplace_back(std::vector<TensorEntry>{
+        {"model.language_model.hyper_connection_mixer.hc_norm.weight","BF16",{10240},{}},
+        {"model.language_model.hyper_connection_mixer.input_mix_weight_down.weight","BF16",{320,10240},{}},
+        {"model.language_model.hyper_connection_mixer.input_mix_weight_up.weight","BF16",{10240,320},{}}});
     groups.emplace_back(std::vector<TensorEntry>{
         {pre+"layer_multipliers","I64",{3},i64_payload({0,0,0})},
         {pre+"ngram_heads_vocab_sizes","I64",{16},i64_payload(vocab)},
         {pre+"ngram_heads_offsets","I64",{16},i64_payload(offsets)}});
     for(const auto& m:matrices) if(m.mtp) push_matrix(m,mtp_tensors);
-    mtp_tensors.push_back({"mtp.layers.0.input_layernorm.weight","BF16",{2560},{}});
+    layer_preserved("mtp.layers.0.",mtp_tensors,true,false);
+    mtp_tensors.push_back({"mtp.hyper_connection_mixer.hc_norm.weight","BF16",{10240},{}});
+    mtp_tensors.push_back({"mtp.hyper_connection_mixer.input_mix_weight_down.weight","BF16",{320,10240},{}});
+    mtp_tensors.push_back({"mtp.hyper_connection_mixer.input_mix_weight_up.weight","BF16",{10240,320},{}});
+    mtp_tensors.push_back({"mtp.pre_fc_norm_embedding.weight","BF16",{2560},{}});
+    mtp_tensors.push_back({"mtp.pre_fc_norm_hidden.weight","BF16",{10240},{}});
+    mtp_tensors.push_back({"mtp.layers.0.input_layernorm.weight","BF16",
+                           o.optional_shrink?std::vector<long long>{1}:std::vector<long long>{2560},{}});
     // pack groups into shards
     const uint64_t limit=(20ull<<30)-(1<<20);
     std::vector<std::vector<TensorEntry>> shards;
@@ -574,6 +626,13 @@ int main() {
             Checkpoint ck; ck.open(d.string(),true,"");
             require(safetensors_header_parses()-before==fix.shards.size()+2,
                     "checkpoint open did not parse each safetensors header exactly once");
+        }
+        { // F02: an engine-required preserved tensor with a bad shape is refused at open — before the fix
+          // this opened and Worker::load memcpy'd its fixed RW-sized region from a 2-byte tensor
+            auto o=BuildOptions{}; o.hc_shrink=true; const auto d=temp.path/"hc-shrunk";
+            build_checkpoint(d,o); rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+            auto q=BuildOptions{}; q.optional_shrink=true; const auto e=temp.path/"opt-shrunk";
+            build_checkpoint(e,q); open_checkpoint(e,q);  // names outside the engine table stay free
         }
         { auto o=BuildOptions{}; o.source_identity=true; const auto d=temp.path/"source-id";
           build_checkpoint(d,o); open_checkpoint(d,o); }

@@ -39,6 +39,13 @@ inline constexpr int kLayerCount = 48;                  // language-model layers
 inline constexpr long long kNgramRowsPerShard = 2500012; // pinned QFN n-gram rows per 128-shard table
 // Upper bound for the manifest file itself: a 409-record v2 manifest is ~1 MB, 16 MiB is generous.
 inline constexpr uint64_t kMaxManifestBytes = 16ull << 20;
+// Engine-side shapes of the preserved tensors Worker::load reads in fixed-size regions (pr2/src/flash/
+// flash.h mirrors these constants; the converter preserves the upstream tensors untouched):
+inline constexpr int kHcLowRank = 320;              // hyper-connection low-rank width (LOWRANK)
+inline constexpr int kIndexerHeads = 4;             // indexer key heads; the projection adds one query head (IDX_NH)
+inline constexpr int kIndexerHeadDim = 128;         // indexer head dimension (IDX_HD)
+inline constexpr int kConvKernel = 4;               // short-convolution width (linear_attn and PLE conv1d)
+inline constexpr long long kVocabRows = 248320;     // shared embedding and lm_head rows (VOCAB)
 inline void fail(const std::string& context, const std::string& key, const std::string& expected,
                  const std::string& actual) {
     throw std::runtime_error(context + ": " + key + ": expected " + expected + ", actual " + actual);
@@ -375,6 +382,69 @@ inline void validate_inventory(const std::vector<Converted>& converted, const In
     take("mtp.fc_hidden",{s.hidden,s.hidden});
     if (!actual.empty()) fail(context,actual.begin()->first,"no unexpected converted matrices","extra record");
 }
+// F02: the engine consumers read FIXED-SIZE regions straight out of the mapping for every preserved
+// tensor below (Worker::load in pr2/src/flash/flash.cu, the load_w16/load_w8/bf_dev call sites) — dtype,
+// shape and exact byte extent are therefore pinned at open: a mistyped or truncated tensor must fail
+// there, not overread at load. Names the text engine never reads (the preserved visual tower, extra
+// layer norms) and the mixers' absent block_inject_weight stay optional.
+inline void require_preserved(const SafeTensors& st, const std::string& name,
+                              const std::vector<long long>& shape, const std::string& context) {
+    if (!st.has(name)) fail(context, name, "engine-required BF16 " + shape_text(shape), "missing");
+    const auto& t = st.get(name);
+    const size_t bytes = elements(shape, context) * 2;
+    if (t.dtype != "BF16" || t.shape != shape || t.nbytes != bytes)
+        fail(context, name, "BF16 " + shape_text(shape) + " with exact byte extent",
+             t.dtype + " " + shape_text(t.shape) + " bytes=" + std::to_string(t.nbytes));
+}
+inline void validate_preserved(const SafeTensors& body, const SafeTensors* mtp, const InventorySpec& s,
+                               const std::string& context) {
+    const long long rw = (long long)s.hc * s.hidden;  // RW = HC*H in the engine
+    auto mixer = [&](const SafeTensors& st, const std::string& pre, bool inject) {
+        require_preserved(st, pre+"hc_norm.weight", {rw}, context);
+        require_preserved(st, pre+"input_mix_weight_down.weight", {kHcLowRank, rw}, context);
+        require_preserved(st, pre+"input_mix_weight_up.weight", {rw, kHcLowRank}, context);
+        if (inject) require_preserved(st, pre+"block_inject_weight.weight", {s.hc, rw}, context);
+    };
+    auto layer = [&](const SafeTensors& st, const std::string& pre, bool full) {
+        mixer(st, pre+"attn_hyper_connection.", true);
+        mixer(st, pre+"mlp_hyper_connection.", true);
+        require_preserved(st, pre+"mlp.gate.weight", {s.experts, s.hidden}, context);
+        require_preserved(st, pre+"mlp.shared_expert_gate.weight", {1, s.hidden}, context);
+        if (full) {
+            require_preserved(st, pre+"self_attn.q_norm.weight", {s.q_head_dim}, context);
+            require_preserved(st, pre+"self_attn.k_norm.weight", {s.q_head_dim}, context);
+            require_preserved(st, pre+"self_attn.indexer.index_qk_proj.weight",
+                              {(long long)(kIndexerHeads+1)*kIndexerHeadDim, s.hidden}, context);
+            require_preserved(st, pre+"self_attn.indexer.q_layernorm.weight", {kIndexerHeadDim}, context);
+            require_preserved(st, pre+"self_attn.indexer.k_layernorm.weight", {kIndexerHeadDim}, context);
+        } else {
+            require_preserved(st, pre+"linear_attn.A_log", {s.lnv_heads}, context);
+            require_preserved(st, pre+"linear_attn.dt_bias", {s.lnv_heads}, context);
+            require_preserved(st, pre+"linear_attn.conv1d.weight", {rw, 1, kConvKernel}, context);
+            require_preserved(st, pre+"linear_attn.norm.weight", {s.lnv_dim}, context);
+            require_preserved(st, pre+"linear_attn.in_proj_a.weight", {s.lnv_heads, s.hidden}, context);
+            require_preserved(st, pre+"linear_attn.in_proj_b.weight", {s.lnv_heads, s.hidden}, context);
+        }
+    };
+    require_preserved(body, "model.language_model.embed_tokens.weight", {kVocabRows, s.hidden}, context);
+    require_preserved(body, "lm_head.weight", {kVocabRows, s.hidden}, context);
+    mixer(body, "model.language_model.hyper_connection_mixer.", false);  // head mixer: no inject rows
+    for (int i=0;i<s.layers;++i) {
+        const auto pre="model.language_model.layers."+std::to_string(i)+".";
+        layer(body, pre, body.has(pre+"self_attn.q_proj.weight_packed"));  // same family rule as layer_types
+        if (i==s.ple_layer) {
+            require_preserved(body, pre+"ple.norm_key.weight", {rw}, context);
+            require_preserved(body, pre+"ple.norm_query.weight", {rw}, context);
+            require_preserved(body, pre+"ple.norm_conv.weight", {rw}, context);
+            require_preserved(body, pre+"ple.conv1d.weight", {rw, 1, kConvKernel}, context);
+        }
+    }
+    if (!mtp) return;  // want_mtp: the opened MTP block is read the same way
+    mixer(*mtp, "mtp.hyper_connection_mixer.", false);
+    layer(*mtp, "mtp.layers.0.", true);  // the MTP block is a full-attention layer
+    require_preserved(*mtp, "mtp.pre_fc_norm_embedding.weight", {s.hidden}, context);
+    require_preserved(*mtp, "mtp.pre_fc_norm_hidden.weight", {rw}, context);
+}
 } // namespace checkpoint_detail
 
 struct Checkpoint {
@@ -573,7 +643,9 @@ struct Checkpoint {
             }
         }
         // Architecture is fixed; fixtures exercise pure helpers, never a runtime bypass.
-        validate_inventory({kLayerCount,512,2560,640,24,256,2,16,128,48,128,640,4,1});
+        const InventorySpec spec{kLayerCount,512,2560,640,24,256,2,16,128,48,128,640,4,1};
+        validate_inventory(spec);
+        validate_preserved(body, want_mtp ? &mtp : nullptr, spec, path);
         for(const auto& c:converted) {
             const bool is_mtp=c.source_key.rfind("mtp.",0)==0;
             if(!is_mtp || want_mtp) validate_int8_tensor(is_mtp?mtp:body,c.base,c.shape,c.file);
