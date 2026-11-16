@@ -57,6 +57,10 @@ LM = "model.language_model."
 MAX_SHARD_BYTES = 20 << 30  # mirror of kMaxShardBytes in src/flash/checkpoint.h
 MTP_FC_EMBEDDING_K_MULTIPLIERS = (1, 2)  # mirror of kMtpFcEmbeddingKMultipliers in src/flash/checkpoint.h
 MANIFEST_SCHEMA = "qfn-int8-v2"  # mirror of kManifestSchema in src/flash/checkpoint.h
+BODY_MATRICES = 398  # mirror of kBodyMatrices in src/flash/checkpoint.h
+MTP_MATRICES = 11  # mirror of kMtpMatrices in src/flash/checkpoint.h
+LAYER_COUNT = 48  # mirror of kLayerCount in src/flash/checkpoint.h
+NGRAM_ROWS_PER_SHARD = 2500012  # mirror of kNgramRowsPerShard in src/flash/checkpoint.h
 NGRAM_OUT_NAME = "ngram_int8.safetensors"
 HEADER_MARGIN = 8 << 20  # safetensors header/padding headroom kept below every shard byte cap
 QUANT = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
@@ -304,7 +308,8 @@ def sha256_file(path, chunk=1 << 22):
 
 
 def source_digest(src):
-    """Deterministic integrity record for the source checkpoint: the raw bytes of its
+    """Deterministic traceability record for the source checkpoint (NOT an integrity proof — that
+    comes from --check --src): the raw bytes of its
     model.safetensors.index.json when the reader used one, else a digest over the sorted
     (filename, size) inventory of the source weight files. The weight_files form is BEST-EFFORT:
     it records only names and sizes, so size-preserving edits inside a weight file are invisible
@@ -348,8 +353,8 @@ def validate_ngram_file(path, full_model, expected_rows=None):
                 rows = shape[0]
             elif shape[0] != rows:
                 raise ValueError(f"{name}: inconsistent n-gram rows {shape[0]} != {rows}")
-        if full_model and rows != 2500012:
-            raise ValueError(f"external n-gram rows {rows}, expected 2500012 for pinned QFN")
+        if full_model and rows != NGRAM_ROWS_PER_SHARD:
+            raise ValueError(f"external n-gram rows {rows}, expected {NGRAM_ROWS_PER_SHARD} for pinned QFN")
         if expected_rows is not None and rows != expected_rows:
             raise ValueError(f"external n-gram rows {rows}, expected {expected_rows}")
     return {"size_bytes": os.path.getsize(path), "rows_per_shard": rows,
@@ -640,7 +645,7 @@ def validate_qfn_source(src, cfg, ngram_path, out):
     if cfg.get("quantization_config"):
         raise ValueError("QFN source config is already quantized")
     dims, names, table_names, descriptors, headers, full_model = inspect_qfn_source(src, cfg)
-    ngram = validate_ngram_file(ngram_path, full_model, 2500012 if full_model else None)
+    ngram = validate_ngram_file(ngram_path, full_model, NGRAM_ROWS_PER_SHARD if full_model else None)
     out = os.path.abspath(out)
     if os.path.exists(out) and (not os.path.isdir(out) or os.listdir(out)):
         raise ValueError(f"QFN output directory must be empty: {out}")
@@ -826,11 +831,6 @@ def cmd_make_qfn(a, cfg):
     }
     with open(os.path.join(a.out, "qfn-int8-manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    with open(os.path.join(a.out, "QENGINE_INT8.md"), "w") as f:
-        f.write("QFN INT8 symmetric group-128 weights, sharded body, "
-                + ("self-contained n-gram table." if a.external_ngram is None
-                   else "external n-gram table (identity + sha256 only in the manifest).")
-                + " Executed by the flash INT8 W8 runtime on branches split/int8-runtime+; upstream release pending.\n")
     log(f"QFN: {len(converted)} matrices in {len(files)} body shards, {len(excluded)} n-gram source tensors excluded; "
         f"{'self-contained' if a.external_ngram is None else 'external'} n-gram; {time.time() - t0:.0f}s")
 
@@ -958,12 +958,12 @@ def inspect_qfn_source(src, cfg):
     descriptors = [d for n in names if (d := qfn_descriptor(n)) is not None]
     body_count = sum(d["part"] == "body" for d in descriptors)
     mtp_count = sum(d["part"] == "mtp" for d in descriptors)
-    full_model = dims == (2560, 48, 512, 640)
+    full_model = dims == (2560, LAYER_COUNT, 512, 640)
     if not descriptors:
         raise ValueError("QFN source contains no selected matrices")
-    if mtp_count != 11:
-        raise ValueError(f"QFN MTP selection must contain 11 matrices, found {mtp_count}")
-    if full_model and (body_count, len(table_names)) != (398, 128):
+    if mtp_count != MTP_MATRICES:
+        raise ValueError(f"QFN MTP selection must contain {MTP_MATRICES} matrices, found {mtp_count}")
+    if full_model and (body_count, len(table_names)) != (BODY_MATRICES, 128):
         raise ValueError(f"pinned QFN inventory mismatch: body={body_count}, MTP={mtp_count}, n-gram={len(table_names)}")
     headers = {name: tensor_info(src, name) for name in names}
     for desc in descriptors:
@@ -1032,10 +1032,11 @@ def check_qfn(a, manifest_path, manifest):
     recipe = manifest.get("recipe", {})
     if int(recipe.get("search", -1)) != a.search or recipe.get("group_size") != 128:
         raise ValueError("--search/group_size does not match QFN manifest")
-    if manifest.get("runtime_supported") is not True:
-        raise ValueError("QFN manifest must state runtime_supported=true (the flash INT8 W8 runtime executes v2)")
+    if not isinstance(manifest.get("runtime_supported"), bool):
+        raise ValueError("QFN manifest must carry a boolean runtime_supported (review R2-8: presence and type are the contract; "
+                         "true states the flash INT8 W8 runtime executes the checkpoint)")
     if not isinstance(manifest.get("source"), dict):
-        raise ValueError("manifest is missing the source integrity record")
+        raise ValueError("manifest is missing the source traceability record")
     source = manifest["source"]
     if (source.get("index_sha256_kind") not in ("index_json", "weight_files") or
             not re.fullmatch(r"[0-9a-f]{64}", str(source.get("index_sha256", "")))):
@@ -1132,9 +1133,9 @@ def check_qfn(a, manifest_path, manifest):
         raise ValueError("source index digest differs from the manifest: this checkpoint was not made from --src")
     ngram_src = validate_ngram_file(table_path, False, None)
     source_dims = qfn_dims(src_cfg)
-    full_source = source_dims == (2560, 48, 512, 640)
-    if full_source and ngram_src["rows_per_shard"] != 2500012:
-        raise ValueError("pinned QFN requires 2500012 n-gram rows")
+    full_source = source_dims == (2560, LAYER_COUNT, 512, 640)
+    if full_source and ngram_src["rows_per_shard"] != NGRAM_ROWS_PER_SHARD:
+        raise ValueError(f"pinned QFN requires {NGRAM_ROWS_PER_SHARD} n-gram rows")
     src = Src(a.src)
     dims, source_keys, table_names, descriptors, headers, full_model = inspect_qfn_source(src, src_cfg)
     manifest_tensors = manifest.get("tensors", {})
@@ -1221,8 +1222,9 @@ def check_qfn(a, manifest_path, manifest):
     for key, (error_sq, source_sq, blocks) in sorted(report.items()):
         rel = (error_sq / source_sq) ** 0.5 if source_sq else 0.0
         log(f"{key}: {blocks} blocks, relative L2 error={rel:.6g}")
-    if full_model and (len(descriptors), len(table_names)) != (409, 128):
-        raise ValueError("full QFN verification inventory must be 398 body + 11 MTP matrices and 128 excluded tables")
+    if full_model and (len(descriptors), len(table_names)) != (BODY_MATRICES + MTP_MATRICES, 128):
+        raise ValueError(f"full QFN verification inventory must be {BODY_MATRICES} body + {MTP_MATRICES} MTP "
+                         f"matrices and 128 excluded tables")
     assets = ("generation_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
               "preprocessor_config.json", "processor_config.json", "video_preprocessor_config.json", "LICENSE",
               "vocab.json", "merges.txt")

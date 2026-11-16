@@ -543,7 +543,7 @@ def test_legacy_manifest_clean_break():
         manifest.pop("schema")
         manifest["outputs"]["body"] = "model.safetensors"
         manifest["outputs"]["ngram"] = ngram  # old absolute external path style
-        manifest["source"] = {"repo": "orcarouter/Qwen3.8-Flash-Next-Uncensored",
+        manifest["source"] = {"repo": "test/example-model",
                               "revision": "da29941aee972c7eeab497e05a292c569da1f1d6"}
         with open(manifest_path, "w") as f:
             json.dump(manifest, f)
@@ -795,6 +795,31 @@ def test_qfn_cli_check_corruption_and_early_failures():
             "--kv-from", os.path.join(temp, "nonempty-kv"), ok=False)
 
 
+def test_manifest_runtime_flag_contract():
+    # R2-8: no QENGINE_INT8.md is emitted; the manifest carries a boolean runtime_supported and
+    # --check validates presence+type (either boolean passes), the converter writes true with reason
+    with tempfile.TemporaryDirectory() as temp:
+        src, ngram, _ = qfn_fixture(temp)
+        out = os.path.join(temp, "flagged")
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        path = os.path.join(out, "qfn-int8-manifest.json")
+        assert not os.path.exists(os.path.join(out, "QENGINE_INT8.md")), "converter must not emit QENGINE_INT8.md"
+        with open(path) as f:
+            manifest = json.load(f)
+        assert manifest["runtime_supported"] is True
+        assert "flash INT8 W8 runtime" in manifest["runtime_support_reason"]
+        cli("--check", out)
+        manifest["runtime_supported"] = False
+        with open(path, "w") as f:
+            json.dump(manifest, f)
+        cli("--check", out)  # the contract is presence+boolean, not a pinned value
+        manifest["runtime_supported"] = "yes"
+        with open(path, "w") as f:
+            json.dump(manifest, f)
+        result = cli("--check", out, ok=False)
+        assert "boolean runtime_supported" in result.stdout + result.stderr
+
+
 def test_constants_cannot_drift_from_checkpoint_h():
     # the maintainer's point, applied to constants: the python mirrors in tools/quant_int8.py are
     # comments-only copies of src/flash/checkpoint.h, so parse the header and pin them for real
@@ -807,6 +832,14 @@ def test_constants_cannot_drift_from_checkpoint_h():
     assert schema.group(1) == quant.MANIFEST_SCHEMA
     assert int(limit.group(1)) << int(limit.group(2)) == quant.MAX_SHARD_BYTES
     assert tuple(int(part) for part in multipliers.group(1).split(",")) == quant.MTP_FC_EMBEDDING_K_MULTIPLIERS
+    for name, value in (("kBodyMatrices", quant.BODY_MATRICES), ("kMtpMatrices", quant.MTP_MATRICES),
+                        ("kLayerCount", quant.LAYER_COUNT)):
+        declared = re.search(r"inline constexpr int " + name + r" = (\d+);", header)
+        assert declared and int(declared.group(1)) == value, f"{name} drifted from the python mirror"
+    rows = re.search(r"inline constexpr long long kNgramRowsPerShard = (\d+);", header)
+    assert rows and int(rows.group(1)) == quant.NGRAM_ROWS_PER_SHARD, "kNgramRowsPerShard drifted"
+    assert re.search(r"inline constexpr uint64_t kMaxManifestBytes = (\d+)ull << (\d+);", header), \
+        "kMaxManifestBytes moved out of the expected shape (C++-only bound, parsed for future mirroring)"
 
 
 def test_plan_shards_rejects_tensor_larger_than_cap():
@@ -849,9 +882,10 @@ def test_symlinked_manifest_files_rejected():
     with tempfile.TemporaryDirectory() as temp:
         src, ngram, _ = qfn_fixture(temp, sharded=True)
         out = os.path.join(temp, "symlinked")
-        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        # small cap forces a multi-shard body so the first shard is not the only one
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", "--max-shard-bytes", 1068000)
         manifest, _ = output_mapping(out)
-        assert len(manifest["outputs"]["body"]) > 1, "fixture must produce multiple shards"
+        assert len(manifest["outputs"]["body"]) > 1, "cap must produce multiple shards"
         for name in (manifest["outputs"]["body"][0], manifest["outputs"]["mtp"],
                      "ngram_int8.safetensors", "qfn-int8-manifest.json", "config.json"):
             path = os.path.join(out, name)
@@ -872,9 +906,11 @@ def test_empty_shard_rejected():
     with tempfile.TemporaryDirectory() as temp:
         src, ngram, _ = qfn_fixture(temp, sharded=True)
         out = os.path.join(temp, "emptied")
-        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "")
+        # small cap forces a multi-shard body: victim and other must be different files
+        cli("--src", src, "--out", out, "--ngram-from", ngram, "--kv-from", "", "--max-shard-bytes", 1068000)
         manifest, mapping = output_mapping(out)
         shards = manifest["outputs"]["body"]
+        assert len(shards) > 1, "cap must produce multiple shards"
         victim, other = shards[-1], shards[0]
         merged = load_file(os.path.join(out, other))
         merged.update(load_file(os.path.join(out, victim)))
@@ -912,6 +948,7 @@ def main():
     test_27b_compatibility_and_family_precedence()
     test_qfn_cli_check_corruption_and_early_failures()
     test_constants_cannot_drift_from_checkpoint_h()
+    test_manifest_runtime_flag_contract()
     test_plan_shards_rejects_tensor_larger_than_cap()
     test_duplicate_key_manifest_rejected()
     test_symlinked_manifest_files_rejected()
