@@ -7,8 +7,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <map>
 #include <set>
@@ -38,6 +39,13 @@ inline constexpr int kLayerCount = 48;                  // language-model layers
 inline constexpr long long kNgramRowsPerShard = 2500012; // pinned QFN n-gram rows per 128-shard table
 // Upper bound for the manifest file itself: a 409-record v2 manifest is ~1 MB, 16 MiB is generous.
 inline constexpr uint64_t kMaxManifestBytes = 16ull << 20;
+// Engine-side shapes of the preserved tensors Worker::load reads in fixed-size regions (pr2/src/flash/
+// flash.h mirrors these constants; the converter preserves the upstream tensors untouched):
+inline constexpr int kHcLowRank = 320;              // hyper-connection low-rank width (LOWRANK)
+inline constexpr int kIndexerHeads = 4;             // indexer key heads; the projection adds one query head (IDX_NH)
+inline constexpr int kIndexerHeadDim = 128;         // indexer head dimension (IDX_HD)
+inline constexpr int kConvKernel = 4;               // short-convolution width (linear_attn and PLE conv1d)
+inline constexpr long long kVocabRows = 248320;     // shared embedding and lm_head rows (VOCAB)
 inline void fail(const std::string& context, const std::string& key, const std::string& expected,
                  const std::string& actual) {
     throw std::runtime_error(context + ": " + key + ": expected " + expected + ", actual " + actual);
@@ -67,36 +75,52 @@ inline std::string sandbox_file(const std::string& directory, const std::string&
     return joined.string();
 }
 inline bool is_file(const std::string& path) { return std::filesystem::is_regular_file(path); }
-// Sandbox symlink gate: is_regular_file/status/ifstream all FOLLOW symlinks, so the lexical sandbox
-// above would be escapable if a manifest-named file were replaced by a symlink. Every sandbox-resolved
-// manifest path — the manifest itself, the body shards, and the recorded MTP/config/self-contained
-// n-gram names — must pass this check before its first open. Scope: operator-supplied absolute inputs
-// (FLASH_NGRAM_PATH, the explicit n-gram/MTP override arguments) keep their documented absolute
-// allowance and are deliberately NOT symlink-gated; only paths resolved through the sandbox are.
-// A missing file passes here unchanged so the established "missing" diagnostics stay as they were.
-inline void require_no_symlink(const std::string& path, const std::string& context) {
+// Sandbox symlink gate (review R2 + R3 F11): EVERY component of a sandbox-resolved manifest path below
+// the checkpoint root must be a non-symlink. Checking only the final component left names like
+// "sub/shard.safetensors" escapable through an intermediate directory replaced by a symlink to an
+// outside directory. Missing components pass through so the established "missing" diagnostics stay;
+// the checkpoint root itself is operator-chosen and deliberately not gated. Scope: operator-supplied
+// absolute inputs (FLASH_NGRAM_PATH, the explicit n-gram/MTP override arguments) keep their documented
+// absolute allowance and are NOT symlink-gated; only sandbox-joined names are.
+inline void require_no_symlink(const std::string& root, const std::string& path, const std::string& context) {
     std::error_code ec;
-    const auto type = std::filesystem::symlink_status(path, ec).type();
-    if (!ec && type == std::filesystem::file_type::symlink)
-        fail(context, "path", "regular file (the sandbox never follows symlinks)", "symbolic link: " + path);
+    const auto rel = std::filesystem::path(path).lexically_relative(std::filesystem::path(root));
+    if (rel.empty() || rel.is_absolute()) {  // not under the root: keep the final-component check alone
+        const auto type = std::filesystem::symlink_status(path, ec).type();
+        if (!ec && type == std::filesystem::file_type::symlink)
+            fail(context, "path", "regular file (the sandbox never follows symlinks)", "symbolic link: " + path);
+        return;
+    }
+    auto prefix = std::filesystem::path(root);
+    for (const auto& part : rel) {
+        prefix /= part;
+        const auto status = std::filesystem::symlink_status(prefix, ec);
+        if (ec) return;  // missing or unreadable component: the later guarded open reports it
+        if (status.type() == std::filesystem::file_type::symlink)
+            fail(context, "path", "no symlink component (the sandbox never follows symlinks)",
+                 "symbolic link component: " + prefix.string());
+    }
 }
-inline std::string read_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error(path + ": cannot open file");
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-}
-// stat the file first: it must exist, be a regular file (S_ISREG) and fit the bound before any read.
 inline std::string read_bounded_file(const std::string& path, uint64_t max_bytes, const std::string& context) {
-    std::error_code ec;
-    const auto st = std::filesystem::status(path, ec);
-    if (ec || st.type() == std::filesystem::file_type::not_found)
-        fail(context, "file", "existing regular file", "missing");
-    if (st.type() != std::filesystem::file_type::regular)
-        fail(context, "file", "regular file", "not a regular file");
-    const uint64_t bytes=std::filesystem::file_size(path,ec);
-    if(ec || bytes>max_bytes)
-        fail(context, "file size", "at most " + std::to_string(max_bytes) + " bytes", std::to_string(bytes));
-    return read_file(path);
+    // F09: same guarded open as the safetensors files: the type/regular check happens before a single
+    // byte is read, so a FIFO or directory at a manifest-recorded name fails cleanly instead of blocking.
+    const int fd = open_regular_file(path, true);
+    struct stat st;
+    const int rc = fstat(fd, &st);
+    if (rc != 0 || st.st_size < 0 || (uint64_t)st.st_size > max_bytes) {
+        const std::string actual = rc ? "unreadable" : std::to_string((long long)st.st_size);
+        ::close(fd);
+        fail(context, "file size", "at most " + std::to_string(max_bytes) + " bytes", actual);
+    }
+    std::string bytes((size_t)st.st_size, '\0');
+    size_t off = 0;
+    while (off < bytes.size()) {
+        const ssize_t n = ::pread(fd, bytes.data() + off, bytes.size() - off, (off_t)off);
+        if (n <= 0) { ::close(fd); throw std::runtime_error(path + ": cannot read file"); }
+        off += (size_t)n;
+    }
+    ::close(fd);
+    return bytes;
 }
 inline Json parse_json(const std::string& bytes, const std::string& context) {
     try { return Json::parse_strict(bytes); }
@@ -152,65 +176,23 @@ inline long long stored_shape_last_dim(const std::string& path, const Json& entr
         offsets.arr[1].i() <= offsets.arr[0].i() || (offsets.arr[1].i()-offsets.arr[0].i()) % 8 != 0)
         fail(path,".weight_shape","I64 data offsets with a whole number of int64s","malformed companion");
     const long long count = (offsets.arr[1].i()-offsets.arr[0].i())/8;
-    std::ifstream in(path,std::ios::binary);
-    if (!in) throw std::runtime_error(path+": cannot open safetensors file");
+    // F09: guarded open (never a blocking open on a special file); the scan route is not sandbox-gated,
+    // so symlinks keep their legacy allowance but the regular-file check still applies via fstat.
+    const int fd = open_regular_file(path,false);
     uint64_t header = 0;
-    if (!in.read((char*)&header,8)) fail(path,".weight_shape","readable stored shape","file shorter than 8 bytes");
-    const uint64_t off = 8 + header + (uint64_t)offsets.arr[0].i() + (uint64_t)(count-1)*8;
+    if (::pread(fd,(char*)&header,8,0)!=8) { ::close(fd); fail(path,".weight_shape","readable stored shape","file shorter than 8 bytes"); }
+    const off_t off = (off_t)(8 + header + (uint64_t)offsets.arr[0].i() + (uint64_t)(count-1)*8);
     int64_t last = 0;
-    if (!in.seekg((std::streamoff)off) || !in.read((char*)&last,8))
-        fail(path,".weight_shape","readable stored shape","truncated payload");
+    const ssize_t got = ::pread(fd,(char*)&last,8,off);
+    ::close(fd);
+    if (got != 8) fail(path,".weight_shape","readable stored shape","truncated payload");
     return last;
 }
-// Validate structure before the legacy mmap reader accesses any header or payload byte. The safetensors
-// header is parsed with the strict reader as well: a duplicate key could otherwise hide an extra tensor.
-inline Json validate_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) throw std::runtime_error(path + ": cannot open safetensors file");
-    const auto end = in.tellg();
-    if (end < 8) fail(path, "file size", "at least 8 bytes", std::to_string((long long)end));
-    const uint64_t size = (uint64_t)end;
-    in.seekg(0);
-    unsigned char prefix[8];
-    in.read((char*)prefix, 8);
-    uint64_t header = 0;
-    for (int i = 0; i < 8; ++i) header |= (uint64_t)prefix[i] << (8 * i);
-    if (header == 0 || header > size - 8 || header > (64ull << 20))
-        fail(path, "header length", "1..min(file size-8,64MiB)", std::to_string(header));
-    std::string bytes((size_t)header, '\0');
-    in.read(bytes.data(), (std::streamsize)header);
-    if (!in) throw std::runtime_error(path + ": truncated safetensors header");
-    const Json j = parse_json(bytes,path);
-    if (j.type != Json::Obj) fail(path, "header", "JSON object", "other JSON type");
-    std::vector<std::pair<uint64_t,uint64_t>> ranges;
-    for (const auto& entry : j.obj) {
-        if (entry.first == "__metadata__") continue;
-        const auto context = path + ": " + entry.first;
-        const auto dtype = text(entry.second, "dtype", context);
-        size_t width = 0;
-        if (dtype == "U8" || dtype == "I8" || dtype == "BOOL" || dtype == "F8_E4M3" || dtype == "F8_E5M2") width = 1;
-        else if (dtype == "BF16" || dtype == "F16" || dtype == "I16" || dtype == "U16") width = 2;
-        else if (dtype == "F32" || dtype == "I32" || dtype == "U32") width = 4;
-        else if (dtype == "F64" || dtype == "I64" || dtype == "U64") width = 8;
-        else fail(context, "dtype", "supported safetensors dtype", dtype);
-        const auto shape = shape_array(field(entry.second, "shape", context), context);
-        const auto offsets = shape_array(field(entry.second, "data_offsets", context), context);
-        const auto n = elements(shape, context);
-        if (offsets.size() != 2 || offsets[1] < offsets[0] || (uint64_t)offsets[1] > size - 8 - header
-            || n > std::numeric_limits<size_t>::max() / width || (uint64_t)(offsets[1] - offsets[0]) != n * width)
-            fail(context, "data_offsets", "in-file extent matching dtype and shape", shape_text(offsets));
-        ranges.emplace_back((uint64_t)offsets[0], (uint64_t)offsets[1]);
-    }
-    std::sort(ranges.begin(), ranges.end());
-    uint64_t next = 0;
-    for (auto r : ranges) {
-        if (r.first != next) fail(path, "data_offsets", "contiguous non-overlapping payload", std::to_string(r.first));
-        next = r.second;
-    }
-    if (next != size - 8 - header) fail(path, "payload bytes", std::to_string(next), std::to_string(size - 8 - header));
-    return j;
-}
-inline void open_file(SafeTensors& st, const std::string& path) { validate_file(path); st.open(path); }
+// F10: safetensors files reach the loader only through SafeTensors::open_strict_validated — one guarded
+// open per file, strict header parse from the mapped bytes exactly once, payload validated against
+// those same bytes and the tensor table indexed from THAT parsed object (returned for manifest
+// cross-checks). The former validate-then-reopen pair (ifstream strict parse + permissive
+// SafeTensors::open on the path again) was double work and a swap/symlink window between the opens.
 inline void validate_recipe(const Json& recipe, const std::string& context) {
     const auto format = text(recipe, "format", context);
     if (format != "symmetric INT8") fail(context, "recipe.format", "symmetric INT8", format);
@@ -317,15 +299,18 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     // values resolve against the model directory, absolute paths are allowed.
     if (outputs.has("ngram")) {
         result.ngram = sandbox_file(directory,text(outputs,"ngram",directory),directory+": outputs.ngram");
-        require_no_symlink(result.ngram, directory+": outputs.ngram");  // sandboxed name: never followed
+        require_no_symlink(directory,result.ngram,directory+": outputs.ngram");  // sandboxed name: never followed
     }
     else if (!ngram_override.empty())
         result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute or checkpoint-relative
     else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
         result.ngram = resolve_path(directory,env);             // same resolution as the argument
     else fail(directory,"outputs.ngram","self-contained table or FLASH_NGRAM_PATH / explicit override","external table not configured");
-    result.mtp = want_mtp ? resolve_path(directory,mtp_override.empty()?mtp_name:mtp_override) : std::string{};
-    if (want_mtp && mtp_override.empty()) require_no_symlink(result.mtp, directory+": outputs.mtp");  // recorded name only; overrides unchanged
+    // sandbox_file already joined the recorded MTP name with the checkpoint directory: wrapping the
+    // result in resolve_path a second time doubled a RELATIVE checkpoint dir
+    // (models/int8/models/int8/mtp.safetensors). Only operator-supplied overrides join again.
+    result.mtp = want_mtp ? (mtp_override.empty() ? mtp_name : resolve_path(directory,mtp_override)) : std::string{};
+    if (want_mtp && mtp_override.empty()) require_no_symlink(directory,result.mtp,directory+": outputs.mtp");  // recorded name only; overrides unchanged
     if (want_mtp && !mtp_override.empty() && std::find(result.body.begin(),result.body.end(),result.mtp) != result.body.end())
         fail(directory,"outputs","separate body/MTP paths",result.mtp);
     if(!is_file(result.ngram)) throw std::runtime_error(result.ngram+": missing INT8 ngram dependency");
@@ -410,6 +395,69 @@ inline void validate_inventory(const std::vector<Converted>& converted, const In
     take("mtp.fc_hidden",{s.hidden,s.hidden});
     if (!actual.empty()) fail(context,actual.begin()->first,"no unexpected converted matrices","extra record");
 }
+// F02: the engine consumers read FIXED-SIZE regions straight out of the mapping for every preserved
+// tensor below (Worker::load in pr2/src/flash/flash.cu, the load_w16/load_w8/bf_dev call sites) — dtype,
+// shape and exact byte extent are therefore pinned at open: a mistyped or truncated tensor must fail
+// there, not overread at load. Names the text engine never reads (the preserved visual tower, extra
+// layer norms) and the mixers' absent block_inject_weight stay optional.
+inline void require_preserved(const SafeTensors& st, const std::string& name,
+                              const std::vector<long long>& shape, const std::string& context) {
+    if (!st.has(name)) fail(context, name, "engine-required BF16 " + shape_text(shape), "missing");
+    const auto& t = st.get(name);
+    const size_t bytes = elements(shape, context) * 2;
+    if (t.dtype != "BF16" || t.shape != shape || t.nbytes != bytes)
+        fail(context, name, "BF16 " + shape_text(shape) + " with exact byte extent",
+             t.dtype + " " + shape_text(t.shape) + " bytes=" + std::to_string(t.nbytes));
+}
+inline void validate_preserved(const SafeTensors& body, const SafeTensors* mtp, const InventorySpec& s,
+                               const std::string& context) {
+    const long long rw = (long long)s.hc * s.hidden;  // RW = HC*H in the engine
+    auto mixer = [&](const SafeTensors& st, const std::string& pre, bool inject) {
+        require_preserved(st, pre+"hc_norm.weight", {rw}, context);
+        require_preserved(st, pre+"input_mix_weight_down.weight", {kHcLowRank, rw}, context);
+        require_preserved(st, pre+"input_mix_weight_up.weight", {rw, kHcLowRank}, context);
+        if (inject) require_preserved(st, pre+"block_inject_weight.weight", {s.hc, rw}, context);
+    };
+    auto layer = [&](const SafeTensors& st, const std::string& pre, bool full) {
+        mixer(st, pre+"attn_hyper_connection.", true);
+        mixer(st, pre+"mlp_hyper_connection.", true);
+        require_preserved(st, pre+"mlp.gate.weight", {s.experts, s.hidden}, context);
+        require_preserved(st, pre+"mlp.shared_expert_gate.weight", {1, s.hidden}, context);
+        if (full) {
+            require_preserved(st, pre+"self_attn.q_norm.weight", {s.q_head_dim}, context);
+            require_preserved(st, pre+"self_attn.k_norm.weight", {s.q_head_dim}, context);
+            require_preserved(st, pre+"self_attn.indexer.index_qk_proj.weight",
+                              {(long long)(kIndexerHeads+1)*kIndexerHeadDim, s.hidden}, context);
+            require_preserved(st, pre+"self_attn.indexer.q_layernorm.weight", {kIndexerHeadDim}, context);
+            require_preserved(st, pre+"self_attn.indexer.k_layernorm.weight", {kIndexerHeadDim}, context);
+        } else {
+            require_preserved(st, pre+"linear_attn.A_log", {s.lnv_heads}, context);
+            require_preserved(st, pre+"linear_attn.dt_bias", {s.lnv_heads}, context);
+            require_preserved(st, pre+"linear_attn.conv1d.weight", {rw, 1, kConvKernel}, context);
+            require_preserved(st, pre+"linear_attn.norm.weight", {s.lnv_dim}, context);
+            require_preserved(st, pre+"linear_attn.in_proj_a.weight", {s.lnv_heads, s.hidden}, context);
+            require_preserved(st, pre+"linear_attn.in_proj_b.weight", {s.lnv_heads, s.hidden}, context);
+        }
+    };
+    require_preserved(body, "model.language_model.embed_tokens.weight", {kVocabRows, s.hidden}, context);
+    require_preserved(body, "lm_head.weight", {kVocabRows, s.hidden}, context);
+    mixer(body, "model.language_model.hyper_connection_mixer.", false);  // head mixer: no inject rows
+    for (int i=0;i<s.layers;++i) {
+        const auto pre="model.language_model.layers."+std::to_string(i)+".";
+        layer(body, pre, body.has(pre+"self_attn.q_proj.weight_packed"));  // same family rule as layer_types
+        if (i==s.ple_layer) {
+            require_preserved(body, pre+"ple.norm_key.weight", {rw}, context);
+            require_preserved(body, pre+"ple.norm_query.weight", {rw}, context);
+            require_preserved(body, pre+"ple.norm_conv.weight", {rw}, context);
+            require_preserved(body, pre+"ple.conv1d.weight", {rw, 1, kConvKernel}, context);
+        }
+    }
+    if (!mtp) return;  // want_mtp: the opened MTP block is read the same way
+    mixer(*mtp, "mtp.hyper_connection_mixer.", false);
+    layer(*mtp, "mtp.layers.0.", true);  // the MTP block is a full-attention layer
+    require_preserved(*mtp, "mtp.pre_fc_norm_embedding.weight", {s.hidden}, context);
+    require_preserved(*mtp, "mtp.pre_fc_norm_hidden.weight", {rw}, context);
+}
 } // namespace checkpoint_detail
 
 struct Checkpoint {
@@ -445,7 +493,9 @@ struct Checkpoint {
             std::sort(files.begin(),files.end());
             if (files.empty()) throw std::runtime_error(directory+": no body safetensors files");
             for (const auto& f:files) {
-                const auto j=validate_file(f);
+                // F10: one guarded open per file; the format detector inspects the very object the
+                // tensors were indexed from (strict parse of the mapped header, no second open)
+                const auto j=body.open_strict_validated(f,false);  // scan route: legacy symlink allowance
                 for(const auto& t:j.obj) if(t.first.size()>14 && t.first.compare(t.first.size()-14,14,".weight_packed")==0) {
                     const auto base=t.first.substr(0,t.first.size()-14);
                     // The .weight_shape companion alone does NOT decide the format: compressed-tensors
@@ -453,6 +503,18 @@ struct Checkpoint {
                     // 4 codes per I32 (K == width*4 -> needs the manifest), INT4 packs 8 nibbles per I32
                     // (K == width*8 -> normal INT4 no-manifest route). Anything else is a broken file.
                     if(j.has(base+".weight_scale") && j.has(base+".weight_shape")) {
+                        // F07: the discriminator only makes sense for a rank>=1 I32-packed matrix with a
+                        // rank>=1 .weight_shape companion. A scalar packed entry (shape []) used to reach
+                        // arr.back() on the empty shape vector (undefined behaviour); the guard rejects
+                        // the degenerate trio cleanly before any file byte or dimension is inspected.
+                        const auto& packed=j[t.first];
+                        const auto& stored=j[base+".weight_shape"];
+                        const long long packed_rank=(long long)packed["shape"].arr.size();
+                        const long long stored_rank=(long long)stored["shape"].arr.size();
+                        if(packed["dtype"].str!="I32" || packed_rank<1 || stored_rank<1)
+                            fail(f,base,"rank>=1 I32 .weight_packed with a rank>=1 .weight_shape companion",
+                                 packed["dtype"].str+" packed rank "+std::to_string(packed_rank)+
+                                 ", companion rank "+std::to_string(stored_rank));
                         const long long k = stored_shape_last_dim(f,j[base+".weight_shape"]);
                         const long long width = j[t.first]["shape"].arr.back().i();
                         if (width*4 == k)
@@ -462,22 +524,21 @@ struct Checkpoint {
                                  std::to_string(width)+"-wide packing");
                     }
                 }
-                body.open(f);
             }
             if(want_mtp) {
-                if(!mtp_override.empty()) open_file(mtp,resolve_path(directory,mtp_override));
+                if(!mtp_override.empty()) mtp.open_strict_validated(resolve_path(directory,mtp_override),false);
                 else {
                     bool found=false;
                     for(const auto* name:{"mtp.safetensors","mtp-int4.safetensors"}) {
                         const auto f=resolve_path(directory,name);
-                        if(is_file(f)){open_file(mtp,f);found=true;}
+                        if(is_file(f)){mtp.open_strict_validated(f,false);found=true;}
                     }
                     if(!found) throw std::runtime_error(directory+": requested MTP checkpoint missing");
                 }
             }
             return;
         }
-        require_no_symlink(path,path);  // the manifest itself is a sandboxed name: never a symlink
+        require_no_symlink(directory,path,path);  // the manifest itself is a sandboxed name: never a symlink
         has_manifest=true; format=WeightFormat::Int8;
         // R2-6: an mtp_override must be a BYTE-COMPATIBLE replacement of the recorded MTP inventory:
         // the header-vs-manifest matching below rejects a replacement with missing, extra or altered
@@ -536,10 +597,11 @@ struct Checkpoint {
         // enforce the size cap, then match every shard header against the manifest mapping exactly
         std::vector<Json> shard_headers;
         for(const auto& shard:resolved.body) {
-            require_no_symlink(shard,shard);  // sandboxed manifest name: reject a substituted symlink
-            if(std::filesystem::file_size(shard)>(uintmax_t)limit)
-                fail(shard,"shard size","at most "+std::to_string(limit)+" bytes",std::to_string(std::filesystem::file_size(shard)));
-            shard_headers.push_back(validate_file(shard));
+            require_no_symlink(directory,shard,shard);  // sandboxed manifest name: reject a substituted symlink
+            // F10: single guarded open per shard — the cap is checked against the fstat'ed size before
+            // mapping, the header is parsed strictly once from the mapped bytes and the tensors below
+            // are indexed from that same parse (no reopen, no second parse, no window in between)
+            shard_headers.push_back(body.open_strict_validated(shard,true,(uint64_t)limit));
         }
         std::map<std::string,std::set<std::string>> expected_per_shard;
         for(const auto& [tensor,shard_file]:tensor_shard) expected_per_shard[shard_file].insert(tensor);
@@ -554,15 +616,16 @@ struct Checkpoint {
         }
         if(want_mtp) {
             auto expected=expected_per_shard[mtp_record_name];
-            const auto header=validate_file(resolved.mtp);
+            const auto header=mtp.open_strict_validated(resolved.mtp, mtp_override.empty());  // recorded name: O_NOFOLLOW
             for(const auto& t:header.obj) if(t.first!="__metadata__") {
                 if(!expected.erase(t.first)) fail(path,t.first,"manifest-listed MTP tensor","unlisted or misplaced output");
             }
             if(!expected.empty()) fail(path,*expected.begin(),"MTP output tensor","missing header");
-            mtp.open(resolved.mtp);
         }
-        const auto config_path=resolve_path(directory,sandbox_file(directory,text(j["outputs"],"config",path),path+": outputs.config"));
-        require_no_symlink(config_path,config_path);  // sandboxed manifest name
+        // recorded manifest paths are already sandbox-joined: resolving the joined value against the
+        // directory again doubled a relative checkpoint dir (models/int8/models/int8/config.json)
+        const auto config_path=sandbox_file(directory,text(j["outputs"],"config",path),path+": outputs.config");
+        require_no_symlink(directory,config_path,config_path);  // sandboxed manifest name
         const auto config=parse_json(read_bounded_file(config_path,4u<<20,config_path),config_path);
         const auto& text_config=config.has("text_config")?config["text_config"]:config;
         { // required keys: never skip a missing one; the error lists everything that is absent
@@ -581,8 +644,7 @@ struct Checkpoint {
                 fail(path,std::string("config.")+expected.first,std::to_string(expected.second),
                      std::to_string(integer(text_config,expected.first,path)));
         }
-        for(const auto& shard:resolved.body) body.open(shard);
-        {
+        {   // body shards are already opened (single guarded open above); layer_types cross-checks the mapping
             const auto& types=field(text_config,"layer_types",path);
             if(types.type!=Json::Arr || types.arr.size()!=(size_t)kLayerCount)
                 fail(path,"config.layer_types",std::to_string(kLayerCount)+" entries","invalid count/type");
@@ -594,7 +656,9 @@ struct Checkpoint {
             }
         }
         // Architecture is fixed; fixtures exercise pure helpers, never a runtime bypass.
-        validate_inventory({kLayerCount,512,2560,640,24,256,2,16,128,48,128,640,4,1});
+        const InventorySpec spec{kLayerCount,512,2560,640,24,256,2,16,128,48,128,640,4,1};
+        validate_inventory(spec);
+        validate_preserved(body, want_mtp ? &mtp : nullptr, spec, path);
         for(const auto& c:converted) {
             const bool is_mtp=c.source_key.rfind("mtp.",0)==0;
             if(!is_mtp || want_mtp) validate_int8_tensor(is_mtp?mtp:body,c.base,c.shape,c.file);
@@ -617,10 +681,10 @@ struct Checkpoint {
         ngram_path=resolved.ngram;
         if(std::filesystem::file_size(ngram_path)!=(uintmax_t)n.size_bytes)
             fail(ngram_path,"size_bytes",std::to_string(n.size_bytes),std::to_string(std::filesystem::file_size(ngram_path)));
-        const auto ngram_header=validate_file(ngram_path);
+        const auto ngram_header=ngram.open_strict_validated(ngram_path, j["outputs"].has("ngram"));  // recorded table: O_NOFOLLOW
         if(ngram_header.obj.size()-(ngram_header.has("__metadata__")?1:0)!=128)
             fail(ngram_path,"tensor inventory","exactly 128 shards","unexpected shard count");
-        ngram.open(ngram_path); validate_ngram_tensors(ngram,n,ngram_path);
+        validate_ngram_tensors(ngram,n,ngram_path);
         const std::string pre="model.language_model.layers.1.ple.ple_embedding.";
         long long total=0;
         if(!body.has(pre+"layer_multipliers")) fail(path,pre+"layer_multipliers","I64 [3]","missing");

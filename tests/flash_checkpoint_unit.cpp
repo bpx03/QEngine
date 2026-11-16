@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <sys/stat.h>  // F09 fixture: mkfifo
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -124,6 +125,8 @@ struct BuildOptions {
     bool ngram_no_sha = false;         // ngram identity without sha256
     long long ngram_rows = 2500012;    // table rows (also the manifest rows_per_shard)
     bool drop_ngram_file = false;      // ngram table file deleted after the build
+    bool hc_shrink = false;            // layer 0 attn hc_norm.weight shrunk to BF16 [1] (engine overread fixture)
+    bool optional_shrink = false;      // a preserved name outside the engine table shrunk (must still open)
 };
 static std::vector<MatrixDef> fixture_matrices(long long fc_k) {
     std::vector<MatrixDef> out;
@@ -193,6 +196,34 @@ static CheckpointFixture build_checkpoint(const fs::path& dir,const BuildOptions
         std::vector<int64_t> dims(s.begin(),s.end());
         list.push_back({m.base+".weight_shape","I64",shape_rank,i64_payload(dims)});
     };
+    // engine-required preserved tensors (mirror of flash/checkpoint.h validate_preserved): hyper-
+    // connection mixers, routers, indexer/norms per layer family, PLE norms and the shared head
+    auto hc_preserved=[&](const std::string& pre,std::vector<TensorEntry>& list,bool inject,bool shrink){
+        list.push_back({pre+"hc_norm.weight","BF16",shrink?std::vector<long long>{1}:std::vector<long long>{10240},{}});
+        list.push_back({pre+"input_mix_weight_down.weight","BF16",{320,10240},{}});
+        list.push_back({pre+"input_mix_weight_up.weight","BF16",{10240,320},{}});
+        if(inject) list.push_back({pre+"block_inject_weight.weight","BF16",{4,10240},{}});
+    };
+    auto layer_preserved=[&](const std::string& pre,std::vector<TensorEntry>& list,bool full,bool shrink){
+        hc_preserved(pre+"attn_hyper_connection.",list,true,shrink);
+        hc_preserved(pre+"mlp_hyper_connection.",list,true,false);
+        list.push_back({pre+"mlp.gate.weight","BF16",{512,2560},{}});
+        list.push_back({pre+"mlp.shared_expert_gate.weight","BF16",{1,2560},{}});
+        if(full){
+            list.push_back({pre+"self_attn.q_norm.weight","BF16",{256},{}});
+            list.push_back({pre+"self_attn.k_norm.weight","BF16",{256},{}});
+            list.push_back({pre+"self_attn.indexer.index_qk_proj.weight","BF16",{640,2560},{}});
+            list.push_back({pre+"self_attn.indexer.q_layernorm.weight","BF16",{128},{}});
+            list.push_back({pre+"self_attn.indexer.k_layernorm.weight","BF16",{128},{}});
+        } else {
+            list.push_back({pre+"linear_attn.A_log","BF16",{48},{}});
+            list.push_back({pre+"linear_attn.dt_bias","BF16",{48},{}});
+            list.push_back({pre+"linear_attn.conv1d.weight","BF16",{10240,1,4},{}});
+            list.push_back({pre+"linear_attn.norm.weight","BF16",{128},{}});
+            list.push_back({pre+"linear_attn.in_proj_a.weight","BF16",{48,2560},{}});
+            list.push_back({pre+"linear_attn.in_proj_b.weight","BF16",{48,2560},{}});
+        }
+    };
     // group body tensors per layer in order; embed tokens and PLE metadata form the trailing groups
     // (n-gram-adjacent tensors ride the final shard, like the converter)
     std::vector<std::vector<TensorEntry>> groups;
@@ -205,14 +236,36 @@ static CheckpointFixture build_checkpoint(const fs::path& dir,const BuildOptions
             if(pos==std::string::npos||std::stoi(m.base.substr(pos+7))!=layer) continue;
             push_matrix(m,groups.back());
         }
+        layer_preserved("model.language_model.layers."+std::to_string(layer)+".",groups.back(),
+                        layer%4==3,o.hc_shrink&&layer==0);
+        if(layer==1) {
+            const std::string pl="model.language_model.layers.1.ple.";
+            groups.back().push_back({pl+"norm_key.weight","BF16",{10240},{}});
+            groups.back().push_back({pl+"norm_query.weight","BF16",{10240},{}});
+            groups.back().push_back({pl+"norm_conv.weight","BF16",{10240},{}});
+            groups.back().push_back({pl+"conv1d.weight","BF16",{10240,1,4},{}});
+        }
     }
-    groups.emplace_back(std::vector<TensorEntry>{{"model.language_model.embed_tokens.weight","BF16",{4,2560},{}}});
+    groups.emplace_back(std::vector<TensorEntry>{
+        {"model.language_model.embed_tokens.weight","BF16",{248320,2560},{}},
+        {"lm_head.weight","BF16",{248320,2560},{}}});
+    groups.emplace_back(std::vector<TensorEntry>{
+        {"model.language_model.hyper_connection_mixer.hc_norm.weight","BF16",{10240},{}},
+        {"model.language_model.hyper_connection_mixer.input_mix_weight_down.weight","BF16",{320,10240},{}},
+        {"model.language_model.hyper_connection_mixer.input_mix_weight_up.weight","BF16",{10240,320},{}}});
     groups.emplace_back(std::vector<TensorEntry>{
         {pre+"layer_multipliers","I64",{3},i64_payload({0,0,0})},
         {pre+"ngram_heads_vocab_sizes","I64",{16},i64_payload(vocab)},
         {pre+"ngram_heads_offsets","I64",{16},i64_payload(offsets)}});
     for(const auto& m:matrices) if(m.mtp) push_matrix(m,mtp_tensors);
-    mtp_tensors.push_back({"mtp.layers.0.input_layernorm.weight","BF16",{2560},{}});
+    layer_preserved("mtp.layers.0.",mtp_tensors,true,false);
+    mtp_tensors.push_back({"mtp.hyper_connection_mixer.hc_norm.weight","BF16",{10240},{}});
+    mtp_tensors.push_back({"mtp.hyper_connection_mixer.input_mix_weight_down.weight","BF16",{320,10240},{}});
+    mtp_tensors.push_back({"mtp.hyper_connection_mixer.input_mix_weight_up.weight","BF16",{10240,320},{}});
+    mtp_tensors.push_back({"mtp.pre_fc_norm_embedding.weight","BF16",{2560},{}});
+    mtp_tensors.push_back({"mtp.pre_fc_norm_hidden.weight","BF16",{10240},{}});
+    mtp_tensors.push_back({"mtp.layers.0.input_layernorm.weight","BF16",
+                           o.optional_shrink?std::vector<long long>{1}:std::vector<long long>{2560},{}});
     // pack groups into shards
     const uint64_t limit=(20ull<<30)-(1<<20);
     std::vector<std::vector<TensorEntry>> shards;
@@ -478,13 +531,14 @@ int main() {
         {
             const auto short_file=temp.path/"short.safetensors";
             { std::ofstream out(short_file,std::ios::binary); out<<"tiny"; }
-            rejects([&] { validate_file(short_file.string()); });
+            auto strict_open=[&](const std::string& p){ SafeTensors st; st.open_strict_validated(p,false); };
+            rejects([&] { strict_open(short_file.string()); });
             const auto long_header=temp.path/"long-header.safetensors";
             { std::ofstream out(long_header,std::ios::binary); uint64_t length=4096; out.write(reinterpret_cast<const char*>(&length),8); out<<"{}"; }
-            rejects([&] { validate_file(long_header.string()); });
+            rejects([&] { strict_open(long_header.string()); });
             const auto truncated=temp.path/"truncated.safetensors";
             matrix_file(truncated); fs::resize_file(truncated,fs::file_size(truncated)-1);
-            rejects([&] { validate_file(truncated.string()); });
+            rejects([&] { strict_open(truncated.string()); });
             const auto dup_key=temp.path/"dup-key.safetensors";
             { // strict header parsing: a duplicate key cannot smuggle a second tensor past the inventory
               std::string header="{\"a.weight_packed\":{\"dtype\":\"I32\",\"shape\":[16,32],\"data_offsets\":[0,2048]},"
@@ -494,7 +548,7 @@ int main() {
               out.write(reinterpret_cast<const char*>(&length),8); out.write(header.data(),header.size());
               std::vector<char> payload(2048,0); out.write(payload.data(),payload.size());
             }
-            rejects([&] { validate_file(dup_key.string()); });
+            rejects([&] { strict_open(dup_key.string()); });
         }
         auto records=inventory();
         const InventorySpec spec{48,512,2560,640,24,256,2,16,128,48,128,640,4,1};
@@ -537,6 +591,19 @@ int main() {
             const auto odd=temp.path/"int4-odd-shape"; fs::create_directories(odd);
             int4_shaped_file(odd/"model-00001-of-00001.safetensors",128,96);  // width 16: 64 != 96 and 128 != 96
             rejects([&]{ Checkpoint ck; ck.open(odd.string(),false,""); });  // neither x4 nor x8: clear error
+            { // F07: a scalar I32 .weight_packed (shape []) with companions used to reach arr.back() on
+              // the empty shape vector (crash); it must now be refused cleanly before any dimension read
+            const auto scalar8=temp.path/"int8-scalar-packed"; fs::create_directories(scalar8);
+            std::string scalar_header="{\"a.weight_packed\":{\"dtype\":\"I32\",\"shape\":[],\"data_offsets\":[0,4]},"
+                "\"a.weight_scale\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[4,6]},"
+                "\"a.weight_shape\":{\"dtype\":\"I64\",\"shape\":[1],\"data_offsets\":[6,14]}}";
+            while(scalar_header.size()%8) scalar_header+=' ';
+            { std::ofstream out(scalar8/"model.safetensors",std::ios::binary); const uint64_t len=scalar_header.size();
+              out.write(reinterpret_cast<const char*>(&len),8); out.write(scalar_header.data(),scalar_header.size());
+              std::vector<char> payload(6,0); out.write(payload.data(),payload.size());
+              const int64_t stored=128; out.write(reinterpret_cast<const char*>(&stored),8); }
+            rejects([&]{ Checkpoint ck; ck.open(scalar8.string(),false,""); });
+            }
             }
         }
 
@@ -550,6 +617,22 @@ int main() {
             require(ck.ngram.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_127"),"ngram table not opened");
             require(ck.body.has("model.language_model.layers.47.mlp.experts.gate_up_proj.weight_packed"),"body shard tensor missing");
             require(ck.mtp.has("mtp.fc_embedding.weight_packed"),"MTP tensor missing");
+        }
+        { // F10: one guarded open parses each safetensors header exactly once — the pre-F10 loader
+          // strict-validated the bytes, then SafeTensors::open REOPENED the path and reparsed it
+          // permissively: double work plus a swap/symlink window between the two opens
+            const auto d=temp.path/"single-parse"; const auto fix=build_checkpoint(d,BuildOptions{});
+            const auto before=safetensors_header_parses();
+            Checkpoint ck; ck.open(d.string(),true,"");
+            require(safetensors_header_parses()-before==fix.shards.size()+2,
+                    "checkpoint open did not parse each safetensors header exactly once");
+        }
+        { // F02: an engine-required preserved tensor with a bad shape is refused at open — before the fix
+          // this opened and Worker::load memcpy'd its fixed RW-sized region from a 2-byte tensor
+            auto o=BuildOptions{}; o.hc_shrink=true; const auto d=temp.path/"hc-shrunk";
+            build_checkpoint(d,o); rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+            auto q=BuildOptions{}; q.optional_shrink=true; const auto e=temp.path/"opt-shrunk";
+            build_checkpoint(e,q); open_checkpoint(e,q);  // names outside the engine table stay free
         }
         { auto o=BuildOptions{}; o.source_identity=true; const auto d=temp.path/"source-id";
           build_checkpoint(d,o); open_checkpoint(d,o); }
@@ -615,6 +698,21 @@ int main() {
             unsetenv("FLASH_NGRAM_PATH");
             require(ck.ngram_path==ext.external_table,"relative FLASH_NGRAM_PATH must resolve against the model directory");
         }
+        { // F05: a relative checkpoint directory: every manifest-recorded path joins with the directory
+          // exactly once (the config and the recorded MTP path used to be re-resolved against it again,
+          // doubling the directory and rejecting every relative-path open)
+            const auto save=fs::current_path();
+            fs::current_path(temp.path);
+            build_checkpoint("rel-ckpt",BuildOptions{});
+            bool opened_mtp=false, opened_plain=false;
+            try { Checkpoint ck; ck.open("rel-ckpt",true,""); opened_mtp=ck.has_manifest; }
+            catch(const std::exception& e) { fprintf(stderr,"rel-ckpt want_mtp: %s\n",e.what()); }
+            try { Checkpoint ck; ck.open("rel-ckpt",false,""); opened_plain=ck.has_manifest; }
+            catch(const std::exception& e) { fprintf(stderr,"rel-ckpt no mtp: %s\n",e.what()); }
+            fs::current_path(save);
+            require(opened_mtp,"relative checkpoint dir with want_mtp did not open");
+            require(opened_plain,"relative checkpoint dir without want_mtp did not open");
+        }
         { // manifest present but not a regular file
             const auto d=temp.path/"manifest-dir"; fs::create_directories(d/"qfn-int8-manifest.json");
             rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
@@ -640,6 +738,49 @@ int main() {
           fs::rename(d/"model_mtp.safetensors",d/"moved-mtp.safetensors");
           fs::create_symlink("moved-mtp.safetensors",d/"model_mtp.safetensors");
           rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+        }
+        { // F09: every checkpoint file is opened through the guarded open (lstat S_ISREG, O_NOFOLLOW,
+          // fstat) — a substituted directory or FIFO at a manifest-recorded name is a clean rejection;
+          // the recorded MTP path used to go straight to an ifstream, which blocked forever on a FIFO.
+            const auto md=temp.path/"mtp-dir"; build_checkpoint(md,BuildOptions{});
+            fs::remove(md/"model_mtp.safetensors"); fs::create_directories(md/"model_mtp.safetensors");
+            rejects([&]{ Checkpoint ck; ck.open(md.string(),true,""); });
+            const auto sd=temp.path/"shard-dir"; const auto sfix=build_checkpoint(sd,BuildOptions{});
+            fs::remove(sd/sfix.shards[0]); fs::create_directories(sd/sfix.shards[0]);
+            rejects([&]{ Checkpoint ck; ck.open(sd.string(),true,""); });
+            const auto cd=temp.path/"config-dir2"; const auto cfix=build_checkpoint(cd,BuildOptions{});
+            fs::remove(cd/"config.json"); fs::create_directories(cd/"config.json");
+            rejects([&]{ Checkpoint ck; ck.open(cd.string(),false,""); });
+            (void)cfix;
+            const auto ff=temp.path/"mtp-fifo"; build_checkpoint(ff,BuildOptions{});
+            fs::remove(ff/"model_mtp.safetensors");
+            require(::mkfifo((ff/"model_mtp.safetensors").string().c_str(),0644)==0,"mkfifo fixture failed");
+            rejects([&]{ Checkpoint ck; ck.open(ff.string(),true,""); });  // must reject, never block
+        }
+        { // F11: an intermediate directory component replaced by a symlink to an OUTSIDE directory must
+          // not smuggle the shard through (the gate used to inspect only the final component); a real
+          // subdirectory with the same manifest rewrite keeps working
+            auto reroute=[&](const fs::path& dir,const std::string& shard){  // record "sub/<shard>" everywhere
+                std::ifstream in(dir/"qfn-int8-manifest.json");
+                const std::string m((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+                const std::string needle="\""+shard+"\"", repl="\"sub/"+shard+"\"";
+                std::string out;
+                for(size_t p=0;;){ const auto q=m.find(needle,p);
+                    if(q==std::string::npos){ out+=m.substr(p); break; }
+                    out+=m.substr(p,q-p)+repl; p=q+needle.size(); }
+                std::ofstream o(dir/"qfn-int8-manifest.json"); o<<out;
+            };
+            const auto d=temp.path/"symlink-sub"; const auto fixture=build_checkpoint(d,BuildOptions{});
+            const auto outside=temp.path/"outside-sub"; fs::create_directories(outside);
+            fs::rename(d/fixture.shards[0],outside/fixture.shards[0]);   // regular file outside the checkpoint dir
+            fs::create_symlink(outside.string(),d/"sub");
+            reroute(d,fixture.shards[0]);
+            rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+            const auto ok=temp.path/"real-sub"; const auto okfix=build_checkpoint(ok,BuildOptions{});
+            fs::create_directories(ok/"sub");
+            fs::rename(ok/okfix.shards[0],ok/"sub"/okfix.shards[0]);
+            reroute(ok,okfix.shards[0]);
+            Checkpoint ck; ck.open(ok.string(),true,""); require(ck.has_manifest,"legit subdirectory shard rejected");
         }
         { setenv("FLASH_NGRAM","bf16",1);
           rejects([&]{ Checkpoint ck; ck.open(base.string(),true,""); });
