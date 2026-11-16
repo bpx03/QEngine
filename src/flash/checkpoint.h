@@ -75,18 +75,31 @@ inline std::string sandbox_file(const std::string& directory, const std::string&
     return joined.string();
 }
 inline bool is_file(const std::string& path) { return std::filesystem::is_regular_file(path); }
-// Sandbox symlink gate: is_regular_file/status/ifstream all FOLLOW symlinks, so the lexical sandbox
-// above would be escapable if a manifest-named file were replaced by a symlink. Every sandbox-resolved
-// manifest path — the manifest itself, the body shards, and the recorded MTP/config/self-contained
-// n-gram names — must pass this check before its first open. Scope: operator-supplied absolute inputs
-// (FLASH_NGRAM_PATH, the explicit n-gram/MTP override arguments) keep their documented absolute
-// allowance and are deliberately NOT symlink-gated; only paths resolved through the sandbox are.
-// A missing file passes here unchanged so the established "missing" diagnostics stay as they were.
-inline void require_no_symlink(const std::string& path, const std::string& context) {
+// Sandbox symlink gate (review R2 + R3 F11): EVERY component of a sandbox-resolved manifest path below
+// the checkpoint root must be a non-symlink. Checking only the final component left names like
+// "sub/shard.safetensors" escapable through an intermediate directory replaced by a symlink to an
+// outside directory. Missing components pass through so the established "missing" diagnostics stay;
+// the checkpoint root itself is operator-chosen and deliberately not gated. Scope: operator-supplied
+// absolute inputs (FLASH_NGRAM_PATH, the explicit n-gram/MTP override arguments) keep their documented
+// absolute allowance and are NOT symlink-gated; only sandbox-joined names are.
+inline void require_no_symlink(const std::string& root, const std::string& path, const std::string& context) {
     std::error_code ec;
-    const auto type = std::filesystem::symlink_status(path, ec).type();
-    if (!ec && type == std::filesystem::file_type::symlink)
-        fail(context, "path", "regular file (the sandbox never follows symlinks)", "symbolic link: " + path);
+    const auto rel = std::filesystem::path(path).lexically_relative(std::filesystem::path(root));
+    if (rel.empty() || rel.is_absolute()) {  // not under the root: keep the final-component check alone
+        const auto type = std::filesystem::symlink_status(path, ec).type();
+        if (!ec && type == std::filesystem::file_type::symlink)
+            fail(context, "path", "regular file (the sandbox never follows symlinks)", "symbolic link: " + path);
+        return;
+    }
+    auto prefix = std::filesystem::path(root);
+    for (const auto& part : rel) {
+        prefix /= part;
+        const auto status = std::filesystem::symlink_status(prefix, ec);
+        if (ec) return;  // missing or unreadable component: the later guarded open reports it
+        if (status.type() == std::filesystem::file_type::symlink)
+            fail(context, "path", "no symlink component (the sandbox never follows symlinks)",
+                 "symbolic link component: " + prefix.string());
+    }
 }
 inline std::string read_bounded_file(const std::string& path, uint64_t max_bytes, const std::string& context) {
     // F09: same guarded open as the safetensors files: the type/regular check happens before a single
@@ -286,7 +299,7 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     // values resolve against the model directory, absolute paths are allowed.
     if (outputs.has("ngram")) {
         result.ngram = sandbox_file(directory,text(outputs,"ngram",directory),directory+": outputs.ngram");
-        require_no_symlink(result.ngram, directory+": outputs.ngram");  // sandboxed name: never followed
+        require_no_symlink(directory,result.ngram,directory+": outputs.ngram");  // sandboxed name: never followed
     }
     else if (!ngram_override.empty())
         result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute or checkpoint-relative
@@ -297,7 +310,7 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     // result in resolve_path a second time doubled a RELATIVE checkpoint dir
     // (models/int8/models/int8/mtp.safetensors). Only operator-supplied overrides join again.
     result.mtp = want_mtp ? (mtp_override.empty() ? mtp_name : resolve_path(directory,mtp_override)) : std::string{};
-    if (want_mtp && mtp_override.empty()) require_no_symlink(result.mtp, directory+": outputs.mtp");  // recorded name only; overrides unchanged
+    if (want_mtp && mtp_override.empty()) require_no_symlink(directory,result.mtp,directory+": outputs.mtp");  // recorded name only; overrides unchanged
     if (want_mtp && !mtp_override.empty() && std::find(result.body.begin(),result.body.end(),result.mtp) != result.body.end())
         fail(directory,"outputs","separate body/MTP paths",result.mtp);
     if(!is_file(result.ngram)) throw std::runtime_error(result.ngram+": missing INT8 ngram dependency");
@@ -525,7 +538,7 @@ struct Checkpoint {
             }
             return;
         }
-        require_no_symlink(path,path);  // the manifest itself is a sandboxed name: never a symlink
+        require_no_symlink(directory,path,path);  // the manifest itself is a sandboxed name: never a symlink
         has_manifest=true; format=WeightFormat::Int8;
         // R2-6: an mtp_override must be a BYTE-COMPATIBLE replacement of the recorded MTP inventory:
         // the header-vs-manifest matching below rejects a replacement with missing, extra or altered
@@ -584,7 +597,7 @@ struct Checkpoint {
         // enforce the size cap, then match every shard header against the manifest mapping exactly
         std::vector<Json> shard_headers;
         for(const auto& shard:resolved.body) {
-            require_no_symlink(shard,shard);  // sandboxed manifest name: reject a substituted symlink
+            require_no_symlink(directory,shard,shard);  // sandboxed manifest name: reject a substituted symlink
             // F10: single guarded open per shard — the cap is checked against the fstat'ed size before
             // mapping, the header is parsed strictly once from the mapped bytes and the tensors below
             // are indexed from that same parse (no reopen, no second parse, no window in between)
@@ -612,7 +625,7 @@ struct Checkpoint {
         // recorded manifest paths are already sandbox-joined: resolving the joined value against the
         // directory again doubled a relative checkpoint dir (models/int8/models/int8/config.json)
         const auto config_path=sandbox_file(directory,text(j["outputs"],"config",path),path+": outputs.config");
-        require_no_symlink(config_path,config_path);  // sandboxed manifest name
+        require_no_symlink(directory,config_path,config_path);  // sandboxed manifest name
         const auto config=parse_json(read_bounded_file(config_path,4u<<20,config_path),config_path);
         const auto& text_config=config.has("text_config")?config["text_config"]:config;
         { // required keys: never skip a missing one; the error lists everything that is absent

@@ -757,6 +757,31 @@ int main() {
             require(::mkfifo((ff/"model_mtp.safetensors").string().c_str(),0644)==0,"mkfifo fixture failed");
             rejects([&]{ Checkpoint ck; ck.open(ff.string(),true,""); });  // must reject, never block
         }
+        { // F11: an intermediate directory component replaced by a symlink to an OUTSIDE directory must
+          // not smuggle the shard through (the gate used to inspect only the final component); a real
+          // subdirectory with the same manifest rewrite keeps working
+            auto reroute=[&](const fs::path& dir,const std::string& shard){  // record "sub/<shard>" everywhere
+                std::ifstream in(dir/"qfn-int8-manifest.json");
+                const std::string m((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+                const std::string needle="\""+shard+"\"", repl="\"sub/"+shard+"\"";
+                std::string out;
+                for(size_t p=0;;){ const auto q=m.find(needle,p);
+                    if(q==std::string::npos){ out+=m.substr(p); break; }
+                    out+=m.substr(p,q-p)+repl; p=q+needle.size(); }
+                std::ofstream o(dir/"qfn-int8-manifest.json"); o<<out;
+            };
+            const auto d=temp.path/"symlink-sub"; const auto fixture=build_checkpoint(d,BuildOptions{});
+            const auto outside=temp.path/"outside-sub"; fs::create_directories(outside);
+            fs::rename(d/fixture.shards[0],outside/fixture.shards[0]);   // regular file outside the checkpoint dir
+            fs::create_symlink(outside.string(),d/"sub");
+            reroute(d,fixture.shards[0]);
+            rejects([&]{ Checkpoint ck; ck.open(d.string(),true,""); });
+            const auto ok=temp.path/"real-sub"; const auto okfix=build_checkpoint(ok,BuildOptions{});
+            fs::create_directories(ok/"sub");
+            fs::rename(ok/okfix.shards[0],ok/"sub"/okfix.shards[0]);
+            reroute(ok,okfix.shards[0]);
+            Checkpoint ck; ck.open(ok.string(),true,""); require(ck.has_manifest,"legit subdirectory shard rejected");
+        }
         { setenv("FLASH_NGRAM","bf16",1);
           rejects([&]{ Checkpoint ck; ck.open(base.string(),true,""); });
           unsetenv("FLASH_NGRAM"); }
