@@ -121,12 +121,12 @@ add_dependencies(qflash qe_build_id)
 
 # CPU unit tests of the comm rules and the exchange flag protocol (no GPU): ctest
 enable_testing()
-foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit qfn_pp_plan_unit load_drop_unit)
+foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit qfn_pp_plan_unit load_drop_unit flash_checkpoint_unit)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cpp)  # the Docker build stage has no tests/
     add_executable(${t} tests/${t}.cpp)
     target_include_directories(${t} PRIVATE src)
     add_test(NAME ${t} COMMAND ${t})
-    if(t STREQUAL load_drop_unit)
+    if(t STREQUAL load_drop_unit OR t STREQUAL flash_checkpoint_unit)
       target_sources(${t} PRIVATE src/safetensors.cpp)
     endif()
     if(t STREQUAL kv_disk_unit)
@@ -136,8 +136,3 @@ foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_o
   endif()
 endforeach()
 
-option(QE_BUILD_FLASH_INT8_TESTS "Build Flash INT8 unit tests" OFF)
-if(QE_BUILD_FLASH_INT8_TESTS)
-  add_executable(flash_checkpoint_unit tests/flash_checkpoint_unit.cpp src/safetensors.cpp)
-  target_include_directories(flash_checkpoint_unit PRIVATE src)
-endif()
