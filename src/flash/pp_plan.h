@@ -163,9 +163,10 @@ inline bool cards_uneven(const std::vector<CardSpeed>& c, double tol = 0.10, dou
     return false;
 }
 struct ModelBytes;
-inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes);
+inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes, double group_bytes);
 inline std::vector<int> partition_cards(int n, const CostModel& cm, double ctx, const DecodeCost& dc, double w,
-                                        const std::vector<CardSpeed>& cs, double h2d) {
+                                        const std::vector<CardSpeed>& cs, double h2d,
+                                        double group_bytes = ModelBytes::kInt4GroupBytes) {
     double pf_tot = cm.head_last, dc_tot = dc.head;
     for (int li = 0; li < kLayers; li++) { pf_tot += cm.layer(li, ctx); dc_tot += dc.layer(li); }
     return partition(n, kLayers, [&](int s, int l0, int l1) {
@@ -175,7 +176,7 @@ inline std::vector<int> partition_cards(int n, const CostModel& cm, double ctx, 
         const CardSpeed& c = cs[s];
         pf /= std::max(0.05, c.pf);
         de /= std::max(0.05, c.dc);
-        pf += stage_host_bytes(l0, l1, s == n - 1, c.free) / h2d * 1e3 / 4.096;  // ms per 1K prompt tokens
+        pf += stage_host_bytes(l0, l1, s == n - 1, c.free, group_bytes) / h2d * 1e3 / 4.096;  // ms per 1K prompt tokens
         return (1 - w) * pf / (pf_tot / n) + w * de / (dc_tot / n);
     });
 }
@@ -339,8 +340,8 @@ inline StageMem stage_mem(const ModelBytes& mb, const Card& c, int l0, int l1, b
 }
 
 // expert bytes of a stage that do not fit next to its fixed part in free_bytes (host-backed, staged per micro-batch)
-inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes) {
-    const ModelBytes mb;
+inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes, double group_bytes) {
+    const ModelBytes mb(group_bytes);
     return stage_mem(mb, Card{free_bytes, 24e9}, l0, l1, last, true, 8704, 0.0, 2.0e9).host;
 }
 

@@ -3412,7 +3412,7 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
     std::vector<void*> pp_holds;
     if (par == flash_pp::Par::PP_PREFILL) {
         std::string err;
-        pp_bounds_v = pp_bounds(e->ng, 65536, false, &err);
+        pp_bounds_v = pp_bounds(e->ng, 65536, false, &err, weight_group_bytes(e->checkpoint.format));
         if (pp_bounds_v.empty()) { fprintf(stderr, "qflash: %s\n", err.c_str()); return nullptr; }
         const flash_pp::ModelBytes mb((double)flash::group_bytes(e->checkpoint.format));
         const double xmb = env_double("FLASH_PF_STAGE_XMB", 2048) * 1048576.0;
@@ -3433,8 +3433,8 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
     if (par == flash_pp::Par::PP) {  // mode B: one stage worker per card (whole layers), the planner's split
         std::string err;
         const int nst = pptp ? (int)groups.size() : e->ng;
-        e->ppb_bounds = pptp ? pptp_bounds(groups, env_ll("FLASH_PPB_SPLIT_CTX", 32768), &err)
-                             : pp_bounds(e->ng, env_ll("FLASH_PPB_SPLIT_CTX", 32768), true, &err);
+        e->ppb_bounds = pptp ? pptp_bounds(groups, env_ll("FLASH_PPB_SPLIT_CTX", 32768), &err, weight_group_bytes(e->checkpoint.format))
+                             : pp_bounds(e->ng, env_ll("FLASH_PPB_SPLIT_CTX", 32768), true, &err, weight_group_bytes(e->checkpoint.format));
         if (e->ppb_bounds.empty()) { fprintf(stderr, "qflash: %s\n", err.c_str()); return nullptr; }
         ng_done.wait();  // (the stages size their expert budgets at load: after the host registrations)
         std::vector<int> tps;

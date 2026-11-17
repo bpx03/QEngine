@@ -13,19 +13,19 @@ The converter (`tools/quant_int8.py`) writes a self-contained checkpoint directo
   per 128-wide group) and `.weight_shape`; every other tensor is stored byte-identical to the source;
 - `qfn-int8-manifest.json` maps every tensor to its shard, records the source digests, and carries the
   n-gram table identity with a `sha256`;
-- the INT8 n-gram table is materialized inside the checkpoint (`ngram_int8.safetensors`, hard link with a
-  copy fallback) unless you convert with `--external-ngram`, which records identity only and expects the
-  table to be mounted with `FLASH_NGRAM_PATH`.
+- the INT8 n-gram table is copied into the checkpoint (`ngram_int8.safetensors`) by default; `--link-ngram`
+  hard-links it instead, and `--external-ngram` records the identity only and expects the table to be
+  mounted with `FLASH_NGRAM_PATH`.
 
 The runtime detects the format from the checkpoint itself (manifest present, tensor shapes); nothing in the
 image or the binary selects INT8, and INT4 checkpoints keep loading exactly as before.
 
 ## Converting
 
-    python3 tools/quant_int8.py --src <bf16 checkpoint dir> --out <int8 dir> \
-        --ngram-from <ngram_int8 dir> --kv-from <kv template dir>
+    python3 tools/quant_int8.py --src <bf16 checkpoint dir> --out <int8 dir>         --ngram-from <ngram_int8 dir> --kv-from <kv template dir>
 
-Optional: `--external-ngram`, `--max-shard-bytes`, `--search`, `--jobs`. Afterwards verify the output:
+Optional: `--link-ngram`, `--external-ngram`, `--max-shard-bytes`, `--search`, `--dev`. Afterwards verify
+the output:
 
     python3 tools/quant_int8.py --check <int8 dir>            # shards, manifest, n-gram identity
     python3 tools/quant_int8.py --check <int8 dir> --src <dir>  # also re-quantizes and compares codes/scales
@@ -42,18 +42,23 @@ manifest, opens the shards and selects the W8 kernels per checkpoint. Useful ove
 ## What the machine needs
 
 INT8 expert groups are 998,400 B per 128-wide group (against 506,880 B at INT4), so all routed expert
-groups together are roughly 123 GB. At boot the host plan sizes, in order: the host-backed share of the
-experts (what the cards cannot keep resident), then the n-gram table, then the KV archive and pinned
-prefixes. On a host where the n-gram table does not fit next to the experts it is served from the page
-cache instead of being pinned, and the boot log says so (`n-gram table not pinned ... read from the page
-cache instead`); nothing fails at load for host RAM. The start-up line prints the plan (`QE_HOST_BUDGET_TABLE=1`
-prints the full table). VRAM needs are the same as INT4: resident groups are chosen from the free memory
-reported per card at boot.
+groups together are roughly 123 GB. The cards keep only what fits in their free VRAM next to everything
+else; the rest is pinned host RAM: about **92 GB on a 2-card host and about 72 GB on a 3-card host**, plus
+the base the server itself needs (process, pinned embeddings, KV archive and pinned prefixes, and the
+51.8 GB n-gram table while it stays pinned).
+
+The experts are the one budget the start-up plan never reduces: when the host-backed experts do not fit,
+the plan says so at boot (a warning naming the experts' GB against the host's free RAM) and the pin guard
+refuses the load when the memory is really not there - the same rule INT4 follows. What does degrade is
+the n-gram table: on a host where it does not fit next to the experts it is served from the page cache
+instead of pinned, and the boot log says so (`n-gram table not pinned ... read from the page cache
+instead`). The start-up line prints the plan (`QE_HOST_BUDGET_TABLE=1` prints the full table). VRAM needs
+are the same as INT4: resident groups are chosen from the free memory reported per card at boot.
 
 ## Tested modes and performance
 
-Converted and served on 2-card (PP2 x TP2) and 3-card RTX 3090 hosts, decode and prefill, with and without
-MTP (`FLASH_MTP_K=0`, K=1, K=2), balanced draft head on, INT8 n-gram table pinned and in page-cache mode.
-INT4 checkpoints on the same binaries are unaffected by everything on this page.
+Converted and served on a five-rank tensor-parallel RTX 3090 host (5 x 24 GB): decode and prefill
+benchmarks, with and without MTP drafts (`FLASH_MTP_K` = 0, 1, 2), the INT8 n-gram table pinned. Other
+parallel layouts exercise the same W8 code paths but have not been benchmarked on an INT8 checkpoint.
 
-Speed and quality against INT4: to be measured. This PR does not claim any equivalence.
+Speed and quality against INT4: to be measured.

@@ -337,8 +337,8 @@ int main(int argc, char** argv) try {
         if (env_int("FLASH_CARD_CAL", 1)) printf("cards: %s\n", pp_calibrate(devs).c_str());  // (heterogeneous split)
         {
             std::string err;
-            pps.bounds = pps.pptp ? pptp_bounds(pps.groups, (long long)prompt.size(), &err)
-                                  : pp_bounds(ncards, (long long)prompt.size(), pps.par == flash_pp::Par::PP, &err);
+            pps.bounds = pps.pptp ? pptp_bounds(pps.groups, (long long)prompt.size(), &err, weight_group_bytes(checkpoint.format))
+                                  : pp_bounds(ncards, (long long)prompt.size(), pps.par == flash_pp::Par::PP, &err, weight_group_bytes(checkpoint.format));
             if (pps.bounds.empty()) { fprintf(stderr, "flash_run: %s\n", err.c_str()); return 1; }
         }
         printf("pipeline (%s): %d stages, layers", pps.pptp ? "pptp" : flash_pp::par_name(pps.par), pps.nst);

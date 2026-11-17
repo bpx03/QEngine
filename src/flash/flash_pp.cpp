@@ -1522,7 +1522,7 @@ bool pp_hop_p2p() {
     return !g_no_p2p.load();
 }
 
-std::vector<int> pp_bounds(int n, long long np, bool decode, std::string* err) {
+std::vector<int> pp_bounds(int n, long long np, bool decode, std::string* err, double group_bytes) {
     std::vector<int> b = flash_pp::parse_layers(env_str("FLASH_PP_LAYERS"), n, err);
     if (!err->empty()) return {};
     if (!b.empty()) return b;
@@ -1530,7 +1530,7 @@ std::vector<int> pp_bounds(int n, long long np, bool decode, std::string* err) {
     const double w = decode ? std::clamp(env_double("FLASH_PP_DECODE_W", 0.5), 0.0, 1.0) : 0.0;
     if ((int)g_cards.size() == n && flash_pp::cards_uneven(g_cards) && env_int("FLASH_PP_CARD_SPLIT", 1)) {
         const double h2d = pp_h2d_gbps(22.0) * 1e9;
-        return flash_pp::partition_cards(n, cm, np / 2.0, flash_pp::DecodeCost{}, w, g_cards, h2d);
+        return flash_pp::partition_cards(n, cm, np / 2.0, flash_pp::DecodeCost{}, w, g_cards, h2d, group_bytes);
     }
     return flash_pp::partition_mixed(n, cm, np / 2.0, flash_pp::DecodeCost{}, w);
 }
@@ -1589,8 +1589,11 @@ std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vec
     std::vector<std::thread> th;
     std::vector<int> udev;
     for (int d : devs) if (std::find(udev.begin(), udev.end(), d) == udev.end()) udev.push_back(d);
-    for (int d : udev)
-        th.emplace_back([&, d] {
+    std::vector<std::string> load_err(udev.size());
+    for (size_t ti = 0; ti < udev.size(); ti++) {
+        const int d = udev[ti];
+        th.emplace_back([&, d, ti] {
+            try {
             std::vector<int> mine;
             for (int s = 0; s < n; s++) if (devs[s] == d) mine.push_back(s);
             for (size_t j = 0; j < mine.size(); j++) {
@@ -1608,8 +1611,16 @@ std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vec
                 S[s]->load(st, ht, s == n - 1 ? mst : nullptr);
                 S[s]->alloc_state();
             }
-        });
+            } catch (...) {  // (the TP loader threads' pattern: a worker thread that throws would call std::terminate;
+                             //  record and report at the join - qe_create / flash_main turn it into a clean refusal)
+                try { throw; }
+                catch (const std::exception& ex) { if (load_err[ti].empty()) load_err[ti] = ex.what(); }
+                catch (...) { if (load_err[ti].empty()) load_err[ti] = "unknown error"; }
+            }        });
+    }
     for (auto& t : th) t.join();
+    for (const std::string& m : load_err)
+        if (!m.empty()) { fprintf(stderr, "qflash: weight load failed: %s\n", m.c_str()); throw std::runtime_error(m); }
     for (Worker* w : S) w->set_ngram(ngd);
     return S;
 }
@@ -1636,7 +1647,7 @@ bool box_report_wanted(const std::vector<int>& devs, bool pptp) {
 std::vector<std::vector<int>> pptp_groups(const std::vector<int>& devs, std::string* err) {
     return flash_pp::parse_stage_map(env_str("FLASH_PP_MAP"), devs, env_int("FLASH_PP_TP", 2), err);
 }
-std::vector<int> pptp_bounds(const std::vector<std::vector<int>>& groups, long long np, std::string* err) {
+std::vector<int> pptp_bounds(const std::vector<std::vector<int>>& groups, long long np, std::string* err, double group_bytes) {
     const int n = (int)groups.size();
     std::vector<int> b = flash_pp::parse_layers(env_str("FLASH_PP_LAYERS"), n, err);
     if (!err->empty()) return {};
@@ -1674,7 +1685,7 @@ std::vector<int> pptp_bounds(const std::vector<std::vector<int>>& groups, long l
     const flash_pp::CostModel cm;
     const double w = std::clamp(env_double("FLASH_PP_DECODE_W", 0.5), 0.0, 1.0);
     const double h2d = pp_h2d_gbps(22.0) * 1e9;
-    return flash_pp::partition_cards(n, cm, np / 2.0, flash_pp::DecodeCost{}, w, gs, h2d);
+    return flash_pp::partition_cards(n, cm, np / 2.0, flash_pp::DecodeCost{}, w, gs, h2d, group_bytes);
 }
 
 std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups, const std::vector<int>& bounds, int ctx,
@@ -1736,8 +1747,11 @@ std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups,
     std::vector<int> udev;
     for (int d : dev) if (std::find(udev.begin(), udev.end(), d) == udev.end()) udev.push_back(d);
     std::vector<std::thread> th;
-    for (int d : udev)
-        th.emplace_back([&, d] {
+    std::vector<std::string> load_err(udev.size());
+    for (size_t ti = 0; ti < udev.size(); ti++) {
+        const int d = udev[ti];
+        th.emplace_back([&, d, ti] {
+            try {
             std::vector<int> mine;
             for (int i = 0; i < nw; i++) if (dev[i] == d) mine.push_back(i);
             for (size_t j = 0; j < mine.size(); j++) {
@@ -1752,8 +1766,16 @@ std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups,
                 W[i]->load(st, ht, s == n - 1 ? mst : nullptr);
                 W[i]->alloc_state();
             }
-        });
+            } catch (...) {  // (the TP loader threads' pattern: a worker thread that throws would call std::terminate;
+                             //  record and report at the join - qe_create / flash_main turn it into a clean refusal)
+                try { throw; }
+                catch (const std::exception& ex) { if (load_err[ti].empty()) load_err[ti] = ex.what(); }
+                catch (...) { if (load_err[ti].empty()) load_err[ti] = "unknown error"; }
+            }        });
+    }
     for (auto& t : th) t.join();
+    for (const std::string& m : load_err)
+        if (!m.empty()) { fprintf(stderr, "qflash: weight load failed: %s\n", m.c_str()); throw std::runtime_error(m); }
     // the TP exchange peers inside every group (as the TP server does over all its ranks)
     for (int s = 0; s < n; s++)
         for (int r = 0; r < tps[s] && tps[s] > 1; r++) {

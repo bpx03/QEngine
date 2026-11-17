@@ -219,6 +219,8 @@ template<int Bits> struct ExpertLayout {
 };
 static_assert(ExpertLayout<4>::bytes == GRP_BYTES);
 static_assert(ExpertLayout<8>::bytes == 998400);
+// the expert group size a checkpoint's weight format carries (planning arithmetic; not device code)
+inline double weight_group_bytes(WeightFormat f) { return f == WeightFormat::Int8 ? 998400.0 : 506880.0; }
 // the 128-wide expert group size of an opened checkpoint format: the host RAM plan and the pipeline planner size
 // the experts with it (INT8 groups are 998,400 B, not the INT4 506,880 B)
 inline size_t group_bytes(WeightFormat format) { return format == WeightFormat::Int8 ? ExpertLayout<8>::bytes : ExpertLayout<4>::bytes; }
