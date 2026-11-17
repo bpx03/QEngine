@@ -8,6 +8,7 @@
 // again (27B QE_PREFIX_GB). Built as libqflash.so.
 #include "../env.h"
 #include "ngram_ahead.h"
+#include "sidecar_load.h"
 #include "../pool_order.h"
 #include "../kernels/watchdog.cuh"
 #include <dirent.h>
@@ -3314,25 +3315,16 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     }
     if (e->ng <= kMaxTp && par != flash_pp::Par::PP) e->plans = make_plan(e->ng, wts);
     std::vector<int> draft_ids;
-    if (FILE* f = fopen((model + "/token_rank.bin").c_str(), "rb")) {
-        draft_ids.resize(65536);
-        draft_ids.resize(fread(draft_ids.data(), 4, 65536, f));
-        fclose(f);
-    }
     std::vector<std::vector<int>> cold;
     const std::string cf = env_str("FLASH_COLD") ? env_str("FLASH_COLD") : model + "/cold_experts.json";
-    if (FILE* f = fopen(cf.c_str(), "r")) {
-        std::string js;
-        char buf[65536];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) js.append(buf, n);
-        fclose(f);
-        Json j = Json::parse(js);
-        for (auto& l : j["layers"].arr) {
-            std::vector<int> v;
-            for (auto& x : l.arr) v.push_back((int)x.i());
-            cold.push_back(v);
-        }
+    try {  // the sidecars are model-directory input: a bad one refuses the load cleanly, never a throw across the C boundary
+        draft_ids = sidecar::load_token_rank(model + "/token_rank.bin", 65536, VOCAB);
+        cold = sidecar::load_cold_experts(cf, LAYERS, NE);
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "qflash: %s\n", ex.what());
+        ng_th.join();  // (the n-gram table pinning thread runs since above; on this base it is a std::thread, join it as the OOM path does)
+        delete e;
+        return nullptr;
     }
     std::vector<float> prior;  // expert-cache seed: per-token routing probabilities [48][512] (tools/flash_expert_prior.py)
     {
