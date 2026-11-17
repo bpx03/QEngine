@@ -219,13 +219,16 @@ template<int Bits> struct ExpertLayout {
 };
 static_assert(ExpertLayout<4>::bytes == GRP_BYTES);
 static_assert(ExpertLayout<8>::bytes == 998400);
+// the 128-wide expert group size of an opened checkpoint format: the host RAM plan and the pipeline planner size
+// the experts with it (INT8 groups are 998,400 B, not the INT4 506,880 B)
+inline size_t group_bytes(WeightFormat format) { return format == WeightFormat::Int8 ? ExpertLayout<8>::bytes : ExpertLayout<4>::bytes; }
 constexpr int MAXJOB = 896;              // job lists: at least this (3 cards: >= the groups of any card, 2565 x 0.34 + margin);
                                          // a card with more local groups (2 cards: ~1283) sizes them by plan_groups
 constexpr int PF_SHJ = 64;               // prefill: rows per shared-expert job (the shared expert sees every row)
 constexpr int MAXJOB_PF = 3072;  // prefill jobs: (expert, 64-row chunk, local group) <= 896 + 2 x rows x 11 / 64 (4096 rows)
 struct MoeJob {            // device descriptor of one local expert group (scales: __half for INT4, bf16 for W8)
-    const uint4* gq; const void* gs;
-    const uint4* dq; const void* ds;
+    const uint4* gq; const __half* gs;
+    const uint4* dq; const __half* ds;
 };
 // Dynamic expert cache (cold groups, see Worker::ec_*): the kernels resolve a cold local group ci (gmap index >= ndev)
 // through a device pointer table, entry = device slot address, or host-mapped address | 1 (served zero-copy over
@@ -247,6 +250,18 @@ __device__ __forceinline__ const char* grp_ptr(const char* groups, int li, int n
     return reinterpret_cast<const char*>(p & ~(uintptr_t)1);
 }
 #endif
+
+#ifdef __CUDACC__
+__device__ __forceinline__ const char* grp_ptr4(const char* groups, int li, int ndev, const ColdTab& ct, unsigned* coldcnt) {
+    if (li < ndev) return groups + (size_t)li * GRP_BYTES;
+    const int ci = li - ndev;
+    const uintptr_t p = ct.ptr[ci];
+    ct.touch[ci] = 1;
+    if ((p & 1) && coldcnt) atomicAdd(coldcnt, 1u);
+    return reinterpret_cast<const char*>(p & ~(uintptr_t)1);
+}
+#endif
+
 struct PfJob {             // prefill: one local expert group and its rows [off, off + n) of the token / weight lists
     MoeJob w;
     int off, n;

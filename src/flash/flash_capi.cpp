@@ -40,6 +40,7 @@
 #include <string>
 #include <thread>
 #include <future>
+#include <optional>
 #include <vector>
 
 #include "../json.h"
@@ -112,79 +113,63 @@ public:
         { std::lock_guard<std::mutex> l(mu_); stop_ = true; }
         cv_.notify_all();
         if (th_.joinable()) th_.join();
-        std::lock_guard<std::mutex> l(mu_);
-        if (pending_) ::free(pending_);
     }
-    // pins slabs only when the coordinating thread has drained all GPU work
-    // while less than `headroom` pinned bytes are free, up to `budget`, and only while the host
+    // pins slabs in the background while less than `headroom` pinned bytes are free (on demand: a full budget of
+    // 2 MB pages takes minutes to fault in next to a large page cache), up to `budget`, and only while the host
     // keeps its margin (host_mem.h: MemAvailable - margin >= two slabs; else it waits and retries)
     void start(size_t budget, size_t slab, size_t headroom) {
+        if (!budget || !slab) return;
         th_ = std::thread([this, budget, slab, headroom] {
             double secs = 0;
             bool held = false;
-            while (true) {
-                size_t sz;
+            while (!stop_) {
                 {
                     std::unique_lock<std::mutex> l(mu_);
                     cv_.wait(l, [&] { return stop_ || (pinned_ < budget && pinned_ < used_ + headroom); });
                     if (stop_) return;
-                    sz = std::min(slab, budget - pinned_);
                 }
+                const size_t sz = std::min(slab, budget - pinned_);
                 if (qe_hostmem::headroom(true) < sz + slab) {  // the host is short of memory: not now
                     if (!held)
                         fprintf(stderr, "[qflash] archive pool: pinning held at %.1f GB (MemAvailable %.1f GB, margin %.1f GB)\n",
-                                pinned() / 1e9, qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9);
+                                pinned_ / 1e9, qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9);
                     held = true;
                     std::unique_lock<std::mutex> l(mu_);
                     cv_.wait_for(l, std::chrono::seconds(2), [&] { return stop_.load(); });
-                    if (stop_) return;
                     continue;
                 }
-                if (held) fprintf(stderr, "[qflash] archive pool: pinning resumed at %.1f GB\n", pinned() / 1e9);
+                if (held) fprintf(stderr, "[qflash] archive pool: pinning resumed at %.1f GB\n", pinned_ / 1e9);
                 held = false;
                 const auto t0 = std::chrono::steady_clock::now();
                 void* p = nullptr;
-                if (posix_memalign(&p, 1 << 21, sz) != 0 || !p) return;
+                if (posix_memalign(&p, 1 << 21, sz) != 0 || !p) break;
                 static const bool thp = env_int("FLASH_ARCHIVE_THP", 1);
                 if (thp) madvise(p, sz, MADV_HUGEPAGE);
                 memset(p, 0, sz);  // fault the pages in without the driver
-                std::unique_lock<std::mutex> l(mu_);
-                if (stop_) { ::free(p); return; }
-                pending_ = p;
-                pending_size_ = sz;
-                pending_result_ = cudaSuccess;
-                cv_.notify_all();
-                cv_.wait(l, [&] { return stop_ || pending_ == nullptr; });
-                if (stop_) return;
-                if (pending_result_ != cudaSuccess) {
+                bool reg_ok;
+                {
+                    // (no QeWdSlow here: a background registration of 1 GB slabs, minutes long at boot, would keep the
+                    // device watchdog from catching a real hang; reviews Flash-Next M6 / 27B L5)
+                    reg_ok = !stop_ && cudaHostRegister(p, sz, cudaHostRegisterPortable) == cudaSuccess;
+                }
+                if (!reg_ok) {
+                    cudaGetLastError();
+                    ::free(p);
+                    if (stop_) break;
                     fprintf(stderr, "[qflash] archive pool: cudaHostRegister failed at %.1f GB pinned, retrying in 10 s\n", pinned_ / 1e9);
+                    std::unique_lock<std::mutex> l(mu_);
                     cv_.wait_for(l, std::chrono::seconds(10), [&] { return stop_.load(); });
-                    if (stop_) return;
                     continue;
                 }
                 secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                std::lock_guard<std::mutex> l(mu_);
+                slabs_.add((char*)p, sz);
+                pinned_ += sz;
+                qe_hostmem::charged() += sz;
                 if (env_int("FLASH_SLOT_LOG", 0))
                     fprintf(stderr, "[qflash] archive pool: %.1f GB pinned (%.1f s), %.2f GB used\n", pinned_ / 1e9, secs, used_ / 1e9);
             }
         });
-    }
-    template<class Quiesce>
-    void register_pending(Quiesce&& quiesce) {
-        std::lock_guard<std::mutex> l(mu_);
-        if (!pending_) return;
-        quiesce();
-        pending_result_ = cudaHostRegister(pending_, pending_size_, cudaHostRegisterPortable);
-        if (pending_result_ == cudaSuccess) {
-            slabs_.add((char*)pending_, pending_size_);
-            pinned_ += pending_size_;
-            qe_hostmem::charged() += pending_size_;
-        } else {
-            cudaGetLastError();
-            ::free(pending_);
-        }
-        pending_ = nullptr;
-        pending_size_ = 0;
-        cv_.notify_all();
     }
     char* alloc(size_t bytes, bool& pinned) {
         bytes = kve::SlabSet::round(bytes);
@@ -264,9 +249,6 @@ private:
     std::thread th_;
     std::atomic<bool> stop_{false};
     size_t pinned_ = 0, used_ = 0, pused_ = 0;
-    void* pending_ = nullptr;
-    size_t pending_size_ = 0;
-    cudaError_t pending_result_ = cudaSuccess;
 };
 
 // one host buffer per GPU: a KV segment or a recurrent state
@@ -720,15 +702,6 @@ struct FE {
     };
     void run(const char* tag = "job") {
         flash::tl_serving = true;
-        hpool.register_pending([this] {
-            int original;
-            CUDA_CHECK(cudaGetDevice(&original));
-            for (int r = 0; r < ng; r++) {
-                CUDA_CHECK(cudaSetDevice(devs[r]));
-                CUDA_CHECK(cudaDeviceSynchronize());
-            }
-            CUDA_CHECK(cudaSetDevice(original));
-        });
         run_tag.store(tag);
         qe_diag::job_tag().store(tag);
         if (ppb) {  // the stage threads (one per card); the bound slot first (the prefill flow re-binds between micro-batches)
@@ -2806,7 +2779,7 @@ static double wait_free_vram(const std::vector<int>& devs, double need, int* dmi
     }
     return fmin;
 }
-void* qe_create(const char* model_dir, const char* devices, int max_t, const char* split_s) {
+static void* qe_create_body(const char* model_dir, const char* devices, int max_t, const char* split_s) {
     (void)kv4_mode();  // the KV format (FLASH_KV_BITS) before any plan sizes the pool
     flash_pp::Par par = flash_pp::Par::AUTO;
     bool pptp = false;
@@ -2876,7 +2849,11 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     const std::string model = model_dir;
     e->kmax=env_int("FLASH_MTP_K",3);
     try {
-        e->checkpoint.open(model,e->kmax>0,env_str("QE_MTP_FILE")?env_str("QE_MTP_FILE"):"");
+        // the MTP block is opened as before the checkpoint loader (upstream opens both MTP files unconditionally):
+        // FLASH_MTP_K=0 only turns the draft off while &e->mst still reaches every Worker::load and the pipeline
+        // builders, so an unopened MTP would leave empty tensors for the loader threads. The override is
+        // FLASH_-named: QE_MTP_FILE belongs to the QEngine 27B engine
+        e->checkpoint.open(model,true,env_str("FLASH_MTP_FILE")?env_str("FLASH_MTP_FILE"):"");
     } catch (const std::exception& ex) {
         fprintf(stderr, "qflash: %s\n", ex.what());
         delete e; return nullptr;
@@ -2978,11 +2955,17 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     // see the README); FLASH_NGRAM=bf16 keeps the BF16 table, FLASH_NGRAM=int8 requires the INT8 one
     const char* ngv = env_str("FLASH_NGRAM");
     const bool ng8 = e->checkpoint.format == WeightFormat::Int8 || (ngv ? !strcmp(ngv, "int8") : ngram_tensors.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_0"));
-    const auto ngram_span = checkpoint_detail::ngram_span(ngram_tensors, ng8);
+    // the one-span pin (offset + owner file of the whole table) is decided by the manifest's recorded table; the
+    // manifest-less route keeps the released loader's mapping scan (no gap-free shard requirement)
+    std::optional<checkpoint_detail::NgramSpan> ngram_span;
+    if (e->checkpoint.has_manifest) ngram_span = checkpoint_detail::ngram_span(ngram_tensors, ng8);
     {
         const TensorInfo& emb = e->st.get("model.language_model.embed_tokens.weight");
-        if(emb.dtype!="BF16" || emb.shape!=std::vector<long long>{VOCAB,H} || emb.nbytes!=(size_t)VOCAB*H*2)
-            throw std::runtime_error("model.language_model.embed_tokens.weight: expected BF16 [248320,2560]");
+        if(emb.dtype!="BF16" || emb.shape!=std::vector<long long>{VOCAB,H} || emb.nbytes!=(size_t)VOCAB*H*2) {
+            fprintf(stderr, "qflash: model.language_model.embed_tokens.weight: expected BF16 [248320,2560], got %s\n",
+                    (emb.dtype + " " + std::to_string(emb.nbytes) + " B").c_str());
+            delete e; return nullptr;
+        }
         e->ht.embed = (const bf16*)pin_host(emb.data, emb.nbytes);
         const std::string pe = "model.language_model.layers.1.ple.ple_embedding.";
         for (int i = 0; i < 128; i++) {
@@ -3023,7 +3006,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         }
         CUDA_CHECK(cudaSetDevice(cur));  // (the current device as before)
         in.cards = (int)ud.size();
-        in.experts = hb::qfn_expert_host_est(in.cards, fr);
+        in.experts = hb::qfn_expert_host_est(in.cards, fr, (double)flash::group_bytes(e->checkpoint.format));
         uintptr_t lo = ~(uintptr_t)0, hi = 0;
         const std::string pe = "model.language_model.layers.1.ple.ple_embedding.";
         for (int i = 0; i < 128; i++) {
@@ -3097,8 +3080,10 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             lo = std::min(lo, (uintptr_t)t.data);
             hi = std::max(hi, (uintptr_t)t.data + t.nbytes);
         }
-        const size_t foff=ngram_span.offset;
-        const std::string& fpath=ngram_span.file;
+        size_t foff = 0;
+        std::string fpath;
+        if (ngram_span) { foff = ngram_span->offset; fpath = ngram_span->file; }
+        else fpath = ngram_tensors.file_of((const void*)lo, &foff);  // (manifest-less route: the released loader's scan)
         // FLASH_NGRAM_PIN=0: the table stays in the file mapping (pageable, read from the page cache / disk on demand):
         // the GPU gathers read it through HMM (pageable memory access, open kernel modules), no host RAM is pinned
         // (the plan decided on the machine's size; at pinning time the host must really have the room, next to the larger of
@@ -3407,7 +3392,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                     (1.58e9 + 5.46e9 / n + flash_pp::tp_ctx_tok_bytes() * (double)cmin / n + 0.9e9) / 1e9);
             fflush(stderr);
             qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp)
-            ng_th.get();  // (the n-gram table preparation runs since above)
+            try { ng_th.get(); } catch (...) {}  // (the n-gram table preparation runs since above; this path leaves anyway)
             delete e;
             return nullptr;
         }
@@ -3429,7 +3414,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         std::string err;
         pp_bounds_v = pp_bounds(e->ng, 65536, false, &err);
         if (pp_bounds_v.empty()) { fprintf(stderr, "qflash: %s\n", err.c_str()); return nullptr; }
-        const flash_pp::ModelBytes mb;
+        const flash_pp::ModelBytes mb((double)flash::group_bytes(e->checkpoint.format));
         const double xmb = env_double("FLASH_PF_STAGE_XMB", 2048) * 1048576.0;
         for (int r = 0; r < e->ng; r++) {
             const bool last = r == e->ng - 1;
@@ -3493,6 +3478,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         // each sizing its expert cache to its share of what is free then
         std::vector<std::thread> th;
         std::vector<int> udev;
+        std::vector<std::exception_ptr> errors(e->ng);  // (loader-thread failures surface here: nothing may throw across the C boundary)
         for (int r = 0; r < e->ng; r++) if (std::find(udev.begin(), udev.end(), e->devs[r]) == udev.end()) udev.push_back(e->devs[r]);
         for (int d : udev)
             th.emplace_back([&, d] {
@@ -3501,6 +3487,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                 for (size_t j = 0; j < mine.size(); j++) {
                     const int r = mine[j];
                     CUDA_CHECK(cudaSetDevice(d));
+                    try {
                     e->W[r] = new Worker(e->plans[r], e->devs[r], e->comm, e->ctx, e->checkpoint.format);
                     e->W[r]->set_cold(cold);
                     e->W[r]->set_expert_prior(prior);
@@ -3515,9 +3502,20 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                     e->W[r]->alloc_state();
                     fprintf(stderr, "[qflash %.0fs] GPU%d: weights %.1f s, wait for the n-gram table %.1f s, state + expert groups %.1f s\n",
                             secs(), e->devs[r], b - a, c - b, secs() - c);
+                    } catch (...) { if (!errors[r]) errors[r] = std::current_exception(); }
                 }
             });
         for (auto& t : th) t.join();
+        for (const auto& error : errors)
+            if (error) {
+                try { std::rethrow_exception(error); }
+                catch (const std::exception& ex) { fprintf(stderr, "qflash: weight load failed: %s\n", ex.what()); }
+                catch (...) { fprintf(stderr, "qflash: weight load failed: unknown error\n"); }
+                fflush(stderr);
+                try { ng_th.get(); } catch (...) {}  // (the n-gram thread finishes before the tear-down)
+                delete e;
+                return nullptr;
+            }
         if (g_load_drop.on())
             fprintf(stderr, "[qflash %.0fs] model files: page cache of each layer dropped once loaded (%.1f GB of file ranges; QE_LOAD_DROP=0 keeps it)\n",
                     secs(), g_load_drop.dropped() / 1e9);
@@ -3543,7 +3541,23 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     } else {
         e->steer_json = steer_info_json(e->steer, e->steer_def);  // no vector: still lists the dropped ones
     }
-    ng_th.get();
+    try {
+        ng_th.get();  // (the n-gram thread's own exceptions surface here, never through the C boundary)
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "qflash: n-gram table preparation failed: %s\n", ex.what());
+        fflush(stderr);
+        for (auto* w : e->W)
+            if (w) w->stop_ngram_stage();
+        delete e;
+        return nullptr;
+    } catch (...) {
+        fprintf(stderr, "qflash: n-gram table preparation failed: unknown error\n");
+        fflush(stderr);
+        for (auto* w : e->W)
+            if (w) w->stop_ngram_stage();
+        delete e;
+        return nullptr;
+    }
     for (int i = 0; i < 128; i++) {
         if (ng8) e->ht.ngram8[i] = (const uint8_t*)ng_host[i];
         else e->ht.ngram[i] = (const bf16*)ng_host[i];
@@ -3772,6 +3786,21 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     if (e->pph)
         for (Worker* w : e->pph->S) w->set_serving();
     return e;
+}
+// the C boundary: qe_create never throws (the server calls it through ctypes). The loader-thread and n-gram
+// failures carry their own message where they join; the catches here are the net for everything else.
+void* qe_create(const char* model_dir, const char* devices, int max_t, const char* split_s) {
+    try {
+        return qe_create_body(model_dir, devices, max_t, split_s);
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "qflash: engine start failed: %s\n", ex.what());
+        fflush(stderr);
+        return nullptr;
+    } catch (...) {
+        fprintf(stderr, "qflash: engine start failed: unknown error\n");
+        fflush(stderr);
+        return nullptr;
+    }
 }
 
 void qe_destroy(void* p) {

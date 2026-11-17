@@ -18,6 +18,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <optional>
 #include <vector>
 
 #include "../gpu_guard.h"
@@ -116,7 +117,8 @@ int main(int argc, char** argv) try {
     }
     const bool use_mtp = kdraft > 0;
     Checkpoint checkpoint;
-    checkpoint.open(model,use_mtp,env_str("QE_MTP_FILE") ? env_str("QE_MTP_FILE") : "");
+    // FLASH_MTP_FILE: the QFN-named override (QE_MTP_FILE belongs to the QEngine 27B engine)
+    checkpoint.open(model,use_mtp,env_str("FLASH_MTP_FILE") ? env_str("FLASH_MTP_FILE") : "");
     const SafeTensors& st=checkpoint.body;
     const SafeTensors& mst=checkpoint.mtp;
     const SafeTensors& ngram_tensors=checkpoint.ngram_tensors();
@@ -221,7 +223,10 @@ int main(int argc, char** argv) try {
     // INT8 n-gram table when the model directory has it (FLASH_NGRAM=bf16 / int8 forces one)
     const char* ngv = env_str("FLASH_NGRAM");
     const bool ng8 = checkpoint.format == WeightFormat::Int8 || (ngv ? !strcmp(ngv, "int8") : ngram_tensors.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_0"));
-    const auto ngram_span = checkpoint_detail::ngram_span(ngram_tensors, ng8);
+    // the one-span pin (offset + owner file of the whole table) is decided by the manifest's recorded table; the
+    // manifest-less route keeps the released loader's mapping scan (no gap-free shard requirement)
+    std::optional<checkpoint_detail::NgramSpan> ngram_span;
+    if (checkpoint.has_manifest) ngram_span = checkpoint_detail::ngram_span(ngram_tensors, ng8);
     {
         const TensorInfo& emb = st.get("model.language_model.embed_tokens.weight");
         if(emb.dtype!="BF16" || emb.shape!=std::vector<long long>{VOCAB,H} || emb.nbytes!=(size_t)VOCAB*H*2)
@@ -251,8 +256,10 @@ int main(int argc, char** argv) try {
         }
         // file-backed mappings cannot be registered: copied into page-locked THP memory (pin_host)
         const size_t b = lo, e = hi;
-        const size_t foff = ngram_span.offset;
-        const std::string& fpath = ngram_span.file;
+        size_t foff = 0;
+        std::string fpath;
+        if (ngram_span) { foff = ngram_span->offset; fpath = ngram_span->file; }
+        else fpath = ngram_tensors.file_of((const void*)b, &foff);  // (manifest-less route: the released loader's scan)
         const bool pinned = env_int("FLASH_NGRAM_PIN", 1);  // 0: file mapping (HMM)
         if (!pinned && (env_int("FLASH_NGRAM_RANDOM", 1)))  // random rows: no read-around
             madvise((void*)(b & ~(uintptr_t)4095), e - (b & ~(uintptr_t)4095), MADV_RANDOM);
@@ -349,7 +356,7 @@ int main(int argc, char** argv) try {
     // stage fixed size + its KV for the context + 2 GB of experts) stays free while the TP workers take their budget
     std::vector<void*> holds;
     if (pps.par == flash_pp::Par::PP_PREFILL) {
-        const flash_pp::ModelBytes mb;
+        const flash_pp::ModelBytes mb((double)flash::group_bytes(checkpoint.format));
         for (int r = 0; r < ng; r++) {
             const flash_pp::StageMem m = flash_pp::stage_mem(mb, flash_pp::Card{}, pps.bounds[r], pps.bounds[r + 1], r == ncards - 1, use_mtp, 8704, 0, 1.04e9);
             // views: the dense part, buffers, KV and ring (m.fixed with a 2 GB ring) + the MTP block's own experts on the

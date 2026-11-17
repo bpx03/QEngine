@@ -178,8 +178,8 @@ template<int Bits> struct GroupFixture {
 };
 template<int Bits,int NT> static void decode_launch(const MoeJob* jobs,const int* count,const float* weights,
                                                     const __half* x,__half* act,float* y,int m) {
-    k_moe_gu<Bits,NT><<<dim3(16,2),128>>>(jobs,count,weights,x,act,m);
-    k_moe_dn<Bits,NT><<<H/16,256>>>(jobs,count,act,y,m);
+    if constexpr (Bits == 4) { k_moe_gu<NT><<<dim3(16,2),128>>>(jobs,count,weights,x,act,m); k_moe_dn<NT><<<H/16,256>>>(jobs,count,act,y,m); }
+    else { k_moe_gu_w8<8,NT><<<dim3(16,2),128>>>(jobs,count,weights,x,act,m); k_moe_dn_w8<8,NT><<<H/16,256>>>(jobs,count,act,y,m); }
 }
 template<int Bits> static void decode_rows(const MoeJob* jobs,const int* count,const float* weights,
                                            const __half* x,__half* act,float* y,int m) {
@@ -303,8 +303,8 @@ template<int Bits> static void expert_case() {
             if(first.empty()) first=actual;
             else require(std::memcmp(first.data(),actual.data(),actual.size()*4)==0,"placement changes expert arithmetic");
             for(int gy : {1,2}) {
-                k_moe_gu_g<Bits><<<dim3(16,gy),128>>>(jobs.p,count.p,jrow.p,grouped_weights.p,x.p,act.p);
-                k_moe_dn_g<Bits><<<H/16,256>>>(jobs.p,count.p,jrow.p,act.p,y.p,m);
+                if constexpr (Bits == 4) { k_moe_gu_g<<<dim3(16,gy),128>>>(jobs.p,count.p,jrow.p,grouped_weights.p,x.p,act.p); k_moe_dn_g<><<<H/16,256>>>(jobs.p,count.p,jrow.p,act.p,y.p,m); }
+                else { k_moe_gu_g_w8<8><<<dim3(16,gy),128>>>(jobs.p,count.p,jrow.p,grouped_weights.p,x.p,act.p); k_moe_dn_g_w8<8><<<H/16,256>>>(jobs.p,count.p,jrow.p,act.p,y.p,m); }
                 CUDA_CHECK(cudaDeviceSynchronize());
                 CUDA_CHECK(cudaMemcpy(actual.data(),y.p,actual.size()*4,cudaMemcpyDeviceToHost));
                 compare(actual,expected,1e-2);
@@ -356,8 +356,8 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
     CUDA_CHECK(cudaMemcpy(device.p,group.packed.data(),group.packed.size(),cudaMemcpyHostToDevice));
     if constexpr(BuildJobs)
         CUDA_CHECK(cudaMemcpy(device.p+group.packed.size(),device.p,group.packed.size(),cudaMemcpyDeviceToDevice));
-    const MoeJob w{reinterpret_cast<const uint4*>(device.p),device.p+ExpertLayout<Bits>::gs,
-                  reinterpret_cast<const uint4*>(device.p+ExpertLayout<Bits>::dq),device.p+ExpertLayout<Bits>::ds};
+    const MoeJob w{reinterpret_cast<const uint4*>(device.p),reinterpret_cast<const __half*>(device.p+ExpertLayout<Bits>::gs),
+                  reinterpret_cast<const uint4*>(device.p+ExpertLayout<Bits>::dq),reinterpret_cast<const __half*>(device.p+ExpertLayout<Bits>::ds)};
     for(int m : {1,2,3,8,9,16,17,32,33,64,65}) {
         if constexpr(BuildJobs) { if(m!=3 && m!=65) continue; }
         std::vector<__half> input(size_t(m)*H);
@@ -388,7 +388,7 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
         std::vector<float> dn_pf_baseline[2]; std::vector<__half> dn_q_baseline[2];  // per-variant byte baselines across the four placements (BuildJobs)
         auto run_jobs=[&](const std::vector<PfJob>& list) {  // every kernel over the job list of the current placement
             k_xh_to_q<G><<<m,H/16>>>(x.p,xq.p,xqs.p);
-            k_moe_gu_q<Bits,G,1><<<2*nj,256>>>(jobs.p,count.p,tl.p,wl.p,xq.p,xqs.p,act.p);
+            if constexpr (Bits == 4) k_moe_gu_q<G,1><<<2*nj,256>>>(jobs.p,count.p,tl.p,wl.p,xq.p,xqs.p,act.p); else k_moe_gu_q_w8<8,G,1><<<2*nj,256>>>(jobs.p,count.p,tl.p,wl.p,xq.p,xqs.p,act.p);
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(saved.p,act.p,size_t(nact)*GRP*2,cudaMemcpyDeviceToDevice));
             std::vector<float> expected_act(size_t(m)*GRP);
@@ -427,7 +427,7 @@ template<int Bits,int G,bool BuildJobs=false> static void prefill_case() {
             for(bool deterministic : {false,true}) {
                 CUDA_CHECK(cudaMemset(output.p,0,size_t(m)*H*4));
                 CUDA_CHECK(cudaMemset(fixed.p,0,size_t(m)*H*8));
-                k_moe_dn_pf<Bits,2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,tl.p,saved.p,output.p,deterministic?fixed.p:nullptr);
+                if constexpr (Bits == 4) k_moe_dn_pf<2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,tl.p,saved.p,output.p,deterministic?fixed.p:nullptr); else k_moe_dn_pf_w8<8,2><<<dim3(H/16/8,nj),128>>>(jobs.p,count.p,tl.p,saved.p,output.p,deterministic?fixed.p:nullptr);
                 if(deterministic) k_fx_to_f<<<256,256>>>(fixed.p,output.p,size_t(m)*H);
                 CUDA_CHECK(cudaDeviceSynchronize());
                 std::vector<float> actual(size_t(m)*H);
@@ -655,7 +655,9 @@ static void real_samples(const std::string& model) {
     }
     std::sort(files.begin(),files.end());
     if (files.empty()) throw std::runtime_error(model+": no body safetensors files");
-    for (const auto& f : files) { checkpoint_detail::validate_file(f); tensors.open(f); }
+    // SafeTensors::open parses every shard header here and validate_int8_tensor below checks the
+    // shapes; the framing validator of the manifest route is checkpoint.h's own guarded open
+    for (const auto& f : files) tensors.open(f);
     const std::string prefix="model.language_model.layers.0.mlp.experts.";
     const auto& gq=tensors.get(prefix+"gate_up_proj.weight_packed");
     const auto& gs=tensors.get(prefix+"gate_up_proj.weight_scale");

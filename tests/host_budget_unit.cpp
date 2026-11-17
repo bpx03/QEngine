@@ -75,6 +75,9 @@ int main() {
     // the estimate against the 1.3.4 boots: 2 cards 31.2 GB host-backed, 3 cards (GPU1 desktop) 11.9 GB
     EXPECT(std::fabs(qfn_expert_host_est(2, cards_free(2, false)) - 31.2e9) < 2.5e9);
     EXPECT(std::fabs(qfn_expert_host_est(3, cards_free(3, true)) - 11.9e9) < 2.5e9);
+    // INT8 checkpoint (W8): same expert count with 998,400 B groups (flash.h ExpertLayout<8>); the estimate scales
+    // with the group size, so a W8 plan costs the experts almost twice as much as the INT4 ones
+    EXPECT(std::fabs(qfn_expert_host_est(2, cards_free(2, false), 998400.0) - 31.2e9 * (998400.0 / 506880.0)) < 5e9);
 
     for (int n : {2, 3}) {
         for (double tg : {64.0, 92.0, 128.0, 251.0}) {
@@ -107,6 +110,14 @@ int main() {
             if (tg == 92.0 && n == 2) {  // club #1906: the table does not fit next to ~31 GB of experts
                 EXPECT(!oa.ngram_pinned && oa.reduced && oa.archive > 0 && oa.archive < 48e9 && oa.ngram_cache > 0);
                 EXPECT(line(a, oa).find("n-gram table not pinned") != std::string::npos);
+                // the same box with an INT8 checkpoint: the W8 experts (~61 GB at 2 cards) push the n-gram table
+                // to the page cache as well; the plan degrades with a warning, it never fails (review item 5)
+                In w = qfn(total, avail, 2);
+                w.experts = qfn_expert_host_est(2, cards_free(2, false), 998400.0);
+                const Out ow = plan(w);
+                EXPECT(!ow.ngram_pinned && ow.reduced && ow.archive >= 0);
+                EXPECT(w.base + w.fixed + w.experts + ow.ngram_cache + ow.archive + ow.prefix <= total - ow.reserve + 1e6);
+                EXPECT(line(w, ow).find("n-gram table not pinned") != std::string::npos);
             }
             if (tg == 92.0 && n == 3) EXPECT(oa.ngram_pinned && oa.archive > 8e9 && oa.archive < 48e9);
             if (tg == 64.0) EXPECT(!oa.ngram_pinned);

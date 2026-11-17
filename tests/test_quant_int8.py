@@ -410,8 +410,8 @@ def test_qfn_self_converted_sharded_and_single_file():
         assert not os.path.isabs(manifest["outputs"]["ngram"])
         assert "path" not in manifest["ngram"]
         assert manifest["ngram"]["sha256"] == quant.sha256_file(copied)
-        assert manifest["runtime_supported"] is False
-        assert "no runtime in this repository executes INT8 W8 checkpoints yet" in manifest["runtime_support_reason"]
+        assert manifest["runtime_supported"] is True
+        assert "flash INT8 W8 runtime executes" in manifest["runtime_support_reason"]
         assert len(manifest["tensors"]["excluded"]) == 128
         assert len(manifest["tensors"]["converted"]) == 25
         assert "repo" not in manifest["source"] and "revision" not in manifest["source"]
@@ -877,7 +877,7 @@ def test_qfn_cli_check_corruption_and_early_failures():
 
 def test_manifest_runtime_flag_contract():
     # No QENGINE_INT8.md is emitted; the manifest carries a boolean runtime_supported and --check
-    # validates presence and type. New QFN manifests report that no runtime is available yet.
+    # validates presence and type. New QFN manifests state that the flash runtime executes them.
     with tempfile.TemporaryDirectory() as temp:
         src, ngram, _ = qfn_fixture(temp)
         out = os.path.join(temp, "flagged")
@@ -886,8 +886,8 @@ def test_manifest_runtime_flag_contract():
         assert not os.path.exists(os.path.join(out, "QENGINE_INT8.md")), "converter must not emit QENGINE_INT8.md"
         with open(path) as f:
             manifest = json.load(f)
-        assert manifest["runtime_supported"] is False
-        assert "no runtime in this repository executes INT8 W8 checkpoints yet" in manifest["runtime_support_reason"]
+        assert manifest["runtime_supported"] is True
+        assert "flash INT8 W8 runtime executes" in manifest["runtime_support_reason"]
         cli("--check", out)
         manifest["runtime_supported"] = False
         with open(path, "w") as f:

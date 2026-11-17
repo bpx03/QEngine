@@ -194,7 +194,7 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
 #pragma unroll
     for (int a = 0; a < WT; a++) {
         qp[a] = pj.w.gq + (size_t)(tw0 + a) * chunks * 32 + lane;
-        sp[a] = static_cast<const char*>(pj.w.gs) + (size_t)(tw0 + a) * groups * 16 * 2;
+        sp[a] = reinterpret_cast<const char*>(pj.w.gs) + (size_t)(tw0 + a) * groups * 16 * 2;
     }
     float acc[WT][NTT][4];
 #pragma unroll
@@ -204,7 +204,7 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
 #pragma unroll
     for (int s = 0; s < NST - 1; s++) stage(s);
     uint4 wn[WT][NW], wn2[WT][NW];  // weights of the next two steps
-    float sn[WT][2], sn2[WT][2];
+    typename ScaleRaw<Bits>::type sn[WT][2], sn2[WT][2];  // weight scales (rows g, g + 8) of the next two steps
 #pragma unroll
     for (int a = 0; a < WT; a++) {
 #pragma unroll
@@ -212,8 +212,8 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
             wn[a][q] = __ldg(qp[a] + q * 32);
             wn2[a][q] = __ldg(qp[a] + (NW + q) * 32);
         }
-        sn[a][0] = moe_scale<Bits>(sp[a], g); sn[a][1] = moe_scale<Bits>(sp[a], g + 8);
-        sn2[a][0] = moe_scale<Bits>(sp[a], 16 + g); sn2[a][1] = moe_scale<Bits>(sp[a], 24 + g);
+        sn[a][0] = gs_raw<Bits>(sp[a], g); sn[a][1] = gs_raw<Bits>(sp[a], g + 8);
+        sn2[a][0] = gs_raw<Bits>(sp[a], 16 + g); sn2[a][1] = gs_raw<Bits>(sp[a], 24 + g);
     }
     for (int ks = 0; ks < NKS; ks++) {
         const int b = ks % NST;
@@ -226,11 +226,11 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
                 w[a][q] = wn[a][q]; wn[a][q] = wn2[a][q];
                 if (ks + 2 < NKS) wn2[a][q] = __ldg(qp[a] + (size_t)((ks + 2) * NW + q) * 32);
             }
-            sw0[a] = sn[a][0]; sw8[a] = sn[a][1];
+            sw0[a] = gs_f<Bits>(sn[a][0]); sw8[a] = gs_f<Bits>(sn[a][1]);
             sn[a][0] = sn2[a][0]; sn[a][1] = sn2[a][1];
             if (ks + 2 < NKS) {
-                sn2[a][0] = moe_scale<Bits>(sp[a], (ks + 2) * 16 + g);
-                sn2[a][1] = moe_scale<Bits>(sp[a], (ks + 2) * 16 + g + 8);
+                sn2[a][0] = gs_raw<Bits>(sp[a], (ks + 2) * 16 + g);
+                sn2[a][1] = gs_raw<Bits>(sp[a], (ks + 2) * 16 + g + 8);
             }
         }
         asm volatile("cp.async.wait_group %0;" ::"n"(NST - 2));
@@ -293,8 +293,172 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
         }
     }
 }
-template <int Bits, int G, int WT = 2>  // WT = 1: two blocks per job (row halves)
+
+template <int G, int NTT, int WT>  // WT: 16-row tiles per warp (2: the whole group in one block, 1: half, rh)
+__device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __restrict__ tl, const float* __restrict__ wl,
+                                         const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
+                                         __half* __restrict__ act, int8_t (*xs)[GQ_TT][GQ_KS],
+                                         float2 (*ss)[GQ_TT][GQ_KS / G]) {
+    constexpr int KS = GQ_KS, NKS = H / KS, NST = GQ_NST, SUB = KS / G, chunks = H >> 6, groups = H >> 7;
+    const int m = pj.n;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    // staging: thread -> token row st_r (0..63), 16-byte pieces 2 st_h, 2 st_h + 1 of the 128-byte step slice
+    const int st_r = threadIdx.x >> 2, st_h = threadIdx.x & 3;
+    const int8_t* xrow = xq + (size_t)tl[pj.off + (st_r < m ? st_r : m - 1)] * XQ_LD;
+    const float2* srow = xqs + (size_t)tl[pj.off + ((int)threadIdx.x < m ? (int)threadIdx.x : m - 1)] * XQS_LD;
+    auto stage = [&](int ks) {
+        const int b = ks % NST;
+        if (st_r < 8 * NTT) {
+#pragma unroll
+            for (int p2 = 0; p2 < 2; p2++) {
+                const int p = 2 * st_h + p2, ps = p ^ ((st_r & 1) << 2);
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[b][st_r][ps * 16]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(xrow + ks * KS + p * 16));
+            }
+        }
+        // the token's scales: L2 only (.cg / ld.cg), never L1. They live in the XH rows k_xh_to_q quantized in place
+        // just before; an L1 line of the old fp16 row (an SM that read those rows earlier, e.g. k_xh_to_x on the comm
+        // stream) returned stale scales through cp.async.ca: a few tokens' activations garbage now and then
+        // (rc3_fixes_2026-10-27: 4-6 / 10 det 16K repeats differ, gate_up run twice on the same inputs differed)
+        if ((int)threadIdx.x < 8 * NTT) {
+            if constexpr (SUB == 2) {
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(&ss[b][threadIdx.x][0]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(srow + ks * SUB));
+            } else {
+#pragma unroll
+                for (int s = 0; s < SUB; s++) ss[b][threadIdx.x][s] = __ldcg(srow + ks * SUB + s);
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    const int tw0 = WT == 2 ? 2 * warp : 8 * rh + warp;  // first 16-row tile of the warp
+    const uint4* qp[WT];
+    const __half* sp[WT];
+#pragma unroll
+    for (int a = 0; a < WT; a++) {
+        qp[a] = pj.w.gq + (size_t)(tw0 + a) * chunks * 32 + lane;
+        sp[a] = pj.w.gs + (size_t)(tw0 + a) * groups * 16;
+    }
+    float acc[WT][NTT][4];
+#pragma unroll
+    for (int a = 0; a < WT; a++)
+#pragma unroll
+        for (int j = 0; j < NTT; j++) acc[a][j][0] = acc[a][j][1] = acc[a][j][2] = acc[a][j][3] = 0.f;
+#pragma unroll
+    for (int s = 0; s < NST - 1; s++) stage(s);
+    uint4 wn[WT][2], wn2[WT][2];  // weights of the next two steps
+    __half sn[WT][2], sn2[WT][2];  // weight scales (rows g, g + 8) of the next two steps
+#pragma unroll
+    for (int a = 0; a < WT; a++) {
+        wn[a][0] = __ldg(qp[a]); wn[a][1] = __ldg(qp[a] + 32);
+        wn2[a][0] = __ldg(qp[a] + 64); wn2[a][1] = __ldg(qp[a] + 96);
+        sn[a][0] = sp[a][g]; sn[a][1] = sp[a][g + 8];
+        sn2[a][0] = sp[a][16 + g]; sn2[a][1] = sp[a][24 + g];
+    }
+    for (int ks = 0; ks < NKS; ks++) {
+        const int b = ks % NST;
+        uint4 w[WT][2];
+        float sw0[WT], sw8[WT];
+#pragma unroll
+        for (int a = 0; a < WT; a++) {
+            w[a][0] = wn[a][0]; w[a][1] = wn[a][1]; wn[a][0] = wn2[a][0]; wn[a][1] = wn2[a][1];
+            sw0[a] = __half2float(sn[a][0]); sw8[a] = __half2float(sn[a][1]);
+            sn[a][0] = sn2[a][0]; sn[a][1] = sn2[a][1];
+            if (ks + 2 < NKS) {
+                wn2[a][0] = __ldg(qp[a] + (size_t)(2 * ks + 4) * 32); wn2[a][1] = __ldg(qp[a] + (size_t)(2 * ks + 5) * 32);
+                sn2[a][0] = sp[a][(ks + 2) * 16 + g]; sn2[a][1] = sp[a][(ks + 2) * 16 + g + 8];
+            }
+        }
+        asm volatile("cp.async.wait_group %0;" ::"n"(NST - 2));
+        __syncthreads();
+        if (ks + NST - 1 < NKS) stage(ks + NST - 1);
+        else asm volatile("cp.async.commit_group;");  // keep the group count in step
+        uint32_t ci[WT][NTT][4];  // integer sums of the current activation group (+ M)
+#pragma unroll
+        for (int c = 0; c < 2; c++) {  // 64-k chunk c of the step
+            uint32_t A[WT][2][4];      // [tile][k32 step][fragment]
+#pragma unroll
+            for (int a = 0; a < WT; a++) {
+                q_dequant(w[a][c].x, w[a][c].y, A[a][0]);
+                q_dequant(w[a][c].z, w[a][c].w, A[a][1]);
+            }
+            const bool first = c == 0 || G == 64;
+#pragma unroll
+            for (int s2 = 0; s2 < 2; s2++) {
+#pragma unroll
+                for (int j = 0; j < NTT; j++) {
+                    const int row = 8 * j + g, pc = (c * 4 + t4) ^ ((row & 1) << 2);
+                    const uint2 bq = *reinterpret_cast<const uint2*>(&xs[b][row][pc * 16 + 8 * s2]);
+#pragma unroll
+                    for (int a = 0; a < WT; a++) {
+                        if (s2 == 0 && first) q_mma_init(ci[a][j], A[a][0], bq.x, bq.y);
+                        else q_mma(ci[a][j], A[a][s2], bq.x, bq.y);
+                    }
+                }
+            }
+            if (G == 128 && c == 0) continue;
+            // flush the group's integer sums: (f - M) * sx per token, then * sw per row
+            const int sg = G == 64 ? c : 0;
+#pragma unroll
+            for (int j = 0; j < NTT; j++) {
+                const float2 x0 = ss[b][8 * j + 2 * t4][sg], x1 = ss[b][8 * j + 2 * t4 + 1][sg];
+#pragma unroll
+                for (int a = 0; a < WT; a++) {
+                    const float f0 = __fmaf_rn(__uint_as_float(ci[a][j][0]), x0.x, x0.y);
+                    const float f1 = __fmaf_rn(__uint_as_float(ci[a][j][1]), x1.x, x1.y);
+                    const float f2 = __fmaf_rn(__uint_as_float(ci[a][j][2]), x0.x, x0.y);
+                    const float f3 = __fmaf_rn(__uint_as_float(ci[a][j][3]), x1.x, x1.y);
+                    const float s0 = sw0[a], s8 = sw8[a];
+                    acc[a][j][0] = __fmaf_rn(f0, s0, acc[a][j][0]);
+                    acc[a][j][1] = __fmaf_rn(f1, s0, acc[a][j][1]);
+                    acc[a][j][2] = __fmaf_rn(f2, s8, acc[a][j][2]);
+                    acc[a][j][3] = __fmaf_rn(f3, s8, acc[a][j][3]);
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();  // the next job of this block restages the buffers
+#pragma unroll
+    for (int a = 0; a < WT; a++) {
+        const int col = (tw0 + a) * 8 + g;
+#pragma unroll
+        for (int j = 0; j < NTT; j++) {
+            const int n0 = 8 * j + 2 * t4, n1 = n0 + 1;
+            if (n0 < m) store_xh(act + (size_t)(pj.aoff + n0) * GRP, col, silu(acc[a][j][0]) * acc[a][j][2] * wl[pj.off + n0]);
+            if (n1 < m) store_xh(act + (size_t)(pj.aoff + n1) * GRP, col, silu(acc[a][j][1]) * acc[a][j][3] * wl[pj.off + n1]);
+        }
+    }
+}
+
+// INT4 prefill gate/up kernel as released with part 1 (the INT8 variant is k_moe_gu_q_w8 below)
+template <int G, int WT = 2>  // WT = 1: two blocks per job (row halves), ~half the registers (2 blocks / SM)
 __global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
+                                                     const int* __restrict__ tl, const float* __restrict__ wl,
+                                                     const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
+                                                     __half* __restrict__ act) {
+    static_assert(G == 64 || G == 128, "G");
+    __shared__ __align__(16) int8_t xs[GQ_NST][GQ_TT][GQ_KS];
+    __shared__ __align__(16) float2 ss[GQ_NST][GQ_TT][GQ_KS / G];
+    const int nj = *njobs;
+    for (int jb = (int)blockIdx.x; jb < nj * (3 - WT); jb += gridDim.x) {
+        const int job = nj - 1 - jb / (3 - WT), rh = jb % (3 - WT);
+        const PfJob pj = jobs[job];
+        switch ((pj.n + 7) >> 3) {
+            case 1: gu_q_job<G, 1, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 2: gu_q_job<G, 2, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 3: gu_q_job<G, 3, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 4: gu_q_job<G, 4, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 5: gu_q_job<G, 5, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 6: gu_q_job<G, 6, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 7: gu_q_job<G, 7, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            default: gu_q_job<G, 8, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+        }
+    }
+}
+template <int Bits, int G, int WT = 2>  // WT = 1: two blocks per job (row halves)
+
+__global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q_w8(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                      const int* __restrict__ tl, const float* __restrict__ wl,
                                                      const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
                                                      __half* __restrict__ act) {

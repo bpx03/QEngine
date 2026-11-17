@@ -229,15 +229,15 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
     do {                                                                                          \
         const int nt_ = ((m) + 7) / 8;                                                            \
         if (format_ == WeightFormat::Int8) {                                                      \
-            if (nt_ == 1) KERNEL<8, 1><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                     \
-            else if (nt_ == 2) KERNEL<8, 2><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
-            else if (nt_ == 3) KERNEL<8, 3><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
-            else KERNEL<8, 4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                              \
+            if (nt_ == 1) KERNEL##_w8<8, 1><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                     \
+            else if (nt_ == 2) KERNEL##_w8<8, 2><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
+            else if (nt_ == 3) KERNEL##_w8<8, 3><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
+            else KERNEL##_w8<8, 4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                              \
         } else {                                                                                  \
-            if (nt_ == 1) KERNEL<4, 1><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                     \
-            else if (nt_ == 2) KERNEL<4, 2><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
-            else if (nt_ == 3) KERNEL<4, 3><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
-            else KERNEL<4, 4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                              \
+            if (nt_ == 1) KERNEL<1><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                     \
+            else if (nt_ == 2) KERNEL<2><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
+            else if (nt_ == 3) KERNEL<3><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                \
+            else KERNEL<4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                              \
         }                                                                                         \
     } while (0)
 // decode attention: key tiles per used split (FLASH_ATTN_DMIN; 0: always all dec_split_ splits). Only for launches of
@@ -1368,6 +1368,10 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
         load_layer(ms, mtp_, "mtp.layers.0.", -1);
         mtp_mixer_ = hc_from(ms, "mtp.hyper_connection_mixer.", false);
         if (format_ == WeightFormat::Int8) {
+            // mtp.fc_embedding is stored [H, 2H] = [token_embedding | hidden] -> hidden (the format spec in
+            // checkpoint.h): the step applies it to the token-embedding vector alone (fc_hidden carries the hidden
+            // half, see the R = fc_embedding(en) + fc_hidden(hn) prefill kernel), so the W8 load deliberately packs
+            // the first H columns - the token-embedding half - and [H, H] matrices take the same block unchanged
             mtp_fce_ = load_w8_packed(ms, H, H, {{"mtp.fc_embedding", 0, H, 0, H, 0, 0}}, this, A, st_);
             mtp_fch_ = load_w8_packed(ms, H, H, {{"mtp.fc_hidden", 0, H, 0, H, 0, 0}}, this, A, st_);
         } else {
@@ -3014,10 +3018,11 @@ void Worker::load_deferred_groups() {
         fprintf(stderr, "[flash] expert budget: %lld MB per card for the cached CUDA graphs (FLASH_GRAPH_MB), %.0f MB of it on "
                 "top of FLASH_EC_MARGIN_MB\n", lm.graph_mb, lm.graph_add_mb);
     const double margin_mb = lm.total_mb;
-    // + per layer: gmap, allocation rounding (2 MiB), the cache table (8 B per group)
-    const long long packed_scratch = format_==WeightFormat::Int8 ? 3LL*64*group_bytes_ : 0;
+    // + per layer: gmap, allocation rounding (2 MiB), the cache table (8 B per group). The W8 staging scratch is NOT
+    // in here: it lives only while the groups below are staged and goes before the ring allocation (see after the
+    // loop); only the part the ring's reservation does not already keep free comes out of the resident cache
     const long long other = (long long)nshared * group_bytes_ + (long long)ec_defer_l_.size() * (2 << 20)
-        + (long long)gs.size() * 8 + packed_scratch;
+        + (long long)gs.size() * 8;
     long long nres = (long long)((fr - (long long)(margin_mb * 1048576.0) - other) * card_share_) / (long long)group_bytes_;
     nres = std::max(0LL, std::min<long long>(nres, gs.size()));
     // prefill staging ring (2 x the most cold groups of a layer, capped by FLASH_PF_STAGE_MB): its groups come out of the
@@ -3047,6 +3052,12 @@ void Worker::load_deferred_groups() {
         pfs_cap0_ = (int)(ring0 / 2);
         pfs_resv_ = ring * (long long)group_bytes_;
     }
+    // the W8 staging scratch (three thread-local load buffers, at most 64 groups each): live only across the group
+    // loop below and released before the ring is allocated, so it costs the resident cache only what the ring's
+    // reservation (free over the same window) does not already cover - nothing on the defaults, and never held
+    // past the load
+    if (format_ == WeightFormat::Int8)
+        nres = std::max(0LL, nres - std::max(0LL, 3LL * 64 * (long long)group_bytes_ - (long long)pfs_resv_) / (long long)group_bytes_);
     const size_t ncold = gs.size() - nres;
     std::map<int, std::vector<char>> isc;
     for (auto& d : ec_defer_l_) isc[d.li].assign((NE + 1) * NGRP, 0);
@@ -3057,6 +3068,8 @@ void Worker::load_deferred_groups() {
         load_groups(*d.st, L_[d.li], d.pre, isc[d.li]);
         g_load_drop.done(d.st, d.pre);  // (load_groups read the mapping synchronously)
     }
+    g_s1.release();
+    g_s2.release();
     g_s3.release();
     ec_defer_l_.clear();
     g_hs.release();
@@ -3890,7 +3903,18 @@ int Worker::ec_verify(const char* where) {
     return bad;
 }
 // FLASH_GSUM: per-group sums of nb groups at stride GRP_BYTES (k_csum weights, word index within the group)
-__global__ void k_gsum(const uint32_t* __restrict__ g, unsigned long long* __restrict__ out, size_t group_bytes) {
+__global__ void k_gsum(const uint32_t* __restrict__ g, unsigned long long* __restrict__ out) {
+    const uint32_t* p = g + (size_t)blockIdx.x * (GRP_BYTES / 4);
+    unsigned long long s = 0;
+    for (size_t i = threadIdx.x; i < GRP_BYTES / 4; i += blockDim.x) s += (unsigned long long)p[i] * (1 + (i & 255));
+    __shared__ unsigned long long sh[256];
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if ((int)threadIdx.x < o) sh[threadIdx.x] += sh[threadIdx.x + o]; __syncthreads(); }
+    if (threadIdx.x == 0) out[blockIdx.x] = sh[0];
+}
+// the same digest for a checkpoint whose groups are not the INT4 stride (W8: 998,400 B): same math, runtime stride
+__global__ void k_gsum_w8(const uint32_t* __restrict__ g, unsigned long long* __restrict__ out, size_t group_bytes) {
     const uint32_t* p = g + (size_t)blockIdx.x * (group_bytes / 4);
     unsigned long long s = 0;
     for (size_t i = threadIdx.x; i < group_bytes / 4; i += blockDim.x) s += (unsigned long long)p[i] * (1 + (i & 255));
@@ -3925,7 +3949,10 @@ void Worker::gsum(int nw, unsigned long long* experts, unsigned long long* other
         if (maxdev) {
             unsigned long long* d;
             CUDA_CHECK(cudaMalloc(&d, (size_t)maxdev * 8));
-            k_gsum<<<maxdev, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(L.groups), d, group_bytes_);
+            if (group_bytes_ != GRP_BYTES)
+                k_gsum_w8<<<maxdev, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(L.groups), d, group_bytes_);
+            else
+                k_gsum<<<maxdev, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(L.groups), d);
             CUDA_CHECK(cudaMemcpyAsync(dsum.data(), d, (size_t)maxdev * 8, cudaMemcpyDeviceToHost, st_));
             CUDA_CHECK(cudaStreamSynchronize(st_));
             CUDA_CHECK(cudaFree(d));
@@ -4975,14 +5002,14 @@ void Worker::moe(Layer& L, int m) {
                 CUDA_CHECK(cudaMemcpyAsync((char*)xqsnap_ + (size_t)pfbn_ * H * 2, pftl_, (size_t)m * (TOPK + 1) * 4, cudaMemcpyDeviceToDevice, st_));
             }
             lend_use(pfact_, (size_t)m * (TOPK + 1) * NGRP * GRP * 2, "MoE activations (pfact_)");
-            if (format_ == WeightFormat::Int8) k_moe_gu_q<8, 64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
-            else k_moe_gu_q<4, 64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+            if (format_ == WeightFormat::Int8) k_moe_gu_q_w8<8,64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+            else k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
             static const bool gu2x = env_int("FLASH_DBG_GU2X", 0);  // debug: gate_up twice
             if (gu2x && actsnap_) {
                 const size_t rows = pfact_bytes_ / (GRP * 2);
                 CUDA_CHECK(cudaMemcpyAsync(actsnap_, pfact_, pfact_bytes_, cudaMemcpyDeviceToDevice, st_));
-                if (format_ == WeightFormat::Int8) k_moe_gu_q<8, 64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
-                else k_moe_gu_q<4, 64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+                if (format_ == WeightFormat::Int8) k_moe_gu_q_w8<8,64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+                else k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
                 k_cmp_rows<<<(unsigned)rows, 64, 0, st_>>>(reinterpret_cast<const unsigned*>(pfact_), reinterpret_cast<const unsigned*>(actsnap_), (int)rows, GRP / 2, xqrec_, li_dbg, 2);
             }
             if (xqchk && xqsnap_) {
@@ -5031,8 +5058,8 @@ void Worker::moe(Layer& L, int m) {
             }
         } else {
             if (format_ == WeightFormat::Int8)
-                k_moe_dn_pf<8, 2><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pftl_, pfact_, part_, detpart_);
-            else k_moe_dn_pf<4, 2><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pftl_, pfact_, part_, detpart_);
+                k_moe_dn_pf_w8<8,2><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pftl_, pfact_, part_, detpart_);
+            else k_moe_dn_pf<2><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pftl_, pfact_, part_, detpart_);
         }
         KCHK("k_moe_dn_pf");
         if (detpart_) k_fx_to_f<<<256, 256, 0, st_>>>(detpart_, part_, (size_t)m * H);
@@ -5080,14 +5107,15 @@ void Worker::moe(Layer& L, int m) {
                     k_jobchk<<<1, 1, 0, st_>>>(njobs_, maxj, maxjob_, 2, m, jobchk_); }
     if (grouped) {
         static const int gy = env_int("FLASH_MOE_GY", 320);  // job blocks (loop past it)
-        BITS_LAUNCH(k_moe_gu_g, dim3(2 * GRP / 16, std::min(maxj, gy > 0 ? gy : maxj)), 128, jobs_, njobs_, jrow_, jw_, xh_, acth_);
+        if (format_ == WeightFormat::Int8) k_moe_gu_g_w8<8><<<dim3(2 * GRP / 16, std::min(maxj, gy > 0 ? gy : maxj)), 128, 0, st_>>>(jobs_, njobs_, jrow_, jw_, xh_, acth_);
+        else k_moe_gu_g<<<dim3(2 * GRP / 16, std::min(maxj, gy > 0 ? gy : maxj)), 128, 0, st_>>>(jobs_, njobs_, jrow_, jw_, xh_, acth_);
         KCHK("k_moe_gu_g");
         if (format_ == WeightFormat::Int8) {
-            if (dn_fx_) k_moe_dn_g<8, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
-            else k_moe_dn_g<8, false><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
+            if (dn_fx_) k_moe_dn_g_w8<8,true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
+            else k_moe_dn_g_w8<8,false><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
         } else {
-            if (dn_fx_) k_moe_dn_g<4, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
-            else k_moe_dn_g<4, false><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
+            if (dn_fx_) k_moe_dn_g<true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
+            else k_moe_dn_g<false><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
         }
         KCHK("k_moe_dn_g");
         return;
@@ -5097,15 +5125,15 @@ void Worker::moe(Layer& L, int m) {
     if (dn_fx_) {  // full batch invariance (FLASH_ATTN_CHUNK=1): fixed-point sums
         const int nt = (m + 7) / 8;
         if (format_ == WeightFormat::Int8) {
-            if (nt == 1) k_moe_dn<8, 1, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-            else if (nt == 2) k_moe_dn<8, 2, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-            else if (nt == 3) k_moe_dn<8, 3, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-            else k_moe_dn<8, 4, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            if (nt == 1) k_moe_dn_w8<8,1, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            else if (nt == 2) k_moe_dn_w8<8,2, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            else if (nt == 3) k_moe_dn_w8<8,3, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            else k_moe_dn_w8<8,4, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
         } else {
-            if (nt == 1) k_moe_dn<4, 1, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-            else if (nt == 2) k_moe_dn<4, 2, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-            else if (nt == 3) k_moe_dn<4, 3, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-            else k_moe_dn<4, 4, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            if (nt == 1) k_moe_dn<1, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            else if (nt == 2) k_moe_dn<2, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            else if (nt == 3) k_moe_dn<3, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+            else k_moe_dn<4, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
         }
     } else
     NT_LAUNCH_B(m, k_moe_dn, H / 16, 256, jobs_, njobs_, acth_, part_, m);

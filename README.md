@@ -682,11 +682,10 @@ Native W8 uses lossless repacking into the existing W8 layout. INT8 expert group
 tensor-core accumulation per 128-k group; INT4 keeps its existing arithmetic. Residency, cold staging and borrowed
 prefill storage use the selected format's group size. No quality or throughput equivalence is claimed.
 
-Build acceptance fixtures with `-DQE_BUILD_FLASH_INT8_TESTS=ON`: `flash_checkpoint_unit` validates manifests and
-headers; `flash_int8_unit` checks repacking, arithmetic and residency. `INT8_MODEL=<dir>` adds real-checkpoint rows.
-Build the overlay with `docker build -f Dockerfile --target flash-overlay --build-arg BASE_RUNTIME=<current image>
---build-arg CUDA_ARCHS=86 --build-arg REVISION=<integrated commit>`; its `qe_build.txt` identifies the rebuilt
-Flash binaries. The INT4 runtime keeps working: the format is chosen per checkpoint, not by the image.
+Build acceptance fixtures with the normal build: `flash_checkpoint_unit` validates manifests and headers (ctest);
+`flash_int8_unit` builds with the tree and checks repacking, arithmetic and residency in a GPU window.
+`INT8_MODEL=<dir>` adds real-checkpoint rows. The image needs nothing INT8-specific: the format is chosen per
+checkpoint, not by the image, and the INT4 runtime keeps working.
 
 ### Qwen3.8-27B
 

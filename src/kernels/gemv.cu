@@ -1461,7 +1461,6 @@ void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cuda
 
 // pre-quantized INT8 (row-major int8 [N][K], bf16 scales [N][K/128], as quantize_w8 computes them) -> the W8 layout;
 // the same fragment index math as quantize_w8_kernel, so a checkpoint storing quantize_w8's values loads bit-identical
-template <bool OffsetBinary>
 __global__ void tile_w8_kernel(const int8_t* __restrict__ src, const bf16* __restrict__ ssrc, int N, int K,
                                uint8_t* __restrict__ q, bf16* __restrict__ s) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1473,14 +1472,31 @@ __global__ void tile_w8_kernel(const int8_t* __restrict__ src, const bf16* __res
     const int ln = (rr & 7) * 4 + tq;
     const int ai = (half * 2 + (rr >> 3)) * 2 + odd;
     const size_t base = (((size_t)rt * (K >> 5) + (ks >> 1)) * 32 + ln) * 16 + (ks & 1) * 8;
-    q[base + ai] = (uint8_t)src[i] ^ (OffsetBinary ? 0x80 : 0);
+    q[base + ai] = (uint8_t)src[i];
+    if ((k & 127) == 0) s[((size_t)rt * (K >> 7) + (k >> 7)) * 16 + rr] = ssrc[(size_t)row * (K >> 7) + (k >> 7)];
+}
+
+// the same tiling for the offset-binary codes of QFN INT8 checkpoints (stored code = value + 128): only the stored
+// byte differs, so the INT4-era tile_w8_kernel above stays untouched
+__global__ void tile_w8_ob_kernel(const int8_t* __restrict__ src, const bf16* __restrict__ ssrc, int N, int K,
+                                  uint8_t* __restrict__ q, bf16* __restrict__ s) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)N * K) return;
+    const int row = (int)(i / K), k = (int)(i % K);
+    const int rt = row >> 4, rr = row & 15;
+    const int ks = k >> 4, col = k & 15;
+    const int tq = (col & 7) >> 1, half = col >> 3, odd = col & 1;
+    const int ln = (rr & 7) * 4 + tq;
+    const int ai = (half * 2 + (rr >> 3)) * 2 + odd;
+    const size_t base = (((size_t)rt * (K >> 5) + (ks >> 1)) * 32 + ln) * 16 + (ks & 1) * 8;
+    q[base + ai] = (uint8_t)src[i] ^ 0x80;
     if ((k & 127) == 0) s[((size_t)rt * (K >> 7) + (k >> 7)) * 16 + rr] = ssrc[(size_t)row * (K >> 7) + (k >> 7)];
 }
 
 void tile_w8(const int8_t* src, const bf16* ssrc, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st) {
     CHECK(n % 16 == 0 && k % 128 == 0, "tile_w8 %d %d", n, k);
     const size_t e = (size_t)n * k;
-    tile_w8_kernel<false><<<(unsigned)((e + 255) / 256), 256, 0, st>>>(src, ssrc, n, k, (uint8_t*)dst_q, dst_s);
+    tile_w8_kernel<<<(unsigned)((e + 255) / 256), 256, 0, st>>>(src, ssrc, n, k, (uint8_t*)dst_q, dst_s);
 }
 
 void quantize_w8(const bf16* src, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st) {
@@ -1493,7 +1509,7 @@ void repack_w8(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst
                bf16* dst_s, cudaStream_t st) {
     CHECK(n % 16 == 0 && k % 128 == 0, "repack_w8 %d %d", n, k);
     const size_t count = (size_t)n * k;
-    tile_w8_kernel<true><<<(unsigned)((count + 255) / 256), 256, 0, st>>>(
+    tile_w8_ob_kernel<<<(unsigned)((count + 255) / 256), 256, 0, st>>>(
         reinterpret_cast<const int8_t*>(src_q), src_s, n, k,
         reinterpret_cast<uint8_t*>(dst_q), dst_s);
 }
