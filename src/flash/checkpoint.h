@@ -165,10 +165,18 @@ inline std::vector<long long> shape_array(const Json& j, const std::string& cont
     }
     return shape;
 }
-// Last stored dimension of a .weight_shape companion. The header JSON only records the offsets: the
-// companion is a 1-D I64 vector whose element count comes from (end-start)/8, so the last element —
-// the stored logical K — is read without trusting the header's shape list.
-inline long long stored_shape_last_dim(const std::string& path, const Json& entry) {
+// Last stored dimension of a .weight_shape companion, read from the file bytes SafeTensors::open has
+// already mapped. The header JSON only records the offsets: the companion is a 1-D I64 vector whose
+// element count comes from (end-start)/8, so the last element — the stored logical K — is read without
+// trusting the header's shape list. The scan route reaches this once per packed matrix, and reading
+// through the existing mapping replaces the second open+pread pair per matrix the manifest route has
+// already dropped (see the single-open note above validate_recipe): no reopen, no second parse, no
+// swap window between the two opens. The header entry keeps its dtype and whole-int64 offset checks;
+// the bounds check is now the mapping's own (index() rejects data_offsets outside the mapped file)
+// plus the indexed payload being exactly the header's int64 count. The stored K must be a positive
+// multiple of 8 — the discriminator below compares it against the packed width.
+inline long long stored_shape_last_dim(const SafeTensors& st, const std::string& path,
+                                       const std::string& name, const Json& entry) {
     if (text(entry,"dtype",path) != "I64") fail(path,".weight_shape","I64 logical shape",text(entry,"dtype",path));
     const auto& offsets = field(entry,"data_offsets",path);
     if (offsets.type != Json::Arr || offsets.arr.size() != 2 ||
@@ -176,16 +184,15 @@ inline long long stored_shape_last_dim(const std::string& path, const Json& entr
         offsets.arr[1].i() <= offsets.arr[0].i() || (offsets.arr[1].i()-offsets.arr[0].i()) % 8 != 0)
         fail(path,".weight_shape","I64 data offsets with a whole number of int64s","malformed companion");
     const long long count = (offsets.arr[1].i()-offsets.arr[0].i())/8;
-    // Guarded open (never a blocking open on a special file); the scan route is not sandbox-gated,
-    // so symlinks keep their legacy allowance but the regular-file check still applies via fstat.
-    const int fd = open_regular_file(path,false);
-    uint64_t header = 0;
-    if (::pread(fd,(char*)&header,8,0)!=8) { ::close(fd); fail(path,".weight_shape","readable stored shape","file shorter than 8 bytes"); }
-    const off_t off = (off_t)(8 + header + (uint64_t)offsets.arr[0].i() + (uint64_t)(count-1)*8);
+    if (!st.has(name))
+        fail(path,name,"companion indexed in the mapped file","tensor not indexed");
+    const auto& t = st.get(name);
+    if (t.dtype != "I64" || t.data == nullptr || t.nbytes != (size_t)count*8)
+        fail(path,name,"indexed I64 payload of "+std::to_string(count*8)+" bytes",
+             t.dtype+" payload of "+std::to_string((long long)t.nbytes)+" bytes");
     int64_t last = 0;
-    const ssize_t got = ::pread(fd,(char*)&last,8,off);
-    ::close(fd);
-    if (got != 8) fail(path,".weight_shape","readable stored shape","truncated payload");
+    std::memcpy(&last,t.data+t.nbytes-8,8);  // the mapped offset can be unaligned: memcpy, never a cast
+    if (last <= 0 || last % 8 != 0) fail(path,".weight_shape","stored K a positive multiple of 8",std::to_string(last));
     return last;
 }
 // Manifest-backed safetensors files reach the loader through SafeTensors::open_strict_validated — one guarded
@@ -537,7 +544,7 @@ struct Checkpoint {
                             fail(f,base,"rank>=1 I32 .weight_packed with a rank>=1 .weight_shape companion",
                                  packed["dtype"].str+" packed rank "+std::to_string(packed_rank)+
                                  ", companion rank "+std::to_string(stored_rank));
-                        const long long k = stored_shape_last_dim(f,j[base+".weight_shape"]);
+                        const long long k = stored_shape_last_dim(body,f,base+".weight_shape",stored);
                         const long long width = j[t.first]["shape"].arr.back().i();
                         if (width*4 == k)
                             throw std::runtime_error(f+": packed INT8 checkpoint requires qfn-int8-manifest.json");
