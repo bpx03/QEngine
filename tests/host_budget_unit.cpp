@@ -75,8 +75,8 @@ int main() {
     // the estimate against the 1.3.4 boots: 2 cards 31.2 GB host-backed, 3 cards (GPU1 desktop) 11.9 GB
     EXPECT(std::fabs(qfn_expert_host_est(2, cards_free(2, false)) - 31.2e9) < 2.5e9);
     EXPECT(std::fabs(qfn_expert_host_est(3, cards_free(3, true)) - 11.9e9) < 2.5e9);
-    // INT8 checkpoint (W8): 998,400 B groups (flash.h ExpertLayout<8>) put ~122.9 GB of routed expert groups on
-    // the table against ~62.4 GB at INT4. The cards keep the SAME VRAM share as INT4 (~31 GB at 2 cards of free
+    // INT8 checkpoint (W8): 998,400 B groups (flash.h ExpertLayout<8>) put 48 x 512 x 5 groups = 122.68 GB
+    // of routed expert bytes on the table against 62.29 GB at INT4. The cards keep the SAME VRAM share as INT4 (~31 GB at 2 cards of free
     // boot VRAM), so the host-backed estimate is the W8 total minus that resident share: about 92 GB at 2 cards,
     // not the INT4 figure scaled by the group ratio. 3 cards: same rule, ~73 GB.
     EXPECT(std::fabs(qfn_expert_host_est(2, cards_free(2, false), 998400.0) - 92.0e9) < 2.5e9);

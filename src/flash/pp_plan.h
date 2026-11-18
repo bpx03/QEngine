@@ -1,6 +1,6 @@
 #pragma once
-// Pipeline-parallel (PP) planning for the Flash-Next engine: pure host logic, no CUDA, so tests/qfn_pp_plan_unit.cpp
-// checks it with a plain C++ compiler.
+// Pipeline-parallel (PP) planning for the Flash-Next engine: pure host logic, no CUDA, so a plain C++
+// compiler can check it (no device headers reach this file).
 //
 // FLASH_PAR selects how the cards split the model:
 //   tp          tensor-parallel (today's default): every card holds a slice of every layer, all cards work on every
@@ -60,6 +60,8 @@ inline bool is_qsa(int li) { return li % kQsaEvery == kQsaEvery - 1; }
 // when it resolves the KV format (flash.cu kv4_mode), before any plan (the unit tests keep FP8)
 inline double& kv_layer_bytes() { static double b = 1040.0; return b; }
 struct ModelBytes {
+    // INT4 mirror of flash.h ExpertLayout<4>::bytes (506,880 B per 128-wide group); this header stays
+    // CUDA-free on purpose, so the constant is spelled here and not derived from the device layout.
     static constexpr double kInt4GroupBytes = 506880.0;
     ModelBytes() : expert_layer(2565.0 * kInt4GroupBytes), mtp_experts(2565.0 * kInt4GroupBytes) {}
     explicit ModelBytes(double group_bytes) : expert_layer(2565.0 * group_bytes), mtp_experts(2565.0 * group_bytes) {}
