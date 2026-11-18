@@ -5672,7 +5672,12 @@ __global__ void __launch_bounds__(256) k_moe_dn_g_w8(const MoeJob* __restrict__ 
         p.s8 = moe_scale<Bits>(jb.ds, (size_t)r * 16 + g + 8) * kXhScale;
         const int* rl = jrow + jj * (MAXM + 1);
         p.cnt = rl[0]; p.r0 = rl[1 + 2 * t4]; p.r1 = rl[2 + 2 * t4];
-        const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + g) * GRP + t4 * 16);
+        // the activation slot of the FIRST tile clamps to row 0 past the count, exactly as the further
+        // tiles below clamp theirs: with FX the padding slot's nf is folded into every row of the block
+        // (nfb), so a NaN sitting in a dead row propagates through the whole block - the discarded-MMA-
+        // columns argument only holds without the fixed-point flush
+        const int sl = g < p.cnt ? g : 0;
+        const uint4* xr = reinterpret_cast<const uint4*>(acth + ((size_t)jj * MAXM + sl) * GRP + t4 * 16);
         p.b[0] = xr[0]; p.b[1] = xr[1]; p.b[2] = xr[8]; p.b[3] = xr[9];
     };
     auto tile = [&](const uint4* w, float sg, float sg8, const uint4* bb4, int cnt, int t0, int row0, int row1) {
