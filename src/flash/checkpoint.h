@@ -478,9 +478,21 @@ struct Checkpoint {
         using namespace checkpoint_detail;
         model_dir=directory;
         const auto path=resolve_path(directory,"qfn-int8-manifest.json");
-        if(std::filesystem::exists(path) && !is_file(path))
-            fail(path,"manifest","regular file","non-file path");
-        if (!is_file(path)) {
+        // The existence probe is a symlink_status, never exists()/is_regular_file(): those FOLLOW links, so
+        // a dangling symlink named qfn-int8-manifest.json read as "no manifest" and fell through to the scan
+        // route, where a packed INT8 trio died on the width discriminator instead of the symlink gate, and an
+        // INT4 directory scanned as if the reserved name were not there at all. The manifest is a sandboxed
+        // name: any symlink at it, dangling or not, is a require_no_symlink rejection; only a true absence
+        // (or an unreadable probe, which the scan's directory_iterator then reports its own way) selects
+        // the scan route.
+        std::error_code manifest_probe_ec;
+        const auto manifest_type=std::filesystem::symlink_status(path,manifest_probe_ec).type();
+        const bool manifest_present=!manifest_probe_ec && manifest_type!=std::filesystem::file_type::not_found;
+        if (manifest_present) {
+            require_no_symlink(directory,path,path);  // the manifest itself is a sandboxed name: never a symlink
+            if(!is_file(path)) fail(path,"manifest","regular file","non-file path");
+        }
+        if (!manifest_present) {
             // the format comes from the tensor headers below, never from config.json: an AutoRound INT4
             // directory legitimately carries quantization_config groups with 8-bit entries (its lm_head /
             // KV quantizers), and reading the format there would refuse a working INT4 checkpoint
@@ -550,7 +562,6 @@ struct Checkpoint {
             }
             return;
         }
-        require_no_symlink(directory,path,path);  // the manifest itself is a sandboxed name: never a symlink
         has_manifest=true; format=WeightFormat::Int8;
         // An mtp_override must be a BYTE-COMPATIBLE replacement of the recorded MTP inventory:
         // the header-vs-manifest matching below rejects a replacement with missing, extra or altered

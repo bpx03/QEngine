@@ -617,6 +617,30 @@ int main(int argc, char** argv) {
             fs::create_directories(legacy/"ngram_int8.safetensors");
             { Checkpoint ck; ck.open(legacy.string(),false,"");
               require(!ck.has_manifest && ck.format==WeightFormat::Int4,"INT4 directory route changed"); }
+            { // manifest existence is probed with symlink_status, so a DANGLING symlink named
+              // qfn-int8-manifest.json is not "no manifest": the packed INT8 directory (the bug: it fell
+              // through to the scan route and died on the width discriminator "requires
+              // qfn-int8-manifest.json") and the otherwise-valid INT4 directory (it scanned as if the
+              // reserved name were absent) are both rejected by the symlink gate instead, and only a
+              // true absence keeps the scan route.
+                const auto dangling_manifest=[&](const fs::path& d,bool packed8){
+                    fs::create_directories(d);
+                    if (packed8) matrix_file(d/"model.safetensors"); else int4(d/"model-00001-of-00001.safetensors");
+                    fs::create_symlink("no-such-manifest.json",d/"qfn-int8-manifest.json");
+                    bool via_symlink_gate=false;
+                    try { Checkpoint ck; ck.open(d.string(),false,""); }
+                    catch(const std::runtime_error& e){ const std::string m=e.what();
+                        via_symlink_gate = m.find("symbolic link")!=std::string::npos &&
+                                           m.find("requires qfn-int8-manifest")==std::string::npos; }
+                    require(via_symlink_gate,(d.string()+": a dangling qfn-int8-manifest.json link did not reach the symlink gate").c_str());
+                };
+                dangling_manifest(temp.path/"manifest-link-int8",true);   // the width-error case of the bug
+                dangling_manifest(temp.path/"manifest-link-int4",false);  // the silently-scanning INT4 case
+                const auto absent=temp.path/"manifest-absent"; fs::create_directories(absent);
+                int4(absent/"model-00001-of-00001.safetensors");
+                { Checkpoint ck; ck.open(absent.string(),false,"");  // a true absence still scans, as today
+                  require(!ck.has_manifest && ck.format==WeightFormat::Int4,"a directory without a manifest stopped scanning"); }
+            }
             { // the manifest-less route keeps main's behavior for the MTP pair and for dangling links:
               // BOTH names (mtp.safetensors, mtp-int4.safetensors) are opened and cross-checked, a missing one
               // fails the start, a dangling *.safetensors link is an open failure and not a skip - except the
