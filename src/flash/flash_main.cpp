@@ -1,5 +1,6 @@
 #include "../env.h"
 #include "ngram_ahead.h"
+#include "sidecar_load.h"
 #include <sys/mman.h>
 #include <cuda_profiler_api.h>
 // flash_run: load Qwen3.8-Flash-Next (qengine INT4 checkpoint) on 2 to 4 GPUs (TP; 4: opt-in), run a prompt and greedy decode.
@@ -292,33 +293,18 @@ int main(int argc, char** argv) {
         plans = make_plan(ng, wts);
     }
     std::vector<int> draft_ids;  // MTP draft vocabulary: the most frequent tokens (token_rank.bin)
-    {
-        const int nd = env_int("FLASH_DRAFT_V", 65536);
-        FILE* f = fopen((model + "/token_rank.bin").c_str(), "rb");
-        if (f && nd > 0) {
-            draft_ids.resize(nd);
-            draft_ids.resize(fread(draft_ids.data(), 4, nd, f));
-            fclose(f);
-        }
-    }
     std::vector<std::vector<int>> cold;
-    if (cold_file == "default") cold_file = model + "/cold_experts.json";
-    if (cold_file != "none") {
-        FILE* f = fopen(cold_file.c_str(), "r");
-        if (f) {
-            std::string js;
-            char buf[65536];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) js.append(buf, n);
-            fclose(f);
-            Json j = Json::parse(js);
-            for (auto& l : j["layers"].arr) {
-                std::vector<int> v;
-                for (auto& e : l.arr) v.push_back((int)e.i());
-                cold.push_back(v);
-            }
-            printf("cold experts: %zu per layer in host memory (%s)\n", cold.empty() ? 0 : cold[0].size(), cold_file.c_str());
+    try {  // the sidecars are model-directory input: a bad one refuses the run with the rule that failed
+        const int nd = env_int("FLASH_DRAFT_V", 65536);
+        if (nd > 0) draft_ids = sidecar::load_token_rank(model + "/token_rank.bin", nd, VOCAB);
+        if (cold_file == "default") cold_file = model + "/cold_experts.json";
+        if (cold_file != "none") {
+            cold = sidecar::load_cold_experts(cold_file, LAYERS, NE);  // (empty for a missing file: no probe open first)
+            if (!cold.empty()) printf("cold experts: %zu per layer in host memory (%s)\n", cold[0].size(), cold_file.c_str());
         }
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "%s\n", ex.what());
+        return 1;
     }
     std::vector<float> prior;  // expert-cache seed: per-token routing probabilities [48][512] (tools/flash_expert_prior.py)
     {
