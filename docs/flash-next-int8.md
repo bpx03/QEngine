@@ -22,7 +22,8 @@ image or the binary selects INT8, and INT4 checkpoints keep loading exactly as b
 
 ## Converting
 
-    python3 tools/quant_int8.py --src <bf16 checkpoint dir> --out <int8 dir>         --ngram-from <ngram_int8 dir> --kv-from <kv template dir>
+    python3 tools/quant_int8.py --src <bf16 checkpoint dir> --out <int8 dir> \
+        --ngram-from <ngram_int8 dir> --kv-from <kv template dir>
 
 Optional: `--link-ngram`, `--external-ngram`, `--max-shard-bytes`, `--search`, `--dev`. Afterwards verify
 the output:

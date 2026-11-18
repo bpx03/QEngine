@@ -687,6 +687,9 @@ Build acceptance fixtures with the normal build: `flash_checkpoint_unit` validat
 `INT8_MODEL=<dir>` adds real-checkpoint rows. The image needs nothing INT8-specific: the format is chosen per
 checkpoint, not by the image, and the INT4 runtime keeps working.
 
+Host RAM: about 92 GB of pinned host-backed experts on 2 cards and about 72 GB on 3 (the cards keep the same
+VRAM share as INT4), plus the base the server needs; details on the [INT8 checkpoint page](docs/flash-next-int8.md).
+
 ### Qwen3.8-27B
 
 - INT4 weights repacked at load (a few seconds, no conversion) into tensor-core layouts.
