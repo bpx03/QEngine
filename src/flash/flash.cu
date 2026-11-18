@@ -4824,7 +4824,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             const bool cstg = xstage_ && xout_ && mr > 8;
             const Xchg xcs = cstg ? xchg_outbox(1, xc, cpar, xper(p_)) : xc;
             if (!pf_ && !cdh && !cstg && p_.ngpu > 1) comm_test_spin(st_);  // test (QE_DECODE_TEST_STORE_US)
-            xb_add(XB_PART, (size_t)mr * (size_t)xper(p_) * 4 * (p_.ngpu - 1));
+            xb_add(XB_PART, (size_t)mr * (x16o ? (size_t)QPC(p_) * XP16 * 4 : (size_t)xper(p_) * 4) * (p_.ngpu - 1));
             if (qsa_split_ && !dh && qsa_defers(m, sel_on_)) {  // pipelined: the combine + o_proj in qsa_back
                 // (qsa_defers(m) = x16o && (!cstg || xcs_) && mr == m: the pipelined loop asks it before the chunk)
                 // CE (FLASH_QSA_PIPE_CE): the outbox of this parity is free once its previous side copies finished; the
