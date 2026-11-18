@@ -1076,7 +1076,7 @@ def check_qfn(a, manifest_path, manifest):
     if int(recipe.get("search", -1)) != a.search or recipe.get("group_size") != 128:
         raise ValueError("--search/group_size does not match QFN manifest")
     if not isinstance(manifest.get("runtime_supported"), bool):
-        raise ValueError("QFN manifest must carry a boolean runtime_supported (review R2-8: presence and type are the contract; "
+        raise ValueError("QFN manifest must carry a boolean runtime_supported (presence and type are the contract; "
                          "true states the flash INT8 W8 runtime executes the checkpoint)")
     if not isinstance(manifest.get("source"), dict):
         raise ValueError("manifest is missing the source traceability record")

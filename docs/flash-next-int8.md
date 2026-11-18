@@ -53,7 +53,8 @@ the plan says so at boot (a warning naming the experts' GB against the host's fr
 refuses the load when the memory is really not there - the same rule INT4 follows. What does degrade is
 the n-gram table: on a host where it does not fit next to the experts it is served from the page cache
 instead of pinned, and the boot log says so (`n-gram table not pinned ... read from the page cache
-instead`). The start-up line prints the plan (`QE_HOST_BUDGET_TABLE=1` prints the full table). VRAM needs
+instead`). The start-up line prints the plan either way; the full plan table is printed by the CPU unit test
+`tests/host_budget_unit.cpp` when run with `QE_HOST_BUDGET_TABLE=1` (a test knob, not a server option). VRAM needs
 are the same as INT4: resident groups are chosen from the free memory reported per card at boot.
 
 ## Tested modes and performance
@@ -63,3 +64,6 @@ benchmarks, with and without MTP drafts (`FLASH_MTP_K` = 0, 1, 2), the INT8 n-gr
 parallel layouts exercise the same W8 code paths but have not been benchmarked on an INT8 checkpoint.
 
 Speed and quality against INT4: to be measured.
+
+See also the README's [QFN INT8 (W8) checkpoints](../README.md#qfn-int8-w8-checkpoints) section for the
+conversion summary and the surrounding engine options.
