@@ -619,8 +619,9 @@ int main(int argc, char** argv) {
               require(!ck.has_manifest && ck.format==WeightFormat::Int4,"INT4 directory route changed"); }
             { // the manifest-less route keeps main's behavior for the MTP pair and for dangling links:
               // BOTH names (mtp.safetensors, mtp-int4.safetensors) are opened and cross-checked, a missing one
-              // fails the start, a dangling *.safetensors link is an open failure and not a skip, and an explicit
-              // MTP override replaces the pair. This is the layer the FLASH_MTP_K=0 fix lives on: qe_create asks
+              // fails the start, a dangling *.safetensors link is an open failure and not a skip - except the
+              // mtp-prefixed names, which main filters before it ever opens a name - and an explicit MTP
+              // override replaces the pair. This is the layer the FLASH_MTP_K=0 fix lives on: qe_create asks
               // for the MTP block unconditionally (kmax only switches the draft off), pinned here as want_mtp=true.
                 const auto mtp_file=[&](const fs::path& p){
                     std::string header="{\"blk.weight\":{\"dtype\":\"F16\",\"shape\":[4,4],\"data_offsets\":[0,32]}}";
@@ -646,6 +647,11 @@ int main(int argc, char** argv) {
                 int4(dangle/"model-00001-of-00001.safetensors");
                 fs::create_symlink("no-such-target.safetensors",dangle/"link-00002-of-00009.safetensors");
                 rejects([&]{ Checkpoint ck; ck.open(dangle.string(),false,""); });  // main fails on the dangling link
+                const auto dangle_mtp=temp.path/"dangling-mtp-dir"; fs::create_directories(dangle_mtp);
+                int4(dangle_mtp/"model-00001-of-00001.safetensors");
+                fs::create_symlink("no-such-mtp.safetensors",dangle_mtp/"mtp-int4.safetensors");
+                { Checkpoint ck; ck.open(dangle_mtp.string(),false,"");  // main filtered mtp names before opening:
+                  require(!ck.mtp.has("blk.weight"),"a dangling mtp link broke a start that did not want MTP"); }
             }
             const auto legacy8=temp.path/"int8-nomanifest"; fs::create_directories(legacy8);
             matrix_file(legacy8/"model.safetensors");  // packed + scale + weight_shape without a manifest

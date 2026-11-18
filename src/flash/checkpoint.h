@@ -487,15 +487,18 @@ struct Checkpoint {
             std::vector<std::string> files;
             for (const auto& e : std::filesystem::directory_iterator(directory)) {
                 const auto name=e.path().filename().string();
-                // real INT4 directories contain a stray ngram_int8.safetensors DIRECTORY: only regular files qualify
-                // (that skip is part of the accepted format layer); every regular *.safetensors the released loader
-                // would open stays in the scan, model_mtp.safetensors included - an INT8 directory without manifest
-                // is refused by the format check below, exactly one file earlier
-                if (e.path().extension()==".safetensors" && e.is_symlink() && !std::filesystem::exists(e.path()))
-                    // as on main: the released loader tried to open every *.safetensors name in the directory, so a
-                    // dangling link fails the start there; silently skipping it is a manifest-route behavior only
-                    throw std::runtime_error(e.path().string()+": cannot open (symbolic link with a missing target)");
+                // the released INT4 directories keep their regular 51.8 GB n-gram table in an
+                // ngram_int8.safetensors DIRECTORY (safetensors directory format): only regular files qualify, so
+                // the table never enters the body scan (that skip is part of the accepted format layer); every
+                // regular *.safetensors the released loader would open stays in the scan, model_mtp.safetensors
+                // included - an INT8 directory without manifest is refused by the format check below, one file earlier
                 if (e.is_regular_file() && e.path().extension()==".safetensors" && name.rfind("mtp",0)!=0) files.push_back(e.path().string());
+                else if (e.path().extension()==".safetensors" && name.rfind("mtp",0)!=0 && e.is_symlink() && !std::filesystem::exists(e.path()))
+                    // as on main, where the loader opened every non-mtp name in the directory: a dangling link
+                    // fails the start there, while silently skipping it is a manifest-route behavior only. mtp-
+                    // prefixed names are filtered before the open, so a dangling mtp* link stays as invisible as
+                    // it is on main (unless MTP is requested: the pair check below reports it)
+                    throw std::runtime_error(e.path().string()+": cannot open (symbolic link with a missing target)");
             }
             std::sort(files.begin(),files.end());
             if (files.empty()) throw std::runtime_error(directory+": no body safetensors files");
