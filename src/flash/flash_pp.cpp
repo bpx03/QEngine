@@ -1590,6 +1590,9 @@ std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vec
     std::vector<int> udev;
     for (int d : devs) if (std::find(udev.begin(), udev.end(), d) == udev.end()) udev.push_back(d);
     std::vector<std::string> load_err(udev.size());
+    // a thread the system could not start throws here: join the joinables before the vector unwinds
+    struct LoaderJoiner { std::vector<std::thread>* th; bool ok = false;
+        ~LoaderJoiner() { if (ok) return; for (auto& t : *th) if (t.joinable()) t.join(); } } lj{&th};
     for (size_t ti = 0; ti < udev.size(); ti++) {
         const int d = udev[ti];
         th.emplace_back([&, d, ti] {
@@ -1619,6 +1622,7 @@ std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vec
             }        });
     }
     for (auto& t : th) t.join();
+    lj.ok = true;  // stage loader threads joined
     for (const std::string& m : load_err)
         if (!m.empty()) { fprintf(stderr, "qflash: weight load failed: %s\n", m.c_str()); throw std::runtime_error(m); }
     for (Worker* w : S) w->set_ngram(ngd);
@@ -1748,6 +1752,9 @@ std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups,
     for (int d : dev) if (std::find(udev.begin(), udev.end(), d) == udev.end()) udev.push_back(d);
     std::vector<std::thread> th;
     std::vector<std::string> load_err(udev.size());
+    // a thread the system could not start throws here: join the joinables before the vector unwinds
+    struct LoaderJoiner { std::vector<std::thread>* th; bool ok = false;
+        ~LoaderJoiner() { if (ok) return; for (auto& t : *th) if (t.joinable()) t.join(); } } lj{&th};
     for (size_t ti = 0; ti < udev.size(); ti++) {
         const int d = udev[ti];
         th.emplace_back([&, d, ti] {
@@ -1774,6 +1781,7 @@ std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups,
             }        });
     }
     for (auto& t : th) t.join();
+    lj.ok = true;  // stage loader threads joined
     for (const std::string& m : load_err)
         if (!m.empty()) { fprintf(stderr, "qflash: weight load failed: %s\n", m.c_str()); throw std::runtime_error(m); }
     // the TP exchange peers inside every group (as the TP server does over all its ranks)

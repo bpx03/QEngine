@@ -378,6 +378,10 @@ int main(int argc, char** argv) try {
         std::vector<int> udev;
         std::vector<std::exception_ptr> errors(ng);
         for (int r = 0; r < ng; r++) if (std::find(udev.begin(), udev.end(), devs[r]) == udev.end()) udev.push_back(devs[r]);
+        // a thread the system could not start throws here: the joinables already created would be
+        // destroyed (std::terminate) at the vector's unwind - join them on that way out
+        struct LoaderJoiner { std::vector<std::thread>* th; bool ok = false;
+            ~LoaderJoiner() { if (ok) return; for (auto& t : *th) if (t.joinable()) t.join(); } } lj{&th};
         for (int d : udev)
             th.emplace_back([&, d] {
                 std::vector<int> mine;
@@ -398,6 +402,7 @@ int main(int argc, char** argv) try {
                 }
             });
         for (auto& t : th) t.join();
+        lj.ok = true;  // all loader threads are joined
         for(const auto& error:errors) if(error) std::rethrow_exception(error);
     }
     for (size_t r = 0; r < holds.size(); r++)

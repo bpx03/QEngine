@@ -3495,6 +3495,10 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
         std::vector<int> udev;
         std::vector<std::exception_ptr> errors(e->ng);  // (loader-thread failures surface here: nothing may throw across the C boundary)
         for (int r = 0; r < e->ng; r++) if (std::find(udev.begin(), udev.end(), e->devs[r]) == udev.end()) udev.push_back(e->devs[r]);
+        // a thread the system could not start throws here, before the start guard has anyone to join:
+        // the joinables already created would be destroyed (std::terminate) at the vector's unwind
+        struct LoaderJoiner { std::vector<std::thread>* th; bool ok = false;
+            ~LoaderJoiner() { if (ok) return; for (auto& t : *th) if (t.joinable()) t.join(); } } lj{&th};
         for (int d : udev)
             th.emplace_back([&, d] {
                 std::vector<int> mine;
@@ -3521,6 +3525,7 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
                 }
             });
         for (auto& t : th) t.join();
+        lj.ok = true;  // all loader threads are joined: the start guard stands down for them
         for (const auto& error : errors)
             if (error) {
                 try { std::rethrow_exception(error); }
