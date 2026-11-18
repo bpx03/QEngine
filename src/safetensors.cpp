@@ -29,7 +29,7 @@ int open_regular_file(const std::string& path, bool nofollow) {
     throw std::runtime_error(path + ": not a regular file");  // swapped to a special file between lstat and open
 }
 
-void SafeTensors::open(const std::string& path, const std::set<std::string>* only, bool shadow) {
+Json SafeTensors::open(const std::string& path, const std::set<std::string>* only, bool shadow) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + path);
     struct stat st;
@@ -50,6 +50,7 @@ void SafeTensors::open(const std::string& path, const std::set<std::string>* onl
     Json j = Json::parse(header);
     ++safetensors_header_parses();
     index(j, (const char*)base + 8 + hlen, size - 8 - hlen, path, only, shadow);
+    return j;
 }
 
 static size_t st_width_of(const std::string& d) {  // payload width of a supported safetensors dtype

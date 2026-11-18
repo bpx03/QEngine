@@ -50,7 +50,7 @@ class SafeTensors {
 public:
     // only != nullptr: register just these names (an index that maps a name to this file); shadow: this file's tensors
     // replace earlier ones of the same name on purpose (tuned weights), no duplicate check
-    void open(const std::string& path, const std::set<std::string>* only = nullptr, bool shadow = false);
+    Json open(const std::string& path, const std::set<std::string>* only = nullptr, bool shadow = false);
     // Single-open checkpoint facade (used only by flash/checkpoint.h): guarded open (open_regular_file:
     // S_ISREG + O_NOFOLLOW when nofollow + fstat), mmap, and the header is parsed STRICTLY from the
     // mapped bytes exactly once; the payload is validated against those same bytes and the tensor table

@@ -188,7 +188,7 @@ inline long long stored_shape_last_dim(const std::string& path, const Json& entr
     if (got != 8) fail(path,".weight_shape","readable stored shape","truncated payload");
     return last;
 }
-// Safetensors files reach the loader only through SafeTensors::open_strict_validated — one guarded
+// Manifest-backed safetensors files reach the loader through SafeTensors::open_strict_validated — one guarded
 // open per file, strict header parse from the mapped bytes exactly once, payload validated against
 // those same bytes and the tensor table indexed from THAT parsed object (returned for manifest
 // cross-checks). The former validate-then-reopen pair (ifstream strict parse + permissive
@@ -488,14 +488,21 @@ struct Checkpoint {
             for (const auto& e : std::filesystem::directory_iterator(directory)) {
                 const auto name=e.path().filename().string();
                 // real INT4 directories contain a stray ngram_int8.safetensors DIRECTORY: only regular files qualify
-                if (e.is_regular_file() && e.path().extension()==".safetensors" && name.rfind("mtp",0)!=0 && name!="model_mtp.safetensors") files.push_back(e.path().string());
+                // (that skip is part of the accepted format layer); every regular *.safetensors the released loader
+                // would open stays in the scan, model_mtp.safetensors included - an INT8 directory without manifest
+                // is refused by the format check below, exactly one file earlier
+                if (e.path().extension()==".safetensors" && e.is_symlink() && !std::filesystem::exists(e.path()))
+                    // as on main: the released loader tried to open every *.safetensors name in the directory, so a
+                    // dangling link fails the start there; silently skipping it is a manifest-route behavior only
+                    throw std::runtime_error(e.path().string()+": cannot open (symbolic link with a missing target)");
+                if (e.is_regular_file() && e.path().extension()==".safetensors" && name.rfind("mtp",0)!=0) files.push_back(e.path().string());
             }
             std::sort(files.begin(),files.end());
             if (files.empty()) throw std::runtime_error(directory+": no body safetensors files");
             for (const auto& f:files) {
-                // One guarded open per file; the format detector inspects the very object the
-                // tensors were indexed from (strict parse of the mapped header, no second open)
-                const auto j=body.open_strict_validated(f,false);  // scan route: legacy symlink allowance
+                // Keep the legacy loader for manifest-less INT4. Detection reuses its parsed header
+                // without imposing manifest-only contiguity, dtype or header-cap checks.
+                const auto j=body.open(f);  // legacy header and payload semantics, including alignment gaps
                 for(const auto& t:j.obj) if(t.first.size()>14 && t.first.compare(t.first.size()-14,14,".weight_packed")==0) {
                     const auto base=t.first.substr(0,t.first.size()-14);
                     // The .weight_shape companion alone does NOT decide the format: compressed-tensors
@@ -526,14 +533,16 @@ struct Checkpoint {
                 }
             }
             if(want_mtp) {
-                if(!mtp_override.empty()) mtp.open_strict_validated(resolve_path(directory,mtp_override),false);
+                if(!mtp_override.empty()) mtp.open(resolve_path(directory,mtp_override));
                 else {
-                    bool found=false;
+                    // as on main: the released loader opened BOTH MTP names and relied on the identical-duplicate
+                    // rule to cross-check them; taking either file alone is a manifest-route allowance, not this route
                     for(const auto* name:{"mtp.safetensors","mtp-int4.safetensors"}) {
                         const auto f=resolve_path(directory,name);
-                        if(is_file(f)){mtp.open_strict_validated(f,false);found=true;}
+                        if(!is_file(f))
+                            throw std::runtime_error(f+": the manifest-less route opens both MTP files, as the released loader did");
+                        mtp.open(f);
                     }
-                    if(!found) throw std::runtime_error(directory+": requested MTP checkpoint missing");
                 }
             }
             return;

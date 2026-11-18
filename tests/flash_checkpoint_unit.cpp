@@ -436,7 +436,36 @@ static void open_checkpoint(const fs::path& dir,const BuildOptions& o) {
     require(ck.converted.size()==409,"converted inventory changed");
 }
 
-int main() {
+static void alignment_gap_test() {
+    Temp temp;
+        { // Legacy INT4 alignment padding must not enter the manifest-only strict route.
+            const auto d=temp.path/"int4-gap"; fs::create_directories(d);
+            const auto p=d/"model.safetensors";
+            std::string h=R"({"m.weight_packed":{"dtype":"I32","shape":[1,1],"data_offsets":[0,4]},"m.weight_scale":{"dtype":"F16","shape":[1],"data_offsets":[8,10]}})";
+            while(h.size()%8) h+=' ';
+            const std::array<char,10> bytes{{1,2,3,4,0,0,0,0,5,6}};
+            { std::ofstream out(p,std::ios::binary); const uint64_t n=h.size();
+              out.write(reinterpret_cast<const char*>(&n),8); out.write(h.data(),h.size()); out.write(bytes.data(),bytes.size()); }
+            auto check=[&](const SafeTensors& st) {
+                require(st.get("m.weight_packed").nbytes==4 && std::memcmp(st.get("m.weight_packed").data,bytes.data(),4)==0,"gapped INT4 packed bytes changed");
+                require(st.get("m.weight_scale").nbytes==2 && std::memcmp(st.get("m.weight_scale").data,bytes.data()+8,2)==0,"gapped INT4 scale bytes changed");
+            };
+            { SafeTensors legacy; legacy.open(p.string()); check(legacy); }
+            rejects([&]{ SafeTensors strict; strict.open_strict_validated(p.string(),false); });
+            bool opened=false;
+            try { Checkpoint ck; ck.open(d.string(),false,""); check(ck.body); opened=!ck.has_manifest && ck.format==WeightFormat::Int4; }
+            catch(const std::runtime_error& e) { fprintf(stderr,"alignment-gap INT4: %s\n",e.what()); }
+            require(opened,"manifest-less INT4 alignment gap rejected by runtime loader");
+        }
+
+}
+
+int main(int argc, char** argv) {
+    if(argc==2 && std::string(argv[1])=="--alignment-gap-only") {
+        try { alignment_gap_test(); }
+        catch(const std::exception& e) { fprintf(stderr,"alignment-gap: %s\n",e.what()); return 1; }
+        return fails ? 1 : 0;
+    }
     try {
         Temp temp;
         for(const char* invalid : {"", "{", "[", "{\"x\":", "{\"x\":1,}", "[1,]", "{\"x\":1,\"x\":2}", "01", "-", "1.", "1e",
@@ -483,6 +512,14 @@ int main() {
             require(selected.body.size()==1 && selected.body[0]==(temp.path/"model-00001-of-00001.safetensors").string(),"body shard not sandbox-joined");
             require(selected.mtp==(temp.path/"model_mtp.safetensors").string(),"MTP output changed");
             require(selected.ngram==(temp.path/"ngram_int8.safetensors").string(),"self-contained ngram path changed");
+            // UNIFIED rule: a recorded self-contained table wins; override/env are
+            // reported as IGNORED by Checkpoint::open and never reach the resolver result.
+            require(resolve_outputs(resolve_manifest,root,true,"",absolute).ngram==(temp.path/"ngram_int8.safetensors").string(),
+                    "operator ngram override must not beat a recorded self-contained table");
+            setenv("FLASH_NGRAM_PATH",absolute.c_str(),1);
+            require(resolve_outputs(resolve_manifest,root,true,"").ngram==(temp.path/"ngram_int8.safetensors").string(),
+                    "FLASH_NGRAM_PATH must not beat a recorded self-contained table");
+            unsetenv("FLASH_NGRAM_PATH");
             require(resolve_outputs(resolve_manifest,root,false,"").mtp.empty(),"unrequested MTP opened");
             const auto override_path=(temp.path/"explicit-mtp.safetensors").string();
             require(resolve_outputs(resolve_manifest,root,true,override_path).mtp==override_path,"explicit MTP override ignored");
@@ -580,6 +617,36 @@ int main() {
             fs::create_directories(legacy/"ngram_int8.safetensors");
             { Checkpoint ck; ck.open(legacy.string(),false,"");
               require(!ck.has_manifest && ck.format==WeightFormat::Int4,"INT4 directory route changed"); }
+            { // the manifest-less route keeps main's behavior for the MTP pair and for dangling links:
+              // BOTH names (mtp.safetensors, mtp-int4.safetensors) are opened and cross-checked, a missing one
+              // fails the start, a dangling *.safetensors link is an open failure and not a skip, and an explicit
+              // MTP override replaces the pair. This is the layer the FLASH_MTP_K=0 fix lives on: qe_create asks
+              // for the MTP block unconditionally (kmax only switches the draft off), pinned here as want_mtp=true.
+                const auto mtp_file=[&](const fs::path& p){
+                    std::string header="{\"blk.weight\":{\"dtype\":\"F16\",\"shape\":[4,4],\"data_offsets\":[0,32]}}";
+                    while(header.size()%8) header+=' ';
+                    std::ofstream out(p,std::ios::binary); const uint64_t len=header.size();
+                    out.write(reinterpret_cast<const char*>(&len),8); out.write(header.data(),header.size());
+                    std::vector<char> payload(32,0); out.write(payload.data(),payload.size());
+                };
+                const auto mroot=temp.path/"mtp-route"; fs::create_directories(mroot);
+                int4(mroot/"model-00001-of-00001.safetensors");
+                mtp_file(mroot/"mtp.safetensors"); mtp_file(mroot/"mtp-int4.safetensors");
+                { Checkpoint ck; ck.open(mroot.string(),true,"");
+                  require(ck.mtp.has("blk.weight"),"manifest-less MTP pair did not open"); }
+                { Checkpoint ck; ck.open(mroot.string(),false,"");   // want_mtp=false opens no MTP at all
+                  require(!ck.mtp.has("blk.weight"),"MTP opened without want_mtp"); }
+                fs::remove(mroot/"mtp-int4.safetensors");
+                rejects([&]{ Checkpoint ck; ck.open(mroot.string(),true,""); });  // main needs both names
+                mtp_file(mroot/"mtp-int4.safetensors");
+                mtp_file(temp.path/"explicit-mtp2.safetensors");
+                { Checkpoint ck; ck.open(mroot.string(),true,(temp.path/"explicit-mtp2.safetensors").string());
+                  require(ck.mtp.has("blk.weight"),"MTP override did not open"); }
+                const auto dangle=temp.path/"dangling-dir"; fs::create_directories(dangle);
+                int4(dangle/"model-00001-of-00001.safetensors");
+                fs::create_symlink("no-such-target.safetensors",dangle/"link-00002-of-00009.safetensors");
+                rejects([&]{ Checkpoint ck; ck.open(dangle.string(),false,""); });  // main fails on the dangling link
+            }
             const auto legacy8=temp.path/"int8-nomanifest"; fs::create_directories(legacy8);
             matrix_file(legacy8/"model.safetensors");  // packed + scale + weight_shape without a manifest
             rejects([&]{ Checkpoint ck; ck.open(legacy8.string(),false,""); });  // width*4 == stored K: INT8
