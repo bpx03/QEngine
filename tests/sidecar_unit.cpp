@@ -100,6 +100,16 @@ int main() {
     // strict parse: trailing garbage is refused, not silently accepted
     write_file(dir / "c7.json", cold_json(good) + " oops");
     EXPECT(cold_throws(dir / "c7.json", ""));  // parse_strict must fail (any message)
+    // size cap: cold_experts.json is read bounded before the parse (kMaxColdJsonBytes = 16 MiB, the
+    // manifest cap's size in checkpoint.h); a bigger file is refused with the cap in its message.
+    // Without the cap the bytes reach the JSON parser first and the message is the parser's, without
+    // this number - so this case fails there.
+    {
+        const fs::path huge = dir / "huge.json";
+        write_file(huge, std::string((size_t)sidecar::kMaxColdJsonBytes + 16, 'x'));
+        EXPECT(cold_throws(huge, "16777216"));
+        fs::remove(huge);
+    }
 
     // token_rank.bin: missing empty; the list is capped at cap; ids must be whole and in [0, VOCAB).
     EXPECT(sidecar::load_token_rank((dir / "absent.bin").string(), 65536, VOCAB).empty());

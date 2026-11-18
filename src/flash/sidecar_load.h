@@ -3,8 +3,10 @@
 // lm_head row gather of the balanced draft head (set_draft_vocab) - ids past the end there are silent
 // device-side out-of-bounds writes/reads, so every id is checked whole and in range here, at the one
 // parse point both entry points and the unit test share. Rules:
-//   cold_experts.json - strict JSON object {"layers": [...]} with exactly `layers` arrays of whole
-//     expert ids in [0, experts), no duplicates within a layer;
+//   cold_experts.json - read only up to kMaxColdJsonBytes (the cap runs while reading, before the
+//     parse, so a junk file of any size gets a clean refusal instead of being slurped whole), then a
+//     strict JSON object {"layers": [...]} with exactly `layers` arrays of whole expert ids in
+//     [0, experts), no duplicates within a layer;
 //   token_rank.bin    - the released reader's read, validated: at most `cap` whole little-endian
 //     int32 ids (the draft head consumes only the first `cap` rows) and every id read must lie in
 //     [0, vocab). Bytes past the last whole id inside the cap are trailing padding the old
@@ -24,6 +26,11 @@
 #include <vector>
 
 namespace sidecar {
+
+// Upper bound for cold_experts.json itself: the real file is 48 layers x at most 512 expert ids, a
+// little over 100 KB. 16 MiB is the same generous cap checkpoint.h puts on the manifest file
+// (kMaxManifestBytes), and it is applied while reading, before the JSON parse ever runs.
+inline constexpr unsigned long long kMaxColdJsonBytes = 16ull << 20;
 
 inline std::vector<int> load_token_rank(const std::string& path, int cap, int vocab) {
     std::vector<int> ids;
@@ -55,7 +62,14 @@ inline std::vector<std::vector<int>> load_cold_experts(const std::string& path, 
     std::string js;
     char buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) js.append(buf, n);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        js.append(buf, n);
+        if (js.size() > kMaxColdJsonBytes) {
+            fclose(f);
+            throw std::runtime_error(path + ": cold_experts.json: over the " + std::to_string(kMaxColdJsonBytes) +
+                                     " byte cap (not a cold-expert list)");
+        }
+    }
     fclose(f);
     const Json j = Json::parse_strict(js);
     if (j.type != Json::Obj || !j.has("layers") || j["layers"].type != Json::Arr)
