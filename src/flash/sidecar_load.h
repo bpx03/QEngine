@@ -5,8 +5,13 @@
 // parse point both entry points and the unit test share. Rules:
 //   cold_experts.json - strict JSON object {"layers": [...]} with exactly `layers` arrays of whole
 //     expert ids in [0, experts), no duplicates within a layer;
-//   token_rank.bin    - whole little-endian int32 token ids in [0, vocab); at most `cap` ids are read
-//     (the draft head consumes only the first `cap` rows, so ids past the cap stay unread, as before).
+//   token_rank.bin    - the released reader's read, validated: at most `cap` whole little-endian
+//     int32 ids (the draft head consumes only the first `cap` rows) and every id read must lie in
+//     [0, vocab). Bytes past the last whole id inside the cap are trailing padding the old
+//     fread(data, 4, cap, f) never looked at, and a short or empty file meant "fewer rows / draft
+//     vocab off", exactly like a missing one: all of those load, as on every server released before
+//     this check existed. Only ids outside the vocabulary - what used to reach the tables as silent
+//     device-side OOB - and a read that comes up short under a concurrent truncate are refused.
 // A bad sidecar throws std::runtime_error with the path and the rule; the C entry point catches it at
 // its boundary and refuses the load. A missing file is not an error (both sidecars are optional).
 #pragma once
@@ -27,11 +32,10 @@ inline std::vector<int> load_token_rank(const std::string& path, int cap, int vo
     fseek(f, 0, SEEK_END);
     const long long bytes = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (bytes < 4 || bytes % 4) {
-        fclose(f);
-        throw std::runtime_error(path + ": token_rank.bin: " + std::to_string(bytes) + " bytes, not whole int32 ids");
-    }
-    ids.resize(std::min<long long>(bytes / 4, cap));
+    // whole ids inside the cap region only - what the released reader read, and nothing more: bytes
+    // past the last whole id (or past cap * 4) were never part of the list, as on main
+    const long long whole = bytes > 0 ? bytes / 4 : 0;
+    ids.resize(std::min<long long>(whole, cap));
     const size_t got = fread(ids.data(), 4, ids.size(), f);
     fclose(f);
     if (got != ids.size())

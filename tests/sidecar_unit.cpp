@@ -1,6 +1,9 @@
 // CPU-only unit test for the shared sidecar loaders (src/flash/sidecar_load.h): cold_experts.json and
 // token_rank.bin rules, acceptance and every rejection path. Built and run by CMake/ctest (tests/sidecar_unit.cpp
-// is in the foreach list in CMakeLists.txt; it needs no GPU and no python harness).
+// is in the foreach list in CMakeLists.txt; it needs no GPU and no python harness). The acceptance side is pinned
+// against the released reader: every token_rank.bin that main's fread(data, 4, cap, f) served (trailing bytes,
+// short and empty files included) must still load, and only ids that can hurt the device tables (outside the
+// vocabulary) plus the malformed-JSON paths are refused.
 #include "flash/sidecar_load.h"
 
 #include <cstdio>
@@ -52,6 +55,12 @@ static bool cold_throws(const fs::path& p, const char* needle) {
     }
 }
 
+static std::string rank_blob(const std::vector<int>& ts) {
+    std::string s;
+    for (int t : ts) s.append((const char*)&t, 4);
+    return s;
+}
+
 int main() {
     const fs::path dir = fs::temp_directory_path() / "flash_sidecar_unit";
     fs::remove_all(dir);
@@ -92,45 +101,52 @@ int main() {
     write_file(dir / "c7.json", cold_json(good) + " oops");
     EXPECT(cold_throws(dir / "c7.json", ""));  // parse_strict must fail (any message)
 
-    // token_rank.bin: missing empty; whole int32 ids in [0, vocab); cap; short read; junk tail
+    // token_rank.bin: missing empty; the list is capped at cap; ids must be whole and in [0, VOCAB).
     EXPECT(sidecar::load_token_rank((dir / "absent.bin").string(), 65536, VOCAB).empty());
-    std::string ids;
-    for (int t : {5, 0, VOCAB - 1, 12345}) {
-        const int v = t;
-        ids.append((const char*)&v, 4);
-    }
+    const std::string ids = rank_blob({5, 0, VOCAB - 1, 12345});
     write_file(dir / "rank.bin", ids);
     const auto rank = sidecar::load_token_rank((dir / "rank.bin").string(), 65536, VOCAB);
     EXPECT(rank.size() == 4 && rank[2] == VOCAB - 1);
     EXPECT(sidecar::load_token_rank((dir / "rank.bin").string(), 2, VOCAB).size() == 2);  // cap: reads only 2
-    std::string tail = ids;
-    tail.push_back(0x41);  // 17 bytes: not whole int32 ids
-    write_file(dir / "ragged.bin", tail);
-    try {
-        sidecar::load_token_rank((dir / "ragged.bin").string(), 65536, VOCAB);
-        EXPECT(false);
-    } catch (const std::exception& ex) {
-        EXPECT(std::strstr(ex.what(), "not whole int32 ids") != nullptr);
+
+    // main's reader read whole int32s with fread and never looked at bytes past the last whole id, so
+    // a legitimate token_rank.bin with a trailing tail served fine on every released server. A size
+    // check on the whole file (bytes % 4) refuses those models again - an acceptance regression: the
+    // cap region is all that gets validated. These cases fail on the pre-fix header.
+    for (int extra = 1; extra <= 3; extra++) {
+        const fs::path p = dir / ("tail" + std::to_string(extra) + ".bin");
+        write_file(p, ids + std::string((size_t)extra, 0x41));
+        const auto t = sidecar::load_token_rank(p.string(), 65536, VOCAB);
+        EXPECT(t.size() == 4 && t[3] == 12345);
     }
-    std::string bad = ids;
-    const int neg = -1;
-    bad.insert(0, (const char*)&neg, 4);
-    write_file(dir / "neg.bin", bad);
+    // junk past the cap too: the released fread stopped at cap ids and ignored the rest, ragged size
+    // or not - only the first cap ids load, and the trailing bytes are not an error
+    write_file(dir / "overcap.bin", ids + std::string(7, 0x55));
+    const auto capped = sidecar::load_token_rank((dir / "overcap.bin").string(), 2, VOCAB);
+    EXPECT(capped.size() == 2 && capped[1] == 0);
+
+    // empty file and a sub-element file: fread returned 0 ids on main, and an empty list is what "no
+    // sidecar" means (the Worker guards the draft vocab on !draft_ids_.empty()), so both load empty.
+    write_file(dir / "empty.bin", "");
+    EXPECT(sidecar::load_token_rank((dir / "empty.bin").string(), 65536, VOCAB).empty());
+    write_file(dir / "stub.bin", std::string("\x07\x00", 2));
+    EXPECT(sidecar::load_token_rank((dir / "stub.bin").string(), 65536, VOCAB).empty());
+
+    // what is genuinely poison: ids outside the vocabulary land as out-of-bounds row gathers on the
+    // device. Refused whole, both signs.
+    write_file(dir / "neg.bin", rank_blob({-1, 5}));
     try {
         sidecar::load_token_rank((dir / "neg.bin").string(), 65536, VOCAB);
         EXPECT(false);
     } catch (const std::exception& ex) {
         EXPECT(std::strstr(ex.what(), "outside [0, 248320)") != nullptr);
     }
-    // 10 bytes: 2 whole ids + 2 stray bytes. On a regular file the read itself cannot come up short
-    // (the loader sizes the read to the file), so this case lands in the whole-int32 size check; either
-    // rejection message is accepted to pin the rule, not the code path that reports it.
-    write_file(dir / "short.bin", ids.substr(0, 10));
+    write_file(dir / "big.bin", rank_blob({5, VOCAB}));
     try {
-        sidecar::load_token_rank((dir / "short.bin").string(), 65536, VOCAB);
+        sidecar::load_token_rank((dir / "big.bin").string(), 65536, VOCAB);
         EXPECT(false);
     } catch (const std::exception& ex) {
-        EXPECT(std::strstr(ex.what(), "short read") != nullptr || std::strstr(ex.what(), "not whole int32 ids") != nullptr);
+        EXPECT(std::strstr(ex.what(), "outside [0, 248320)") != nullptr);
     }
 
     printf("sidecar_unit: %s (%d failures)\n", fails ? "FAILED" : "ok", fails);
