@@ -7,13 +7,29 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
-void SafeTensors::open(const std::string& path, const std::set<std::string>* only, bool shadow) {
+int open_regular_file(const std::string& path, bool nofollow) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0)
+        throw std::runtime_error(path + ": missing file (" + std::strerror(errno) + ")");
+    if (nofollow && S_ISLNK(st.st_mode))
+        throw std::runtime_error(path + ": symbolic link (the sandbox never follows symlinks)");
+    if (!S_ISLNK(st.st_mode) && !S_ISREG(st.st_mode))
+        throw std::runtime_error(path + ": not a regular file");  // FIFO, dir, socket, device: refuse before opening
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0));
+    if (fd < 0) throw std::runtime_error(path + ": cannot open (" + std::strerror(errno) + ")");
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) return fd;
+    ::close(fd);
+    throw std::runtime_error(path + ": not a regular file");  // swapped to a special file between lstat and open
+}
+
+Json SafeTensors::open(const std::string& path, const std::set<std::string>* only, bool shadow) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + path);
     struct stat st;
@@ -32,8 +48,83 @@ void SafeTensors::open(const std::string& path, const std::set<std::string>* onl
         throw std::runtime_error("not a safetensors file (bad header): " + path);
     std::string header((const char*)base + 8, hlen);
     Json j = Json::parse(header);
-    const char* data = (const char*)base + 8 + hlen;
-    const size_t dsize = size - 8 - hlen;
+    ++safetensors_header_parses();
+    index(j, (const char*)base + 8 + hlen, size - 8 - hlen, path, only, shadow);
+    return j;
+}
+
+static size_t st_width_of(const std::string& d) {  // payload width of a supported safetensors dtype
+    if (d == "U8" || d == "I8" || d == "BOOL" || d == "F8_E4M3" || d == "F8_E5M2") return 1;
+    if (d == "BF16" || d == "F16" || d == "I16" || d == "U16") return 2;
+    if (d == "F32" || d == "I32" || d == "U32") return 4;
+    if (d == "F64" || d == "I64" || d == "U64") return 8;
+    return 0;
+}
+
+Json SafeTensors::open_strict_validated(const std::string& path, bool nofollow, uint64_t max_size) {
+    const int fd = open_regular_file(path, nofollow);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0) { ::close(fd); throw std::runtime_error(path + ": cannot stat file"); }
+    if (max_size && (uint64_t)st.st_size > max_size) {
+        ::close(fd);
+        throw std::runtime_error(path + ": shard size " + std::to_string((long long)st.st_size) +
+                                 " bytes exceeds the manifest limit " + std::to_string(max_size));
+    }
+    const size_t size = (size_t)st.st_size;
+    void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (base == MAP_FAILED) throw std::runtime_error("mmap failed " + path);
+    try {
+        uint64_t hlen = 0;
+        if (size >= 8) memcpy(&hlen, base, 8);
+        if (size < 10 || hlen > size - 8 || hlen > (64ull << 20) || ((const char*)base)[8] != '{')
+            throw std::runtime_error("not a safetensors file (bad header): " + path);
+        const std::string header((const char*)base + 8, hlen);
+        Json j = Json::parse_strict(header);  // the one and only parse of these header bytes
+        ++safetensors_header_parses();
+        if (j.type != Json::Obj) throw std::runtime_error(path + ": header is not a JSON object");
+        // structural validation against the mapped bytes: supported dtype, bounded shape, and
+        // contiguous, non-overlapping, exactly-covering payload (the previous file-validation checks)
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;
+        for (const auto& e : j.obj) {
+            if (e.first == "__metadata__") continue;
+            const auto w = st_width_of(e.second.has("dtype") ? e.second["dtype"].str : "");
+            bool shape_ok = w && e.second.has("shape") && e.second["shape"].type == Json::Arr &&
+                            e.second.has("data_offsets") && e.second["data_offsets"].type == Json::Arr;
+            uint64_t n = 1;
+            if (shape_ok)
+                for (const auto& d : e.second["shape"].arr) {
+                    if (d.type != Json::Num || d.num < 0 || d.num > 9007199254740991.0 || (double)d.i() != d.num ||
+                        n > size / (uint64_t)std::max<long long>(d.i(), 1) + 1)
+                        { shape_ok = false; break; }
+                    n *= (uint64_t)d.i();
+                }
+            const auto& off = shape_ok ? e.second["data_offsets"] : Json{};
+            const bool offs_ok = shape_ok && off.arr.size() == 2 && off.arr[0].type == Json::Num && off.arr[1].type == Json::Num &&
+                                 off.arr[0].num >= 0 && off.arr[1].num >= 0 && (double)off.arr[0].i() == off.arr[0].num &&
+                                 (double)off.arr[1].i() == off.arr[1].num &&
+                                 (uint64_t)off.arr[1].i() <= size - 8 - hlen && off.arr[1].i() >= off.arr[0].i();
+            if (!offs_ok || (uint64_t)(off.arr[1].i() - off.arr[0].i()) != n * w)
+                throw std::runtime_error(path + ": " + e.first + ": malformed dtype, shape or data_offsets");
+            ranges.emplace_back((uint64_t)off.arr[0].i(), (uint64_t)off.arr[1].i());
+        }
+        std::sort(ranges.begin(), ranges.end());
+        uint64_t next = 0;
+        for (const auto& r : ranges) {
+            if (r.first != next) throw std::runtime_error(path + ": data_offsets overlap or leave a gap");
+            next = r.second;
+        }
+        if (next != size - 8 - hlen) throw std::runtime_error(path + ": payload bytes differ from the tensor extents");
+        const char* data = (const char*)base + 8 + hlen;
+        maps_.push_back({base, size});
+        paths_.push_back(path);
+        index(j, data, size - 8 - hlen, path, nullptr, false);  // the tensors come from the object validated above
+        return j;
+    } catch (...) { munmap(base, size); throw; }
+}
+
+void SafeTensors::index(const Json& j, const char* data, size_t dsize, const std::string& path,
+                        const std::set<std::string>* only, bool shadow) {
     for (auto& [name, v] : j.obj) {
         if (name == "__metadata__") continue;
         if (only && !only->count(name)) continue;

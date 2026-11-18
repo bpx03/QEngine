@@ -95,12 +95,13 @@ inline std::string fmt(const char* f, double a = 0, double b = 0, double c = 0) 
     return s;
 }
 
-// Flash-Next: host-backed expert bytes before the load. All routed groups (48 layers x 512 experts x 5 groups of
-// 506,880 B = 62.3 GB) minus what the cards keep resident: per card its free VRAM at boot minus the non-expert part,
-// 4.6 GB + 10.44 GB / cards (dense split over the TP ranks, KV pool, buffers, margins), fitted to the 1.3.4 boots:
-// 2 cards 15.5 GB resident / card (31.2 GB host), 3 cards 17.3 GB (11.9 GB host).
-inline double qfn_expert_host_est(int cards, const std::vector<double>& free_bytes) {
-    const double routed = 48.0 * 512 * 5 * 506880.0;
+// Flash-Next: host-backed expert bytes before the load. All routed groups (48 layers x 512 experts x 5 groups;
+// one 128-wide group is 506,880 B at INT4 - the default - and 998,400 B at INT8, so the INT8 plan must pass the
+// INT8 group size or it misses ~60 GB) minus what the cards keep resident: per card its free VRAM at boot minus
+// the non-expert part, 4.6 GB + 10.44 GB / cards (dense split over the TP ranks, KV pool, buffers, margins),
+// fitted to the 1.3.4 boots: 2 cards 15.5 GB resident / card (31.2 GB host), 3 cards 17.3 GB (11.9 GB host).
+inline double qfn_expert_host_est(int cards, const std::vector<double>& free_bytes, double group_bytes = 506880.0) {
+    const double routed = 48.0 * 512 * 5 * group_bytes;
     double res = 0;
     for (double f : free_bytes) res += std::max(0.0, f - 4.6 * GB - 10.44 * GB / std::max(1, cards));
     return std::max(0.0, routed - res);

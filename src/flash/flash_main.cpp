@@ -18,6 +18,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <optional>
 #include <vector>
 
 #include "../gpu_guard.h"
@@ -83,7 +84,7 @@ struct PpSetup {
     std::vector<std::vector<int>> groups;
     int nst = 0;                      // stages
 };
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     std::string ids_file, cold_file = "default";
     std::string model = "models/Qwen3.8-Flash-Next-QE-INT4", ids_s, logits_path, devs_s, w_s;
     int gen = 16, ctx = 262144, kdraft = 0;
@@ -114,6 +115,13 @@ int main(int argc, char** argv) {
         else if (a == "--ids-file") ids_file = nxt();
         else if (a == "--cold") cold_file = nxt();
     }
+    const bool use_mtp = kdraft > 0;
+    Checkpoint checkpoint;
+    // FLASH_MTP_FILE: the QFN-named override (QE_MTP_FILE belongs to the QEngine 27B engine)
+    checkpoint.open(model,use_mtp,env_str("FLASH_MTP_FILE") ? env_str("FLASH_MTP_FILE") : "");
+    const SafeTensors& st=checkpoint.body;
+    const SafeTensors& mst=checkpoint.mtp;
+    const SafeTensors& ngram_tensors=checkpoint.ngram_tensors();
     std::vector<int> devs, prompt;
     if (devs_s.empty()) {  // default: every visible GPU (CUDA_VISIBLE_DEVICES), at most 3
         int n = 0;
@@ -210,32 +218,24 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     auto secs = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
 
-    SafeTensors st;
-    {
-        DIR* d = opendir(model.c_str());
-        for (dirent* e; (e = readdir(d));) {
-            std::string n = e->d_name;
-            if (n.size() > 12 && n.substr(n.size() - 12) == ".safetensors" && n.rfind("mtp", 0) != 0) st.open(model + "/" + n);
-        }
-        closedir(d);
-    }
-    SafeTensors mst;  // MTP: BF16 dense parts + the INT4 experts
-    bool use_mtp = kdraft > 0;
-    if (use_mtp) {
-        mst.open(model + "/mtp.safetensors");
-        mst.open(model + "/mtp-int4.safetensors");
-    }
+    // Checkpoint owns every mapping until all workers and startup threads finish.
     HostTables ht;
     // INT8 n-gram table when the model directory has it (FLASH_NGRAM=bf16 / int8 forces one)
     const char* ngv = env_str("FLASH_NGRAM");
-    const bool ng8 = ngv ? !strcmp(ngv, "int8") : st.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_0");
+    const bool ng8 = checkpoint.format == WeightFormat::Int8 || (ngv ? !strcmp(ngv, "int8") : ngram_tensors.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_0"));
+    // the one-span pin (offset + owner file of the whole table) is decided by the manifest's recorded table; the
+    // manifest-less route keeps the released loader's mapping scan (no gap-free shard requirement)
+    std::optional<checkpoint_detail::NgramSpan> ngram_span;
+    if (checkpoint.has_manifest) ngram_span = checkpoint_detail::ngram_span(ngram_tensors, ng8);
     {
         const TensorInfo& emb = st.get("model.language_model.embed_tokens.weight");
+        if(emb.dtype!="BF16" || emb.shape!=std::vector<long long>{VOCAB,H} || emb.nbytes!=(size_t)VOCAB*H*2)
+            throw std::runtime_error("model.language_model.embed_tokens.weight: expected BF16 [248320,2560]");
         ht.embed = (const bf16*)pin_host(emb.data, emb.nbytes);
         const std::string pe = "model.language_model.layers.1.ple.ple_embedding.";
         for (int i = 0; i < 128; i++) {
-            if (ng8) ht.ngram8.push_back((const uint8_t*)st.get(pe + "ngram_q8.shard_" + std::to_string(i)).data);
-            else ht.ngram.push_back((const bf16*)st.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight").data);
+            if (ng8) ht.ngram8.push_back((const uint8_t*)ngram_tensors.get(pe + "ngram_q8.shard_" + std::to_string(i)).data);
+            else ht.ngram.push_back((const bf16*)ngram_tensors.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight").data);
         }
         memcpy(ht.mult, st.get(pe + "layer_multipliers").data, 24);
         memcpy(ht.vsz, st.get(pe + "ngram_heads_vocab_sizes").data, 8 * PLE_HEADS);
@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
         uintptr_t lo = ~(uintptr_t)0, hi = 0;
         auto tens = [&](int i) -> const TensorInfo& {
             const std::string pe = "model.language_model.layers.1.ple.ple_embedding.";
-            return ng8 ? st.get(pe + "ngram_q8.shard_" + std::to_string(i)) : st.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight");
+            return ng8 ? ngram_tensors.get(pe + "ngram_q8.shard_" + std::to_string(i)) : ngram_tensors.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight");
         };
         for (int i = 0; i < 128; i++) {
             const TensorInfo& t = tens(i);
@@ -257,7 +257,9 @@ int main(int argc, char** argv) {
         // file-backed mappings cannot be registered: copied into page-locked THP memory (pin_host)
         const size_t b = lo, e = hi;
         size_t foff = 0;
-        const std::string fpath = st.file_of((const void*)b, &foff);
+        std::string fpath;
+        if (ngram_span) { foff = ngram_span->offset; fpath = ngram_span->file; }
+        else fpath = ngram_tensors.file_of((const void*)b, &foff);  // (manifest-less route: the released loader's scan)
         const bool pinned = env_int("FLASH_NGRAM_PIN", 1);  // 0: file mapping (HMM)
         if (!pinned && (env_int("FLASH_NGRAM_RANDOM", 1)))  // random rows: no read-around
             madvise((void*)(b & ~(uintptr_t)4095), e - (b & ~(uintptr_t)4095), MADV_RANDOM);
@@ -335,8 +337,8 @@ int main(int argc, char** argv) {
         if (env_int("FLASH_CARD_CAL", 1)) printf("cards: %s\n", pp_calibrate(devs).c_str());  // (heterogeneous split)
         {
             std::string err;
-            pps.bounds = pps.pptp ? pptp_bounds(pps.groups, (long long)prompt.size(), &err)
-                                  : pp_bounds(ncards, (long long)prompt.size(), pps.par == flash_pp::Par::PP, &err);
+            pps.bounds = pps.pptp ? pptp_bounds(pps.groups, (long long)prompt.size(), &err, weight_group_bytes(checkpoint.format))
+                                  : pp_bounds(ncards, (long long)prompt.size(), pps.par == flash_pp::Par::PP, &err, weight_group_bytes(checkpoint.format));
             if (pps.bounds.empty()) { fprintf(stderr, "flash_run: %s\n", err.c_str()); return 1; }
         }
         printf("pipeline (%s): %d stages, layers", pps.pptp ? "pptp" : flash_pp::par_name(pps.par), pps.nst);
@@ -345,12 +347,16 @@ int main(int argc, char** argv) {
         printf("%s\n", ng ? (" ; TP decode on " + std::to_string(ng) + " cards").c_str() : "");
     }
     std::vector<Worker*> W(ng);
+    struct WorkerLifetime {
+        const std::vector<Worker*>& workers;
+        ~WorkerLifetime() { for(auto* worker:workers) if(worker) worker->stop_ngram_stage(); }
+    } worker_lifetime{W};
     std::vector<int> nw(ng);
     // mode A: the stage workers share the first ng cards with the TP workers; FLASH_PP_STAGE_MB (default: the planner's
     // stage fixed size + its KV for the context + 2 GB of experts) stays free while the TP workers take their budget
     std::vector<void*> holds;
     if (pps.par == flash_pp::Par::PP_PREFILL) {
-        const flash_pp::ModelBytes mb;
+        const flash_pp::ModelBytes mb((double)flash::group_bytes(checkpoint.format));
         for (int r = 0; r < ng; r++) {
             const flash_pp::StageMem m = flash_pp::stage_mem(mb, flash_pp::Card{}, pps.bounds[r], pps.bounds[r + 1], r == ncards - 1, use_mtp, 8704, 0, 1.04e9);
             // views: the dense part, buffers, KV and ring (m.fixed with a 2 GB ring) + the MTP block's own experts on the
@@ -370,7 +376,12 @@ int main(int argc, char** argv) {
         // sizing its expert cache to its share of what is free then
         std::vector<std::thread> th;
         std::vector<int> udev;
+        std::vector<std::exception_ptr> errors(ng);
         for (int r = 0; r < ng; r++) if (std::find(udev.begin(), udev.end(), devs[r]) == udev.end()) udev.push_back(devs[r]);
+        // a thread the system could not start throws here: the joinables already created would be
+        // destroyed (std::terminate) at the vector's unwind - join them on that way out
+        struct LoaderJoiner { std::vector<std::thread>* th; bool ok = false;
+            ~LoaderJoiner() { if (ok) return; for (auto& t : *th) if (t.joinable()) t.join(); } } lj{&th};
         for (int d : udev)
             th.emplace_back([&, d] {
                 std::vector<int> mine;
@@ -378,7 +389,8 @@ int main(int argc, char** argv) {
                 for (size_t j = 0; j < mine.size(); j++) {
                     const int r = mine[j];
                     CUDA_CHECK(cudaSetDevice(d));
-                    W[r] = new Worker(plans[r], devs[r], comm, ctx);
+                    try {
+                    W[r] = new Worker(plans[r], devs[r], comm, ctx, checkpoint.format);
                     W[r]->set_cold(cold);
                     W[r]->set_expert_prior(prior);
                     W[r]->set_draft_vocab(draft_ids);
@@ -386,9 +398,12 @@ int main(int argc, char** argv) {
                     W[r]->load(st, ht, use_mtp ? &mst : nullptr);
                     nw[r] = W[r]->nallocs();
                     W[r]->alloc_state();
+                    } catch (...) { errors[r] = std::current_exception(); }
                 }
             });
         for (auto& t : th) t.join();
+        lj.ok = true;  // all loader threads are joined
+        for(const auto& error:errors) if(error) std::rethrow_exception(error);
     }
     for (size_t r = 0; r < holds.size(); r++)
         if (holds[r]) { CUDA_CHECK(cudaSetDevice(devs[r])); CUDA_CHECK(cudaFree(holds[r])); }
@@ -398,8 +413,8 @@ int main(int argc, char** argv) {
         const int stage_seqs = env_set("FLASH_MAX_SEQS") ? 0 : pps.par == flash_pp::Par::PP ? std::max(1, env_int("FLASH_PP_SEQS", 1)) : 1;
         std::vector<const Worker*> vw;
         if (pps.views) vw.assign(W.begin(), W.end());
-        pps.S = pps.pptp ? pp_make_groups(pps.groups, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd, stage_seqs)
-                         : pp_make_stages(devs, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd, vw, stage_seqs);
+        pps.S = pps.pptp ? pp_make_groups(pps.groups, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd, checkpoint.format, stage_seqs)
+                         : pp_make_stages(devs, pps.bounds, ctx, st, ht, use_mtp ? &mst : nullptr, cold, prior, draft_ids, ngd, checkpoint.format, vw, stage_seqs);
         pps.mb = pp_microbatch(pps.S, pps.bounds, (long long)prompt.size());
         int maxb = 0;
         for (Worker* w : pps.S) maxb = std::max(maxb, w->pf_batch((long long)prompt.size() + 64));
@@ -1406,4 +1421,12 @@ int main(int argc, char** argv) {
     for (int t : gen_toks) printf(",%d", t);
     printf("\n");
     return 0;
+}
+catch (const std::exception& ex) {
+    fprintf(stderr,"flash_run: %s\n",ex.what());
+    return 1;
+}
+catch (...) {
+    fprintf(stderr,"flash_run: unknown startup failure\n");
+    return 1;
 }

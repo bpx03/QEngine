@@ -159,6 +159,8 @@ batches only).
 
 ### KV cache in host RAM (Flash-Next)
 
+> QFN INT8 (W8) checkpoints: format, conversion and machine needs: [flash-next-int8.md](flash-next-int8.md).
+
 By default the attention KV of all conversations shares one VRAM pool of 262,144 tokens. With `FLASH_KV=ram` the K/V
 rows of the 12 sparse-attention layers and the MTP layer live in pinned host RAM, and VRAM keeps the indexer keys of
 every position plus a cache of recently used KV blocks. The blocks the indexer selects that are not in the cache are

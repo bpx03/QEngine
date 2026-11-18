@@ -43,6 +43,9 @@ void gemv_w8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cuda
 void quantize_w8(const bf16* src, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st);
 // pre-quantized INT8 (row-major int8 [n][k] + bf16 group-128 scales [n][k/128]) into the same W8 layout
 void tile_w8(const int8_t* src, const bf16* ssrc, int n, int k, uint4* dst_q, bf16* dst_s, cudaStream_t st);
+// Offset-binary packed checkpoint codes use the same tile layout, with the sign bit restored.
+void repack_w8(const int32_t* src_q, const bf16* src_s, int n, int k, uint4* dst_q,
+               bf16* dst_s, cudaStream_t st);
 inline size_t w8_qbytes(int n, int k) { return (size_t)n * k; }
 
 // y[m][n] = sum_k x[m][k] * W[n][k]   (fp32 out, row stride ldy; x bf16 with row stride ldx)

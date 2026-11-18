@@ -42,6 +42,23 @@ __device__ __forceinline__ void q_dequant(uint32_t q0, uint32_t q1, uint32_t a[4
     a[2] = q_nib4(q1);
     a[3] = q_nib4(q1 >> 4);
 }
+// Expert XQ swaps the middle two bytes relative to the row-GEMM R8 layout.
+template <int Bits>
+__device__ __forceinline__ void q_expert_fragment(const uint4* w, int c, uint32_t a[2][4]) {
+    if constexpr (Bits == 4) {
+        q_dequant(w[c].x, w[c].y, a[0]);
+        q_dequant(w[c].z, w[c].w, a[1]);
+    } else {
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const uint4 u = w[2 * c + s];
+            a[s][0] = __byte_perm(u.x, u.y, 0x5140);
+            a[s][1] = __byte_perm(u.x, u.y, 0x7362);
+            a[s][2] = __byte_perm(u.z, u.w, 0x5140);
+            a[s][3] = __byte_perm(u.z, u.w, 0x7362);
+        }
+    }
+}
 __device__ __forceinline__ float q_scale(float amax) {  // 22 significant bits: M * sx exact in fp32
     return amax > 0.f ? __uint_as_float(__float_as_uint(amax / 127.f) & ~3u) : 1.f;
 }
@@ -132,6 +149,151 @@ __global__ void __launch_bounds__(160) k_agq_unpack(const char* __restrict__ in,
 // fragment loads), the weights and their scales go straight to registers two steps ahead. act[aoff + t][128] (XH
 // layout) = silu(g) * u * w, as k_moe_gu_pf2. Jobs run largest index first (the shared expert's 64-row jobs are last).
 constexpr int GQ_TT = 64, GQ_KS = 128, GQ_NST = 4;
+template <int Bits, int G, int NTT, int WT>  // WT: 16-row tiles per warp
+__device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __restrict__ tl, const float* __restrict__ wl,
+                                         const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
+                                         __half* __restrict__ act, int8_t (*xs)[GQ_TT][GQ_KS],
+                                         float2 (*ss)[GQ_TT][GQ_KS / G]) {
+    static_assert(Bits == 4 || Bits == 8, "Bits");
+    constexpr int KS = GQ_KS, NKS = H / KS, NST = GQ_NST, SUB = KS / G, chunks = (H >> 6) * (Bits / 4), groups = H >> 7;
+    constexpr int NW = Bits / 2;
+    const int m = pj.n;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    // staging: thread -> token row st_r (0..63), 16-byte pieces 2 st_h, 2 st_h + 1 of the 128-byte step slice
+    const int st_r = threadIdx.x >> 2, st_h = threadIdx.x & 3;
+    const int8_t* xrow = xq + (size_t)tl[pj.off + (st_r < m ? st_r : m - 1)] * XQ_LD;
+    const float2* srow = xqs + (size_t)tl[pj.off + ((int)threadIdx.x < m ? (int)threadIdx.x : m - 1)] * XQS_LD;
+    auto stage = [&](int ks) {
+        const int b = ks % NST;
+        if (st_r < 8 * NTT) {
+#pragma unroll
+            for (int p2 = 0; p2 < 2; p2++) {
+                const int p = 2 * st_h + p2, ps = p ^ ((st_r & 1) << 2);
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[b][st_r][ps * 16]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(xrow + ks * KS + p * 16));
+            }
+        }
+        // the token's scales: L2 only (.cg / ld.cg), never L1. They live in the XH rows k_xh_to_q quantized in place
+        // just before; an L1 line of the old fp16 row (an SM that read those rows earlier, e.g. k_xh_to_x on the comm
+        // stream) returned stale scales through cp.async.ca: a few tokens' activations garbage now and then
+        // (rc3_fixes_2026-10-27: 4-6 / 10 det 16K repeats differ, gate_up run twice on the same inputs differed)
+        if ((int)threadIdx.x < 8 * NTT) {
+            if constexpr (SUB == 2) {
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(&ss[b][threadIdx.x][0]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(srow + ks * SUB));
+            } else {
+#pragma unroll
+                for (int s = 0; s < SUB; s++) ss[b][threadIdx.x][s] = __ldcg(srow + ks * SUB + s);
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    const int tw0 = WT == 2 ? 2 * warp : 8 * rh + warp;  // first 16-row tile of the warp
+    const uint4* qp[WT];
+    const void* sp[WT];
+#pragma unroll
+    for (int a = 0; a < WT; a++) {
+        qp[a] = pj.w.gq + (size_t)(tw0 + a) * chunks * 32 + lane;
+        sp[a] = reinterpret_cast<const char*>(pj.w.gs) + (size_t)(tw0 + a) * groups * 16 * 2;
+    }
+    float acc[WT][NTT][4];
+#pragma unroll
+    for (int a = 0; a < WT; a++)
+#pragma unroll
+        for (int j = 0; j < NTT; j++) acc[a][j][0] = acc[a][j][1] = acc[a][j][2] = acc[a][j][3] = 0.f;
+#pragma unroll
+    for (int s = 0; s < NST - 1; s++) stage(s);
+    uint4 wn[WT][NW], wn2[WT][NW];  // weights of the next two steps
+    typename ScaleRaw<Bits>::type sn[WT][2], sn2[WT][2];  // weight scales (rows g, g + 8) of the next two steps
+#pragma unroll
+    for (int a = 0; a < WT; a++) {
+#pragma unroll
+        for (int q = 0; q < NW; q++) {
+            wn[a][q] = __ldg(qp[a] + q * 32);
+            wn2[a][q] = __ldg(qp[a] + (NW + q) * 32);
+        }
+        sn[a][0] = gs_raw<Bits>(sp[a], g); sn[a][1] = gs_raw<Bits>(sp[a], g + 8);
+        sn2[a][0] = gs_raw<Bits>(sp[a], 16 + g); sn2[a][1] = gs_raw<Bits>(sp[a], 24 + g);
+    }
+    for (int ks = 0; ks < NKS; ks++) {
+        const int b = ks % NST;
+        uint4 w[WT][NW];
+        float sw0[WT], sw8[WT];
+#pragma unroll
+        for (int a = 0; a < WT; a++) {
+#pragma unroll
+            for (int q = 0; q < NW; q++) {
+                w[a][q] = wn[a][q]; wn[a][q] = wn2[a][q];
+                if (ks + 2 < NKS) wn2[a][q] = __ldg(qp[a] + (size_t)((ks + 2) * NW + q) * 32);
+            }
+            sw0[a] = gs_f<Bits>(sn[a][0]); sw8[a] = gs_f<Bits>(sn[a][1]);
+            sn[a][0] = sn2[a][0]; sn[a][1] = sn2[a][1];
+            if (ks + 2 < NKS) {
+                sn2[a][0] = gs_raw<Bits>(sp[a], (ks + 2) * 16 + g);
+                sn2[a][1] = gs_raw<Bits>(sp[a], (ks + 2) * 16 + g + 8);
+            }
+        }
+        asm volatile("cp.async.wait_group %0;" ::"n"(NST - 2));
+        __syncthreads();
+        if (ks + NST - 1 < NKS) stage(ks + NST - 1);
+        else asm volatile("cp.async.commit_group;");  // keep the group count in step
+        uint32_t ci[WT][NTT][4];  // integer sums of the current activation group (+ M)
+#pragma unroll
+        for (int c = 0; c < 2; c++) {  // 64-k chunk c of the step
+            uint32_t A[WT][2][4];      // [tile][k32 step][fragment]
+#pragma unroll
+            for (int a = 0; a < WT; a++) {
+                q_expert_fragment<Bits>(w[a], c, A[a]);
+            }
+            const bool first = c == 0 || G == 64;
+#pragma unroll
+            for (int s2 = 0; s2 < 2; s2++) {
+#pragma unroll
+                for (int j = 0; j < NTT; j++) {
+                    const int row = 8 * j + g, pc = (c * 4 + t4) ^ ((row & 1) << 2);
+                    const uint2 bq = *reinterpret_cast<const uint2*>(&xs[b][row][pc * 16 + 8 * s2]);
+#pragma unroll
+                    for (int a = 0; a < WT; a++) {
+                        if (s2 == 0 && first) q_mma_init(ci[a][j], A[a][0], bq.x, bq.y);
+                        else q_mma(ci[a][j], A[a][s2], bq.x, bq.y);
+                    }
+                }
+            }
+            if (G == 128 && c == 0) continue;
+            // flush the group's integer sums: (f - M) * sx per token, then * sw per row
+            const int sg = G == 64 ? c : 0;
+#pragma unroll
+            for (int j = 0; j < NTT; j++) {
+                const float2 x0 = ss[b][8 * j + 2 * t4][sg], x1 = ss[b][8 * j + 2 * t4 + 1][sg];
+#pragma unroll
+                for (int a = 0; a < WT; a++) {
+                    const float f0 = __fmaf_rn(__uint_as_float(ci[a][j][0]), x0.x, x0.y);
+                    const float f1 = __fmaf_rn(__uint_as_float(ci[a][j][1]), x1.x, x1.y);
+                    const float f2 = __fmaf_rn(__uint_as_float(ci[a][j][2]), x0.x, x0.y);
+                    const float f3 = __fmaf_rn(__uint_as_float(ci[a][j][3]), x1.x, x1.y);
+                    const float s0 = sw0[a], s8 = sw8[a];
+                    acc[a][j][0] = __fmaf_rn(f0, s0, acc[a][j][0]);
+                    acc[a][j][1] = __fmaf_rn(f1, s0, acc[a][j][1]);
+                    acc[a][j][2] = __fmaf_rn(f2, s8, acc[a][j][2]);
+                    acc[a][j][3] = __fmaf_rn(f3, s8, acc[a][j][3]);
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();  // the next job of this block restages the buffers
+#pragma unroll
+    for (int a = 0; a < WT; a++) {
+        const int col = (tw0 + a) * 8 + g;
+#pragma unroll
+        for (int j = 0; j < NTT; j++) {
+            const int n0 = 8 * j + 2 * t4, n1 = n0 + 1;
+            if (n0 < m) store_xh(act + (size_t)(pj.aoff + n0) * GRP, col, silu(acc[a][j][0]) * acc[a][j][2] * wl[pj.off + n0]);
+            if (n1 < m) store_xh(act + (size_t)(pj.aoff + n1) * GRP, col, silu(acc[a][j][1]) * acc[a][j][3] * wl[pj.off + n1]);
+        }
+    }
+}
+
 template <int G, int NTT, int WT>  // WT: 16-row tiles per warp (2: the whole group in one block, 1: half, rh)
 __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __restrict__ tl, const float* __restrict__ wl,
                                          const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
@@ -268,6 +430,8 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
         }
     }
 }
+
+// INT4 prefill gate/up kernel as released with part 1 (the INT8 variant is k_moe_gu_q_w8 below)
 template <int G, int WT = 2>  // WT = 1: two blocks per job (row halves), ~half the registers (2 blocks / SM)
 __global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                      const int* __restrict__ tl, const float* __restrict__ wl,
@@ -289,6 +453,31 @@ __global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q(const PfJob* 
             case 6: gu_q_job<G, 6, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
             case 7: gu_q_job<G, 7, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
             default: gu_q_job<G, 8, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+        }
+    }
+}
+template <int Bits, int G, int WT = 2>  // WT = 1: two blocks per job (row halves)
+
+__global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q_w8(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
+                                                     const int* __restrict__ tl, const float* __restrict__ wl,
+                                                     const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
+                                                     __half* __restrict__ act) {
+    static_assert(G == 64 || G == 128, "G");
+    __shared__ __align__(16) int8_t xs[GQ_NST][GQ_TT][GQ_KS];
+    __shared__ __align__(16) float2 ss[GQ_NST][GQ_TT][GQ_KS / G];
+    const int nj = *njobs;
+    for (int jb = (int)blockIdx.x; jb < nj * (3 - WT); jb += gridDim.x) {
+        const int job = nj - 1 - jb / (3 - WT), rh = jb % (3 - WT);
+        const PfJob pj = jobs[job];
+        switch ((pj.n + 7) >> 3) {
+            case 1: gu_q_job<Bits, G, 1, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 2: gu_q_job<Bits, G, 2, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 3: gu_q_job<Bits, G, 3, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 4: gu_q_job<Bits, G, 4, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 5: gu_q_job<Bits, G, 5, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 6: gu_q_job<Bits, G, 6, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 7: gu_q_job<Bits, G, 7, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            default: gu_q_job<Bits, G, 8, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
         }
     }
 }
@@ -326,9 +515,11 @@ __global__ void __launch_bounds__(256) k_act_to_q(__half* __restrict__ act, int 
     *reinterpret_cast<uint4*>(row + 16 * i) = make_uint4(o4[0], o4[1], o4[2], o4[3]);
     if (i == 0) { const float sxv = sc * kXhScale; *reinterpret_cast<float2*>(row + GRP) = make_float2(sxv, -kQMagic * sxv); }
 }
-template <int NTT, int TT, bool PK = true>  // TT: 16-row output tiles per warp (block: 4 x TT tiles); PK: half2 slot stores
+template <int Bits, int NTT, int TT, bool PK = true>  // TT: 16-row output tiles per warp (block: 4 x TT tiles); PK: half2 slot stores
 __device__ __forceinline__ void dn_q_job(const PfJob* __restrict__ jobs, int job, int ngj, const __half* __restrict__ act,
                                          SlotBuf slots) {
+    static_assert(Bits == 4 || Bits == 8, "Bits");
+    constexpr int NW = Bits / 2;
     const int pn = jobs[job].n, poff = jobs[job].off;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
     const int rb = (blockIdx.x * 4 + warp) * TT;
@@ -340,14 +531,15 @@ __device__ __forceinline__ void dn_q_job(const PfJob* __restrict__ jobs, int job
         for (int j = 0; j < NTT; j++) acc[a][j][0] = acc[a][j][1] = acc[a][j][2] = acc[a][j][3] = 0.f;
     for (int k = 0; k < ngj; k++) {
         const PfJob pj = jobs[job + k];
-        uint4 w[TT][2];
+        uint4 w[TT][NW];
         float s0[TT], s8[TT];
 #pragma unroll
         for (int a = 0; a < TT; a++) {
-            const uint4* qp = pj.w.dq + (size_t)(rb + a) * 2 * 32 + lane;
-            w[a][0] = __ldg(qp); w[a][1] = __ldg(qp + 32);
-            s0[a] = __half2float(pj.w.ds[(rb + a) * 16 + g]);
-            s8[a] = __half2float(pj.w.ds[(rb + a) * 16 + g + 8]);
+            const uint4* qp = pj.w.dq + (size_t)(rb + a) * NW * 32 + lane;
+#pragma unroll
+            for (int q = 0; q < NW; q++) w[a][q] = __ldg(qp + q * 32);
+            s0[a] = moe_scale<Bits>(pj.w.ds, (rb + a) * 16 + g);
+            s8[a] = moe_scale<Bits>(pj.w.ds, (rb + a) * 16 + g + 8);
         }
         uint4 bq[NTT][2];
         float2 x0[NTT], x1[NTT];
@@ -367,8 +559,7 @@ __device__ __forceinline__ void dn_q_job(const PfJob* __restrict__ jobs, int job
             uint32_t A[TT][2][4];
 #pragma unroll
             for (int a = 0; a < TT; a++) {
-                q_dequant(w[a][c].x, w[a][c].y, A[a][0]);
-                q_dequant(w[a][c].z, w[a][c].w, A[a][1]);
+                q_expert_fragment<Bits>(w[a], c, A[a]);
             }
 #pragma unroll
             for (int s2 = 0; s2 < 2; s2++)
@@ -439,7 +630,7 @@ __device__ __forceinline__ void dn_q_job(const PfJob* __restrict__ jobs, int job
         }
     }
 }
-template <int TT = 2, bool PK = true, int MINB = 1>  // grid (H / 16 / 4 / TT, jobs)
+template <int Bits, int TT = 2, bool PK = true, int MINB = 1>  // grid (H / 16 / 4 / TT, jobs)
 __global__ void __launch_bounds__(128, MINB) k_moe_dn_q(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                   const __half* __restrict__ act, SlotBuf slots) {
     const int job = blockIdx.y;
@@ -453,14 +644,14 @@ __global__ void __launch_bounds__(128, MINB) k_moe_dn_q(const PfJob* __restrict_
         sb.lo = lo;
     }
     switch ((jobs[job].n + 7) >> 3) {
-        case 1: dn_q_job<1, TT, PK>(jobs, job, ngj, act, sb); break;
-        case 2: dn_q_job<2, TT, PK>(jobs, job, ngj, act, sb); break;
-        case 3: dn_q_job<3, TT, PK>(jobs, job, ngj, act, sb); break;
-        case 4: dn_q_job<4, TT, PK>(jobs, job, ngj, act, sb); break;
-        case 5: dn_q_job<5, TT, PK>(jobs, job, ngj, act, sb); break;
-        case 6: dn_q_job<6, TT, PK>(jobs, job, ngj, act, sb); break;
-        case 7: dn_q_job<7, TT, PK>(jobs, job, ngj, act, sb); break;
-        default: dn_q_job<8, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 1: dn_q_job<Bits, 1, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 2: dn_q_job<Bits, 2, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 3: dn_q_job<Bits, 3, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 4: dn_q_job<Bits, 4, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 5: dn_q_job<Bits, 5, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 6: dn_q_job<Bits, 6, TT, PK>(jobs, job, ngj, act, sb); break;
+        case 7: dn_q_job<Bits, 7, TT, PK>(jobs, job, ngj, act, sb); break;
+        default: dn_q_job<Bits, 8, TT, PK>(jobs, job, ngj, act, sb); break;
     }
 }
 

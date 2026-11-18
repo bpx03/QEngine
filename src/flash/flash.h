@@ -26,6 +26,7 @@
 #include "../kernels/sample.cuh"
 #include "../safetensors.h"
 #include "graph_oom.h"
+#include "checkpoint.h"
 
 namespace flash {
 // a thread that drives the workers (the API caller in run() / each(), the rank threads): the only ones that may take
@@ -205,11 +206,29 @@ constexpr int GRP = 128, NGRP = INTER / GRP;
 constexpr size_t GG_Q = (size_t)2 * GRP * H / 2, GG_S = (size_t)2 * GRP * (H / 128) * 2;
 constexpr size_t GD_Q = (size_t)H * GRP / 2, GD_S = (size_t)H * (GRP / 128) * 2;
 constexpr size_t GRP_BYTES = GG_Q + GG_S + GD_Q + GD_S;
+template<int Bits> struct ExpertLayout {
+    static_assert(Bits == 4 || Bits == 8);
+    static constexpr size_t gate_q = (size_t)2 * GRP * H * Bits / 8;
+    static constexpr size_t gate_s = GG_S;
+    static constexpr size_t down_q = (size_t)H * GRP * Bits / 8;
+    static constexpr size_t down_s = GD_S;
+    static constexpr size_t gs = gate_q;
+    static constexpr size_t dq = gs + gate_s;
+    static constexpr size_t ds = dq + down_q;
+    static constexpr size_t bytes = ds + down_s;
+};
+static_assert(ExpertLayout<4>::bytes == GRP_BYTES);
+static_assert(ExpertLayout<8>::bytes == 998400);
+// the expert group size a checkpoint's weight format carries (planning arithmetic; not device code)
+inline double weight_group_bytes(WeightFormat f) { return f == WeightFormat::Int8 ? (double)ExpertLayout<8>::bytes : (double)ExpertLayout<4>::bytes; }
+// the 128-wide expert group size of an opened checkpoint format: the host RAM plan and the pipeline planner size
+// the experts with it (INT8 groups are 998,400 B, not the INT4 506,880 B)
+inline size_t group_bytes(WeightFormat format) { return format == WeightFormat::Int8 ? ExpertLayout<8>::bytes : ExpertLayout<4>::bytes; }
 constexpr int MAXJOB = 896;              // job lists: at least this (3 cards: >= the groups of any card, 2565 x 0.34 + margin);
                                          // a card with more local groups (2 cards: ~1283) sizes them by plan_groups
 constexpr int PF_SHJ = 64;               // prefill: rows per shared-expert job (the shared expert sees every row)
 constexpr int MAXJOB_PF = 3072;  // prefill jobs: (expert, 64-row chunk, local group) <= 896 + 2 x rows x 11 / 64 (4096 rows)
-struct MoeJob {            // device descriptor of one local expert group
+struct MoeJob {            // device descriptor of one local expert group (scales: __half for INT4, bf16 for W8)
     const uint4* gq; const __half* gs;
     const uint4* dq; const __half* ds;
 };
@@ -223,7 +242,19 @@ struct ColdTab {
     __host__ __device__ ColdTab(const uintptr_t* p, unsigned char* t) : ptr(p), touch(t) {}
 };
 #ifdef __CUDACC__
+template<int Bits>
 __device__ __forceinline__ const char* grp_ptr(const char* groups, int li, int ndev, const ColdTab& ct, unsigned* coldcnt) {
+    if (li < ndev) return groups + (size_t)li * ExpertLayout<Bits>::bytes;
+    const int ci = li - ndev;
+    const uintptr_t p = ct.ptr[ci];
+    ct.touch[ci] = 1;
+    if ((p & 1) && coldcnt) atomicAdd(coldcnt, 1u);
+    return reinterpret_cast<const char*>(p & ~(uintptr_t)1);
+}
+#endif
+
+#ifdef __CUDACC__
+__device__ __forceinline__ const char* grp_ptr4(const char* groups, int li, int ndev, const ColdTab& ct, unsigned* coldcnt) {
     if (li < ndev) return groups + (size_t)li * GRP_BYTES;
     const int ci = li - ndev;
     const uintptr_t p = ct.ptr[ci];
@@ -232,6 +263,7 @@ __device__ __forceinline__ const char* grp_ptr(const char* groups, int li, int n
     return reinterpret_cast<const char*>(p & ~(uintptr_t)1);
 }
 #endif
+
 struct PfJob {             // prefill: one local expert group and its rows [off, off + n) of the token / weight lists
     MoeJob w;
     int off, n;
@@ -269,6 +301,7 @@ struct Layer {
     W8 router8;            // the same INT8 g128 (default: KL at the BF16 floor)
     char* groups = nullptr;   // local expert groups, stride GRP_BYTES (device: indices < ndev)
     char* hgroups = nullptr;  // cold groups in mapped pinned host memory (indices >= ndev): the full host copy
+    W8 ple_key8, ple_val8;
     char* hgroups_h = nullptr;  // the same, host address
     // shared expert views (mode A stage, Worker::set_views): the cold groups have no own host copy; csrc[j] is cold
     // group j's address for the kernels (host-mapped, or a peer card's VRAM), csrc_h[j] the copy source (the same under
@@ -338,7 +371,7 @@ struct HostTables {        // shared by the workers (host memory)
 
 class Worker {
 public:
-    Worker(const Plan& p, int device, const Comm& comm, int max_ctx);
+    Worker(const Plan& p, int device, const Comm& comm, int max_ctx, WeightFormat format);
     void load(const SafeTensors& st, const HostTables& ht, const SafeTensors* mtp = nullptr);
     void alloc_state();             // KV pool for max_ctx, DeltaNet states, buffers
     size_t free_bytes() const;
@@ -407,6 +440,12 @@ public:
     // rows of a prefill batch whose buffers never take memory from the expert cache (the rest of pf_batch() is
     // borrowed from it for the batch, prefill-r3)
     int pf_batch_base() const { return pfbn_base_; }
+    // a prefill batch takes the expert cache's lent tails (bt_want_, reclaimed by the following ec_tick): rows past
+    // the base buffer always do; an INT8 batch staged by the copy engine also does while the ring extension lives in
+    // cache slots, so the staging gets the whole ring (pfs_full_) instead of running capped through pfs_cap0_
+    static bool prefill_borrow_tails(WeightFormat format, int n, int base, bool staged, bool extension_lent) {
+        return n > base || (format == WeightFormat::Int8 && staged && extension_lent);
+    }
     // rows of the next prefill batch with r rows left and batches of up to B rows: nominal B - PFM (a tail of <= PFM
     // rows joins the last one); with big batches (B > pf_batch_base()) the last two are balanced when the plain split
     // would leave a tail of <= pf_batch_base() rows and both halves can be big: a small
@@ -443,7 +482,7 @@ public:
     long long cold_bytes() const {
         long long n = 0;
         for (const Layer& L : L_) n += L.ncold;
-        return n * (long long)GRP_BYTES;
+        return n * (long long)group_bytes_;
     }
     void prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const bf16* ple_rows, const int* mtp_toks, int* out,
                        int* draft);
@@ -498,6 +537,8 @@ public:
     void set_ngram(const NgramDev& n) { ngp_ = n; }
     // table not pinned (FLASH_NGRAM_PIN=0): the step's rows go through a mapped staging buffer filled by a host thread
     void start_ngram_stage(const HostTables* ht);
+    // Join before the table mappings or staging buffers can be released.
+    void stop_ngram_stage();
     // temperature <= 0: greedy; else sampled verification rows / first token (same seed on every card)
     void set_sampling(float temperature, float top_p, int top_k, float min_p, unsigned long long seed);
     // presence / frequency penalty of the bound slot (after set_sampling, which turns it off); its counts restart
@@ -975,8 +1016,8 @@ private:
     int pfs_capn() const { return pfs_full_ ? pfs_cap_ : pfs_cap0_; }
     int pfs_min_rows() const;  // [qfn-p1-stage] rows from which a batch stages (FLASH_PF_STAGE_MIN, else by ring fit)
     char* pfs_addr(int half, int p) const {
-        return p < pfs_cap0_ ? pfs_ring_ + ((size_t)half * pfs_cap0_ + p) * GRP_BYTES
-                             : pfs_ext_ + ((size_t)half * (pfs_cap_ - pfs_cap0_) + (p - pfs_cap0_)) * GRP_BYTES;
+        return p < pfs_cap0_ ? pfs_ring_ + ((size_t)half * pfs_cap0_ + p) * group_bytes_
+                             : pfs_ext_ + ((size_t)half * (pfs_cap_ - pfs_cap0_) + (p - pfs_cap0_)) * group_bytes_;
     }
     long long pfs_resv_ = 0;            // bytes kept free for the ring by the expert budget
     uintptr_t* pfs_tab_d_ = nullptr;    // per cold group: its ring address (or host address | 1 past pfs_cap_)
@@ -1008,7 +1049,8 @@ private:
     bool pfs_plan();                     // decides pfs_skip_ for the coming staged batch, fills and uploads its table
     void pfs_init();
     void pfs_copy(int li);
-    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool bt = false; int prev = -1; bool ik = false; bool fz = false; bool al = false; };  // al: a KV-array tail that is also mapped as big-batch rows (al_*)  // ik: in the tail of an indexer-key array (KV streaming)  // bt: a tail of the big-batch buffers (prev: its group when taken)  // pf: lent to the prefill staging ring
+    // al: a KV-array tail also mapped as big-batch rows; ik: an indexer-key tail; bt: a big-batch tail.
+    struct EcSlot { char* addr; size_t off; int ci; cudaEvent_t ev; bool live; bool bt = false; int prev = -1; bool ik = false; bool fz = false; bool al = false; };
     std::vector<float> ec_prior_;
     std::vector<EcSlot> ec_slots_;
     std::vector<int> ec_slot_of_;      // cold group -> slot or -1
@@ -1207,6 +1249,8 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     Plan p_;
     bool dev_first_ = true;  // the first worker on its card (per-card registrations, see the constructor)
     int card_workers_ = 1;
+    WeightFormat format_ = WeightFormat::Int4;
+    size_t group_bytes_ = GRP_BYTES;
     double card_share_ = 1.0;  // the part of the card's free memory this worker's expert cache takes (several stages on a card)
   public:
     void set_card_share(double f) { card_share_ = std::clamp(f, 0.05, 1.0); }
@@ -1467,6 +1511,11 @@ private:
     int *motok_ = nullptr, *mposd_ = nullptr, *vtok_ = nullptr, *acc_ = nullptr, *dr_ = nullptr, *hist2_ = nullptr;
     int *em_ = nullptr, *em_h_ = nullptr;  // emitted tokens (host-mapped)
     NgramDev ngp_{};
+    std::atomic<bool> ng_stop_{false};
+    std::thread ng_thread_;
+    long long* ng_req_host_ = nullptr;
+    uint8_t* ng_stage_host_ = nullptr;
+    unsigned* ng_flags_host_ = nullptr;
     cudaEvent_t ev0_ = nullptr, ev1_ = nullptr;
     // FLASH_HOSTT=1 (diagnostic): host phases of the single-sequence step and the GPU idle gap between steps (rank 0)
     cudaEvent_t htev_[2] = {nullptr, nullptr};
@@ -1508,8 +1557,8 @@ private:
     void mkstream(cudaStream_t* s, unsigned flags, int prio);
     int vown_ = -1;
     void view_groups(Layer& L, int li);  // li = -1: the MTP block
-    const char* cold_h(const Layer& L, int j) const { return L.csrc_h.empty() ? L.hgroups_h + (size_t)j * GRP_BYTES : L.csrc_h[j]; }
-    const char* cold_d(const Layer& L, int j) const { return L.csrc.empty() ? L.hgroups + (size_t)j * GRP_BYTES : L.csrc[j]; }
+    const char* cold_h(const Layer& L, int j) const { return L.csrc_h.empty() ? L.hgroups_h + (size_t)j * group_bytes_ : L.csrc_h[j]; }
+    const char* cold_d(const Layer& L, int j) const { return L.csrc.empty() ? L.hgroups + (size_t)j * group_bytes_ : L.csrc[j]; }
     // copies out of the cold sources: host -> device (TP), or any (views: peer VRAM too)
     cudaMemcpyKind cold_kind() const { return vtp_.empty() ? cudaMemcpyHostToDevice : cudaMemcpyDefault; }
     void* pp_rx_[2] = {};

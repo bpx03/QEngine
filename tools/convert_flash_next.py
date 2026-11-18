@@ -51,8 +51,9 @@ NE, H, I = 512, 2560, 640
 GPTQ_DENSE = {"linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
               "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"}
 
-# QSA q/k/v/o stay BF16 (engine: INT8 at load): RTN INT4 of them lengthened reasoning ~2.9x in a community
-# W4A16 (community report); MTP stays BF16 (fp8 MTP halved acceptance, HF #47)
+# Legacy W4A16 route: QSA q/k/v/o stay BF16 (engine quantizes them at load); native QFN INT8
+# checkpoints load packed codes instead (`tools/quant_int8.py`). RTN INT4 of these lengthened reasoning
+# ~2.9x in a community W4A16 report; MTP stays BF16 (fp8 MTP halved acceptance, HF #47).
 RTN_BF16 = ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
             "ple.key_proj", "ple.value_proj")
 

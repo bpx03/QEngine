@@ -320,7 +320,9 @@ void pp_xfer_prepare(const std::vector<Worker*>& stages, const std::vector<Worke
 // set-up (flash_run, the server): stage bounds (FLASH_PP_LAYERS or the planner; empty + *err on a bad value), the peer
 // copy integrity of a card pair, the stage workers (one per card, loaded in parallel; views: mode A shared expert views
 // of these TP workers, one per card in order), the prefill micro-batch for a prompt of np tokens
-std::vector<int> pp_bounds(int n, long long np, bool decode, std::string* err);
+// group_bytes: the checkpoint's expert group size (506,880 INT4 / 998,400 INT8) so uneven-card splits price
+// the host-backed experts of an INT8 checkpoint at their real size; the default keeps the INT4 plan unchanged
+std::vector<int> pp_bounds(int n, long long np, bool decode, std::string* err, double group_bytes = 506880.0);
 // heterogeneous cards: per-card speeds (relative to the median card) and free VRAM from the boot calibration; pp_bounds
 // then splits by them when the cards differ (equal cards keep the plain split)
 void pp_set_cards(const std::vector<flash_pp::CardSpeed>& c);
@@ -331,14 +333,14 @@ bool pp_p2p_ok(int a, int b);
 std::vector<Worker*> pp_make_stages(const std::vector<int>& devs, const std::vector<int>& bounds, int ctx, const SafeTensors& st,
                                     const HostTables& ht, const SafeTensors* mst, const std::vector<std::vector<int>>& cold,
                                     const std::vector<float>& prior, const std::vector<int>& draft_ids, const NgramDev& ngd,
-                                    const std::vector<const Worker*>& views = {}, int max_seqs = 0);
+                                    WeightFormat format, const std::vector<const Worker*>& views = {}, int max_seqs = 0);
 // PP x TP: the workers of every rank of every stage (groups[s] = the devices of stage s, its ranks in order), stage by
 // stage; each group of t > 1 gets its own comm (P2P where the cards allow, the TP exchange path probe) and its ranks
 // the peers' exchange buffers. comms: the groups' comms (kept by the caller for the run)
 std::vector<Worker*> pp_make_groups(const std::vector<std::vector<int>>& groups, const std::vector<int>& bounds, int ctx,
                                     const SafeTensors& st, const HostTables& ht, const SafeTensors* mst,
                                     const std::vector<std::vector<int>>& cold, const std::vector<float>& prior,
-                                    const std::vector<int>& draft_ids, const NgramDev& ngd, int max_seqs = 0);
+                                    const std::vector<int>& draft_ids, const NgramDev& ngd, WeightFormat format, int max_seqs = 0);
 // the C API's start-up decisions for the pipeline planner, each read through the environment variable when the user
 // set it (variables, not setenv: issue #11). The first probe of the process stays. The host link in GB/s:
 void pp_set_h2d_probe(double gbps);
@@ -350,7 +352,7 @@ bool pp_hop_p2p();               // FLASH_PP_P2P, else not after pp_set_no_p2p
 std::string layout_report(const std::vector<Worker*>& W);
 bool box_report_wanted(const std::vector<int>& devs, bool pptp);
 // PP x TP stage bounds: FLASH_PP_LAYERS, else the planner's split by each group's speed (pp_plan.h group_speeds)
-std::vector<int> pptp_bounds(const std::vector<std::vector<int>>& groups, long long np, std::string* err);
+std::vector<int> pptp_bounds(const std::vector<std::vector<int>>& groups, long long np, std::string* err, double group_bytes = 506880.0);
 // the groups for FLASH_PAR=pptp from FLASH_PP_MAP / FLASH_PP_TP (default 2) over devs (empty + *err when malformed)
 std::vector<std::vector<int>> pptp_groups(const std::vector<int>& devs, std::string* err);
 // wall: the model's prefill time; ctx0: the positions before the rows (a suffix after a cached prefix: its attention reads

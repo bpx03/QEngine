@@ -660,6 +660,36 @@ from 455 to 580 tok/s on 3 cards and from 233 to 332 tok/s on 2 cards (October 3
 because short-request throughput is about 12 % lower (the indexer keys and block cache take VRAM from the experts).
 Details: [docs/advanced.md](docs/advanced.md#kv-cache-in-host-ram-flash-next).
 
+#### QFN INT8 (W8) checkpoints
+
+`tools/quant_int8.py --src <bf16 dir> --out <dir> --ngram-from <table> --kv-from ''` writes sharded body files
+(`model-00001-of-000NN.safetensors`, ≤ 20 GiB each, layer-grouped), `model_mtp.safetensors`,
+`qfn-int8-manifest.json` and — by default — the n-gram table itself (`ngram_int8.safetensors`) next to the
+weights. Selected matrices use `.weight_packed` (offset-binary INT8 codes), `.weight_scale` (BF16, group 128)
+and `.weight_shape` (I64). The manifest schema is `qfn-int8-v2`: it maps every tensor to its shard, records the
+source digest (and repo/revision only when actually given), and keeps the table identity plus `sha256`. With the
+opt-in `--external-ngram` the table stays outside the output and the manifest records identity only; mount it by
+setting `FLASH_NGRAM_PATH` (absolute or checkpoint-directory-relative) or an explicit override — these apply to
+external checkpoints; a checkpoint recorded as self-contained always opens its recorded `outputs.ngram`, and a
+configured override is reported as ignored. Format selection never depends on `config.json`. Existing upstream mixed INT4/W8 checkpoints remain supported.
+
+Selected matrices: routed and shared experts, DeltaNet projections, QSA q/k/v/o, PLE key/value and MTP attention,
+experts and fc_embedding/fc_hidden. Other tensors remain byte-identical. `--check <dir> [--src <bf16 dir>]`
+re-verifies shards, the n-gram identity and (with `--src`) re-quantized codes and scales.
+The shared `lm_head.weight` stays BF16 on disk; full and balanced-draft heads use the existing runtime W8 loader.
+
+Native W8 uses lossless repacking into the existing W8 layout. INT8 expert groups use BF16 scales and FP32
+tensor-core accumulation per 128-k group; INT4 keeps its existing arithmetic. Residency, cold staging and borrowed
+prefill storage use the selected format's group size. No quality or throughput equivalence is claimed.
+
+Build acceptance fixtures with the normal build: `flash_checkpoint_unit` validates manifests and headers (ctest);
+`flash_int8_unit` builds with the tree and checks repacking, arithmetic and residency in a GPU window.
+`INT8_MODEL=<dir>` adds real-checkpoint rows. The image needs nothing INT8-specific: the format is chosen per
+checkpoint, not by the image, and the INT4 runtime keeps working.
+
+Host RAM: about 92 GB of pinned host-backed experts on 2 cards and about 72 GB on 3 (the cards keep the same
+VRAM share as INT4), plus the base the server needs; details on the [INT8 checkpoint page](docs/flash-next-int8.md).
+
 ### Qwen3.8-27B
 
 - INT4 weights repacked at load (a few seconds, no conversion) into tensor-core layouts.

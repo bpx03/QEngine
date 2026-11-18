@@ -40,6 +40,7 @@
 #include <string>
 #include <thread>
 #include <future>
+#include <optional>
 #include <vector>
 
 #include "../json.h"
@@ -390,7 +391,9 @@ struct PpHy {
 struct FE {
     std::vector<int> devs;
     int ng = 3, ctx = 0, kmax = 3;
-    SafeTensors st, mst;
+    Checkpoint checkpoint;
+    SafeTensors& st=checkpoint.body;
+    SafeTensors& mst=checkpoint.mtp;
     HostTables ht;
     // [qfn-pf-bgap] the next prefill batch's n-gram rows, built while the current batch runs (qe_prefill_more_slot)
     std::unique_ptr<flash_ng::RowsAhead> ra;
@@ -2342,6 +2345,7 @@ static void ra_make(FE* e) {
 }  // namespace
 
 extern "C" {
+int qe_set_steering_ex(void* p, int vec, float scale, int mode, int lo, int hi);
 
 // ---------------------------------------------------------------- FLASH_PAR=pp_prefill: per-request hybrid (PpHy)
 // copy rate into card `dst` from pinned host memory (src < 0) or from card src (peer copy), bytes / s; 0 on failure
@@ -2382,7 +2386,7 @@ static void pp_hybrid_init(FE* e, const std::string& model, const std::vector<in
     h->bounds = bounds;
     // the stages hold one sequence (slot 0); FLASH_MAX_SEQS sizes the TP ranks' slots
     std::vector<const Worker*> views(e->W.begin(), e->W.end());
-    h->S = pp_make_stages(e->devs, bounds, e->ctx, e->st, e->ht, &e->mst, cold, prior, draft_ids, e->ngd, views, 1);
+    h->S = pp_make_stages(e->devs, bounds, e->ctx, e->st, e->ht, &e->mst, cold, prior, draft_ids, e->ngd, e->checkpoint.format, views, 1);
     int maxb = 0;
     for (Worker* w : h->S) maxb = std::max(maxb, w->pf_batch());
     h->pp = new PpEngine(h->S, std::max(maxb, MAXP));
@@ -2775,7 +2779,7 @@ static double wait_free_vram(const std::vector<int>& devs, double need, int* dmi
     }
     return fmin;
 }
-void* qe_create(const char* model_dir, const char* devices, int max_t, const char* split_s) {
+static void* qe_create_body(const char* model_dir, const char* devices, int max_t, const char* split_s) {
     (void)kv4_mode();  // the KV format (FLASH_KV_BITS) before any plan sizes the pool
     flash_pp::Par par = flash_pp::Par::AUTO;
     bool pptp = false;
@@ -2840,8 +2844,20 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             par = flash_pp::Par::TP;
         }
     }
+    if (!model_dir) return nullptr;  // checked before the engine is allocated: nothing to release yet
     FE* e = new FE();
     const std::string model = model_dir;
+    try {
+        // the MTP block is opened as before the checkpoint loader (upstream opens both MTP files unconditionally):
+        // FLASH_MTP_K=0 only turns the draft off while &e->mst still reaches every Worker::load and the pipeline
+        // builders, so an unopened MTP would leave empty tensors for the loader threads. The override is
+        // FLASH_-named: QE_MTP_FILE belongs to the QEngine 27B engine
+        e->checkpoint.open(model,true,env_str("FLASH_MTP_FILE")?env_str("FLASH_MTP_FILE"):"");
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "qflash: %s\n", ex.what());
+        delete e; return nullptr;
+    }
+    const SafeTensors& ngram_tensors=e->checkpoint.ngram_tensors();
     for (auto& x : split(devices && *devices ? devices : "0,1,2", ',')) e->devs.push_back(std::stoi(x));
     e->ng = e->devs.size();
     std::vector<std::vector<int>> groups;  // PP x TP: the stages' cards
@@ -2933,29 +2949,27 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     }
     auto t0 = std::chrono::steady_clock::now();
     auto secs = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-    {
-        DIR* d = opendir(model.c_str());
-        if (!d) { fprintf(stderr, "qflash: cannot open %s\n", model_dir); delete e; return nullptr; }
-        for (dirent* de; (de = readdir(d));) {
-            std::string n = de->d_name;
-            if (n.size() > 12 && n.substr(n.size() - 12) == ".safetensors" && n.rfind("mtp", 0) != 0) e->st.open(model + "/" + n);
-        }
-        closedir(d);
-    }
-    e->mst.open(model + "/mtp.safetensors");
-    e->mst.open(model + "/mtp-int4.safetensors");
     // the INT8 n-gram table (ngram_int8.safetensors, tools/convert_ngram_int8.py) is pinned instead of the BF16 one when
     // the model directory has it (51.8 instead of 102.4 GB of host memory; KL vs BF16 below the run-to-run noise,
     // see the README); FLASH_NGRAM=bf16 keeps the BF16 table, FLASH_NGRAM=int8 requires the INT8 one
     const char* ngv = env_str("FLASH_NGRAM");
-    const bool ng8 = ngv ? !strcmp(ngv, "int8") : e->st.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_0");
+    const bool ng8 = e->checkpoint.format == WeightFormat::Int8 || (ngv ? !strcmp(ngv, "int8") : ngram_tensors.has("model.language_model.layers.1.ple.ple_embedding.ngram_q8.shard_0"));
+    // the one-span pin (offset + owner file of the whole table) is decided by the manifest's recorded table; the
+    // manifest-less route keeps the released loader's mapping scan (no gap-free shard requirement)
+    std::optional<checkpoint_detail::NgramSpan> ngram_span;
+    if (e->checkpoint.has_manifest) ngram_span = checkpoint_detail::ngram_span(ngram_tensors, ng8);
     {
         const TensorInfo& emb = e->st.get("model.language_model.embed_tokens.weight");
+        if(emb.dtype!="BF16" || emb.shape!=std::vector<long long>{VOCAB,H} || emb.nbytes!=(size_t)VOCAB*H*2) {
+            fprintf(stderr, "qflash: model.language_model.embed_tokens.weight: expected BF16 [248320,2560], got %s\n",
+                    (emb.dtype + " " + std::to_string(emb.nbytes) + " B").c_str());
+            delete e; return nullptr;
+        }
         e->ht.embed = (const bf16*)pin_host(emb.data, emb.nbytes);
         const std::string pe = "model.language_model.layers.1.ple.ple_embedding.";
         for (int i = 0; i < 128; i++) {
-            if (ng8) e->ht.ngram8.push_back((const uint8_t*)e->st.get(pe + "ngram_q8.shard_" + std::to_string(i)).data);
-            else e->ht.ngram.push_back((const bf16*)e->st.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight").data);
+            if (ng8) e->ht.ngram8.push_back((const uint8_t*)ngram_tensors.get(pe + "ngram_q8.shard_" + std::to_string(i)).data);
+            else e->ht.ngram.push_back((const bf16*)ngram_tensors.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight").data);
         }
         memcpy(e->ht.mult, e->st.get(pe + "layer_multipliers").data, 24);
         memcpy(e->ht.vsz, e->st.get(pe + "ngram_heads_vocab_sizes").data, 8 * PLE_HEADS);
@@ -2991,12 +3005,12 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         }
         CUDA_CHECK(cudaSetDevice(cur));  // (the current device as before)
         in.cards = (int)ud.size();
-        in.experts = hb::qfn_expert_host_est(in.cards, fr);
+        in.experts = hb::qfn_expert_host_est(in.cards, fr, (double)flash::group_bytes(e->checkpoint.format));
         uintptr_t lo = ~(uintptr_t)0, hi = 0;
         const std::string pe = "model.language_model.layers.1.ple.ple_embedding.";
         for (int i = 0; i < 128; i++) {
-            const TensorInfo& t = ng8 ? e->st.get(pe + "ngram_q8.shard_" + std::to_string(i))
-                                      : e->st.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight");
+            const TensorInfo& t = ng8 ? ngram_tensors.get(pe + "ngram_q8.shard_" + std::to_string(i))
+                                      : ngram_tensors.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight");
             lo = std::min(lo, (uintptr_t)t.data);
             hi = std::max(hi, (uintptr_t)t.data + t.nbytes);
         }
@@ -3051,13 +3065,14 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     size_t ng_bytes = 0;
     std::promise<void> ng_prom;
     std::shared_future<void> ng_done = ng_prom.get_future().share();
-    std::thread ng_th([&] {
+    auto ng_th=std::async(std::launch::async,[&] {
+        try {
         const double a = secs();
         uintptr_t lo = ~(uintptr_t)0, hi = 0;
         auto tens = [&](int i) -> const TensorInfo& {
             const std::string pe = "model.language_model.layers.1.ple.ple_embedding.";
-            return ng8 ? e->st.get(pe + "ngram_q8.shard_" + std::to_string(i))
-                       : e->st.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight");
+            return ng8 ? ngram_tensors.get(pe + "ngram_q8.shard_" + std::to_string(i))
+                       : ngram_tensors.get(pe + "ngram_embedding.shard_" + std::to_string(i) + ".weight");
         };
         for (int i = 0; i < 128; i++) {
             const TensorInfo& t = tens(i);
@@ -3065,7 +3080,9 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             hi = std::max(hi, (uintptr_t)t.data + t.nbytes);
         }
         size_t foff = 0;
-        const std::string fpath = e->st.file_of((const void*)lo, &foff);
+        std::string fpath;
+        if (ngram_span) { foff = ngram_span->offset; fpath = ngram_span->file; }
+        else fpath = ngram_tensors.file_of((const void*)lo, &foff);  // (manifest-less route: the released loader's scan)
         // FLASH_NGRAM_PIN=0: the table stays in the file mapping (pageable, read from the page cache / disk on demand):
         // the GPU gathers read it through HMM (pageable memory access, open kernel modules), no host RAM is pinned
         // (the plan decided on the machine's size; at pinning time the host must really have the room, next to the larger of
@@ -3107,7 +3124,27 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         ng_bytes = hi - lo;
         ng_secs = secs() - a;
         ng_prom.set_value();
+        } catch(...) { ng_prom.set_exception(std::current_exception()); throw; }
     });
+    // From here until the successful return the engine is being built and every leave path must not strand
+    // the threads it already started: the n-gram table thread fills e->ngd, the rank pool runs jobs, the
+    // monitor watches the jobs. A thread-creation failure (EAGAIN on emplace_back) throws through
+    // qe_create_body in the middle of that, so the teardown runs from a guard, not from each catch.
+    struct StartGuard {
+        FE* e; std::shared_future<void> ng_done; bool ok = false;
+        ~StartGuard() {
+            if (ok) return;
+            e->quit.store(true);
+            e->bump_go();  // wakes the sleeping rank workers (they see quit before they take a job)
+            for (auto& t : e->pool) if (t.joinable()) t.join();
+            if (e->mon.joinable()) e->mon.join();
+            ng_done.wait();
+            for (Worker* w : e->W) if (w) w->stop_ngram_stage();
+            if (e->pph)
+                for (Worker* w : e->pph->S) if (w) w->stop_ngram_stage();
+            delete e;
+        }
+    } ng_guard{e, ng_done};
     // (4 cards: for TP4 asked for, and for auto where the driver reports peer access: the pick reads the data check. Without
     // that, forced mode B on 4 and mode B on more cards: the stages make their own 1-card comms; PP x TP: the groups theirs)
     const bool comm_built = flash_pp::comm_wanted(e->ng, par, pptp, e->ng == 4 && !forced && driver_peer_all(e->devs));
@@ -3224,8 +3261,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             if (par == flash_pp::Par::PP && !e->steer.empty() && e->ng <= 3) { par = flash_pp::Par::TP; why = "auto: steering vectors need TP"; }
             if (par == flash_pp::Par::TP && e->ng > kMaxTp) {
                 fprintf(stderr, "qflash: TP runs on 2 to 4 GPUs (%d given)\n", e->ng);
-                delete e;
-                return nullptr;
+                return nullptr;  // (the start guard stops the threads and releases the engine)
             }
             // (test only: the same on fewer cards, with one of the test hooks of these stops)
             const bool t_arm = !kv_ram_mode() && par == flash_pp::Par::TP && (env_int("FLASH_TEST_TP_LOAD_OOM", 0) || env_int("FLASH_TEST_TP_RAM_STOP", 0) || env_int("FLASH_TEST_TP_CTX_STOP", 0));
@@ -3373,9 +3409,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                     (1.58e9 + 5.46e9 / n + flash_pp::tp_ctx_tok_bytes() * (double)cmin / n + 0.9e9) / 1e9);
             fflush(stderr);
             qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp)
-            ng_th.join();  // (the n-gram table pinning thread runs since above)
-            delete e;
-            return nullptr;
+            return nullptr;  // (the start guard waits for the n-gram thread and releases the engine)
         }
         if (c < e->ctx) {
             fprintf(stderr, "[qflash] context %lld -> %lld tokens to fit the cards' memory (GPU%d %.1f GB free; about %.1f GB per card "
@@ -3393,9 +3427,9 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     std::vector<void*> pp_holds;
     if (par == flash_pp::Par::PP_PREFILL) {
         std::string err;
-        pp_bounds_v = pp_bounds(e->ng, 65536, false, &err);
+        pp_bounds_v = pp_bounds(e->ng, 65536, false, &err, weight_group_bytes(e->checkpoint.format));
         if (pp_bounds_v.empty()) { fprintf(stderr, "qflash: %s\n", err.c_str()); return nullptr; }
-        const flash_pp::ModelBytes mb;
+        const flash_pp::ModelBytes mb((double)flash::group_bytes(e->checkpoint.format));
         const double xmb = env_double("FLASH_PF_STAGE_XMB", 2048) * 1048576.0;
         for (int r = 0; r < e->ng; r++) {
             const bool last = r == e->ng - 1;
@@ -3414,19 +3448,19 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     if (par == flash_pp::Par::PP) {  // mode B: one stage worker per card (whole layers), the planner's split
         std::string err;
         const int nst = pptp ? (int)groups.size() : e->ng;
-        e->ppb_bounds = pptp ? pptp_bounds(groups, env_ll("FLASH_PPB_SPLIT_CTX", 32768), &err)
-                             : pp_bounds(e->ng, env_ll("FLASH_PPB_SPLIT_CTX", 32768), true, &err);
+        e->ppb_bounds = pptp ? pptp_bounds(groups, env_ll("FLASH_PPB_SPLIT_CTX", 32768), &err, weight_group_bytes(e->checkpoint.format))
+                             : pp_bounds(e->ng, env_ll("FLASH_PPB_SPLIT_CTX", 32768), true, &err, weight_group_bytes(e->checkpoint.format));
         if (e->ppb_bounds.empty()) { fprintf(stderr, "qflash: %s\n", err.c_str()); return nullptr; }
         ng_done.wait();  // (the stages size their expert budgets at load: after the host registrations)
         std::vector<int> tps;
         if (pptp) {  // PP x TP: every rank of every stage (the server's workers W, ng = all of them)
             for (auto& g : groups) tps.push_back((int)g.size());
-            e->W = pp_make_groups(groups, e->ppb_bounds, e->ctx, e->st, e->ht, &e->mst, cold, prior, draft_ids, e->ngd);
+            e->W = pp_make_groups(groups, e->ppb_bounds, e->ctx, e->st, e->ht, &e->mst, cold, prior, draft_ids, e->ngd, e->checkpoint.format);
             e->ng = (int)e->W.size();
             e->devs.clear();
             for (Worker* w : e->W) e->devs.push_back(w->device());
         } else {
-            e->W = pp_make_stages(e->devs, e->ppb_bounds, e->ctx, e->st, e->ht, &e->mst, cold, prior, draft_ids, e->ngd);
+            e->W = pp_make_stages(e->devs, e->ppb_bounds, e->ctx, e->st, e->ht, &e->mst, cold, prior, draft_ids, e->ngd, e->checkpoint.format);
         }
         e->plans = make_stage_plans(e->ppb_bounds, tps);
         int maxb = 0;
@@ -3459,7 +3493,12 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         // each sizing its expert cache to its share of what is free then
         std::vector<std::thread> th;
         std::vector<int> udev;
+        std::vector<std::exception_ptr> errors(e->ng);  // (loader-thread failures surface here: nothing may throw across the C boundary)
         for (int r = 0; r < e->ng; r++) if (std::find(udev.begin(), udev.end(), e->devs[r]) == udev.end()) udev.push_back(e->devs[r]);
+        // a thread the system could not start throws here, before the start guard has anyone to join:
+        // the joinables already created would be destroyed (std::terminate) at the vector's unwind
+        struct LoaderJoiner { std::vector<std::thread>* th; bool ok = false;
+            ~LoaderJoiner() { if (ok) return; for (auto& t : *th) if (t.joinable()) t.join(); } } lj{&th};
         for (int d : udev)
             th.emplace_back([&, d] {
                 std::vector<int> mine;
@@ -3467,7 +3506,8 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                 for (size_t j = 0; j < mine.size(); j++) {
                     const int r = mine[j];
                     CUDA_CHECK(cudaSetDevice(d));
-                    e->W[r] = new Worker(e->plans[r], e->devs[r], e->comm, e->ctx);
+                    try {
+                    e->W[r] = new Worker(e->plans[r], e->devs[r], e->comm, e->ctx, e->checkpoint.format);
                     e->W[r]->set_cold(cold);
                     e->W[r]->set_expert_prior(prior);
                     e->W[r]->set_draft_vocab(draft_ids);
@@ -3481,9 +3521,19 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                     e->W[r]->alloc_state();
                     fprintf(stderr, "[qflash %.0fs] GPU%d: weights %.1f s, wait for the n-gram table %.1f s, state + expert groups %.1f s\n",
                             secs(), e->devs[r], b - a, c - b, secs() - c);
+                    } catch (...) { if (!errors[r]) errors[r] = std::current_exception(); }
                 }
             });
         for (auto& t : th) t.join();
+        lj.ok = true;  // all loader threads are joined: the start guard stands down for them
+        for (const auto& error : errors)
+            if (error) {
+                try { std::rethrow_exception(error); }
+                catch (const std::exception& ex) { fprintf(stderr, "qflash: weight load failed: %s\n", ex.what()); }
+                catch (...) { fprintf(stderr, "qflash: weight load failed: unknown error\n"); }
+                fflush(stderr);
+                return nullptr;  // (the start guard waits for the n-gram thread and releases the engine)
+            }
         if (g_load_drop.on())
             fprintf(stderr, "[qflash %.0fs] model files: page cache of each layer dropped once loaded (%.1f GB of file ranges; QE_LOAD_DROP=0 keeps it)\n",
                     secs(), g_load_drop.dropped() / 1e9);
@@ -3509,7 +3559,17 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     } else {
         e->steer_json = steer_info_json(e->steer, e->steer_def);  // no vector: still lists the dropped ones
     }
-    ng_th.join();
+    try {
+        ng_th.get();  // (the n-gram thread's own exceptions surface here, never through the C boundary)
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "qflash: n-gram table preparation failed: %s\n", ex.what());
+        fflush(stderr);
+        return nullptr;  // (the start guard stops the staging and releases the engine)
+    } catch (...) {
+        fprintf(stderr, "qflash: n-gram table preparation failed: unknown error\n");
+        fflush(stderr);
+        return nullptr;  // (the start guard stops the staging and releases the engine)
+    }
     for (int i = 0; i < 128; i++) {
         if (ng8) e->ht.ngram8[i] = (const uint8_t*)ng_host[i];
         else e->ht.ngram[i] = (const bf16*)ng_host[i];
@@ -3737,7 +3797,23 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     for (Worker* w : e->W) w->set_serving();  // (the whole load done: the VRAM-pressure check and serving-time reclaims start)
     if (e->pph)
         for (Worker* w : e->pph->S) w->set_serving();
+    ng_guard.ok = true;  // the engine is live: the guard stands down
     return e;
+}
+// the C boundary: qe_create never throws (the server calls it through ctypes). The loader-thread and n-gram
+// failures carry their own message where they join; the catches here are the net for everything else.
+void* qe_create(const char* model_dir, const char* devices, int max_t, const char* split_s) {
+    try {
+        return qe_create_body(model_dir, devices, max_t, split_s);
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "qflash: engine start failed: %s\n", ex.what());
+        fflush(stderr);
+        return nullptr;
+    } catch (...) {
+        fprintf(stderr, "qflash: engine start failed: unknown error\n");
+        fflush(stderr);
+        return nullptr;
+    }
 }
 
 void qe_destroy(void* p) {
@@ -3756,6 +3832,9 @@ void qe_destroy(void* p) {
     e->bump_go();  // wakes the sleeping rank workers (they see quit before they take a job)
     for (auto& t : e->pool) t.join();
     if (e->mon.joinable()) e->mon.join();
+    for (Worker* w : e->W) w->stop_ngram_stage();
+    if (e->pph)
+        for (Worker* w : e->pph->S) w->stop_ngram_stage();
     // GPU memory is released at process exit
 }
 

@@ -1,6 +1,6 @@
 #pragma once
-// Pipeline-parallel (PP) planning for the Flash-Next engine: pure host logic, no CUDA, so tests/qfn_pp_plan_unit.cpp
-// checks it with a plain C++ compiler.
+// Pipeline-parallel (PP) planning for the Flash-Next engine: pure host logic, no CUDA, so a plain C++
+// compiler can check it (no device headers reach this file).
 //
 // FLASH_PAR selects how the cards split the model:
 //   tp          tensor-parallel (today's default): every card holds a slice of every layer, all cards work on every
@@ -52,23 +52,29 @@ constexpr int kRW = 4 * 2560;  // the hyper-connection residual row (4 streams x
 constexpr double kHopBytesPerRow = (double)kRW * 4;  // fp32: 40,960 B per token per boundary
 inline bool is_qsa(int li) { return li % kQsaEvery == kQsaEvery - 1; }
 
-// Bytes of the INT4 checkpoint as the engine lays it out (sizes from the loader: GRP_BYTES = 506,880 per 128-wide
-// expert group, 513 experts x 5 groups per layer; dense parts from the per-card numbers of the PP=2 gate,
-// scaled to the whole layer).
+// Bytes of the checkpoint as the engine lays it out (sizes from the loader: one 128-wide expert group is 506,880 B
+// at INT4 and 998,400 B at INT8 (flash.h ExpertLayout), 513 experts x 5 groups per layer; dense parts from the
+// per-card numbers of the PP=2 gate, scaled to the whole layer). The default construction is the INT4 checkpoint;
+// the loaders pass the group size of the opened format.
 // bytes of one QSA layer's K / V + scales per token: 1,040 (FP8) or 576 (4-bit, FLASH_KV_BITS=4); the engine sets it
 // when it resolves the KV format (flash.cu kv4_mode), before any plan (the unit tests keep FP8)
 inline double& kv_layer_bytes() { static double b = 1040.0; return b; }
 struct ModelBytes {
-    double expert_layer = 2565.0 * 506880.0;  // 1.300 GB: all expert groups of one layer (routed + shared)
-    double gdn_dense = 30.5e6;                // DeltaNet in / out projections, a / b, conv, norms (one whole layer)
-    double qsa_dense = 38.3e6;                // QSA q / k / v / gate / o, indexer projection, norms
-    double hc_layer = 15.2e6;                 // the two hyper-connection reads of a layer (INT8, replicated in TP)
-    double router_layer = 1.4e6;              // INT8 router (528 x 2560)
-    double ple = 16.5e6;                      // layer 1: PLE key / value projections + norms + conv
-    double lm_head = 0.636e9;                 // INT8 lm_head (248,320 x 2560)
-    double draft_head = 0.168e9;              // balanced draft head (65,536 rows)
-    double mtp_dense = 0.07e9;                // MTP block: its QSA layer, fc_embedding / fc_hidden, HC, router
-    double mtp_experts = 1.300e9;             // its expert groups
+    // INT4 mirror of flash.h ExpertLayout<4>::bytes (506,880 B per 128-wide group); this header stays
+    // CUDA-free on purpose, so the constant is spelled here and not derived from the device layout.
+    static constexpr double kInt4GroupBytes = 506880.0;
+    ModelBytes() : expert_layer(2565.0 * kInt4GroupBytes), mtp_experts(2565.0 * kInt4GroupBytes) {}
+    explicit ModelBytes(double group_bytes) : expert_layer(2565.0 * group_bytes), mtp_experts(2565.0 * group_bytes) {}
+    double expert_layer;                    // 1.300 GB at INT4: all expert groups of one layer (routed + shared), 2565 groups
+    double gdn_dense = 30.5e6;              // DeltaNet in / out projections, a / b, conv, norms (one whole layer)
+    double qsa_dense = 38.3e6;              // QSA q / k / v / gate / o, indexer projection, norms
+    double hc_layer = 15.2e6;               // the two hyper-connection reads of a layer (INT8, replicated in TP)
+    double router_layer = 1.4e6;            // INT8 router (528 x 2560)
+    double ple = 16.5e6;                    // layer 1: PLE key / value projections + norms + conv
+    double lm_head = 0.636e9;               // INT8 lm_head (248,320 x 2560)
+    double draft_head = 0.168e9;            // balanced draft head (65,536 rows)
+    double mtp_dense = 0.07e9;              // MTP block: its QSA layer, fc_embedding / fc_hidden, HC, router
+    double mtp_experts;                     // its expert groups (the same 2565 groups of one layer)
     double kv_tok_layer = kv_layer_bytes() + 64.0;  // one QSA layer, one token: K / V + scales (1,040 B fp8, 576 B 4-bit) + pooled indexer key
     double dn_state_layer = 48.0 * 128 * 128 * 4 + 3.0 * (2 * 16 * 128 + 48 * 128) * 4;  // DeltaNet S + conv history, one sequence
     double row_buf = 72.0 * 1024;             // prefill batch buffers per row (R, HC sums, x / xh, part, y, router, n-gram rows, MoE slots)
@@ -159,9 +165,10 @@ inline bool cards_uneven(const std::vector<CardSpeed>& c, double tol = 0.10, dou
     return false;
 }
 struct ModelBytes;
-inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes);
+inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes, double group_bytes);
 inline std::vector<int> partition_cards(int n, const CostModel& cm, double ctx, const DecodeCost& dc, double w,
-                                        const std::vector<CardSpeed>& cs, double h2d) {
+                                        const std::vector<CardSpeed>& cs, double h2d,
+                                        double group_bytes = ModelBytes::kInt4GroupBytes) {
     double pf_tot = cm.head_last, dc_tot = dc.head;
     for (int li = 0; li < kLayers; li++) { pf_tot += cm.layer(li, ctx); dc_tot += dc.layer(li); }
     return partition(n, kLayers, [&](int s, int l0, int l1) {
@@ -171,7 +178,7 @@ inline std::vector<int> partition_cards(int n, const CostModel& cm, double ctx, 
         const CardSpeed& c = cs[s];
         pf /= std::max(0.05, c.pf);
         de /= std::max(0.05, c.dc);
-        pf += stage_host_bytes(l0, l1, s == n - 1, c.free) / h2d * 1e3 / 4.096;  // ms per 1K prompt tokens
+        pf += stage_host_bytes(l0, l1, s == n - 1, c.free, group_bytes) / h2d * 1e3 / 4.096;  // ms per 1K prompt tokens
         return (1 - w) * pf / (pf_tot / n) + w * de / (dc_tot / n);
     });
 }
@@ -335,8 +342,8 @@ inline StageMem stage_mem(const ModelBytes& mb, const Card& c, int l0, int l1, b
 }
 
 // expert bytes of a stage that do not fit next to its fixed part in free_bytes (host-backed, staged per micro-batch)
-inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes) {
-    const ModelBytes mb;
+inline double stage_host_bytes(int l0, int l1, bool last, double free_bytes, double group_bytes) {
+    const ModelBytes mb(group_bytes);
     return stage_mem(mb, Card{free_bytes, 24e9}, l0, l1, last, true, 8704, 0.0, 2.0e9).host;
 }
 

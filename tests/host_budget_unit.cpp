@@ -75,6 +75,12 @@ int main() {
     // the estimate against the 1.3.4 boots: 2 cards 31.2 GB host-backed, 3 cards (GPU1 desktop) 11.9 GB
     EXPECT(std::fabs(qfn_expert_host_est(2, cards_free(2, false)) - 31.2e9) < 2.5e9);
     EXPECT(std::fabs(qfn_expert_host_est(3, cards_free(3, true)) - 11.9e9) < 2.5e9);
+    // INT8 checkpoint (W8): 998,400 B groups (flash.h ExpertLayout<8>) put 48 x 512 x 5 groups = 122.68 GB
+    // of routed expert bytes on the table against 62.29 GB at INT4. The cards keep the SAME VRAM share as INT4 (~31 GB at 2 cards of free
+    // boot VRAM), so the host-backed estimate is the W8 total minus that resident share: about 92 GB at 2 cards,
+    // not the INT4 figure scaled by the group ratio. 3 cards: same rule, ~73 GB.
+    EXPECT(std::fabs(qfn_expert_host_est(2, cards_free(2, false), 998400.0) - 92.0e9) < 2.5e9);
+    EXPECT(std::fabs(qfn_expert_host_est(3, cards_free(3, true), 998400.0) - 72.8e9) < 2.5e9);
 
     for (int n : {2, 3}) {
         for (double tg : {64.0, 92.0, 128.0, 251.0}) {
@@ -107,6 +113,21 @@ int main() {
             if (tg == 92.0 && n == 2) {  // club #1906: the table does not fit next to ~31 GB of experts
                 EXPECT(!oa.ngram_pinned && oa.reduced && oa.archive > 0 && oa.archive < 48e9 && oa.ngram_cache > 0);
                 EXPECT(line(a, oa).find("n-gram table not pinned") != std::string::npos);
+                // the same box with an INT8 checkpoint: the host-backed W8 experts (~92 GB at 2 cards: the cards
+                // keep the same VRAM share as INT4) do not fit either - and the experts are the one budget that is
+                // never reduced. The plan reports the experts short with its warning and degrades the n-gram table
+                // to the page cache; the start itself is not refused here (host_budget.h: e.), the pin guard of
+                // host_mem.h stops the load only when the RAM is really not there - the same rule INT4 follows.
+                In w = qfn(total, avail, 2);
+                w.experts = qfn_expert_host_est(2, cards_free(2, false), 998400.0);
+                const Out ow = plan(w);
+                EXPECT(ow.experts_short);
+                EXPECT(!ow.ngram_pinned && ow.reduced && ow.archive == 0 && ow.prefix == 0);
+                bool ewarn = false;
+                for (const std::string& m : ow.warn)
+                    if (m.find("host-backed expert groups need about") != std::string::npos) ewarn = true;
+                EXPECT(ewarn);  // the experts warning lives in the warn vector (line() carries the reductions)
+                EXPECT(line(w, ow).find("n-gram table not pinned") != std::string::npos);
             }
             if (tg == 92.0 && n == 3) EXPECT(oa.ngram_pinned && oa.archive > 8e9 && oa.archive < 48e9);
             if (tg == 64.0) EXPECT(!oa.ngram_pinned);
