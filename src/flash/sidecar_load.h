@@ -32,6 +32,19 @@ namespace sidecar {
 // (kMaxManifestBytes), and it is applied while reading, before the JSON parse ever runs.
 inline constexpr unsigned long long kMaxColdJsonBytes = 16ull << 20;
 
+namespace detail {
+// fread exactly ids.size() int32s into ids and close f. On a regular file sized from ftell the read
+// cannot come up short; it fires on a file truncated under the size probe (or a non-regular stream),
+// where an uninitialized tail of ids would otherwise reach the device tables.
+inline void read_ids(FILE* f, std::vector<int>& ids, const std::string& path) {
+    const size_t got = fread(ids.data(), 4, ids.size(), f);
+    fclose(f);
+    if (got != ids.size())
+        throw std::runtime_error(path + ": token_rank.bin: short read (" + std::to_string(got) + " of " +
+                                 std::to_string(ids.size()) + " ids)");
+}
+}  // namespace detail
+
 inline std::vector<int> load_token_rank(const std::string& path, int cap, int vocab) {
     std::vector<int> ids;
     FILE* f = fopen(path.c_str(), "rb");
@@ -43,11 +56,7 @@ inline std::vector<int> load_token_rank(const std::string& path, int cap, int vo
     // past the last whole id (or past cap * 4) were never part of the list, as on main
     const long long whole = bytes > 0 ? bytes / 4 : 0;
     ids.resize(std::min<long long>(whole, cap));
-    const size_t got = fread(ids.data(), 4, ids.size(), f);
-    fclose(f);
-    if (got != ids.size())
-        throw std::runtime_error(path + ": token_rank.bin: short read (" + std::to_string(got) + " of " +
-                                 std::to_string(ids.size()) + " ids)");
+    detail::read_ids(f, ids, path);
     for (int t : ids)
         if (t < 0 || t >= vocab)
             throw std::runtime_error(path + ": token_rank.bin: token id " + std::to_string(t) + " outside [0, " +

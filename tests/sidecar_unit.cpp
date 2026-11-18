@@ -100,6 +100,23 @@ int main() {
     // strict parse: trailing garbage is refused, not silently accepted
     write_file(dir / "c7.json", cold_json(good) + " oops");
     EXPECT(cold_throws(dir / "c7.json", ""));  // parse_strict must fail (any message)
+    // rejection clauses that had no case yet: a JSON root that is not an object at all, and an object
+    // with no 'layers' key. Relaxing the root/'layers' clause leaves the parser's own "json: missing key
+    // layers" text where the sidecar rule used to report, so the needle below stops matching and these
+    // cases fail.
+    write_file(dir / "c8.json", "[1,2,3]");
+    EXPECT(cold_throws(dir / "c8.json", "'layers' array"));
+    write_file(dir / "c9.json", "42");
+    EXPECT(cold_throws(dir / "c9.json", "'layers' array"));
+    write_file(dir / "c10.json", "{}");
+    EXPECT(cold_throws(dir / "c10.json", "'layers' array"));
+    // negative expert id: the range clause must catch x.num < 0, because (int)x.num == -1 otherwise
+    // indexes seen[-1], out of bounds for the per-layer duplicate guard (the OOB usually passes
+    // silently, so the refusal itself is what this case pins)
+    std::vector<std::vector<std::string>> negl = good;
+    negl[7] = {"-1"};
+    write_file(dir / "c11.json", cold_json(negl));
+    EXPECT(cold_throws(dir / "c11.json", "outside [0, 512)"));
     // size cap: cold_experts.json is read bounded before the parse (kMaxColdJsonBytes = 16 MiB, the
     // manifest cap's size in checkpoint.h); a bigger file is refused with the cap in its message.
     // Without the cap the bytes reach the JSON parser first and the message is the parser's, without
@@ -158,6 +175,23 @@ int main() {
     } catch (const std::exception& ex) {
         EXPECT(std::strstr(ex.what(), "outside [0, 248320)") != nullptr);
     }
+    // short read: on a regular file sized from ftell the read cannot come up short (only a truncate
+    // under the size probe would), so the clause is tested at the seam it guards - the shared id
+    // reader fed a stream that ends one id early. Dropping the short-read throw lets a vector with an
+    // uninitialized tail through and this case fails.
+    if (FILE* tf = tmpfile()) {
+        const int two[2] = {7, 9};
+        fwrite(two, 4, 2, tf);
+        rewind(tf);
+        std::vector<int> want(3);
+        bool refused = false;
+        try {
+            sidecar::detail::read_ids(tf, want, "short-stream");  // read_ids closes tf
+        } catch (const std::exception& ex) {
+            refused = std::strstr(ex.what(), "short read (2 of 3 ids)") != nullptr;
+        }
+        EXPECT(refused);
+    } else EXPECT(false);
 
     printf("sidecar_unit: %s (%d failures)\n", fails ? "FAILED" : "ok", fails);
     fs::remove_all(dir);
