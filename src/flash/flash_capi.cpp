@@ -147,8 +147,11 @@ public:
                 memset(p, 0, sz);  // fault the pages in without the driver
                 bool reg_ok;
                 {
-                    // (no QeWdSlow here: a background registration of 1 GB slabs, minutes long at boot, would keep the
-                    // device watchdog from catching a real hang; reviews Flash-Next M6 / 27B L5)
+                    // QeWdSlow: under load, with the host near its margin, one registration took 6-10 s per GB and rank 0's
+                    // next launch waited for it while its peers spun in the all-reduce (past the budget: abort, exit 75).
+                    // The peers now wait instead of trapping; small slabs (FLASH_ARCHIVE_SLAB_MB) keep each stall short and
+                    // the run() monitor still ends a real hang.
+                    QeWdSlow slow;
                     reg_ok = !stop_ && cudaHostRegister(p, sz, cudaHostRegisterPortable) == cudaSuccess;
                 }
                 if (!reg_ok) {
@@ -161,10 +164,19 @@ public:
                     continue;
                 }
                 secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                {
+                    std::lock_guard<std::mutex> l(mu_);
+                    slabs_.add((char*)p, sz);
+                    pinned_ += sz;
+                    qe_hostmem::charged() += sz;
+                }
+                // the driver back to the worker threads between two registrations (a step launches in between)
+                static const int gap_ms = env_int("FLASH_ARCHIVE_PIN_GAP_MS", 50);
+                if (gap_ms > 0) {
+                    std::unique_lock<std::mutex> l(mu_);
+                    cv_.wait_for(l, std::chrono::milliseconds(gap_ms), [&] { return stop_.load(); });
+                }
                 std::lock_guard<std::mutex> l(mu_);
-                slabs_.add((char*)p, sz);
-                pinned_ += sz;
-                qe_hostmem::charged() += sz;
                 if (env_int("FLASH_SLOT_LOG", 0))
                     fprintf(stderr, "[qflash] archive pool: %.1f GB pinned (%.1f s), %.2f GB used\n", pinned_ / 1e9, secs, used_ / 1e9);
             }
@@ -204,7 +216,10 @@ public:
     size_t release(size_t want) {
         std::lock_guard<std::mutex> l(mu_);
         return slabs_.drop_free(want, [&](char* base, size_t size) {
-            cudaHostUnregister(base);
+            {
+                QeWdSlow slow;  // (an unregistration holds the driver like a registration)
+                cudaHostUnregister(base);
+            }
             cudaGetLastError();
             ::free(base);
             pinned_ -= size;
@@ -3661,7 +3676,10 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         // pinned system prefixes: their own host budget next to the archive's (0: off)
         const double pgb = e->pref_gb();  // (host-RAM plan; default 8, FLASH_PREFIX_GB wins)
         e->pin_budget = e->budget && pgb > 0 ? (size_t)(pgb * 1e9) : 0;
-        if (e->budget && pin) e->hpool.start(e->budget + e->pin_budget, (size_t)1 << 30, (size_t)(head * 1e9));
+        // slab size: a slab's registration stalls rank 0 while it runs (6-10 s per GB under load near the host margin),
+        // so 256 MB slabs by default; an archive piece larger than a slab goes pageable
+        const size_t slab_mb = (size_t)std::max(64, std::min(1024, env_int("FLASH_ARCHIVE_SLAB_MB", 256)));
+        if (e->budget && pin) e->hpool.start(e->budget + e->pin_budget, slab_mb << 20, (size_t)(head * 1e9));
         fprintf(stderr, "[qflash] %zu sequence slots over a pool of %d periods; archive: %.1f GB host budget%s, checkpoints every %d tokens, "
                 "pinned system prefixes %.1f GB\n", e->sl.size(), e->np, e->budget / 1e9, pin ? " (pinning in the background)" : " (pageable)",
                 e->ckpt_every, e->pin_budget / 1e9);
