@@ -10,6 +10,7 @@ import io
 import json
 import math
 import os
+import struct
 import urllib.request
 
 import numpy as np
@@ -21,6 +22,25 @@ from safetensors import safe_open
 from qe_env import env_int, env_str
 
 IMG_TOKEN = 1 << 30  # engine: ids >= this are image rows (kImgToken)
+
+
+def visual_weight_map(model_dir):
+    """Tensor name -> checkpoint file for every tensor of the model: the safetensors index when the checkpoint
+    has one; without it (INT8 checkpoints from tools/quant_int8.py: sharded body, no index, manifest schemas
+    V1/V2 differ in whether they name the file per tensor) the model shard headers say exactly which file holds
+    which tensor, which is what the C loader's qfn-int8-manifest inventory describes (src/flash/checkpoint.h)."""
+    ip = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(ip):
+        return json.load(open(ip))["weight_map"]
+    idx = {}
+    for f in sorted(os.listdir(model_dir)):
+        if f.startswith("model") and f.endswith(".safetensors"):
+            with open(os.path.join(model_dir, f), "rb") as fh:
+                hdr = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0]))
+            idx.update({k: f for k in hdr if k != "__metadata__"})
+    if not any(k.startswith("model.visual.") for k in idx):
+        raise FileNotFoundError(f"{model_dir}: no safetensors index and no tensors in its model*.safetensors")
+    return idx
 
 
 class VisionEncoder:
@@ -50,7 +70,11 @@ class VisionEncoder:
         self.side = int(v["num_position_embeddings"] ** 0.5)
         self.image_token = cfg["image_token_id"]
         self.vstart, self.vend = cfg["vision_start_token_id"], cfg["vision_end_token_id"]
-        pp = json.load(open(os.path.join(model_dir, "processor_config.json")))["image_processor"]
+        ppf = os.path.join(model_dir, "processor_config.json")
+        if not os.path.exists(ppf):  # INT8 checkpoints regenerated without the sidecar: same values, flat
+            ppf = os.path.join(model_dir, "preprocessor_config.json")
+        pp = json.load(open(ppf))
+        pp = pp.get("image_processor", pp)
         self.mean = np.array(pp["image_mean"], np.float32)
         self.std = np.array(pp["image_std"], np.float32)
         self.min_pixels = pp["size"]["shortest_edge"]
@@ -67,12 +91,7 @@ class VisionEncoder:
         self.stream = self.dev.type == "cuda" and bool(
             env_int("QE_VISION_STREAM", int(cfg.get("model_type", "").startswith("qwen4_exp"))))
         self.hw = None
-        ip = os.path.join(model_dir, "model.safetensors.index.json")
-        if os.path.exists(ip):
-            idx = json.load(open(ip))["weight_map"]
-        else:  # single-file checkpoint (e.g. tools/quant_int8.py output): no index
-            with safe_open(os.path.join(model_dir, "model.safetensors"), "pt") as st:
-                idx = {k: "model.safetensors" for k in st.keys()}
+        idx = visual_weight_map(model_dir)
         names = [k for k in idx if k.startswith("model.visual.")]
         w = {}
         for f in sorted({idx[k] for k in names}):
