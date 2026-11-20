@@ -38,7 +38,11 @@ EN = {"dekoduje": "decoding", "czeka": "waiting", "działa": "up", "start nr": "
       "karty": "GPUs", "pula KV": "KV pool", "statystyki": "statistics",
       "qengine nie działa — czekam na": "qengine is not running — waiting for",
       "statystyki wyzerowane": "stats reset", "reset nie powiódł się": "reset failed",
-      "ten serwer nie obsługuje resetu (potrzebny restart)": "reset not supported by this server (restart needed)"}
+      "ten serwer nie obsługuje resetu (potrzebny restart)": "reset not supported by this server (restart needed)",
+      "trzymany": "held", "zapisane": "saved", "wczytane": "loaded", "usunięte": "dropped", "pominięte": "skipped",
+      "ostatni start z": "last start from", "w VRAM": "in VRAM", "na kartę": "per card", "na miejscu": "in place",
+      "z hosta": "from host", "wspólne prefiksy": "shared prefixes", "ponowne prefille": "re-prefills", "utworzone": "made", "użyte": "used",
+      "ostatni": "last", "przebiegi": "passes", "ms / przebieg": "ms / pass", "brak": "none"}
 LANG = "en"
 
 
@@ -72,16 +76,53 @@ def spark(vals, width):
     return "".join(SPARK[min(7, int(v / top * 7.999))] if v > 0 else " " for v in vals), top
 
 
+def dsv4_view(d):
+    """the DSV4 server's engine panel (engine.dsv4 of /api/stats: one held sequence, the host archive, the K/V pool)"""
+    out = []
+    mc = d.get("max_ctx") or 0
+    out.append(Text(f"{_('kontekst')}: {_('trzymany')} {big(d.get('held', 0))} / {big(mc)} · {d.get('mode', '')}", style="grey62"))
+    a = d.get("archive")
+    if a:
+        out.append(Text(f"{_('archiwum')}: RAM {a['entries']} ({a['bytes'] / 2**30:.1f} / {a.get('cap_gib', 0):.0f} GB) · "
+                        f"{_('zapisane')} {a['saved']}, {_('wczytane')} {a['loaded']}, {_('usunięte')} {a['dropped']}, "
+                        f"{_('pominięte')} {a['skipped']} · {_('ostatni start z')} {a.get('last_src') or _('brak')}", style="grey62"))
+    k = d.get("kvpool")
+    if k:
+        out.append(Text(f"{_('pula')}: {k['parked_vram']} {_('w VRAM')} ({k['vram_mb_card']:.0f} MB {_('na kartę')}), host "
+                        f"{k['host_mb']:.0f} MB · {_('na miejscu')} {k['in_place']}, {_('przesunięcia')} {k['moved']}, "
+                        f"{_('z hosta')} {k['from_host']}, {_('wysiedlenia')} {k['evicted']}, {_('usunięte')} {k['dropped']}",
+                        style="grey62"))
+    rf = d.get("refills")  # [dsv4-rel8-refill] re-prefills (K/V gone from the archive): also in the prefill counters
+    if rf is not None:
+        out.append(Text(f"{_('ponowne prefille')}: {rf['count']} · {big(rf['tokens'])} tok · {rf['s']:.1f} s",
+                        style="bold yellow" if rf["count"] else "grey62"))
+    p = d.get("prefix")
+    if p:
+        out.append(Text(f"{_('wspólne prefiksy')}: {_('utworzone')} {p['made']}, {_('użyte')} {p['used']}", style="grey62"))
+    if d.get("last_ttft_s") is not None:
+        out.append(Text(f"TTFT: {_('ostatni')} {d['last_ttft_s']:.2f} s · {_('śr.')} {d.get('avg_ttft_s') or 0:.2f} s", style="grey62"))
+    ps = d.get("passes")
+    if ps and ps.get("passes"):
+        out.append(Text(f"{_('przebiegi')} {fmt(ps['passes'])} · {_('ms / przebieg')} {ps['pass_ms'] / ps['passes']:.1f} · "
+                        f"tok / {_('przebiegi')} {ps['tokens'] / ps['passes']:.2f}", style="grey50"))
+    return Group(*out)
+
+
 def view(s, width=140, note=None):
     r, se, gl, en, rec = s["rate"], s["session"], s["global"], s.get("engine") or {}, s["records"]
     jobs = s["jobs"]
     act = [j for j in jobs if j["state"] != "queued"]
     queued = [j for j in jobs if j["state"] == "queued"]
-    last_pre = next((j.get("prefill_tps") for j in act + s["recent"] if j.get("prefill_tps")), None)
+    # prompts being prefilled now: their live rate (rows so far / time since their start, per chunk: app.pf_progress)
+    # leads the headline, summed when several share the passes; else the last finished prompt's rate
+    pfl = [j for j in act if j["state"] == "prefill"]
+    live_pre = sum(j.get("prefill_tps") or 0 for j in pfl)
+    last_pre = live_pre if live_pre else next((j.get("prefill_tps") for j in act + s["recent"] if j.get("prefill_tps")), None)
     power = sum(g["power"] for g in s["gpus"])
 
     ver = f"{s['version']} (build {s.get('build', 'unknown')}) " if s.get("version") else ""  # older servers: none
-    head = Text.assemble(("QEngine ", "bold"), (ver, "bold"), (f"{s.get('name', '')}  ", "cyan"),
+    ctx = f" · ctx {big(s['max_ctx'])}" if s.get("max_ctx") else ""  # (DSV4 server)
+    head = Text.assemble(("QEngine ", "bold"), (ver, "bold"), (f"{s.get('name', '')}{ctx}  ", "cyan"),
                          (f"{_('działa')} {dur(se['uptime_s'])} · {_('start nr')} {s['runs']}", "grey62"),
                          (f"   {note[0]}", note[1]) if note else ("   l PL/EN · Ctrl+R reset · q", "grey35"))
     al = (s.get("agents") or {}).get("alarm")
@@ -89,17 +130,28 @@ def view(s, width=140, note=None):
         head = Group(head, Text(f"⚠ {_('nie rozpoznano głównego agenta w sesji')} {al['session'][:8]}… "
                                 f"({al['requests']}) · QE_MAIN_AGENT_RE", style="bold red"))
     lg = (s.get("loop_guard") or {}).get("recent") or []
-    if lg and time.time() - lg[-1]["t"] < 600:  # a conversation repeated the same turn (server/loop_guard.py)
+    lg_on = bool(lg and time.time() - lg[-1]["t"] < 600)
+    if lg_on:  # a conversation repeated the same turn (server/loop_guard.py)
         g = lg[-1]
         head = Group(head, Text(f"⚠ {_('pętla między turami')}: {_('rozmowa')} {g['conversation']} "
                                 f"({g['turns']}× {_('ta sama tura')}) · presence {g['presence']:.1f}, "
                                 f"{_('bez lookup')} · {_('razem')} {s['loop_guard']['triggers']}", style="bold yellow"))
+    pf_lines = []
+    for j in pfl[:2]:  # the top bar: a prefill is running, rows done / to compute, its live rate
+        tot, done = j.get("prefill_total"), j.get("prefill_tok")
+        prog = (f"{big(done)} / {big(tot)} ({100 * done / max(tot, 1):.0f} %) · {fmt(j.get('prefill_tps'))} tok/s · "
+                if tot else "")
+        pf_lines.append(Text(f"▶ prefill {j['label'][:24]}: {prog}{j['elapsed_s']:.1f} s · ctx {big(j['prompt'])}"
+                             f"{' · +' + str(len(pfl) - 2) if len(pfl) > 2 and j is pfl[1] else ''}", style="bold dark_orange",
+                             no_wrap=True, overflow="ellipsis"))  # one row each (the panel size counts them)
+    if pf_lines:
+        head = Group(head, *pf_lines)
     kpi = Table.grid(expand=True, padding=(0, 2))
     for _col in range(7):
         kpi.add_column(justify="center")
     cell = lambda v, l, st="bold": Text.assemble((v + "\n", st), (l, "grey62"))
     kpi.add_row(cell(fmt(r["tok_s_10"]), "tok/s (10 s)", "bold bright_blue"), cell(fmt(r["tok_s_1"]), _("tok/s teraz")),
-                cell(fmt(last_pre), "prefill tok/s", "bold dark_orange"), cell(str(len(act)), _("aktywnych"), "bold green"),
+                cell(fmt(last_pre), "prefill tok/s" + (" ▶" if live_pre else ""), "bold dark_orange"), cell(str(len(act)), _("aktywnych"), "bold green"),
                 cell(str(len(queued)), _("w kolejce")), cell(fmt(r["tokens_per_step"], 2), _("tok/krok MTP")),
                 cell(fmt(power), _("W na GPU")))
 
@@ -173,6 +225,9 @@ def view(s, width=140, note=None):
                          f"{' ' + str(int(c['idle_s'])) + 's' if c.get('idle_s') is not None else ''}{'*' if c.get('generating') else ''}"
                          for c in (en.get("conversations") or [])[:8]) if en.get("conversations") else "", style="grey50"))
 
+    if not en.get("pool_tokens") and en.get("dsv4"):  # the DSV4 server: no paged slot pool, its archive / K/V pool
+        pool = dsv4_view(en["dsv4"])
+
     g = []
     for x in s["gpus"]:
         frac = x["mem"] / x["mem_total"]
@@ -199,7 +254,7 @@ def view(s, width=140, note=None):
     st.add_row(_("najdłuższy kontekst"), big(srec["longest_context"]), big(rec["longest_context"]))
 
     lay = Layout()
-    lay.split_column(Layout(Panel(Group(head, kpi), box=box.ROUNDED), size=6 if al else 5),
+    lay.split_column(Layout(Panel(Group(head, kpi), box=box.ROUNDED), size=5 + bool(al) + lg_on + len(pf_lines)),
                      Layout(Panel(chart, title=_("przepustowość (3 min)"), box=box.ROUNDED), size=4),
                      Layout(name="mid"), Layout(name="bot", size=15))
     lay["mid"].split_row(Layout(Panel(t, title=_("agenci i kolejka"), box=box.ROUNDED), ratio=5),

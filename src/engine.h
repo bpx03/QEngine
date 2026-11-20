@@ -3,6 +3,7 @@
 #include "gpu_others.h"
 #include <mutex>
 #include "host_mem.h"
+#include "host_pressure.h"
 #include <atomic>
 #include <climits>
 #include <chrono>
@@ -50,6 +51,13 @@ public:
     void reset();
     // QE_DECODE_COMM=auto: time real decode steps on P2P stores vs host memory, keep the faster path per mode (qe_create)
     void decode_calibrate();
+    // [q27-perf] start-up: waits until the archive pinner is done, held (host room / pressure) or backing off after a slow
+    // registration, at most QE_ARCHIVE_WAIT_S (30; 0: no wait). Its registrations go only into 20 ms gaps without a GPU job
+    // (drv_gate.h), and a decode step's own GPU time is such a gap (a job returns once its launches are queued): pinning
+    // that ran on into serving made one slab registration (4 GB, ~125 ms) hold a decode step (s150 step 3 code -13 %).
+    // Pinning left after the wait (hold, back-off, cap) goes only into gaps between the server's calls (capi.cpp
+    // QE_STEP_CALL): under steady load new archives use pageable memory until the engine idles
+    void archive_wait();
     // Build the speculative-step CUDA graphs of the first slot for every draft count / sampling
     // mode up front (each takes tens of ms to capture on first use otherwise). Returns seconds.
     // modes: bit 0 greedy, bit 1 sampling
@@ -101,6 +109,7 @@ public:
     // (shared weight reads); out[i*64 ..] receives cnt[i] tokens of slot slots[i]. Single-
     // sequence spec_step() still works on the slot of the last start() / use().
     void release(int slot);
+    void prefill_cancel(int slot);  // [srv-disconnect] the slot's prompt in flight is released next and keeps its rows done
     void step_batch(const int* slots, int n, int* out, int* cnt);
     // make slot the current single sequence again (for spec_step)
     void resume(int slot);
@@ -217,7 +226,20 @@ public:
     void set_limit(int slot, int tokens) {
         Seq& q = seqs_.at(slot);
         q.end = tokens >= 0 ? q.pos + tokens : 0;
+        if (q.rlim == 0) q.rlim = q.end > 0 ? q.end : -1;
     }
+    // [q27-park-c] Park a decoding sequence beyond the seats: its KV rows and recurrent state go to a held host archive (the
+    // pause path's copy, without checkpoint states), its sampling / penalty state and host fields to a record, and the
+    // slot is released (its content stays as an idle conversation until another prompt needs the slot). Returns a handle
+    // (>= 0), -1 when it cannot park (prompt in flight, paused, grammar / token ban / steering / LSA, no archive room).
+    int park(int slot);
+    // Resume a parked sequence into any free slot (its own one without a copy while that still holds its rows): the state
+    // and the pending token exactly as they were, no prefill, so the reply goes on bit-identical. Returns the slot, -1 when
+    // no slot / room / prefill place is free now (retry later), -2 for an unknown handle. *extra: -1; a token only in
+    // the fallback where the held state was not usable (then the token's row was prefilled: the next token, not exact).
+    int unpark(int h, int k, int* extra);
+    void park_drop(int h);  // a parked request ended (client gone): its archive is no longer held
+    int num_parked() const { return (int)parked_.size(); }
     // Prompt tokens that a start() of this prompt would resume from (live slot, snapshot,
     // archive or pinned prefix), without side effects: the scheduler's prefill-cost estimate.
     int probe_cached(const int* ids, int n) const;
@@ -275,6 +297,7 @@ private:
     KvSplit kvs_;
     bool kvs_auto_ = false;  // shares chosen in plan_slots from the free memory after the weights
     long long n_grow_ = 0, n_move_ = 0, n_evict_ = 0, n_pause_ = 0, n_unpause_ = 0, n_release_ = 0;
+    long long n_park_ = 0, n_unpark_ = 0;  // [q27-park-c]
     int max_ctx_ = 0;
     bool yarn_auto_ = false;  // the YaRN factor came from --max-ctx (plan_slots may lower it to the pool's reach)
     int round_cap(int need) const;
@@ -302,6 +325,25 @@ private:
     // of [0, pos) and the delta-net state at pos wait in a held archive, restored when room frees
     struct Paused { KvArchive* arch; int pos; std::vector<int> seq; long long seen; unsigned long long at; };
     std::map<int, Paused> paused_;
+    struct ParkRec {
+        KvArchive* arch = nullptr;
+        const KvArchive* pre = nullptr;  // its shared prefix's pinned host copy (split > 0): held too (review M2)
+        std::vector<int> seq;          // tokens [0, pos)
+        int pos = 0, pending = 0, last_tok = 0, plen = 0, hint = 0, end = 0, rlim = 0, prio = 1;
+        unsigned long long affinity = 0;
+        bool pen = false, no_lookup = false, want_drafts = false, no_ahead = false;
+        std::vector<std::vector<char>> dev;  // per GPU: the slot's sampling parameters + penalty state (Worker::slot_small_*)
+        // the next step's input as parking found it (review M1: a resume verifies the same drafts, so a sampled reply
+        // draws the same numbers): k_avail drafts after the pending token, per GPU; k_avail < 0: none saved (resync)
+        int k_avail = -1;
+        bool k_blk = false;
+        std::vector<std::vector<int>> spec;
+        int pf_slot = -1;  // the held state did not serve: the slot whose rest is prefilled piece by piece (unpark -4)
+    };
+    std::map<int, ParkRec> parked_;
+    int park_next_ = 0;
+    bool resume_mode_ = false;  // start_begin for unpark: no prompt-end snapshot, no block-drafter binding
+    bool arch_nosubs_ = false;  // archive_slot for park: the end state only
     void use_slot(int i);
     int pick_slot(const int* ids, int n, int k, unsigned long long affinity);
     struct KvArchive;  // defined below
@@ -326,9 +368,12 @@ private:
         bool stale = false;         // device token/position invalid (queued step undone)
         int prio = 1;               // scheduling value (set_prio): logs and slot_info only, no order reads it
         int hint = 0;               // end of the system part in its last prompt (0: none), archive_subs keeps a state there
+        int plen = 0;               // length of its last prompt (start_begin): rows past it are that prompt's reply
         bool constrained = false;   // grammar mask on (constrain)
         bool banned = false;        // [tool-choice-ban] static token ban on (ban)
         int end = 0;                // > 0: last position the reply may reach (set_limit)
+        int rlim = 0;               // > 0: the first set_limit after the start (the request's own limit; later calls may be
+                                    // temporary step caps, e.g. the thinking budget's): admission headroom reads this one
         // stop sequences (watch_stops): the drafts of the next step for the caller, no step queued
         // ahead while a stop may start in the step in flight (set_no_ahead), and the undo of the
         // last step so the reply can end where its stop starts (trim)
@@ -434,6 +479,8 @@ private:
         int slot = 0, n = 0, i = 0, kstart = 0, last_m = 1;
         int pin = 0;                      // position whose state is pinned (pin_prefix), 0 = none
         int end_snap = 0;                 // prompt-end state saved at this position (n - 1), 0 = at n
+        int keep_from = -1;               // demote_spent keeps the state at this position (start_begin), -1: none
+        bool resume = false;              // an unpark's resume (demote_spent: nothing demoted)
         int tail_from = 0, last_ck = 0;   // tail checkpoints from this position; the last one taken
         std::vector<int> rolling;         // positions of this prefill's periodic / tail checkpoints
         unsigned long long affinity = 0;
@@ -442,6 +489,8 @@ private:
         std::vector<int> ids, dev_ids, rope3, marks;
         int img_base = 0, img_n = 0;      // this prompt's rows in img_table_: [img_base, img_base + img_n)
         bool dfl = false;                 // the reply runs DFlash2 block steps (drafter context from the prompt)
+        bool keep = false;                // [srv-disconnect] cancelled by its client (prefill_cancel): the release keeps
+                                          // the rows done (a chunk boundary: a valid live end) instead of dropping them
     };
     static constexpr int kMaxPrefills = 2;
     std::vector<PrefillState> pfs_;       // in flight, the newest last
@@ -453,7 +502,11 @@ private:
     bool lookahead_ = true;
     bf16* img_table_ = nullptr;     // image embedding rows of the prompts being prefilled (mapped; one range per prefill)
     size_t img_cap_ = 0;            // rows
+    // [kb-q27-imgtab] grow the table to cap rows (the first keep rows copied): false when the pin fails (nothing changed)
+    bool grow_img_table(size_t cap, size_t keep);
+    size_t img_range(int img_rows, size_t* keep) const;  // the first gap of img_rows rows the prefills in flight leave
     void take_snapshot(const int* ids, int pos, int kind = 0, int replace = 0);
+    void demote_spent(const PrefillState& pf, int pos);  // [q27-snap-demote]
     void snap_host_wait();  // [q27-snapasync] every card's snapshot copy in flight is in its host buffer
     std::vector<Snapshot> snaps_;
     // Pinned prefixes: QE_PREFIX_GB of host memory (default 8) outside the archive LRU
@@ -490,18 +543,22 @@ private:
         char* alloc(size_t bytes, bool& pinned);
         void free(char* p, size_t bytes, bool pinned);
         size_t pinned_bytes() const { return pinned_; }
+        size_t pinned_locked() const { std::lock_guard<std::mutex> l(mu_); return pinned_; }  // (while the pinner runs, review L3)
         size_t used_bytes() const { return used_; }
         size_t pinned_free() const { std::lock_guard<std::mutex> l(mu_); return pinned_ - used_; }
         size_t release(size_t want);  // memory pressure: whole free slabs back to the host (host_mem.h)
         // pinning held between slabs (decode calibration: a 4 GB memset + register next to its steps made 27B c=1
         // timings swing ~30 %); on: returns once the slab in flight is done
         bool pause(bool on);  // true: nothing in flight
+        void wake() { wake_ = true; }  // [q27-reg] a pinner waiting for an idle gap checks the pause / host room again
+        bool settled() const { return settled_; }  // [q27-perf] the pinner is done, held for room or backing off
+        bool started() const { return th_.joinable(); }
     private:
         struct Slab { char* base; size_t size; std::map<size_t, size_t> free; };  // offset -> length
         std::vector<Slab> slabs_;
         mutable std::mutex mu_;
         std::thread th_;
-        std::atomic<bool> stop_{false}, pause_{false}, busy_{false};
+        std::atomic<bool> stop_{false}, pause_{false}, busy_{false}, wake_{false}, settled_{false};
         size_t pinned_ = 0, used_ = 0;
     };
     HostPool hpool_;
@@ -535,6 +592,7 @@ private:
         int prio = 1;                       // of the conversation when archived (Seq::prio): logs only, no order reads it
         double last_s = 0;                  // the conversation's last use (Seq::last_s; restored from it: then), mono_s()
         int split = 0;                      // rows [0, split) live in the prefix named by toks[0, split)
+        int plen = 0;                       // the slot's last prompt length (Seq::plen): rows [plen, n) are its reply
         // pinned prefix (end of a system prompt / shared tools block): outside the LRU and the
         // archive budget, never superseded; new agents of that kind and evicted conversations
         // resume from it (pin_prefix)
@@ -552,6 +610,10 @@ private:
     static constexpr int kMaxSubs = 4;
     size_t archive_budget_ = 0, archive_used_ = 0;
     int archive_min_ = 2048;
+    // [q27-park-arch] checkpoint states an archive keeps besides its end state (QE_ARCH_SUBS, 1..kMaxSubs): each costs a
+    // whole delta-net state (~151 MB on the 27B), so 4 of them made an archive ~0.95 GB and 64 agent sessions on 32 slots
+    // overflowed the budget (LRU over a cyclic order drops exactly the conversation that comes back next)
+    int arch_subs_ = 2;
     bool pool_log_ = false;  // QE_POOL_LOG=1: pool / archive events on stdout
     void archive_slot(int slot, bool force = false);
     // Incremental archiving of idle conversations (archive_more): the archive under
@@ -580,8 +642,32 @@ private:
     qe_hostmem::CapLog cap_log_;
 public:
     const std::string& host_mem_json() const { return host_json_; }
+    std::string host_mem_json_now() {  // + the runtime pressure state (written by mem_pressure, read by the stats thread)
+        std::string j = host_json_;
+        std::lock_guard<std::mutex> l(press_mu_);
+        if (j.size() >= 2 && j.back() == '}' && press_json_.size() > 2) {
+            j.pop_back();
+            j += std::string(j.size() > 1 ? ", " : "") + "\"pressure\": " + press_json_ + "}";
+        }
+        return j;
+    }
     void mem_guard();  // host memory below MemAvailable - margin: the archive gives memory back
 private:
+    // runtime host-memory pressure (host_pressure.h), stages 1-3 here (hold growth, free slabs, shrink the archive): stepped
+    // by mem_guard; the archive's cap while it holds (SIZE_MAX: none)
+    qe_memp::Policy mp_{[] {
+        qe_memp::Config c = qe_memp::Config::from_env((double)qe_hostmem::margin());
+        c.max_stage = std::min(c.max_stage, (int)qe_memp::SHRINK);
+        return c;
+    }()};
+    size_t press_cap_ = SIZE_MAX;
+    bool press_held_ = false;
+    std::mutex press_mu_;
+    std::string press_json_ = "{}";
+    double press_last_ = -1e18;
+    bool press_wait_logged_ = false;
+    void mem_pressure();
+    qe_memp::Policy::Result press_act(int s, size_t step, std::string& what);
     void disk_make_room(size_t need);
     void disk_forget(KvArchive& a);
     bool archive_load(KvArchive& a);
@@ -613,6 +699,10 @@ private:
     std::thread disk_thread_;
     std::thread alloc_thread_;               // pre-pins snapshot buffers in the background
     std::atomic<bool> snap_pause_{false}, snap_busy_{false};
+    // [q27-snap-size] start-up: the background pinner fills the whole store (room permitting) before the first request
+    // (archive_wait waits for snap_done_); afterwards, as before, only as the store fills
+    std::atomic<bool> snap_eager_{true}, snap_done_{false};
+    std::atomic<int> snap_eager_n_{32};  // entries pinned at start-up (the 8 % bound; lowered when the host is short)
     std::atomic<int> snap_n_{0};  // snaps_.size() for the pinner thread (it pins past kSnapBase as the store fills)  // decode calibration: the snapshot pinning held
     std::mutex snap_mu_;
     std::vector<std::vector<void*>> free_bufs_;

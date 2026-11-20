@@ -595,3 +595,16 @@ inline void comm_decode_cache_put(const std::string& key, const DecodeCal& d) {
     snprintf(b, sizeof b, "%.9g %.9g %.9g %.9g", d.tp[0], d.th[0], d.tp[1], d.th[1]);
     comm_cache_write("decode", key, {{"pick", a}, {"ms", b}});
 }
+// the start-up line of a cached pick (#22): says the numbers are not from this boot, and prints n/a for a round that
+// was not measured (fewer than 4 slots: no batched round, the batched path is the single-sequence pick)
+inline void comm_decode_cache_log(const DecodeCal& d) {
+    auto nm = [](int x) { return x == 2 /* kXferHost (comm.cuh) */ ? "pinned host memory" : "P2P SM stores"; };
+    char m[2][96];
+    for (int b = 0; b < 2; b++) {
+        if (d.tp[b] >= 0 && d.th[b] >= 0) snprintf(m[b], sizeof m[b], "P2P %.2f, host memory %.2f ms/step", d.tp[b], d.th[b]);
+        else snprintf(m[b], sizeof m[b], "n/a: no %s round measured", b ? "batched" : "single-sequence");
+    }
+    fprintf(stderr, "[comm] decode collectives (QE_DECODE_COMM=auto, from the start-up cache, not measured this boot: the numbers "
+                    "are from %s): single sequence: %s (%s); batched: %s (%s); QE_DECODE_COMM=remeasure measures again\n",
+            d.when.c_str(), nm(d.x[0]), m[0], nm(d.x[1]), m[1]);
+}

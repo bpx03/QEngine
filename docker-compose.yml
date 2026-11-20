@@ -1,5 +1,5 @@
 # QEngine on 3x RTX 3090. Model directory on the host: QE_MODELS_DIR (must contain Qwen3.8-27B-INT4/).
-#   QE_MODELS_DIR=/path/to/models docker compose up -d
+#   QE_MODELS_DIR=/path/to/models docker compose up -d     (API on all interfaces, no API keys: QE_HOST_PORT=127.0.0.1:8080 keeps it local)
 # P2P between the GPUs depends on the host driver (it works in the container when it works on the host).
 services:
   qengine:
@@ -23,6 +23,7 @@ services:
       QE_EXTRA_ARGS: "${QE_EXTRA_ARGS:-}"
       QE_STEERING: "${QE_STEERING:-0}"   # steering: 0 off, 1 = included refusal_projection (Flash-Next), or a vector name
     ports:
+      # all interfaces (the server has no API keys): QE_HOST_PORT=127.0.0.1:8080 publishes it on this machine only
       - "${QE_HOST_PORT:-8080}:8080"
       - "127.0.0.1:${QE_METRICS_HOST_PORT:-9393}:9393"   # dashboard / Prometheus metrics
     volumes:

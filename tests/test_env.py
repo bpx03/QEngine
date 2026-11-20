@@ -6,6 +6,7 @@
 - the graph-instantiate OOM policy (src/flash/graph_oom.h): tests/graph_oom_unit.cpp, same way;
 - the NaN guard abort rule (src/flash/guard_rule.h): tests/guard_rule_unit.cpp, same way;
 - the host-RAM budget at boot (src/host_budget.h): tests/host_budget_unit.cpp, same way;
+- the runtime host-memory pressure response (src/host_pressure.h): tests/host_pressure_unit.cpp, same way;
 - the Flash-Next eviction order and archive-copy rules (src/flash/kv_evict.h): tests/kv_evict_unit.cpp, same way (property test);
 - SafeTensors::page_out (src/safetensors.cpp, issue #6): tests/page_out_unit.cpp, on a disk directory (not tmpfs);
 - environment writes in src/ only in the Flash-Next constructor and the 27B bench entry; `import app` starts no
@@ -139,6 +140,11 @@ def test_host_budget():
     run_cpp("host_budget_unit")
 
 
+def test_host_pressure():
+    r = run_cpp("host_pressure_unit")
+    assert "all passed" in r.stderr
+
+
 
 def test_kv_evict():
     r = run_cpp("kv_evict_unit")
@@ -171,5 +177,6 @@ if __name__ == "__main__":
     test_graph_oom()
     test_guard_rule()
     test_host_budget()
+    test_host_pressure()
     test_page_out()
     print("test_env: ok")

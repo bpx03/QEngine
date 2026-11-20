@@ -1545,6 +1545,46 @@ __global__ void allgather_ll_kernel(const float* __restrict__ src, int n, float*
     bump_seq(ctr, s);
 }
 
+
+// GLM row-owner prefill ( round 20): the reduce-scatter half of allreduce_rs_rows_kernel (P2P only, same
+// phase-1 packing, same fixed GPU summation order, same bf16 rounding of the sum), the owner writes 0 + bf16(sum) into
+// its own rows of out (rows [m * rank / ngpu, m * (rank + 1) / ngpu)); nothing is published. The second exchange keeps
+// the next call's phase-1 writes off the receive rows until they are read (as the HC own-rows path).
+__global__ void __launch_bounds__(512) rs_own_kernel(float* __restrict__ out, const float* __restrict__ partial, int m,
+                                                     int h, Comm c, int rank, CommCounters ctr) {
+    __shared__ unsigned s_seq;
+    if (threadIdx.x == 0) s_seq = *ctr.seq + 1;
+    __syncthreads();
+    const unsigned s1 = s_seq, s2 = s_seq + 1;
+    const int h4 = h >> 2;
+    const float4* p4 = reinterpret_cast<const float4*>(partial);
+    float4* o4 = reinterpret_cast<float4*>(out);
+    auto owner_begin = [&](int g) { return (int)((long)m * g / c.ngpu); };
+    const int ob = owner_begin(rank), oe = owner_begin(rank + 1);
+    for (int r = blockIdx.x; r < m; r += gridDim.x) {
+        if (r >= ob && r < oe) continue;
+        int og = 0;
+        while (og + 1 < c.ngpu && r >= owner_begin(og + 1)) og++;
+        uint2* dst = c.prs1[og] + ((size_t)rank * c.rs_own + (r - owner_begin(og))) * h4;
+        for (int i = threadIdx.x; i < h4; i += blockDim.x) dst[i] = pack_bf16x4(p4[(size_t)r * h4 + i]);
+    }
+    exchange(c, rank, ctr, s1, true, kWdArRowsExchange);
+    for (int r = ob + blockIdx.x; r < oe; r += gridDim.x)
+        for (int i = threadIdx.x; i < h4; i += blockDim.x) {
+            const size_t idx = (size_t)r * h4 + i;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int g = 0; g < c.ngpu; g++) {
+                const uint2* src = c.prs1[rank] + ((size_t)g * c.rs_own + (r - ob)) * h4 + i;
+                const float4 x = g == rank ? unpack_bf16x4(pack_bf16x4(p4[idx])) : unpack_bf16x4(__ldcv(src));
+                v.x += x.x; v.y += x.y; v.z += x.z; v.w += x.w;
+            }
+            const float4 vb = unpack_bf16x4(pack_bf16x4(v));
+            o4[idx] = make_float4(0.f + vb.x, 0.f + vb.y, 0.f + vb.z, 0.f + vb.w);  // = the zeroed sum + bf16 sum
+        }
+    exchange(c, rank, ctr, s2, true, kWdArRowsExchange);
+    bump_seq(ctr, s2);
+}
+
 }  // namespace
 float comm_test_store_us() {
     static const float v = (float)env_double("QE_DECODE_TEST_STORE_US", 0.0);
@@ -2014,6 +2054,22 @@ bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, i
                                                                   true, false, false, w16, inj, own_rows);
     return true;
 }
+// GLM owner mode only (src/glm). Review r20-L3: QE_AR_RS_ROWS=0 turns it off like the other row reduce-scatters, and the
+// fault hook (QE_FAULT_SKIP_AR_RANK) skips it like allreduce_add
+bool rs_own_ok(const Comm& c, int m, int h) {
+    static const bool rs = env_set("QE_AR_RS_ROWS") ? env_int("QE_AR_RS_ROWS", true) != 0 : true;
+    return rs && c.p2p && c.ngpu > 1 && m >= 3 * c.ngpu && m <= c.rs_rows && h == c.ll_hidden && (h / 4) % kCommBlocks == 0 &&
+           c.prs1[0] != nullptr &&
+           c.pflags[0] != nullptr && m * h <= c.max_elems;
+}
+void allreduce_rs_own(float* out, const float* partial, int m, int h, const Comm& c, int rank, const CommCounters& ctr,
+                      cudaStream_t st, bool overlapped) {
+    CHECK(rs_own_ok(c, m, h) && (h / 4) % kCommBlocks == 0, "allreduce_rs_own %dx%d", m, h);
+    if (qe_fault_skip(rank, "ar")) return;  // test only (QE_FAULT_SKIP_AR_RANK): this rank skips the collective
+    const int nb = std::min(m, overlapped ? env_int("QE_AR_OV_BLOCKS", 4) : 64);
+    rs_own_kernel<<<nb, 512, 0, st>>>(out, partial, m, h, c, rank, ctr);
+}
+
 bool allreduce_hc_ok(const Comm& c, int m, int h) {
     // (no peer access: only the host-staged variant, which needs no peer flags)
     const bool hs = !c.p2p && c.xfer == kXferHost && c.xcnt[0] != nullptr;

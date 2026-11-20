@@ -144,6 +144,8 @@ S_NOCALL, S_THINK, S_TRIE, S_FREE = "nocall", "think", "trie", "free"
 class Tier:
     """Token ids and masks of the tool_choice constraints, built once per server (tokenizer, ThinkIds, end tokens)."""
 
+    think_lead = "\n\n"  # what the template writes between </think> and a call
+
     def __init__(self, tok, think_ids, eos, im_start):
         self.tok, self.ti = tok, think_ids
         self.call = tok.token_to_id("<tool_call>")
@@ -169,7 +171,7 @@ class Tier:
         return h
 
     def trie(self, lead, names):
-        key = (lead, tuple(names))
+        key = (lead, tuple(names))  # (noqa: a subclass may change header())
         t = self._tries.get(key)
         if t is None:
             root = {}
@@ -206,7 +208,7 @@ class Tier:
             return ToolMatcher(self, S_NOCALL, None, None)
         names = spec["names"]
         if opens_in_think and self.ti is not None and self.ti.ok:
-            return ToolMatcher(self, S_THINK, None, self.trie("\n\n", names))
+            return ToolMatcher(self, S_THINK, None, self.trie(self.think_lead, names))
         return ToolMatcher(self, S_TRIE, self.trie("", names), None)
 
 
@@ -249,7 +251,7 @@ class ToolMatcher:
             return False
         self.hist.append((self.state, self.node))
         if len(self.hist) > 64:  # rollback() undoes at most one step's drafts (< 16): a bounded history (review L6)
-            del self.hist[:-32]
+            del self.hist[:-48]   # (optgram review L7: a pass checks up to 32 tokens, then rolls them back)
         self.state, self.node = r
         return True
 
@@ -296,3 +298,18 @@ class ToolMatcher:
     def released(self):
         """The forced part is done: the job may drop the constraint (the rest of the reply decodes freely)."""
         return self.state == S_FREE or (self.state == S_TRIE and bool(self.node.get(None)))
+
+
+class GlmTier(Tier):
+    """[glm-rel-tools] GLM-5.3: the template writes `<tool_call>NAME<arg_key>k</arg_key>...` right after `</think>`."""
+    think_lead = ""
+
+    def header(self, lead, name):
+        h = self.enc(lead + "<tool_call>" + name)
+        for tail in ("<arg_key>x</arg_key><arg_value>v</arg_value></tool_call>", "</tool_call>"):
+            f = self.enc(lead + "<tool_call>" + name + tail)
+            k = 0
+            while k < len(h) and k < len(f) and h[k] == f[k]:
+                k += 1
+            h = h[:k]
+        return h

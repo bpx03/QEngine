@@ -1,5 +1,7 @@
 // Qwen3.8-Flash-Next worker: loading of one card's slice and the decode forward (see flash.h).
 #include "../env.h"
+#include "../qe_log.h"
+#include "../drv_gate.h"
 #include "flash.h"
 #include "pp_plan.h"
 #include <cuda.h>
@@ -12,6 +14,7 @@
 #include "../kernels/watchdog.cuh"
 #include "../gpu_diag.h"
 #include "../host_mem.h"
+#include "../host_pressure.h"
 #include <unistd.h>
 #include "../kernels/ops.cuh"
 
@@ -74,6 +77,63 @@ static cudaError_t host_register_wait(void* p, size_t n, unsigned flags, const c
     return e;
 }
 
+// the registrations of every pin_host / pin_host_file buffer (by the address they returned): unpin_host gives one back
+namespace {
+struct PinRec {
+    const char* ret = nullptr;
+    char* base = nullptr;
+    size_t cap = 0;
+    std::vector<std::pair<char*, size_t>> regs;
+};
+std::mutex& pin_mu() { static std::mutex* m = new std::mutex; return *m; }
+std::vector<PinRec>& pin_recs() { static auto* v = new std::vector<PinRec>; return *v; }
+void pin_note(const char* ret, char* base, size_t cap, std::vector<std::pair<char*, size_t>> regs) {
+    std::lock_guard<std::mutex> l(pin_mu());
+    pin_recs().push_back(PinRec{ret, base, cap, std::move(regs)});
+}
+}  // namespace
+
+bool unpin_host(const void* ret, const std::atomic<bool>* stop, size_t* bytes, double* piece_ms, int* bad) {
+    PinRec r;
+    {
+        std::lock_guard<std::mutex> l(pin_mu());
+        auto& v = pin_recs();
+        auto it = std::find_if(v.begin(), v.end(), [&](const PinRec& x) { return x.ret == (const char*)ret; });
+        if (it == v.end()) return false;
+        r = std::move(*it);
+        v.erase(it);
+    }
+    // one registration at a time, each in an idle gap of the scheduler (drv_gate.h: never next to a step's launches; a
+    // step that starts meanwhile waits for the one piece), then its pages go back in 256 MB pieces with MADV_DONTNEED (a
+    // single free of the whole buffer would hold the process's mmap lock for seconds: every page fault and driver mapping
+    // of the engine waits on it); the emptied mapping is freed at the end, unless a piece is still registered
+    int nbad = 0;
+    double worst = 0;
+    for (auto& [p, n] : r.regs) {
+        cudaError_t e;
+        {
+            qe_drv::Reg g(stop, 20, 2000);
+            if (!g.ok()) return false;  // (shutdown: the memory stays; the process ends)
+            const auto t0 = std::chrono::steady_clock::now();
+            e = cudaHostUnregister(p);
+            cudaGetLastError();
+            worst = std::max(worst, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        if (e != cudaSuccess) { nbad++; continue; }  // (still pinned: its pages stay)
+        constexpr size_t PIECE = (size_t)256 << 20;
+        for (size_t o = 0; o < n; o += PIECE) {
+            madvise(p + o, std::min(PIECE, n - o), MADV_DONTNEED);
+            std::this_thread::yield();
+        }
+    }
+    if (piece_ms) *piece_ms = worst;
+    if (bad) *bad = nbad;
+    if (nbad) return false;
+    ::free(r.base);
+    if (bytes) *bytes = r.cap;
+    return true;
+}
+
 char* pin_host_file(const std::string& path, size_t off, size_t n, const void* src, int threads, const std::vector<int>& numa) {
     constexpr size_t PG = (size_t)2 << 20, BLK = (size_t)8 << 20, AL = 4096;
     const size_t lead = off % AL, foff = off - lead;  // the buffer starts at file offset foff (O_DIRECT alignment)
@@ -89,6 +149,7 @@ char* pin_host_file(const std::string& path, size_t off, size_t n, const void* s
                 "VRAM). Largest processes: %s\n", cap / 1e9, charge.others() / 1e9, av / 1e9, qe_hostmem::top_rss(4).c_str());
         fflush(stderr);
         qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp)
+        qe_log::drain();
         _exit(3);
     }
     CHECK(posix_memalign((void**)&p, PG, cap) == 0 && p, "pin_host_file: out of host memory (%.1f GB)", cap / 1e9);
@@ -151,6 +212,14 @@ char* pin_host_file(const std::string& path, size_t off, size_t n, const void* s
         if (e != cudaSuccess && e != cudaErrorMemoryAllocation) qe_diag::explain_start_failure("pin_host_file: cudaHostRegister", e);
         CHECK(e == cudaSuccess, "pin_host_file: cudaHostRegister: %s", cudaGetErrorString(e));
     }
+    {
+        std::vector<std::pair<char*, size_t>> regs;
+        for (int t = 0; t < threads; t++) {
+            const size_t c0 = cap / PG * t / threads * PG, c1 = cap / PG * (t + 1) / threads * PG;
+            regs.push_back({p + c0, c1 - c0});
+        }
+        pin_note(p + lead, p, cap, std::move(regs));
+    }
     size_t h = 0;
     for (size_t x : hit) h += x;
     posix_fadvise(fd, foff, tot, POSIX_FADV_DONTNEED);
@@ -176,6 +245,7 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
                 "VRAM). Largest processes: %s\n", cap / 1e9, charge.others() / 1e9, av / 1e9, qe_hostmem::top_rss(4).c_str());
         fflush(stderr);
         qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp)
+        qe_log::drain();
         _exit(3);
     }
     CHECK(posix_memalign((void**)&p, PG, cap) == 0 && p, "pin_host: out of host memory (%.1f GB)", cap / 1e9);
@@ -206,6 +276,16 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
     for (auto e : err) {
         if (e != cudaSuccess && e != cudaErrorMemoryAllocation) qe_diag::explain_start_failure("pin_host: cudaHostRegister", e);
         CHECK(e == cudaSuccess, "pin_host: cudaHostRegister: %s", cudaGetErrorString(e));
+    }
+    {
+        std::vector<std::pair<char*, size_t>> regs;
+        if (!chunked) regs.push_back({p, cap});
+        else
+            for (int t = 0; t < threads; t++) {
+                const size_t c0 = cap / PG * t / threads * PG, c1 = cap / PG * (t + 1) / threads * PG;
+                regs.push_back({p + c0, c1 - c0});
+            }
+        pin_note(p, p, cap, std::move(regs));
     }
     return p;
 }
@@ -629,10 +709,11 @@ void* Worker::dalloc(size_t bytes) {
                 "The settings need more VRAM than this card has: lower FLASH_MAX_SEQS (%d slots, ~103 MB of state per slot "
                 "and card on 2 GPUs), the context (--max-ctx), or use FLASH_KV=ram; FLASH_EC_MARGIN_MB applies only to the "
                 "expert cache\n", dev_, vready_ ? "while serving" : "at load", bytes / 1048576.0, free_bytes() / 1048576.0, wbytes_ / 1e9,
-                num_slots() ? num_slots() : std::clamp(env_int("FLASH_MAX_SEQS", 16), 1, 16));
+                num_slots() ? num_slots() : std::clamp(env_int("FLASH_MAX_SEQS", 16), 1, kMaxSlots));
         if (!vready_) {  // at load: a clear stop (no abort, no core dump); the context fit before the load makes it rare
             fflush(stderr);
             qe_load_oom_fallback();  // (FLASH_PAR=auto on 4 cards picked tp: restart in pp, #9)
+            qe_log::drain();
             _exit(3);
         }
         CHECK(false, "flash: out of device memory at load (see above)");
@@ -1390,6 +1471,7 @@ void Worker::view_groups(Layer& L, int li) {
                             "enough host memory. Use FLASH_PAR=tp, or enable P2P\n", b / 1e9, rd, LI, qe_hostmem::available() / 1e9,
                             qe_hostmem::margin() / 1e9);
                     fflush(stderr);
+                    qe_log::drain();
                     _exit(3);
                 }
                 h = pin_host(nullptr, b, 4, false, {gpu_numa_node(rd)});
@@ -5169,21 +5251,38 @@ void Worker::head_sample_b(int m, int* dst, const int* rs, const int* ext) {  //
     sample_rows_slots(cand_all_, p_.ngpu, m, spslot_, rs ? rs : rslot_, sson_d_, dst, st_, ext);
 }
 
-void Worker::start_ngram_stage(const HostTables* ht) {
+bool Worker::start_ngram_stage(const HostTables* ht, bool soft) {
     CUDA_CHECK(cudaSetDevice(dev_));
     CHECK(!ht->ngram8.empty(), "FLASH_NGRAM_PIN=0 needs the INT8 n-gram table");
+    if (ngp_.flags) return true;  // (already staged)
     const size_t rows = (size_t)MAXM * PLE_HEADS;
-    long long* req;
-    uint8_t* stage;
-    unsigned* flags;
+    long long* req = nullptr;
+    uint8_t* stage = nullptr;
+    unsigned* flags = nullptr;
+    void *dr = nullptr, *ds = nullptr, *df = nullptr;
+    if (soft) {  // (runtime switch under host-memory pressure: a failed allocation keeps the pinned table, no abort)
+        const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
+        bool ok = cudaHostAlloc((void**)&req, rows * 8, fl) == cudaSuccess && cudaHostAlloc((void**)&stage, rows * NGRAM_Q8_ROW, fl) == cudaSuccess &&
+                  cudaHostAlloc((void**)&flags, 16, fl) == cudaSuccess;
+        ok = ok && cudaHostGetDevicePointer(&dr, req, 0) == cudaSuccess && cudaHostGetDevicePointer(&ds, stage, 0) == cudaSuccess &&
+             cudaHostGetDevicePointer(&df, flags, 0) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            for (void* q : {(void*)req, (void*)stage, (void*)flags})
+                if (q) cudaFreeHost(q);
+            cudaGetLastError();
+            return false;
+        }
+        memset(flags, 0, 16);
+    } else {
     CUDA_CHECK(cudaHostAlloc((void**)&req, rows * 8, cudaHostAllocMapped | cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc((void**)&stage, rows * NGRAM_Q8_ROW, cudaHostAllocMapped | cudaHostAllocPortable));
     CUDA_CHECK(cudaHostAlloc((void**)&flags, 16, cudaHostAllocMapped | cudaHostAllocPortable));
     memset(flags, 0, 16);
-    void *dr, *ds, *df;
     CUDA_CHECK(cudaHostGetDevicePointer(&dr, req, 0));
     CUDA_CHECK(cudaHostGetDevicePointer(&ds, stage, 0));
     CUDA_CHECK(cudaHostGetDevicePointer(&df, flags, 0));
+    }
     ngp_.req = (long long*)dr;
     ngp_.stage = (const uint8_t*)ds;
     ngp_.flags = (unsigned*)df;
@@ -5243,6 +5342,7 @@ void Worker::start_ngram_stage(const HostTables* ht) {
             }
         }
     }).detach();
+    return true;
 }
 
 void Worker::set_constrained(int slot, bool on) {
@@ -7760,6 +7860,7 @@ unsigned Worker::nf_check(const char* what, int pos) {
                         "emitting garbage tokens (FLASH_GUARD=3)\n", what, pos);
         fflush(stderr);
         fflush(stdout);
+        qe_log::drain();
         abort();
     }
     if (mode != 1) return 0;
@@ -7980,16 +8081,19 @@ int Worker::kv_ram_periods() const {
     if (!kvs_ || !kvh_lazy_) return periods();
     size_t rowb = 0;
     for (auto& a : kvh_arr_) rowb += a.row;
-    const double grow = 0.75 * (double)qe_hostmem::headroom() / p_.ngpu / std::max<size_t>(rowb, 1);  // rows
+    // (host memory pressure, host_pressure.h stage >= 1: no growth beyond what is pinned)
+    const double grow = qe_memp::holding() ? 0.0 : 0.75 * (double)qe_hostmem::headroom() / p_.ngpu / std::max<size_t>(rowb, 1);  // rows
     const long long r = (long long)kvh_pinned_ + (long long)grow;
     return (int)std::min<long long>(periods(), r / p_.own);
 }
 
-void Worker::kvh_pin(int r0, int r1) {  // slab by slab (a release unregisters whole slabs)
-    for (int a0 = r0; a0 < r1; a0 += kvh_slab_)
-        for (auto& a : kvh_arr_)
+void Worker::kvh_pin(int r0, int r1, size_t from) {  // slab by slab (a release unregisters whole slabs)
+    for (int a0 = r0; a0 < r1; a0 += kvh_slab_, from = 0)
+        for (size_t i = from; i < kvh_arr_.size(); i++) {
+            const HArr& a = kvh_arr_[i];
             CUDA_CHECK(cudaHostRegister(a.p + (size_t)a0 * a.row, (size_t)(std::min(r1, a0 + kvh_slab_) - a0) * a.row,
                                         cudaHostRegisterMapped | cudaHostRegisterPortable));
+        }
 }
 
 void Worker::kv_host_ensure(int periods, bool may_release) {
@@ -7999,51 +8103,97 @@ void Worker::kv_host_ensure(int periods, bool may_release) {
     for (auto& a : kvh_arr_) rowb += a.row;
     const int want = std::min(rows_, (int)(((long long)periods * p_.own + kvh_slab_ - 1) / kvh_slab_ * kvh_slab_));
     if (kvh_th_.joinable() && (kvh_done_.load() || want > kvh_pinned_)) {  // the slab pinned ahead
+        // (inside a job the thread cannot be registering: it waits for the driver gate until the job ends; cancelled, it
+        // gives up at once and the rows are pinned below, issue #32)
+        if (!kvh_done_.load()) kvh_cancel_ = true;
         kvh_th_.join();
+        kvh_cancel_ = false;
+        kvh_part_ = kvh_bg_ > kvh_pinned_ ? 0 : kvh_bg_part_;  // (cancelled in the middle of the slab: its first arrays)
         kvs_host_ += (size_t)(kvh_bg_ - kvh_pinned_) * rowb;
         kvh_pinned_ = kvh_bg_;
     }
     static const bool lg = env_int("FLASH_KV_RAM_LOG", 1);
     if (want > kvh_pinned_) {  // not pinned ahead (a jump): now, synchronously
         const auto t0 = std::chrono::steady_clock::now();
-        kvh_pin(kvh_pinned_, want);
+        {
+            // a slow driver call on this rank's thread inside a job: the peers' watchdogs wait instead of trapping (the
+            // run() monitor still ends a real hang). Rare: update_top pins the regions' top before their steps
+            QeWdSlow slow;
+            kvh_pin(kvh_pinned_, want, kvh_part_);
+            kvh_part_ = 0;
+        }
         kvs_host_ += (size_t)(want - kvh_pinned_) * rowb;
         if (lg)
             fprintf(stderr, "[flash] GPU%d KV in RAM: pinned rows %d -> %d (%.2f GB, %.0f ms in the step)\n", dev_, kvh_pinned_, want, kvs_host_ / 1e9,
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         kvh_pinned_ = want;
+        kvh_rel_due_ = false;
     } else if (!(kvh_pinned_ - std::max(want, kvh_min_) >= 2 * kvh_slab_)) {
         kvh_low_ = 0;
+        kvh_rel_due_ = false;
     } else if (may_release && !kvh_th_.joinable() && ++kvh_low_ >= 256) {  // release all but one slab above the top
         // (only at a launch, after 256 launches in a row below: a region move lowers the top for a moment while
-        // the rows above still hold a sequence)
+        // the rows above still hold a sequence). Done after the job (kv_host_release), not inside it
         kvh_low_ = 0;
-        const int keep = std::max(want, kvh_min_) + kvh_slab_;
-        CUDA_CHECK(cudaStreamSynchronize(st_));
-        for (int r0 = (kvh_pinned_ - 1) / kvh_slab_ * kvh_slab_; r0 >= keep; r0 -= kvh_slab_) {
-            const int n = std::min(kvh_slab_, rows_ - r0);
-            for (auto& a : kvh_arr_) {
-                CUDA_CHECK(cudaHostUnregister(a.p + (size_t)r0 * a.row));
-                madvise(a.p + (size_t)r0 * a.row, (size_t)n * a.row, MADV_DONTNEED);
-            }
-            kvs_host_ -= (size_t)n * rowb;
-        }
-        fprintf(stderr, "[flash] GPU%d KV in RAM: released rows %d -> %d (%.2f GB pinned)\n", dev_, kvh_pinned_, keep, kvs_host_ / 1e9);
-        kvh_pinned_ = keep;
+        kvh_rel_keep_ = std::max(want, kvh_min_) + kvh_slab_;
+        kvh_rel_due_ = true;
     }
     // keep one slab pinned beyond the top (background thread), while the host has room for it on every card
-    if (!kvh_th_.joinable() && kvh_pinned_ < rows_ && kvh_pinned_ - want < kvh_slab_ &&
+    if (!kvh_th_.joinable() && !kvh_rel_due_ && kvh_pinned_ < rows_ && kvh_pinned_ - want < kvh_slab_ && !qe_memp::holding() &&
         qe_hostmem::headroom() > (size_t)p_.ngpu * kvh_slab_ * rowb * 2) {
         const int r0 = kvh_pinned_, r1 = std::min(rows_, kvh_pinned_ + kvh_slab_);
-        kvh_bg_ = r1;
+        kvh_bg_ = r0;
+        kvh_bg_part_ = kvh_part_;
         kvh_done_ = false;
+        kvh_cancel_ = false;
         const int dev = dev_;
         kvh_th_ = std::thread([this, r0, r1, dev] {
             CUDA_CHECK(cudaSetDevice(dev));
-            kvh_pin(r0, r1);
+            // array by array, one driver-gate turn each (review L5: the next job waits for one array's registration, not
+            // for the slab's 443 MB); a step that needs the rows cancels between them (drv_gate.h)
+            size_t i = kvh_bg_part_;
+            for (; i < kvh_arr_.size(); i++) {
+                qe_drv::Reg g(&kvh_cancel_);
+                if (!g.ok()) break;
+                const HArr& a = kvh_arr_[i];
+                CUDA_CHECK(cudaHostRegister(a.p + (size_t)r0 * a.row, (size_t)(r1 - r0) * a.row, cudaHostRegisterMapped | cudaHostRegisterPortable));
+            }
+            kvh_bg_part_ = i;
+            if (i == kvh_arr_.size()) kvh_bg_ = r1;
             kvh_done_ = true;
         });
     }
+}
+
+void Worker::kv_host_release() {
+    if (!kvh_rel_due_) return;
+    kvh_rel_due_ = false;
+    const int keep = kvh_rel_keep_;
+    if (!kvs_ || !kvh_lazy_ || kvh_th_.joinable() || kvh_pinned_ <= keep) return;
+    int cur = 0;
+    CUDA_CHECK(cudaGetDevice(&cur));
+    CUDA_CHECK(cudaSetDevice(dev_));
+    size_t rowb = 0;
+    for (auto& a : kvh_arr_) rowb += a.row;
+    CUDA_CHECK(cudaStreamSynchronize(st_));  // (a single-step lookahead may still read the rows)
+    if (kvh_pinned_ < rows_)  // the arrays a cancelled pin-ahead registered of the slab above (kvh_part_)
+        for (size_t i = 0; i < kvh_part_; i++) {
+            const HArr& a = kvh_arr_[i];
+            CUDA_CHECK(cudaHostUnregister(a.p + (size_t)kvh_pinned_ * a.row));
+            madvise(a.p + (size_t)kvh_pinned_ * a.row, (size_t)(std::min(rows_, kvh_pinned_ + kvh_slab_) - kvh_pinned_) * a.row, MADV_DONTNEED);
+        }
+    kvh_part_ = 0;
+    for (int r0 = (kvh_pinned_ - 1) / kvh_slab_ * kvh_slab_; r0 >= keep; r0 -= kvh_slab_) {
+        const int n = std::min(kvh_slab_, rows_ - r0);
+        for (auto& a : kvh_arr_) {
+            CUDA_CHECK(cudaHostUnregister(a.p + (size_t)r0 * a.row));
+            madvise(a.p + (size_t)r0 * a.row, (size_t)n * a.row, MADV_DONTNEED);
+        }
+        kvs_host_ -= (size_t)n * rowb;
+    }
+    fprintf(stderr, "[flash] GPU%d KV in RAM: released rows %d -> %d (%.2f GB pinned)\n", dev_, kvh_pinned_, keep, kvs_host_ / 1e9);
+    kvh_pinned_ = keep;
+    CUDA_CHECK(cudaSetDevice(cur));
 }
 
 void Worker::kv_inval(int base, int t0, int t1) {

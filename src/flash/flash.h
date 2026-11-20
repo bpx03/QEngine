@@ -67,6 +67,9 @@ constexpr int ARU_MAX = 2 * PFM;
 // staged; no peer access: 200 -> 255 ms); bit-identical
 constexpr int kPfStageMin = 1024, kPfStageMinPart = 2048;
 constexpr int MAXM = 32;
+// [qfn-ttft-seats32] sequence slots at most (FLASH_MAX_SEQS): a batched step holds <= MAXM segments; qe_step_batch runs more
+// than MAXM / 2 sequences as groups of <= MAXM / 2 so that every sequence keeps a draft row
+constexpr int kMaxSlots = MAXM;
 constexpr int kSlotCutMax = 64;
 // lone prompt batches from this many rows take the sequence-parallel trunk with P2P exchanges (FLASH_PF_SP_MIN,
 // Worker::pf_sp_min; [qfn-boot-det]: 3 cards 64 tokens 36.3 vs 34.7 ms plain, 96 39.8 vs 40.9, 200 56.9 vs 64.3)
@@ -314,6 +317,11 @@ char* pin_host(const void* src, size_t n, int threads = 32, bool chunked = false
 // dropped afterwards (POSIX_FADV_DONTNEED). Returns the address of byte off (the buffer may start up to 4 KB earlier).
 char* pin_host_file(const std::string& path, size_t off, size_t n, const void* src, int threads = 32,
                     const std::vector<int>& numa = {});
+// Gives a pin_host / pin_host_file buffer back (its address as returned): every registration unregistered in an idle gap
+// of the scheduler (drv_gate.h), the pages returned piece by piece, the buffer freed. Nothing may read it any more.
+// false: not a recorded buffer, stop was set while waiting, or a piece failed to unregister (those pieces and the buffer
+// stay allocated: never freed while pinned). bytes: the buffer's size; piece_ms: the longest unregister; bad: failed pieces.
+bool unpin_host(const void* ret, const std::atomic<bool>* stop, size_t* bytes, double* piece_ms = nullptr, int* bad = nullptr);
 
 constexpr int NGRAM_Q8_ROW = PLE_DIM + 2;  // INT8 n-gram row: 160 int8, then the fp16 scale (x = q * scale)
 struct HostTables {        // shared by the workers (host memory)
@@ -497,7 +505,9 @@ public:
     bool lookup_on() const { return lk_on_; }
     void set_ngram(const NgramDev& n) { ngp_ = n; }
     // table not pinned (FLASH_NGRAM_PIN=0): the step's rows go through a mapped staging buffer filled by a host thread
-    void start_ngram_stage(const HostTables* ht);
+    // soft (the runtime switch under host-memory pressure): a failed allocation returns false instead of aborting
+    bool start_ngram_stage(const HostTables* ht, bool soft = false);
+    bool ngram_staged() const { return ngp_.flags != nullptr; }
     // temperature <= 0: greedy; else sampled verification rows / first token (same seed on every card)
     void set_sampling(float temperature, float top_p, int top_k, float min_p, unsigned long long seed);
     // presence / frequency penalty of the bound slot (after set_sampling, which turns it off); its counts restart
@@ -593,6 +603,8 @@ public:
     int period() const { return p_.period; }
     int cur_slot() const { return cur_slot_; }
     void use_slot(int s, int base);
+    bool kvh_release_due() const { return kvh_rel_due_; }
+    void kv_host_release();  // no job running (FE::run after the job; drv_gate Reg held by the caller)
     void set_kv_top(int periods) { kv_top_ = (long long)periods * p_.period; kv_host_ensure(periods, false); }
     // KV in RAM: positions of the regions of the active sequences (generating / prefilling; -1: unknown = all regions).
     // The block cache is sized to them, not to the pool top: an idle conversation's host rows need no cache entries
@@ -675,6 +687,11 @@ public:
     // the others, SPEC_ROW ints per slot (verify tokens, {pos, commit}, committed pair, host position, pending commits)
     static constexpr int SPEC_ROW = MAXM + 7;
     void spec_state_get(const int* slots, int n, int* buf);
+    // [qfn-ttft-park] slot s's per-slot rows for a parked reply: speculative state (SPEC_ROW ints, with the drafts), sampling
+    // parameters (with the counter) and flag, penalty counts when pen; restore writes them into slot s (any slot)
+    void park_save(int s, bool pen, std::vector<char>& out);
+    void park_restore(int s, bool pen, const std::vector<char>& in);
+    bool lp_slot_on(int s) const { return lp_of(s) != nullptr; }
     void spec_state_set(const int* slots, int n, const int* buf);
     // the next step's verify drafts of slot (1..n of its speculative row): a constrained step's planned drafts (mode B)
     void set_slot_drafts(int slot, const int* d, int n);
@@ -1231,11 +1248,19 @@ private:  // block unions of the prefill attention row groups (flash_pfq.cuh k_q
     std::vector<HArr> kvh_arr_;
     void kv_host_ensure(int periods, bool may_release);  // release: launch time only, after kvh_low_ calls in a row
     int kvh_low_ = 0;
-    void kvh_pin(int r0, int r1);  // cudaHostRegister rows [r0, r1) of every host array
+    void kvh_pin(int r0, int r1, size_t from = 0);  // cudaHostRegister rows [r0, r1) of every host array (from: the first
+                                                    // slab's arrays before it are registered already)
     // one slab pinned ahead in a background thread (kvh_bg_ rows when it is done), joined before the rows are used
     std::thread kvh_th_;
-    std::atomic<bool> kvh_done_{false};
+    std::atomic<bool> kvh_done_{false}, kvh_cancel_{false};  // (cancel: a step needs the rows now, issue #32)
     int kvh_bg_ = 0;
+    // review L5: the thread registers array by array, one driver-gate turn each; cancelled in the middle of a slab, the
+    // arrays it did stay registered: kvh_part_ of the slab at kvh_pinned_ (the next pin starts after them)
+    size_t kvh_bg_part_ = 0, kvh_part_ = 0;
+    // a release found due inside a launch (ec_tick) runs after the job, from the scheduler thread under the driver gate
+    // (kv_host_release; issue #32: no GB-scale unregister inside a step): rows from kvh_rel_keep_ up go back
+    bool kvh_rel_due_ = false;
+    int kvh_rel_keep_ = 0;
     int* psel_ = nullptr;  // KV streaming: resolved blocks of the decode rows keys [MAXM][srows_ / 4] (residency pass -> k_qsa_dec)
     size_t ec_ibound_ = (size_t)-1;  // KV streaming: indexer-key bytes per array in use (expert-cache slots above)
     void kv_need(Layer& L, int m, const int* pos0, const int* rpos, const int* rbase, int* psel = nullptr);  // no-selection rows

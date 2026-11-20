@@ -227,6 +227,36 @@ class Constraint:
     def fill(self, buf):
         self.m.unsafe_compute_mask_ptr(buf.ctypes.data, buf.nbytes)
 
+    def legal_prefix(self, toks, buf):
+        """[dsv4-rel8-optgram] (k, bad): the first k of toks are what the one-token-per-step path would take from here
+        (each allowed by the mask at its position; an allowed end token or a completed grammar ends them); bad = toks[k]
+        is refused, buf then holds the mask at k. The matcher state is unchanged."""
+        m, k, used, bad = self.m, 0, 0, False
+        vt = getattr(m, "validate_tokens", None)   # (llguidance: no state change; ToolMatcher's rollback clears errors)
+        for t in toks:
+            self.fill(buf)
+            if not allowed(buf, t):
+                bad = True
+                break
+            k += 1
+            if t in self.eos:   # (Job.feed ends the reply at an allowed end token)
+                break
+            # (never: the mask allowed it) refused after all: a masked step decides. Checked first without a state
+            # change (optgram review L2: a failed consume_token leaves llguidance in its error state for good)
+            if (vt is not None and vt([t]) != 1) or not m.consume_token(t):
+                k, bad = k - 1, True
+                break
+            used += 1
+            if m.is_stopped():
+                break
+            if self.released():   # (review L3: tool_choice header complete: the rest of the pass is free text,
+                # up to an end token, where Job.feed ends the reply)
+                k = next((i + 1 for i in range(k, len(toks)) if toks[i] in self.eos), len(toks))
+                break
+        if used:
+            m.rollback(used)
+        return k, bad
+
     def consume(self, t):
         """Advance by one emitted token; False when the grammar rejects it (error state)."""
         if self.m.consume_token(t):

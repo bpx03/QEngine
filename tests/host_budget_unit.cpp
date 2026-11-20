@@ -66,7 +66,26 @@ static void row(const char* model, double tot_gib, int n, const In& in, const Ou
            o.ngram_cache / GB, o.archive / GB, o.prefix / GB, o.reduced ? "yes" : "no");
 }
 
+// issue #25: the default plan on 64 / 128 / 256 GB hosts (Flash-Next, 3 cards, KV in VRAM) leaves the runtime margin free
+// when the archive and the prefixes are full: what the plan pins and fills <= MemTotal - reserve - margin
+static void issue25() {
+    for (double tg : {64.0, 128.0, 256.0}) {
+        In in;
+        in.qfn = true; in.cards = 3; in.total = tg * GiB; in.avail = in.total - 4e9;
+        in.experts = 11.9e9; in.ngram = 51.8e9; in.arch_def = 48e9; in.pref_def = 8e9;
+        const Out o = plan(in);
+        const double margin = std::max(8e9, 0.05 * in.total);
+        const double used = in.base + in.fixed + o.pinned + (o.ngram_pinned ? 0 : o.ngram_cache) + o.archive + o.prefix;
+        printf("issue25 %.0f GiB: n-gram %s, archive %.1f + %.1f GB, used %.1f GB, free at full %.1f GB (reserve %.1f + margin %.1f)\n",
+               tg, o.ngram_pinned ? "pinned" : "page cache", o.archive / 1e9, o.prefix / 1e9, used / 1e9, (in.total - used) / 1e9,
+               o.reserve / 1e9, margin / 1e9);
+        EXPECT(used <= in.total - o.reserve - margin + 1e6);
+        if (tg == 256.0) EXPECT(o.archive == 48e9 && o.prefix == 8e9 && o.ngram_pinned);  // the big host keeps the defaults
+    }
+}
+
 int main() {
+    issue25();
     table = getenv("QE_HOST_BUDGET_TABLE") && !strcmp(getenv("QE_HOST_BUDGET_TABLE"), "1");
     if (table) {
         printf("| model | MemTotal GiB | cards | MemAvailable GB | reserve GB | experts GB (est.) | n-gram | page cache GB | archive GB | prefixes GB | reduced |\n");
@@ -111,7 +130,9 @@ int main() {
             if (tg == 92.0 && n == 3) EXPECT(oa.ngram_pinned && oa.archive > 8e9 && oa.archive < 48e9);
             if (tg == 64.0) EXPECT(!oa.ngram_pinned);
             if (tg == 128.0 && n == 3) EXPECT(oa.ngram_pinned);
-            EXPECT(!ob.reduced);  // the 27B's defaults (40 GiB) fit from 64 GiB up
+            // the 27B's defaults (40 GiB) fit from 92 GiB up; at 64 GiB the archive keeps the runtime margin free (#25)
+            if (tg > 64.0) EXPECT(!ob.reduced);
+            else EXPECT(ob.reduced && ob.archive > 30e9);
         }
     }
     // explicit values win, with a warning when they do not fit
@@ -287,7 +308,8 @@ int main() {
                     EXPECT(ox.kv >= w * tb && ox.kv <= 1e6 * tb + 1);
                     EXPECT(line(x, ox).find("KV pool in RAM") != std::string::npos);
                     EXPECT(json(x, ox).find("\"kv_ram_gb\"") != std::string::npos);
-                    if (av == 127e9) EXPECT(ox.ngram_pinned && ox.warn.empty());  // a desktop's worth used: the table stays pinned
+                    if (av == 127e9) EXPECT(ox.ngram_pinned);  // a desktop's worth used: the table stays pinned (the archive may
+                    // be 0 next to the pool: it keeps the runtime margin free, #25; warned)
                     if (av == 127e9 && n >= 3) EXPECT(ox.kv == 1e6 * tb);         // and the whole pool
                 }
             // the order: the archive first (TP4, 127 GB free: the pool whole, the archive smaller than without the pool)

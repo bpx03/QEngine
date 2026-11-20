@@ -321,6 +321,9 @@ public:
     // Point slot i's next speculative step at (token, position) with no drafts to verify
     // (after a queued-ahead step was undone, its device-side token/position are stale).
     void spec_resync(int i, int pos, int tok);
+    // park / unpark (q27_park_review M1): the slot's next-step input (last token + its drafts) and position, exactly
+    void spec_save(int i, int* toks, int n);
+    void spec_restore(int i, int pos, const int* toks, int n);
     // Undo slot i's last (queued-ahead) speculative step: recurrent state back to dn_save.
     void undo_slot(int i);
     // Keep only the first r rows (pending token + accepted drafts) of slot i's last speculative
@@ -391,6 +394,10 @@ public:
     // Recurrent-state snapshots for prompt caching (delta-net states of the current slot +
     // conv histories). The KV cache is position-indexed and needs no copy.
     size_t snapshot_bytes() const;
+    // [q27-park-c] a slot's sampling parameters (seed, counter) + penalty state: saved at park, restored at unpark
+    size_t slot_small_bytes() const;
+    void slot_small_save(int slot, void* host);
+    void slot_small_restore(int slot, const void* host);
     void snapshot_save(void* dst);
     void snapshot_restore(const void* src);
     // [q27-snapasync] snapshot_save off the critical path: the conv rings are staged device-to-device on the stream

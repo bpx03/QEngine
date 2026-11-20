@@ -135,6 +135,38 @@ static void fixed_cases() {
             kve::add_ck(m, mk(300, 2), keep);  // the next prompt end does not push it out
             EXPECT(has_pos(m, 171) && lte_pos(m) == 171 && (int)m.ck.size() == keep);
         }
+    {  // [qfn-ttft-pe] a prompt end (7) per turn: only the latest is kept, the system end / periodic / n - 1 states stay
+        Conv m;
+        kve::add_ck(m, mk(50, 1), 6);      // system end
+        kve::add_ck(m, mk(8192, 3), 6);    // periodic
+        kve::add_ck(m, mk(9999, 2), 6);    // prompt end - 1 of a long turn
+        kve::add_ck(m, mk(10000, 7), 6);
+        for (int t = 1; t <= 8; t++) kve::add_ck(m, mk(10000 + 300 * t, 7), 6);  // short agent turns
+        int n7 = 0;
+        for (auto& x : m.ck) n7 += x->kind == 7;
+        EXPECT(n7 == 1 && has_pos(m, 12400) && has_pos(m, 50) && has_pos(m, 8192) && has_pos(m, 9999) && m.ck.size() == 4);
+        kve::drop_kind(m, 7);
+        EXPECT(m.ck.size() == 3 && !has_pos(m, 12400));
+        // the default cap 3: a long turn's periodic state goes, its n - 1 (an identical retry) and n stay with the system end
+        Conv m3;
+        kve::add_ck(m3, mk(50, 1), 3);
+        kve::add_ck(m3, mk(8192, 3), 3);
+        kve::add_ck(m3, mk(9999, 2), 3);
+        kve::add_ck(m3, mk(10000, 7), 3);
+        EXPECT(m3.ck.size() == 3 && has_pos(m3, 50) && has_pos(m3, 9999) && has_pos(m3, 10000));
+        kve::add_ck(m3, mk(10300, 7), 3);  // the next short turn
+        EXPECT(m3.ck.size() == 3 && has_pos(m3, 9999) && has_pos(m3, 10300) && !has_pos(m3, 10000));
+        // a fork keeps the parent's prompt end until its own turn replaces it in the fork only
+        Conv p;
+        kve::add_ck(p, mk(50, 1), 6);
+        kve::add_ck(p, mk(500, 7), 6);
+        const std::vector<int> ids(500, 7);
+        p.toks = ids; p.kv_n = 500;
+        Conv f;
+        kve::fork_from(f, p, ids.data(), 500);
+        kve::add_ck(f, mk(800, 7), 6);
+        EXPECT(has_pos(p, 500) && !has_pos(f, 500) && has_pos(f, 800) && has_pos(f, 50));
+    }
     {  // a state of an earlier build's mark (kind 6, read back from a disk-cache file) counts as a turn end
         Conv m;
         kve::add_ck(m, mk(10, 6), 2);

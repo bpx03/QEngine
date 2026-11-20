@@ -219,16 +219,27 @@ void fork_from(C& d, const C& from, const int* ids, int L) {
         if (s->pos <= L) d.ck.push_back(s);
     d.prio = from.prio;
 }
-// a new state of c, at most `keep` of them: drop the oldest periodic (3), divergence (5), turn-end (4), prompt-end (2), then
-// system-end (1) state. c's latest turn end (last_turn_end: the turn-end state at the highest position) goes last, for every
-// conversation alike (user decision 2026-11-12): without that each turn's prompt-end state would push out the one turn end
-// left (4 goes before 2), and the ram-mode spare drop keeps exactly that state. It is protected here, not marked on the state:
-// a fork shares its parent's State objects, so a mark would let one conversation's turn demote the other's (review L2). A kind
-// 6 (the mark of earlier builds, read back from a disk-cache file) counts as a turn end (4).
+// the states of one kind go (a fork's parent keeps its own references)
+template <class C>
+void drop_kind(C& c, int kind) {
+    c.ck.erase(std::remove_if(c.ck.begin(), c.ck.end(), [&](const auto& x) { return x->kind == kind; }), c.ck.end());
+}
+// a new state of c, at most `keep` of them: drop the oldest periodic (3), divergence (5), turn-end (4), prompt-end - 1 (2),
+// then system-end (1) state; a prompt end (7) only as the last resort. c's latest turn end (last_turn_end: the turn-end state
+// at the highest position) goes last, for every conversation alike (user decision 2026-11-12): without that each turn's
+// prompt-end state would push out the one turn end left (4 goes before 2), and the ram-mode spare drop keeps exactly that
+// state. It is protected here, not marked on the state: a fork shares its parent's State objects, so a mark would let one
+// conversation's turn demote the other's (review L2). A kind 6 (the mark of earlier builds, read back from a disk-cache file)
+// counts as a turn end (4).
+// A prompt-end state (kind 7, [qfn-ttft-pe]: the state after all rows of a prompt, the next turn's resume point when the
+// client sends another text for the reply) replaces the conversation's earlier one: a state per turn would push out the
+// system end, periodic and divergence states (keep) and grow every archived conversation (64 agent sessions on the 48 GB
+// archive: ~1 GB each, live sessions dropped, 287 old rows recomputed per turn).
 template <class C, class P>
 void add_ck(C& c, P s, int keep) {
     auto& v = c.ck;
-    v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& x) { return x->pos == s->pos; }), v.end());
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& x) { return x->pos == s->pos || (s->kind == 7 && x->kind == 7); }),
+            v.end());
     v.push_back(s);
     while ((int)v.size() > keep) {
         const void* k = last_turn_end(c);

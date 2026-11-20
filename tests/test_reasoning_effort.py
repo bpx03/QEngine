@@ -55,6 +55,18 @@ def test_template_kwargs():
     assert kw["reasoning_effort"] == "medium"
     kw = template_kwargs({"thinking": {"type": "disabled"}}, True, "low")
     assert kw["enable_thinking"] is False
+    # [kb-server] a null enable_thinking counts as not sent (server-small N2); issue #31: the top-level form binds
+    # (a real bool only) unless chat_template_kwargs sets it
+    assert template_kwargs({"chat_template_kwargs": {"enable_thinking": None}}, False)["enable_thinking"] is False
+    assert template_kwargs({"chat_template_kwargs": {"enable_thinking": None}}, True)["enable_thinking"] is True
+    assert template_kwargs({"enable_thinking": False}, True)["enable_thinking"] is False
+    assert template_kwargs({"enable_thinking": True}, False)["enable_thinking"] is True
+    assert template_kwargs({"enable_thinking": "false"}, True)["enable_thinking"] is True
+    assert template_kwargs({"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": True}},
+                           True)["enable_thinking"] is True
+    assert template_kwargs({"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": None}},
+                           True)["enable_thinking"] is False
+    assert template_kwargs({"enable_thinking": True, "reasoning_effort": "none"}, True, None) == {"enable_thinking": False}
     # none (club-3090 #1966): thinking off, no effort variable, from every source and in any case
     off = {"enable_thinking": False}
     for body, flag in (({"reasoning_effort": "none"}, None), ({"reasoning_effort": "None"}, "low"),

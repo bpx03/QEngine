@@ -93,18 +93,56 @@ void Worker::pieces_of(const SlotState& q, bool pend, std::vector<Piece>& out) c
     if (pend) out.push_back({(char*)q.stepc, 4});
 }
 
-// FLASH_MAX_SEQS slots (default 16; a pipeline stage: Plan::max_seqs when set), each with its own state storage; the
+// [qfn-ttft-park] a parked reply's per-slot rows: speculative state (spec_state_get's SPEC_ROW ints: verify tokens with the
+// drafts, {pos, commit}, committed pair, host position, pending commits), sampling parameters (the bound slot's live copy
+// is sp_) and flag, penalty counts (pen)
+void Worker::park_save(int s, bool pen, std::vector<char>& out) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    const size_t a = (size_t)SPEC_ROW * 4, b = sizeof(SampleParams), pb = pen ? pen_state_bytes(VOCAB) : 0;
+    out.assign(a + b + 4 + pb, 0);
+    spec_state_get(&s, 1, (int*)out.data());
+    CUDA_CHECK(cudaMemcpyAsync(out.data() + a, s == cur_slot_ ? sp_ : spslot_ + s, b, cudaMemcpyDeviceToHost, st_));
+    const int on = sson_.at(s);
+    memcpy(out.data() + a + b, &on, 4);
+    if (pb) CUDA_CHECK(cudaMemcpyAsync(out.data() + a + b + 4, pen_of(s), pb, cudaMemcpyDeviceToHost, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));
+}
+void Worker::park_restore(int s, bool pen, const std::vector<char>& in) {
+    CUDA_CHECK(cudaSetDevice(dev_));
+    const size_t a = (size_t)SPEC_ROW * 4, b = sizeof(SampleParams), pb = pen ? pen_state_bytes(VOCAB) : 0;
+    CHECK(in.size() == a + b + 4 + pb, "flash: park record of %zu bytes", in.size());
+    spec_state_set(&s, 1, (const int*)in.data());
+    SampleParams h;
+    memcpy(&h, in.data() + a, b);
+    h.pen = pen_of(s);  // (the counts of the slot it resumes in)
+    CUDA_CHECK(cudaMemcpyAsync(spslot_ + s, &h, b, cudaMemcpyHostToDevice, st_));
+    if (s == cur_slot_) CUDA_CHECK(cudaMemcpyAsync(sp_, &h, b, cudaMemcpyHostToDevice, st_));
+    int on;
+    memcpy(&on, in.data() + a + b, 4);
+    sson_.at(s) = on != 0;
+    if (s == cur_slot_) sampling_ = on != 0;
+    CUDA_CHECK(cudaMemcpyAsync(sson_d_ + s, &on, 4, cudaMemcpyHostToDevice, st_));
+    if (pb) CUDA_CHECK(cudaMemcpyAsync(pen_of(s), in.data() + a + b + 4, pb, cudaMemcpyHostToDevice, st_));
+    CUDA_CHECK(cudaStreamSynchronize(st_));  // (pageable / local sources)
+}
+
+// FLASH_MAX_SEQS slots (default 16, at most kMaxSlots; a pipeline stage: Plan::max_seqs when set), each with its own state storage; the
 // workspace (alloc_state) holds the bound one
 void Worker::alloc_slots() {
     int ns = p_.max_seqs > 0 ? p_.max_seqs : env_int("FLASH_MAX_SEQS", 16);
-    if (ns > 16 || ns < 1) {  // (the batch tables and per-slot graphs are sized for 16: a larger value used to be cut silently)
+    if (ns > kMaxSlots || ns < 1) {  // (a batched step holds at most MAXM segments: a larger value used to be cut silently)
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
-            fprintf(stderr, "[flash] %s=%d: sequence slots are 1 to 16, using %d (conversations past the slots stay in the host "
+            fprintf(stderr, "[flash] %s=%d: sequence slots are 1 to %d, using %d (conversations past the slots stay in the host "
                             "archive, FLASH_KV_ARCHIVE_GB)\n", p_.max_seqs > 0 ? "pipeline stage slots" : "FLASH_MAX_SEQS", ns,
-                    std::max(1, std::min(16, ns)));
+                    kMaxSlots, std::max(1, std::min(kMaxSlots, ns)));
     }
-    ns = std::max(1, std::min(16, ns));
+    ns = std::max(1, std::min(kMaxSlots, ns));
+    // mode B stages step more than 16 sequences one token at a time (no grouped batched steps there: qfn_park_review L6)
+    if (p_.pp() && ns > MAXM / 2) {
+        fprintf(stderr, "[flash] pipeline stage slots: %d, using %d (batched steps hold %d sequences with drafts)\n", ns, MAXM / 2, MAXM / 2);
+        ns = MAXM / 2;
+    }
     const int vl = p_.v1 - p_.v0, kl = p_.k1 - p_.k0;
     const int ch = 2 * kl * DK + vl * DV;
     slots_.assign(ns, SlotState{});

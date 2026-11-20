@@ -78,7 +78,9 @@ struct CgDirs {
     std::vector<std::string> dirs;  // own cgroup first, then the parents
 };
 inline const CgDirs& cg_dirs() {
-    static const CgDirs d = [] {
+    // never destroyed (review / round 21): engine threads (the GLM archive's pressure poll) read it until the process
+    // ends; a static object was destroyed at exit() under them (std::bad_alloc from a freed string, rc 134)
+    static const CgDirs& d = *new CgDirs([] {
         CgDirs r;
         std::string v2path, v1path;
         bool has0 = false;
@@ -101,7 +103,7 @@ inline const CgDirs& cg_dirs() {
             if (p.empty()) break;
         }
         return r;
-    }();
+    }());
     return d;
 }
 inline bool read_num(const std::string& file, double* v) {

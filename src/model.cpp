@@ -756,6 +756,20 @@ void Worker::spec_resync(int i, int pos, int tok) {
     CUDA_CHECK(cudaMemcpy(ss.pos, &pos, 4, cudaMemcpyHostToDevice));
 }
 
+void Worker::spec_save(int i, int* toks, int n) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(toks, slots_.at(i).spec.tokens, (size_t)n * 4, cudaMemcpyDeviceToHost));
+}
+
+void Worker::spec_restore(int i, int pos, const int* toks, int n) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const SpecState& ss = slots_.at(i).spec;
+    CUDA_CHECK(cudaMemcpy(ss.tokens, toks, (size_t)n * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ss.pos, &pos, 4, cudaMemcpyHostToDevice));
+}
+
 std::atomic<bool> g_qe_loaded{false};
 // the engine's emergency release (engine.cpp): the KV pool's chunks past every region on this worker's card, for an
 // out-of-memory on a worker thread while the engine thread waits for the step; true: memory was freed
@@ -1726,6 +1740,32 @@ void Worker::snapshot_restore(const void* src) {
         d += (size_t)kConvRing * dn_ch_ * 2;
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+size_t Worker::slot_small_bytes() const { return sizeof(SampleParams) + 16 + pen_state_bytes(c_.vocab); }
+
+void Worker::slot_small_save(int slot, void* host) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    SeqSlot& sl = slots_.at(slot);
+    char* h = (char*)host;
+    CUDA_CHECK(cudaMemcpy(h, sl.sp, sizeof(SampleParams), cudaMemcpyDeviceToHost));
+    h[sizeof(SampleParams)] = sl.sampling;
+    CUDA_CHECK(cudaMemcpy(h + sizeof(SampleParams) + 16, sl.pen, pen_state_bytes(c_.vocab), cudaMemcpyDeviceToHost));
+}
+
+void Worker::slot_small_restore(int slot, const void* host) {
+    CUDA_CHECK(cudaSetDevice(device));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    SeqSlot& sl = slots_.at(slot);
+    const char* h = (const char*)host;
+    SampleParams p;
+    memcpy(&p, h, sizeof(p));
+    if (p.pen) p.pen = sl.pen;  // (the parameters point at their own slot's counts)
+    CUDA_CHECK(cudaMemcpy(sl.sp, &p, sizeof(p), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(sl.pen, h + sizeof(SampleParams) + 16, pen_state_bytes(c_.vocab), cudaMemcpyHostToDevice));
+    sl.sampling = h[sizeof(SampleParams)] != 0;
+    if (slot == cur_slot_) sampling = sl.sampling;
 }
 
 void Worker::set_sampling(const SampleParams& p, bool on) {

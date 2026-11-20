@@ -2,6 +2,7 @@
 #include <cuda_profiler_api.h>
 #include "env.h"
 #include "engine.h"
+#include "drv_gate.h"
 #include "kernels/watchdog.cuh"
 #include "kernels/gemv.cuh"
 #include "gpu_others.h"
@@ -76,6 +77,10 @@ void GpuPool::loop(int rank) {
 }
 
 void GpuPool::run(const std::function<void(int)>& job) {
+    // [q27-vision-lazy] one job's launches on all cards inside the driver gate (drv_gate.h; as Flash-Next's FE::run): the
+    // server's vision encoder takes the gate (qe_drv_gate) around its launches, so with --vision (CUDA module loading
+    // LAZY) a kernel module loaded at its first launch never meets this job's collectives spinning on a card
+    qe_drv::Step gate;
     std::unique_lock<std::mutex> l(mu_);
     job_ = job;
     pending_ = threads_.size();
@@ -384,11 +389,27 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
                 workers_[r]->set_xchg_peerH(j, peer.xchg_bufH(), peer.xchg_flagsH());  // (null without host candidates)
             }
     plan_slots(max_t);
-    // snapshot store (pinned host, ~80 MB each on the 27B): 4 per sequence slot, at least 32. A prefill takes about 5
-    // states (periodic, tail, divergence, end); with 32 entries 8 agent conversations dropped each other's last usable
-    // state before their next turn and re-prefilled from the system prompt
-    max_snaps_ = std::max(kSnapBase, 4 * (int)seqs_.size());
+    // snapshot store (pinned host, ~151 MB per entry on the 27B, all cards together): 4 per sequence slot, at least 32;
+    // up to 8 per slot while they take at most 8 % of the host's RAM. A prefill takes about 5 states (periodic, tail,
+    // divergence, end); with 32 entries 8 agent conversations dropped each other's last usable state before their next
+    // turn and re-prefilled from the system prompt; with 4 per slot 16 conversations on 16 slots
+    // still did (c16 light: 64 entries evicted on almost every save, 2.5-21.8K rows recomputed per 45 s window,
+    // system-prompt fallbacks; 8 per slot: 0, [q27-snap-size])
+    {
+        size_t eb = 0;
+        for (auto& w : workers_) eb += w->snapshot_bytes();
+        const int ns = (int)seqs_.size();
+        double ram = (double)qe_hostmem::total();  // (a cgroup limit is the host for this process, review try 5 M2)
+        const qe_hostmem::CgroupMem cg = qe_hostmem::cgroup_mem();
+        if (cg.limit > 0) ram = std::min(ram, cg.limit);
+        const int by_ram = eb ? (int)std::min<size_t>(8 * ns, (size_t)(0.08 * ram) / eb) : 8 * ns;
+        max_snaps_ = std::max(kSnapBase, std::max(4 * ns, by_ram));
+        // pinned at start-up: the first kSnapBase and the rest up to the 8 % bound (review try 5 M1); past it (the 4 per slot
+        // floor on a small host) only as the store fills, as before
+        snap_eager_n_ = std::max(kSnapBase, std::min(max_snaps_, by_ram));
+    }
     if (env_set("QE_SNAPSHOTS")) max_snaps_ = std::max(1, env_int("QE_SNAPSHOTS", max_snaps_));
+    snap_eager_n_ = std::min(snap_eager_n_.load(), max_snaps_);
     // checkpoints keep max_snaps_/2 entries of their own (snap_policy.h)
     snap_reserve0_ = max_snaps_ / 2;
     if (env_set("QE_SNAP_CKPT_RESERVE")) snap_reserve0_ = std::max(0, std::min(max_snaps_, env_int("QE_SNAP_CKPT_RESERVE", snap_reserve0_)));
@@ -480,11 +501,11 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         in.base = std::max(0.0, env_double("QE_HOST_BASE_GB", 6.0)) * 1e9;
         double snap = 0;
         for (size_t sz : sizes) snap += (double)sz;
-        // snapshot entries pinned at start: the first kSnapBase (background, no room check); the rest are pinned only as
-        // the store fills and only while MemAvailable - margin holds two more (alloc_thread_, take_snapshot; a failed pin
-        // keeps the store at its size), and unused pre-pinned ones go back under the margin (mem_guard; entries in use
-        // stay): the plan does not take them from the archive, which restores whole conversations
-        in.fixed = (double)emb_bytes_ + snap * std::min(max_snaps_, kSnapBase);
+        // snapshot entries pinned at start: the first kSnapBase (background, no room check) and the rest up to snap_eager_n_
+        // (the 8 % bound, room-checked; [q27-snap-size]), counted here; past them pinned only as the store fills and only
+        // while MemAvailable - margin holds two more (alloc_thread_, take_snapshot; a failed pin keeps the store at its
+        // size), and unused pre-pinned ones go back under the margin (mem_guard; entries in use stay)
+        in.fixed = (double)emb_bytes_ + snap * snap_eager_n_;  // ([q27-snap-size] the entries pinned at start-up)
         for (auto& w : workers_) in.fixed += (double)w->h4_host_bytes_;  // [q27-head4r] bf16 head rows (pinned)
         const double GiB = (double)(1ull << 30);
         in.arch_def = 32 * GiB;
@@ -512,6 +533,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         prefix_budget_ = o.prefix == kp ? (size_t)((env_double("QE_PREFIX_GB", 8.0)) * (1ull << 30)) : (size_t)o.prefix;
     }
     if (env_set("QE_ARCHIVE_MIN")) archive_min_ = env_int("QE_ARCHIVE_MIN", archive_min_);
+    arch_subs_ = std::max(1, std::min<int>(kMaxSubs, env_int("QE_ARCH_SUBS", arch_subs_)));
     if (env_set("QE_SHARE_PREFIX")) share_prefix_ = env_int("QE_SHARE_PREFIX", share_prefix_) != 0;
     pool_log_ = env_int("QE_POOL_LOG", 0);
     disk_init();
@@ -520,6 +542,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
                      (size_t)((env_double("QE_ARCHIVE_SLAB_GB", 4.0)) * (1ull << 30)));
     alloc_thread_ = std::thread([this, sizes] {
         // errors (e.g. the process exiting while pinning) just end the background allocation
+        struct Done { std::atomic<bool>& f; ~Done() { f = true; } } done{snap_done_};  // (archive_wait: every way out)
         size_t tot = 0;
         for (size_t sz : sizes) tot += sz;
         for (int i = 0; i < max_snaps_ && !stop_alloc_; i++) {
@@ -527,8 +550,24 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             // pins none, and none is pinned next to the first replies: c=1 -15 % for seconds after start with 64 at
             // once) and only with host room (review M1)
             snap_busy_ = false;  // (a held calibration does not wait for this)
-            while (i >= kSnapBase && i - snap_n_.load() >= 8 && !stop_alloc_) usleep(50000);
-            if (stop_alloc_ || (i >= kSnapBase && qe_hostmem::headroom(true) < 2 * tot)) break;
+            {  // entries the engine thread made itself (no pre-pinned buffer left under load) count too (review L2)
+                std::lock_guard<std::mutex> lk(snap_mu_);
+                if (snap_n_.load() + (int)free_bufs_.size() > i) continue;
+            }
+            // (at start-up the whole store, then 8 ahead of the entries in use: [q27-snap-size]; inline pins on the engine
+            // thread under load cost ~35 ms each, 128 of them a few seconds of the first minute)
+            // (eager: entries below snap_eager_n_ while archive_wait runs, with a 2-slab cushion for the archive pinner)
+            const bool eager = snap_eager_ && i < snap_eager_n_;
+            if (i >= kSnapBase && !eager) snap_done_ = true;  // (archive_wait: nothing more to wait for)
+            while (i >= kSnapBase && i - snap_n_.load() >= 8 && !stop_alloc_ && !(snap_eager_ && i < snap_eager_n_)) usleep(50000);
+            while (i >= kSnapBase && qe_memp::holding() && !stop_alloc_) usleep(200000);  // (host memory pressure: no growth)
+            if (stop_alloc_) break;
+            if (i >= kSnapBase && snap_eager_ && i < snap_eager_n_ && qe_hostmem::headroom(true) < 2 * tot + ((size_t)8 << 30)) {
+                snap_eager_n_ = i;  // (short at start-up: the rest as the store fills, review try 5 L1; not the end of pinning)
+                i--;
+                continue;
+            }
+            if (i >= kSnapBase && qe_hostmem::headroom(true) < 2 * tot) break;
             for (;;) {  // (decode calibration, as HostPool: announce, then check)
                 snap_busy_ = true;
                 if (!snap_pause_ || stop_alloc_) break;
@@ -536,15 +575,35 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
                 usleep(20000);
             }
             std::vector<void*> b;
-            for (size_t sz : sizes) {
-                void* p;
-                if (cudaHostAlloc(&p, sz, cudaHostAllocPortable) != cudaSuccess) {
-                    cudaGetLastError();
-                    for (void* q : b) cudaFreeHost(q);
+            {
+                // [q27-reg] the pinning under the driver gate (drv_gate.h, issue #32), only in an idle gap of the engine
+                // (20 ms without a job); under sustained decode the store grows on the engine thread between jobs
+                // (snap_save); a decode calibration (snap_pause_) ends the wait, the entry is pinned after it
+                qe_drv::Reg g(&snap_pause_, 20, INT_MAX);
+                // (a pause, a pressure hold or a short host seen only now: not this time, reviews L1 / M1)
+                // (the cached MemAvailable: no /proc read while the gate is held)
+                if (!g.ok() || snap_pause_ || stop_alloc_ || (i >= kSnapBase && (qe_memp::holding() || qe_hostmem::headroom() < 2 * tot))) {
                     snap_busy_ = false;
-                    return;
+                    i--;  // (the same entry again)
+                    continue;
                 }
-                b.push_back(p);
+                {  // the engine thread may have made the entry itself during the wait (review L2, follow-up L-c)
+                    std::lock_guard<std::mutex> lk(snap_mu_);
+                    if (snap_n_.load() + (int)free_bufs_.size() > i) {
+                        snap_busy_ = false;
+                        continue;
+                    }
+                }
+                for (size_t sz : sizes) {
+                    void* p;
+                    if (cudaHostAlloc(&p, sz, cudaHostAllocPortable) != cudaSuccess) {
+                        cudaGetLastError();
+                        for (void* q : b) cudaFreeHost(q);
+                        snap_busy_ = false;
+                        return;
+                    }
+                    b.push_back(p);
+                }
             }
             std::lock_guard<std::mutex> lk(snap_mu_);
             free_bufs_.push_back(std::move(b));
@@ -568,6 +627,7 @@ Engine::~Engine() {
         disk_thread_.join();
     }
     stop_alloc_ = true;
+    snap_pause_ = true;  // (also the snapshot pinner's driver-gate cancel)
     if (alloc_thread_.joinable()) alloc_thread_.join();
     snap_host_wait();  // [q27-snapasync] (no copy into a buffer freed below)
     for (auto& b : free_bufs_)
@@ -591,8 +651,12 @@ Engine::~Engine() {
 // KV pool: every GPU allocates the same number of tokens once; sequence slots (logical, up to
 // kMaxBatch decoding together) get regions of it on demand (ensure_cap), so one long
 // conversation can use most of the memory and many short ones share it.
+// default sequence slots: 16 (user 11-19: the 32-slot pool cost two long conversations on 2 cards; park beyond the seats
+// serves many agents); QE_MAX_SEQS=32 is the opt-in for many agents with short context
+static int default_slots(size_t) { return 16; }
+
 void Engine::plan_slots(int main_cap) {
-    int nslots = env_int("QE_MAX_SEQS", 16);
+    int nslots = env_int("QE_MAX_SEQS", default_slots(workers_.size()));
     size_t cap_tokens = env_ll("QE_POOL_TOKENS", SIZE_MAX);
     if (const char* e = env_str("QE_SLOTS")) {  // legacy: "a,b,c" = 3 slots sharing a+b+c tokens
         std::stringstream ss(e);
@@ -1282,6 +1346,172 @@ bool Engine::unpause_slot(int v) {
     return true;
 }
 
+// ---------------------------------------------------------------- park / unpark ([q27-park-c])
+// A request beyond the decode seats gets its first token from a prefill seat and is parked: the pause path's copy (KV rows
+// and the recurrent state at pos to a held archive), its slot's sampling / penalty state and host fields to a record, and
+// the slot released. unpark restores all of it into any free slot through start_begin's restore (its own slot without a
+// copy while that still holds the rows) and skips the prefill: the next step starts from the same state, position and
+// pending token as an unparked one (drafts start empty; they never change the tokens).
+int Engine::park(int slot) {
+    if (slot < 0 || slot >= (int)seqs_.size()) return -1;
+    Seq& q = seqs_[slot];
+    if (!q.active || q.paused || q.full || pf_of(slot) || q.constrained || q.banned || q.sk >= 0 || q.pos <= q.split ||
+        workers_[0]->lsa_on())
+        return -1;
+    // (an attached conversation resumes only through its prefix's pinned host copy: held with it, review M2)
+    const KvArchive* pre = nullptr;
+    if (q.split > 0) {
+        KvArchive probe;
+        probe.split = q.split;
+        probe.sk = q.sk;
+        probe.toks.assign(q.seq.begin(), q.seq.begin() + q.split);
+        if (!(pre = prefix_host(probe))) return -1;
+    }
+    // parked archives cannot be freed under host-memory pressure (held): at most half of the archive budget (review M5)
+    {
+        size_t held = 0, need = 0;
+        for (auto& kv : parked_) held += kv.second.arch->total;
+        for (auto& w : workers_) need += w->archive_bytes(q.split, q.pos);
+        if (held + need > ram_budget() / 2) return -1;
+    }
+    finish();
+    const int keep_cur = cur_;
+    use_slot(slot);
+    arch_nosubs_ = true;
+    archive_slot(slot, true);
+    arch_nosubs_ = false;
+    KvArchive* arch = nullptr;
+    for (auto& a : archives_)
+        if (a.ram && a.sk == q.sk && a.n == q.pos && a.split == q.split &&
+            std::equal(q.seq.begin(), q.seq.begin() + q.pos, a.toks.begin()))
+            arch = &a;
+    if (!arch) {
+        if (keep_cur >= 0 && keep_cur != slot) use_slot(keep_cur);
+        if (pool_log_) printf("pool: slot %d (%d tokens) cannot be parked: no archive room\n", slot, q.pos), fflush(stdout);
+        return -1;
+    }
+    arch->hold++;
+    if (pre) pre->hold++;
+    ParkRec r;
+    r.arch = arch;
+    r.pre = pre;
+    r.seq.assign(q.seq.begin(), q.seq.begin() + q.pos);
+    r.pos = q.pos, r.pending = q.pending, r.last_tok = q.last_tok, r.plen = q.plen, r.hint = q.hint;
+    r.end = q.end, r.rlim = q.rlim, r.prio = q.prio, r.affinity = q.affinity;
+    r.pen = q.pen, r.no_lookup = q.no_lookup, r.want_drafts = q.want_drafts, r.no_ahead = q.no_ahead;
+    r.dev.resize(workers_.size());
+    const bool spec_ok = !q.stale && q.k_avail >= 0 && q.k_avail <= kMaxSpecK;
+    if (spec_ok) r.k_avail = q.k_avail, r.k_blk = q.k_blk, r.spec.resize(workers_.size());
+    pool_->run([&](int w) {
+        r.dev[w].resize(workers_[w]->slot_small_bytes());
+        workers_[w]->slot_small_save(slot, r.dev[w].data());
+        if (spec_ok) {
+            r.spec[w].resize(r.k_avail + 1);
+            workers_[w]->spec_save(slot, r.spec[w].data(), r.k_avail + 1);
+        }
+    });
+    if (keep_cur >= 0 && keep_cur != slot) use_slot(keep_cur);
+    release(slot);  // (its rows stay as an idle conversation: a resume into this slot copies nothing)
+    const int h = park_next_++;
+    parked_[h] = std::move(r);
+    n_park_++;
+    if (pool_log_) printf("pool: slot %d parked at %d tokens (handle %d)\n", slot, parked_[h].pos, h), fflush(stdout);
+    return h;
+}
+
+// -4: a resume whose held state did not serve is prefilled in pieces of QE_UNPARK_CHUNK rows (4096), one per call, so the
+// other requests run between them (as Flash-Next, qfn_park_review M2); the caller calls again with the same handle
+int Engine::unpark(int h, int k, int* extra) {
+    *extra = -1;
+    auto it = parked_.find(h);
+    if (it == parked_.end()) return -2;
+    ParkRec& r = it->second;
+    auto done = [&](int slot, bool exact) {  // the reply goes on in `slot`
+        Seq& q = seqs_[slot];
+        q.end = r.end, q.rlim = r.rlim;
+        r.arch->hold--;
+        if (r.pre) r.pre->hold--;
+        r.arch->used = ++tick_;
+        r.arch->last_s = mono_s();
+        if (pool_log_) printf("pool: handle %d resumed in slot %d at %d tokens%s\n", h, slot, r.pos, exact ? "" : " (prefilled)"),
+            fflush(stdout);
+        parked_.erase(it);
+        n_unpark_++;
+        return slot;
+    };
+    auto prefill_rest = [&](int slot) {  // one piece; then the first token
+        static const int chunk = std::max(256, env_int("QE_UNPARK_CHUNK", 4096));
+        if (!prefill_more_slot(slot, chunk)) return -4;
+        r.pf_slot = -1;
+        *extra = start_finish_slot(slot);
+        return done(slot, false);
+    };
+    if (r.pf_slot >= 0) return prefill_rest(r.pf_slot);  // the next piece of a resume in progress
+    if ((int)pfs_.size() >= kMaxPrefills) return -1;
+    if (std::all_of(seqs_.begin(), seqs_.end(), [](const Seq& q) { return q.active; })) return -1;  // (no slot free now)
+    // no room next to the running ones (and the paused ones, which resume first): no start_begin and its side effects
+    // (undone step ahead, archiving, evictions) on every retry (review M3)
+    if (!can_admit(it->second.pos + 2 * (kMaxSpecK + 1) + 1)) return -1;
+    std::vector<int> ids = r.seq;
+    ids.push_back(r.pending);
+    // (unsteered, as it was parked: park refuses steered conversations; the caller's next selection is kept)
+    const int sv = steer_vec_, sm = steer_mode_, sl = steer_lo_, sh = steer_hi_;
+    const float ss = steer_scale_;
+    set_steering(-1, 1.f, -1, -1, -1);
+    resume_mode_ = true;
+    static const bool test_miss = env_int("QE_TEST_UNPARK_MISS", 0) != 0;  // test: the held state does not serve
+    no_reuse_ = test_miss;
+    const int slot = start_begin(ids.data(), (int)ids.size(), k, r.affinity, r.hint, nullptr, 0, nullptr, 0);
+    no_reuse_ = false;
+    resume_mode_ = false;
+    steer_vec_ = sv, steer_mode_ = sm, steer_lo_ = sl, steer_hi_ = sh, steer_scale_ = ss;
+    if (slot < 0) return -1;
+    PrefillState* pf = pf_of(slot);
+    Seq& q = seqs_[slot];
+    pool_->run([&](int w) { workers_[w]->slot_small_restore(slot, r.dev[w].data()); });
+    q.plen = r.plen, q.hint = r.hint, q.prio = r.prio;
+    q.pen = r.pen, q.no_lookup = r.no_lookup, q.want_drafts = r.want_drafts, q.no_ahead = r.no_ahead;
+    const bool exact = pf && pf->i == r.pos;
+    if (exact) {
+        pfs_.erase(pfs_.begin() + (pf - pfs_.data()));
+        q.pos = r.pos;
+        q.seq = r.seq;
+        q.last_tok = r.last_tok;
+        q.pending = r.pending;
+        if (r.k_avail >= 0 && r.spec.size() == workers_.size() && r.spec[0].size() == (size_t)r.k_avail + 1 &&
+            r.spec[0][0] == r.pending) {
+            // exact: the pending token, its drafts and the position as parked (review M1), no resync
+            pool_->run([&](int w) { workers_[w]->spec_restore(slot, r.pos, r.spec[w].data(), r.k_avail + 1); });
+            q.k_avail = r.k_avail, q.k_blk = r.k_blk;
+            q.stale = false;
+        } else {
+            q.k_avail = 0, q.k_blk = false;
+            q.stale = true;  // the next step writes the pending token and position to the cards (resync)
+        }
+        if (slot < (int)dcopy_.size()) dcopy_[slot] = 0.f;
+        lk_slot_ = -1;
+        lkb_inval(slot);
+        last_reused_ = r.pos;
+    } else {
+        // the held state did not serve (never expected: the archive is held): the pending token's row is prefilled
+        fprintf(stderr, "[qengine] unpark: slot %d resumed from %d of %d rows: the rest is prefilled\n", slot,
+                pf ? pf->i : -1, r.pos);
+        r.pf_slot = slot;
+        return prefill_rest(slot);
+    }
+    return done(slot, true);
+}
+
+void Engine::park_drop(int h) {
+    auto it = parked_.find(h);
+    if (it == parked_.end()) return;
+    const int s = it->second.pf_slot;  // a resume in progress (unpark -4): its slot goes too
+    it->second.arch->hold--;
+    if (it->second.pre) it->second.pre->hold--;
+    parked_.erase(it);
+    if (s >= 0) release(s);
+}
+
 // ---------------------------------------------------------------- shared prefix regions
 int Engine::find_prefix(const int* ids, int n, long long sk) const {
     for (size_t i = 0; i < pres_.size(); i++)
@@ -1430,6 +1660,16 @@ static size_t admit_headroom() {
     return ah;
 }
 
+// headroom of a running sequence: admit_headroom(), but no more than its reply can still grow (the first set_limit after
+// its start, Seq::rlim: the request's max_tokens, never a later temporary step cap) plus a margin of 1024 tokens; room_or_pause covers growth past it. With 32 slots on 2 cards the 8,192
+// rows per sequence capped the seats that fill ( part B). QE_ADMIT_BY_LIMIT=0: always admit_headroom
+static size_t seq_headroom(size_t ah, int pos, int end) {
+    static const bool by_limit = env_int("QE_ADMIT_BY_LIMIT", 1) != 0;
+    if (!by_limit || end <= 0) return ah;
+    const size_t left = end > pos ? (size_t)(end - pos) : 0;
+    return std::min(ah, left + 1024);
+}
+
 bool Engine::pause_for(int n, int /*prio: ignored, user decision 2026-11-12*/) {
     const size_t ah = admit_headroom();
     if (n > max_ctx_) return false;
@@ -1442,7 +1682,7 @@ bool Engine::pause_for(int n, int /*prio: ignored, user decision 2026-11-12*/) {
         if (!q.active) slot = true;
         else if (pf_of(i)) used += units_of(q);
         else if (!q.paused) {
-            const size_t u = units(std::min<size_t>((size_t)q.pos - q.split + ah, max_ctx_));
+            const size_t u = units(std::min<size_t>((size_t)q.pos - q.split + seq_headroom(ah, q.pos, q.rlim), max_ctx_));
             used += u;
             if (q.max_t > 0 && q.pos > q.split) vs.push_back({(int)i, u});
         }
@@ -1473,8 +1713,9 @@ bool Engine::can_admit(int n) {
         const Seq& q = seqs_[i];
         if (!q.active) slot = true;
         else if (pf_of(i)) used += units_of(q);  // its region already holds the whole prompt
-        else if (q.paused) used += units(std::min<size_t>((size_t)paused_.at(i).pos - q.split + ah, max_ctx_));  // resumes first
-        else used += units(std::min<size_t>((size_t)q.pos - q.split + ah, max_ctx_));
+        else if (q.paused) used += units(std::min<size_t>((size_t)paused_.at(i).pos - q.split +
+                                                          seq_headroom(ah, paused_.at(i).pos, q.rlim), max_ctx_));  // resumes first
+        else used += units(std::min<size_t>((size_t)q.pos - q.split + seq_headroom(ah, q.pos, q.rlim), max_ctx_));
     }
     for (auto& p : pres_) used += units(p.n);
     const size_t need = used + units(std::min<size_t>((size_t)n + ah, max_ctx_));
@@ -1617,6 +1858,7 @@ void Engine::reset() {  // forget every cached prefix (slots and snapshots)
         seqs_[i].paused = false;  // (its archive goes below)
     }
     paused_.clear();
+    parked_.clear();  // (their archives go below; the server fails parked requests before a reset)
     pres_.clear();
     snap_host_wait();  // [q27-snapasync]
     std::lock_guard<std::mutex> lk(snap_mu_);
@@ -1727,6 +1969,7 @@ bool read_all(int fd, void* dst, size_t n, size_t off) {
 
 Engine::HostPool::~HostPool() {
     stop_ = true;
+    wake_ = true;  // (the pinner stops waiting for an idle gap)
     if (th_.joinable()) th_.join();
     for (auto& sl : slabs_) {
         cudaHostUnregister(sl.base);
@@ -1740,11 +1983,31 @@ Engine::HostPool::~HostPool() {
 bool Engine::HostPool::pause(bool on) {  // true: no slab in flight (or released)
     pause_ = on;
     if (!on) return true;
+    wake_ = true;  // (a pinner waiting for an idle gap gives up its wait)
     // the slab in flight (a 4 GB memset + register: 0.6-2.4 s), at most QE_DECODE_CAL_PAUSE_MS (3000)
     const int n = std::max(0, env_int("QE_DECODE_CAL_PAUSE_MS", 3000)) / 10;
     for (int i = 0; i < n && busy_; i++) usleep(10000);
     if (busy_) fprintf(stderr, "[comm] decode calibration: archive pinning still busy after %d ms (timings may be noisy)\n", n * 10);
     return !busy_;
+}
+void Engine::archive_wait() {
+    struct Lazy { std::atomic<bool>& f; ~Lazy() { f = false; } } lazy{snap_eager_};  // (after it: the store grows as it fills)
+    auto settled = [&] { return (!hpool_.started() || hpool_.settled()) && (snap_done_ || qe_memp::holding()); };
+    if (settled()) return;
+    const double max_s = std::max(0.0, env_double("QE_ARCHIVE_WAIT_S", 30.0));
+    const auto t0 = std::chrono::steady_clock::now();
+    double s = 0;
+    while (!settled() && (s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()) < max_s)
+        usleep(10000);
+    if (max_s <= 0) return;  // (QE_ARCHIVE_WAIT_S=0: no wait, no line, review L2)
+    int ns;
+    {
+        std::lock_guard<std::mutex> lk(snap_mu_);
+        ns = snap_n_.load() + (int)free_bufs_.size();
+    }
+    printf("archive pool: start-up waited %.1f s for the pinning (%.1f GB pinned, %d of %d snapshot entries%s)\n", s,
+           hpool_.pinned_locked() / 1e9, ns, max_snaps_,
+           settled() ? "" : ", QE_ARCHIVE_WAIT_S reached: the rest is pinned while the engine is idle"), fflush(stdout);
 }
 void Engine::HostPool::start(size_t budget, size_t slab) {
     if (!budget || !slab) return;
@@ -1752,7 +2015,10 @@ void Engine::HostPool::start(size_t budget, size_t slab) {
         const auto t0 = std::chrono::steady_clock::now();
         size_t total = 0;
         bool held = false;
+        int slow_n = 0;  // slow registrations in a row (the back-off below)
+        size_t cur = slab;  // the slab size; 1 GB after a slow registration (one registration holds the jobs back less, review M2)
         struct Busy { std::atomic<bool>& f; ~Busy() { f = false; } } busy{busy_};
+        struct Settled { std::atomic<bool>& f; ~Settled() { f = true; } } settled{settled_};  // (every way out)
         while (!stop_ && total < budget) {
             // (decode calibration) announce the slab, then check the pause (seq_cst: pause() sees busy_ or this sees
             // pause_), so no slab starts unseen
@@ -1762,15 +2028,18 @@ void Engine::HostPool::start(size_t budget, size_t slab) {
                 busy_ = false;
                 usleep(20000);
             }
-            const size_t sz = std::min(slab, budget - total);
+            const size_t sz = std::min(cur, budget - total);
             // never below the host's margin (host_mem.h): wait while it lacks two slabs (the archive's own
             // pressure release gives slabs back; re-pinning needs the extra slab, no ping-pong)
-            if (qe_hostmem::headroom(true) < sz + slab) {
+            // (host memory pressure, host_pressure.h stage >= 1: no growth either)
+            if (qe_memp::holding() || qe_hostmem::headroom(true) < sz + slab) {
                 if (!held)
-                    printf("archive pool: pinning held at %.1f GB (MemAvailable %.1f GB, margin %.1f GB)\n", total / 1e9,
-                           qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9), fflush(stdout);
+                    printf("archive pool: pinning held at %.1f GB (MemAvailable %.1f GB, margin %.1f GB%s)\n", total / 1e9,
+                           qe_hostmem::available() / 1e9, qe_hostmem::margin() / 1e9,
+                           qe_memp::holding() ? ", host memory pressure" : ""), fflush(stdout);
                 held = true;
                 busy_ = false;  // (waiting for room, no pinning: a pause need not wait for it)
+                settled_ = true;  // (archive_wait: the start-up does not wait for room)
                 for (int i = 0; i < 20 && !stop_; i++) usleep(100000);
                 std::lock_guard<std::mutex> l(mu_);
                 total = pinned_;  // slabs released meanwhile
@@ -1789,11 +2058,47 @@ void Engine::HostPool::start(size_t budget, size_t slab) {
             if (thp) madvise(p, sz, MADV_HUGEPAGE);
             memset(p, 0, sz);  // fault the pages in without the driver
             if (stop_) { ::free(p); return; }
-            cudaError_t rr;
-            {
-                // (no QeWdSlow here: a background registration of 1 GB slabs, minutes long at boot, would keep the device
-                // watchdog from catching a real hang; reviews Flash-Next M6 / 27B L5)
-                rr = cudaHostRegister(p, sz, cudaHostRegisterPortable);
+            // [q27-reg] one registration per slab under the driver gate (drv_gate.h, issue #32; as Flash-Next's pinner):
+            // only in an idle gap of the engine (20 ms without a job), never next to a job's launches on the cards (a
+            // registration slowed by host memory pressure holds the driver lock a rank's launch needs while the other
+            // cards spin in a collective); under sustained decode the pool waits and new archives use pageable memory
+            // (slower copies, same result); a job that starts meanwhile waits for the one registration. A decode
+            // calibration (pause_) ends the wait; the slab stays faulted in and its turn comes after the pause.
+            // (No QeWdSlow: a background registration, minutes long at boot, would keep the device watchdog from catching
+            // a real hang; reviews Flash-Next M6 / 27B L5; the gate's own late mark covers a stalled one)
+            cudaError_t rr = cudaErrorUnknown;
+            double reg_ms = 0;
+            bool done = false;
+            for (;;) {
+                wake_ = false;  // (before the checks: a later pause / pressure / release wakes the wait below)
+                if (stop_) break;
+                // the host-room check again (the wait may be long: a pressure hold or a deficit that started meanwhile
+                // frees the slab instead of registering it, review M1)
+                if (qe_memp::holding() || qe_hostmem::headroom(true) < slab) break;
+                if (!pause_) {
+                    qe_drv::Reg g(&wake_, 20, INT_MAX);
+                    // (a pause / pressure / short host seen only now: not this time either, review L1, follow-up L-a; the
+                    // cached MemAvailable: no /proc read while the gate is held)
+                    if (g.ok() && !pause_ && !wake_ && !qe_memp::holding() && qe_hostmem::headroom() >= slab) {
+                        const auto tr = std::chrono::steady_clock::now();
+                        rr = cudaHostRegister(p, sz, cudaHostRegisterPortable);
+                        reg_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr).count();
+                        done = true;
+                    }
+                }
+                if (done) break;
+                for (;;) {  // (paused: announce again, as above)
+                    busy_ = true;
+                    if (!pause_ || stop_) break;
+                    busy_ = false;
+                    usleep(20000);
+                }
+            }
+            if (!done) {
+                ::free(p);
+                if (stop_) return;
+                // (the held path at the top of the loop logs and waits)
+                continue;
             }
             if (rr != cudaSuccess) {
                 cudaGetLastError();
@@ -1801,11 +2106,29 @@ void Engine::HostPool::start(size_t budget, size_t slab) {
                 fprintf(stderr, "archive pool: pinning stopped at %.1f GB\n", total / 1e9);
                 return;
             }
-            std::lock_guard<std::mutex> l(mu_);
-            slabs_.push_back(Slab{(char*)p, sz, {{0, sz}}});
-            pinned_ += sz;
-            qe_hostmem::charged() += sz;
-            total = pinned_;
+            {
+                std::lock_guard<std::mutex> l(mu_);
+                slabs_.push_back(Slab{(char*)p, sz, {{0, sz}}});
+                pinned_ += sz;
+                qe_hostmem::charged() += sz;
+                total = pinned_;
+            }
+            // a slow registration (host memory pressure: issue #32 field data 6-16 s per GB instead of ~0.1 s): the next
+            // one would hold the jobs back as long, so pinning pauses 30 s, doubling to 8 min (as Flash-Next's pinner;
+            // the limit: 1 s per GB of slab, at least 1 s)
+            if (reg_ms > std::max(1000.0, sz / 1e6)) {
+                const int pause_s = 30 << std::min(slow_n++, 4);
+                cur = std::min(slab, (size_t)1 << 30);
+                printf("archive pool: a slab registration took %.1f s (host memory pressure; MemAvailable %.1f GB): pinning "
+                       "paused for %d s at %.1f GB (then %.1f GB slabs), new archive copies use pageable memory meanwhile\n",
+                       reg_ms / 1e3, qe_hostmem::available() / 1e9, pause_s, total / 1e9, cur / 1e9), fflush(stdout);
+                busy_ = false;  // (no slab in flight: a calibration need not wait for the pause)
+                settled_ = true;  // (archive_wait: the start-up does not wait for the back-off)
+                for (int i = 0; i < pause_s * 10 && !stop_; i++) usleep(100000);
+            } else {
+                slow_n = 0;
+                cur = slab;  // (a fast registration again: full slabs, so long archives fit again; follow-up L-b)
+            }
         }
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         printf("archive pool: %.1f GB pinned in %.1f s\n", total / 1e9, secs);
@@ -1857,11 +2180,18 @@ char* Engine::HostPool::alloc(size_t bytes, bool& pinned) {
 }
 
 size_t Engine::HostPool::release(size_t want) {
+    wake_ = true;  // (host memory short: a pinner waiting for an idle gap checks the room again, review M1)
+    auto whole = [](const Slab& sl) { return sl.free.size() == 1 && sl.free.begin()->first == 0 && sl.free.begin()->second == sl.size; };
+    {  // nothing to give back: no gate (a slow pinner registration would hold the pressure response for nothing, review L3)
+        std::lock_guard<std::mutex> l(mu_);
+        if (!want || std::none_of(slabs_.begin(), slabs_.end(), whole)) return 0;
+    }
+    qe_drv::Reg g;  // [q27-reg] the unregisters under the driver gate (before mu_: the gate, then the pool lock, everywhere)
     std::lock_guard<std::mutex> l(mu_);
     size_t got = 0;
     for (size_t i = slabs_.size(); i-- > 0 && got < want;) {
         Slab& sl = slabs_[i];
-        if (sl.free.size() != 1 || sl.free.begin()->first != 0 || sl.free.begin()->second != sl.size) continue;
+        if (!whole(sl)) continue;
         cudaHostUnregister(sl.base);
         cudaGetLastError();
         ::free(sl.base);
@@ -1950,7 +2280,8 @@ void Engine::disk_forget(KvArchive& a) {
 }
 
 size_t Engine::ram_budget() {
-    const size_t cap = std::min(archive_budget_, archive_used_ + hpool_.pinned_free() + qe_hostmem::headroom());
+    size_t cap = std::min(archive_budget_, archive_used_ + hpool_.pinned_free() + qe_hostmem::headroom());
+    if (qe_memp::holding() && press_cap_ != SIZE_MAX) cap = std::min(cap, press_cap_);  // (pressure: no growth)
     if (cap < archive_budget_) {
         if (cap_log_.due(cap / 1e9))
             printf("archive: host memory low, budget capped at %.1f of %.1f GB (%.1f GB used, MemAvailable %.1f GB, "
@@ -1967,12 +2298,19 @@ size_t Engine::ram_budget() {
 // first, then archives in ram_make_room's order
 void Engine::mem_guard() {
     vram_tick();  // (also when idle: the server calls this every second; a shrunk pool grows back without requests, H1)
+    mem_pressure();
     if (!qe_hostmem::deficit()) return;
     {  // pre-pinned snapshot buffers not in use go back first (taken again on demand while the host has room, review M2)
         std::vector<std::vector<void*>> fb;
-        {
+        {  // (only as many as cover the deficit: up to ~19 GB of them since [q27-snap-size], review try 5 L2)
+            size_t tot = 0;
+            for (auto& w : workers_) tot += w->snapshot_bytes();
+            const size_t d = qe_hostmem::deficit(true);
             std::lock_guard<std::mutex> lk(snap_mu_);
-            fb.swap(free_bufs_);
+            for (size_t got = 0; !free_bufs_.empty() && got < std::max<size_t>(d, 1); got += tot) {
+                fb.push_back(std::move(free_bufs_.back()));
+                free_bufs_.pop_back();
+            }
         }
         for (auto& b : fb)
             for (void* p : b) cudaFreeHost(p);
@@ -1987,6 +2325,8 @@ void Engine::mem_guard() {
         ram_make_room(0, 2, u0 > d - got ? u0 - (d - got) : 0);
         got += hpool_.release(d - got);
     }
+    // (while holding, what the guard evicted is not written again: the cap goes down by it, not by normal turnover; F2)
+    if (press_held_ && press_cap_ != SIZE_MAX) press_cap_ -= std::min(press_cap_, u0 > archive_used_ ? u0 - archive_used_ : (size_t)0);
     static double last_log = -1e18;  // a persistent deficit (nothing left to give) is logged once a minute
     const double tnow = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     if (got == 0 && archive_used_ == u0 && tnow - last_log < 60) return;
@@ -1994,6 +2334,108 @@ void Engine::mem_guard() {
     printf("archive: host memory below the margin by %.1f GB (MemAvailable %.1f GB, margin %.1f GB): archive %.1f -> "
            "%.1f GB used, %.1f -> %.1f GB pinned\n", d / 1e9, qe_hostmem::available(true) / 1e9, qe_hostmem::margin() / 1e9,
            u0 / 1e9, archive_used_ / 1e9, p0 / 1e9, hpool_.pinned_bytes() / 1e9), fflush(stdout);
+}
+
+// one action of stage s (host_pressure.h): GAVE, WAIT (nothing back yet, something left), EMPTY (nothing left)
+qe_memp::Policy::Result Engine::press_act(int s, size_t step, std::string& what) {
+    using PR = qe_memp::Policy::Result;
+    char b[256];
+    switch (s) {
+    case qe_memp::HOLD:
+        if (press_held_) return PR::EMPTY;
+        press_held_ = true;
+        press_cap_ = archive_used_;
+        hpool_.wake();  // (a pinner waiting for an idle gap checks the hold before it registers, review M1)
+        snprintf(b, sizeof b, "archive held at %.1f GB, pinning stopped", press_cap_ / 1e9);
+        what = b;
+        return PR::GAVE;
+    case qe_memp::RELEASE: {
+        size_t nb = 0;
+        {  // pre-pinned snapshot buffers not in use first (not taken again while holding)
+            std::vector<std::vector<void*>> fb;
+            {
+                std::lock_guard<std::mutex> lk(snap_mu_);
+                fb.swap(free_bufs_);
+            }
+            for (auto& v : fb)
+                for (void* p : v) cudaFreeHost(p), nb++;
+        }
+        const size_t p0 = hpool_.pinned_bytes(), got = hpool_.release((size_t)-1);
+        if (!got && !nb) return PR::EMPTY;
+        snprintf(b, sizeof b, "%.1f GB of free archive slabs returned (pinned %.1f -> %.1f GB), %zu unused snapshot buffers freed",
+                 got / 1e9, p0 / 1e9, hpool_.pinned_bytes() / 1e9, nb);
+        what = b;
+        return PR::GAVE;
+    }
+    case qe_memp::SHRINK: {
+        // archives go 1 GB at a time until `step` came back to the host (whole slabs released, pageable archives freed:
+        // charged() falls) or step + one slab was evicted without it (no compaction here: a slab goes back only when every
+        // archive in it went; evicting on would lose the archive for nothing; review M1)
+        const size_t u0 = archive_used_, c0 = (size_t)qe_hostmem::charged().load();
+        static const size_t slab = (size_t)(env_double("QE_ARCHIVE_SLAB_GB", 4.0) * (1ull << 30));
+        size_t got = 0;
+        while (archive_used_ > 0 && got < step && u0 - archive_used_ < step + slab) {
+            const size_t u = archive_used_;
+            ram_make_room(0, 2, u > ((size_t)1 << 30) ? u - ((size_t)1 << 30) : 0);
+            hpool_.release((size_t)-1);
+            const size_t c = (size_t)qe_hostmem::charged().load();
+            got = c0 > c ? c0 - c : 0;
+            if (archive_used_ == u) break;  // (nothing evictable)
+        }
+        press_cap_ = std::min(press_cap_, archive_used_);
+        if (!got) {
+            if (archive_used_ < u0 && !press_wait_logged_) {
+                printf("host memory pressure: stage 3: %.1f GB of archives evicted, no slab returned yet\n", (u0 - archive_used_) / 1e9);
+                fflush(stdout);
+                press_wait_logged_ = true;
+            }
+            return archive_used_ > 0 && archive_used_ < u0 ? PR::WAIT : PR::EMPTY;
+        }
+        snprintf(b, sizeof b, "archive %.1f -> %.1f GB used, %.1f GB returned to the host", u0 / 1e9, archive_used_ / 1e9, got / 1e9);
+        what = b;
+        return PR::GAVE;
+    }
+    }
+    return PR::EMPTY;
+}
+
+// runtime host-memory pressure (host_pressure.h): the staged response, stepped by the server's ~1/s check and archive_more
+void Engine::mem_pressure() {
+    const double now = qe_memp::now_s();
+    if (now - press_last_ < 0.5) return;
+    press_last_ = now;
+    if (!mp_.config().on) {
+        std::lock_guard<std::mutex> l(press_mu_);
+        press_json_ = "{\"on\": false}";
+        return;
+    }
+    qe_memp::Monitor::get().start();
+    const qe_memp::Reading r = qe_memp::Monitor::get().last();
+    const qe_memp::Policy::Event ev = mp_.step(r, now);
+    if (ev.to < ev.from) {
+        printf("host memory pressure: calm for %.0f s, stage %d -> %d (%s)%s; %s\n", mp_.config().recover_s * mp_.recover_mult(),
+               ev.from, ev.to, qe_memp::stage_name(ev.to), ev.to == 0 ? ": growth resumes" : "", qe_memp::describe(r).c_str());
+        fflush(stdout);
+        if (ev.to == 0) { press_held_ = false; press_cap_ = SIZE_MAX; press_wait_logged_ = false; }
+    }
+    const size_t step = ev.f.deficit_only ? std::min((size_t)mp_.config().step, (size_t)ev.f.deficit + ((size_t)1 << 30))
+                                          : (size_t)mp_.config().step;
+    for (int guard = 0; mp_.act_due() && guard < 8; guard++) {
+        const int s = mp_.stage();
+        if (s > qe_memp::NONE) qe_memp::g_stage().store(std::max(qe_memp::g_stage().load(), s));
+        std::string what;
+        const qe_memp::Policy::Result res = press_act(s, step, what);
+        const bool was_exh = mp_.exhausted();
+        mp_.acted(now, res);
+        if (res == qe_memp::Policy::GAVE)
+            printf("host memory pressure: stage %d (%s): %s; %s\n", s, qe_memp::stage_name(s), what.c_str(), qe_memp::describe(r).c_str());
+        else if (mp_.exhausted() && !was_exh)
+            printf("host memory pressure: stage %d, nothing left to give back (%s)\n", s, qe_memp::describe(r).c_str());
+        fflush(stdout);
+    }
+    qe_memp::g_stage().store(mp_.stage());
+    std::lock_guard<std::mutex> l(press_mu_);
+    press_json_ = qe_memp::json(mp_, r);
 }
 
 qe_arch::Rank Engine::arch_rank(const KvArchive& a) const { return {a.last_s, a.used}; }
@@ -2157,6 +2599,15 @@ std::vector<Engine::ArchSub> Engine::archive_subs(const Seq& q, int n) {
     for (auto it : superseded)
         for (size_t si = 0; si < it->subs.size(); si++)
             if (!have(it->subs[si]) && !add_sub(it, si)) break;
+    // [q27-park-arch] and their end states (first in each GPU's buffer): a parked reply's archive ends at its prompt end,
+    // the state the conversation's next turn resumes from when its client replaces the reply; without it that state went
+    // with the covered archive once the snapshot store had dropped its copy (64 sessions: ~1 in 3 turns at 8-10K)
+    for (auto it : superseded)
+        if (it->ram && it->n < n && it->n >= 512 && !have(it->n)) {
+            ArchSub x{it->n, {}, it->ram, true};
+            for (int r = 0; r < ng; r++) x.src.push_back(it->ram->at(r).get());
+            subs.push_back(std::move(x));
+        }
     // the system-prompt state may only be in an archive this one does not cover (the conversation that was restored from
     // it, a branch of its own) or in the pinned prefix: it is a prefix of this conversation all the same. Only for what can
     // reach a file (split 0; an attached conversation resumes from the prefix itself). RAM before a file at one position.
@@ -2188,10 +2639,19 @@ std::vector<Engine::ArchSub> Engine::archive_subs(const Seq& q, int n) {
         }
     }
     std::sort(subs.begin(), subs.end(), [](const ArchSub& a, const ArchSub& b) { return a.pos > b.pos; });
-    if ((int)subs.size() > kMaxSubs) {
-        auto sys = std::find_if(subs.begin(), subs.end(), [&](const ArchSub& x) { return x.pos <= q.hint; });
-        if (sys != subs.end() && sys - subs.begin() >= kMaxSubs) subs[kMaxSubs - 1] = std::move(*sys);
-        subs.resize(kMaxSubs);
+    // [q27-park-arch] an archive attached to a shared prefix restores only from that prefix's pinned host copy (it is
+    // skipped without one), which holds the state at its end: a state at or below the split is a duplicate of it
+    if (q.split > 0)
+        subs.erase(std::remove_if(subs.begin(), subs.end(), [&](const ArchSub& x) { return x.pos <= q.split; }), subs.end());
+    // the newest arch_subs_ (the prompt end of the last turn first); past the cap the system-prompt state (split 0) stays
+    // too (in place of the last one at kMaxSubs, the file format's limit)
+    if ((int)subs.size() > arch_subs_) {
+        auto sys = q.split == 0 ? std::find_if(subs.begin(), subs.end(), [&](const ArchSub& x) { return x.pos <= q.hint; })
+                                : subs.end();
+        const bool keep_sys = sys != subs.end() && sys - subs.begin() >= arch_subs_;
+        const int at = arch_subs_ < kMaxSubs ? arch_subs_ : kMaxSubs - 1;
+        if (keep_sys && sys - subs.begin() > at) subs[at] = std::move(*sys);  // (at its place already: no self-move)
+        subs.resize(keep_sys ? at + 1 : arch_subs_);
     }
     return subs;
 }
@@ -2237,7 +2697,7 @@ void Engine::archive_slot(int slot, bool force) {
             return;
         }
     const int ng = workers_.size();
-    std::vector<ArchSub> subs = archive_subs(q, n);
+    std::vector<ArchSub> subs = arch_nosubs_ ? std::vector<ArchSub>{} : archive_subs(q, n);  // (park: the end state only)
     KvArchive a;
     a.sk = q.sk;
     a.split = q.split;  // rows [0, split) stay with the shared prefix (named by the tokens)
@@ -2251,10 +2711,15 @@ void Engine::archive_slot(int slot, bool force) {
         return;
     }
     if (pool_log_)
-        printf("archive: slot %d %d tokens prio %d, %zu checkpoints, %.2f GB (used %.2f of %.2f GB)\n", slot, n, q.prio,
-               subs.size(), a.total / 1e9, (archive_used_ + a.total) / 1e9, archive_budget_ / 1e9), fflush(stdout);
+    {
+        std::string at;
+        for (auto& x : subs) at += " " + std::to_string(x.pos);
+        printf("archive: slot %d %d tokens prio %d, %zu checkpoints (at%s), %.2f GB (used %.2f of %.2f GB)\n", slot, n, q.prio,
+               subs.size(), at.c_str(), a.total / 1e9, (archive_used_ + a.total) / 1e9, archive_budget_ / 1e9), fflush(stdout);
+    }
     a.prio = q.prio;
     a.last_s = q.last_s;
+    a.plen = q.plen;
     a.ram = std::make_shared<Bufs>(&hpool_);
     for (size_t sz : a.sizes) a.ram->add(sz);
     for (auto& x : subs) a.subs.push_back(x.pos);
@@ -2318,6 +2783,7 @@ bool Engine::bg_prepare(int slot) {
     a.toks.assign(q.seq.begin(), q.seq.begin() + n);
     a.n = n;
     a.prio = q.prio;
+    a.plen = q.plen;
     b.piece.assign(ng, 0);
     archive_used_ += a.total;  // reserved now (ram_make_room made room for it)
     bg_ = std::move(b);
@@ -2357,6 +2823,10 @@ void Engine::bg_finish(bool all) {
 }
 
 bool Engine::archive_more(size_t budget) {
+    mem_pressure();  // (the server archives while idle without calling mem_guard: the policy is stepped here too)
+    // host memory pressure: no new optional copy (one already prepared goes on: its memory is taken); the C API says
+    // "not now" (2) so the server asks again after the pressure (qe_archive_more)
+    if (qe_memp::holding() && bg_.slot < 0) return true;
     static const size_t min_bytes = 1 << 20;
     if (budget < min_bytes) budget = min_bytes;
     if (bg_.slot < 0) {
@@ -2824,7 +3294,7 @@ void Engine::persist() {
     finish();
     const int keep = cur_;
     for (int sl = 0; sl < (int)seqs_.size(); sl++)
-        if (seqs_[sl].pos >= archive_min_) {
+        if (seqs_[sl].pos >= archive_min_ && !pf_of(sl)) {  // (not a prompt in flight, e.g. a resume prefilled in pieces)
             use_slot(sl);
             archive_slot(sl);
         }
@@ -2993,7 +3463,8 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
             // store); a failed pin keeps the store at its size instead of ending the process (review H1 / M1)
             size_t tot = 0;
             for (auto& w : workers_) tot += w->snapshot_bytes();
-            bool ok = (int)snaps_.size() < kSnapBase || qe_hostmem::headroom() >= 2 * tot;
+            const bool held = (int)snaps_.size() >= kSnapBase && qe_memp::holding();  // (pressure: no growth now, later again)
+            bool ok = (int)snaps_.size() < kSnapBase || (!held && qe_hostmem::headroom() >= 2 * tot);
             for (size_t r = 0; ok && r < workers_.size(); r++) {
                 void* p;
                 if (cudaHostAlloc(&p, workers_[r]->snapshot_bytes(), cudaHostAllocPortable) != cudaSuccess) {
@@ -3003,7 +3474,9 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
                     b.push_back(p);
                 }
             }
-            if (!ok) {
+            if (!ok && held) {
+                b.clear();  // (an entry is reused below; the store's size limit is kept for after the pressure, review F3)
+            } else if (!ok) {
                 for (void* p : b) cudaFreeHost(p);
                 b.clear();
                 if (max_snaps_ > (int)snaps_.size())
@@ -3040,6 +3513,24 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
         if (async) workers_[r]->snapshot_save_async(s->bufs[r]);
         else workers_[r]->snapshot_save(s->bufs[r]);
     });
+}
+
+// [q27-snap-demote] a new prompt-end state of a slot: the slot's older prompt-end states that are prefixes of this prompt
+// past its system part (the conversation's earlier turns: the old prompt end a replaced reply resumed from, the live end
+// and the prompt end before it of a turn that extended its reply) have served and go first when the prompt-end quota is
+// full, instead of aging with the live ones. Refreshed / aging, a conversation held two or three recent prompt-end
+// states, so 16 conversations on 16 slots filled the 32-entry quota and a turn queued behind ~30 others lost its own
+// state (re-prefilled 0.2-7K rows). Kept: PrefillState::keep_from (start_begin); an
+// unpark's prefill demotes nothing. Only the eviction order changes.
+// QE_SNAP_DEMOTE=0: off
+void Engine::demote_spent(const PrefillState& pf, int pos) {
+    static const bool on = env_int("QE_SNAP_DEMOTE", 1) != 0;
+    if (!on || pf.resume) return;
+    const Seq& q = seqs_[pf.slot];
+    for (auto& x : snaps_)
+        if (x.slot == pf.slot && x.kind == 1 && x.sk == q.sk && x.pos < pos && x.pos > q.hint && x.pos != pf.keep_from &&
+            (size_t)x.pos <= pf.ids.size() && std::equal(x.toks.begin(), x.toks.end(), pf.ids.begin()))
+            x.used = 0;
 }
 
 void Engine::snap_host_wait() {
@@ -3184,6 +3675,52 @@ int Engine::start_mm(const int* ids, int n, int k, unsigned long long affinity, 
     return start_finish();
 }
 
+// [kb-q27-imgtab] the first gap of img_rows rows of the image table the prefills in flight leave
+size_t Engine::img_range(int img_rows, size_t* keep) const {
+    std::vector<std::pair<size_t, size_t>> used;
+    for (auto& o : pfs_)
+        if (o.img_n > 0) used.push_back({(size_t)o.img_base, (size_t)o.img_base + o.img_n});
+    std::sort(used.begin(), used.end());
+    size_t base = 0;
+    for (auto& [a, b] : used) {
+        if (base + img_rows <= a) break;
+        base = std::max(base, b);
+    }
+    *keep = 0;  // rows of the table in use by the others
+    for (auto& u : used) *keep = std::max(*keep, u.second);
+    return base;
+}
+
+bool Engine::grow_img_table(size_t cap, size_t keep) {
+    bf16* t = nullptr;
+    const cudaError_t err = cudaHostAlloc(&t, cap * cfg_.hidden * 2, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        cudaGetLastError();  // (reset the last-error state of the failed call)
+        fprintf(stderr, "[qengine] image table: pinning %.1f MB failed: %s\n", cap * cfg_.hidden * 2 / 1e6,
+                cudaGetErrorString(err));
+        return false;
+    }
+    if (img_table_ && keep) memcpy(t, img_table_, keep * cfg_.hidden * 2);
+    bf16* old = img_table_;
+    img_table_ = t;
+    img_cap_ = cap;
+    pool_->run([&](int r) {
+        CUDA_CHECK(cudaSetDevice(workers_[r]->device));
+        set_image_table(img_table_);
+        set_image_table_spec(img_table_);
+    });
+    // (after the switch, and once nothing queued on the cards can still read the old table: chunks of the other
+    // prefill read the copy; only when the table grows)
+    if (old) {
+        pool_->run([&](int r) {
+            CUDA_CHECK(cudaSetDevice(workers_[r]->device));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        });
+        CUDA_CHECK(cudaFreeHost(old));
+    }
+    return true;
+}
+
 // Prompt prefill in three parts so that a server can run decode steps of other sequences
 // between its chunks: start_begin (slot, prompt cache, chunk plan), prefill_more (next chunks),
 // start_finish (first token). Returns the slot, -1 if the pool cannot hold the prompt.
@@ -3201,6 +3738,16 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     }
     CHECK(k >= 0 && k <= kMaxSpecK, "k=%d (max %d)", k, kMaxSpecK);
     CHECK(n >= 1, "empty prompt");
+    if (img_rows > 0) {  // [kb-q27-imgtab] (q27-engine-small review L2): a failed pin fails this start, not the process
+        size_t keep = 0;
+        const size_t need = img_range(img_rows, &keep) + img_rows;
+        if (need > img_cap_ && !grow_img_table(std::max<size_t>(need, 2 * img_cap_), keep) &&
+            !grow_img_table(need, keep)) {
+            fprintf(stderr, "[qengine] image prompt refused: no pinned host memory for its %d image rows (%.1f MB)\n",
+                    img_rows, need * cfg_.hidden * 2 / 1e6);
+            return -1;
+        }
+    }
     if (!has_mtp()) k = 0;
     k_ = k;
     last_copied_ = 0;
@@ -3229,7 +3776,21 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     if (slot != cur_) use_slot(slot);
     const auto t1 = now();
     const int victim = seqs_[slot].pos;
-    if (lcpk(seqs_[slot].seq, seqs_[slot].sk, sk, ids, n) < seqs_[slot].pos) archive_slot(slot);
+    const int old_plen = seqs_[slot].plen;  // (the slot's last prompt: demote_spent keeps a repeat's resume state)
+    {
+        // the prompt leaves the slot's content: archive it first. Not when it leaves only inside the reply of the slot's
+        // own last prompt (the next turn of the conversation whose client sent another assistant text, or dropped the
+        // reasoning): the rows up to there stay in the slot and the prompt-end state is a snapshot, so the copy (the whole
+        // conversation, ~45 ms per turn at 5K rows on 2 cards) would only keep the old reply's rows.
+        // QE_ARCH_REPLY=0: archive in that case too, as before
+        static const bool skip_reply = env_int("QE_ARCH_REPLY", 1) != 0;
+        const Seq& v = seqs_[slot];
+        const int l = lcpk(v.seq, v.sk, sk, ids, n);
+        // (same steering key; review M1: an identical prompt of another conversation that took this slot loses at most
+        // that conversation's reply rows, which its next turn recomputes from the shared prompt-end state)
+        const bool own = v.sk == sk;
+        if (l < v.pos && !(skip_reply && own && v.plen > 1 && l >= v.plen - 1 && v.pos > v.plen)) archive_slot(slot);
+    }
     const auto t2 = now();
     for (auto& w : workers_) w->set_sampling(samp_, samp_on_);
     Seq& q = seqs_[slot];
@@ -3247,6 +3808,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     steer_slot(slot);  // the slot's device steering = its conversation's key (stream-ordered, no graph change)
     const unsigned long long prev_aff = q.affinity;
     q.hint = hint;
+    q.plen = n;
     q.used = ++tick_;
     q.last_s = mono_s();
     q.affinity = affinity;
@@ -3254,6 +3816,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     q.admit = ++tick_;
     q.stale = false;
     q.end = 0;
+    q.rlim = 0;
     q.want_drafts = q.no_ahead = false;
     q.drafts.clear();
     q.rb_epoch = -1;
@@ -3299,7 +3862,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         // conversation (Claude Code's subagent-progress summary: the same history plus a short
         // question, arriving right after the reply) or the conversation's own next turn when
         // the fork took this slot first resumes from here instead of recomputing the reply.
-        take_snapshot(ids, from, 1);  // kept like a prompt end (the conversation's next turn)
+        if (!resume_mode_) take_snapshot(ids, from, 1);  // kept like a prompt end (the conversation's next turn)
     } else if (!no_reuse_) {
         // Longest snapshot (of any slot) of a prefix of the prompt whose KV entries some slot
         // still holds: this slot itself (no copy), or another one (KV prefix copied over, e.g.
@@ -3339,7 +3902,18 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         if (best_arch) {
             from = best_pos;
             best_arch->used = ++tick_;
-            if (2 * best_pos >= best_arch->n) best_arch->last_s = mono_s();  // (not a short shared prefix of another conversation)
+            // [q27-park-arch] the next turn of the archived conversation that replaced its last reply (a client that sends
+            // another assistant text, or drops the reasoning): past this start the slot holds everything of the archive but
+            // that reply's rows, and the slot's own archive later carries the prompt-end state. The old one goes first
+            // when room is needed instead of being refreshed: with more conversations than the budget holds, refreshing
+            // it pushed out the archive of a conversation that comes back next (64 sessions on 32 slots: 1.4K old
+            // tokens recomputed per turn). Only the eviction order changes. QE_ARCH_DEMOTE=0: refresh as before
+            static const bool demote = env_int("QE_ARCH_DEMOTE", 1) != 0;
+            const int al = lcp_of(best_arch->toks, ids, n);
+            if (demote && !best_arch->pinned && best_arch->plen > 1 && best_arch->n > best_arch->plen &&
+                al >= best_arch->plen - 1 && al < best_arch->n)
+                best_arch->last_s = 0;
+            else if (2 * best_pos >= best_arch->n) best_arch->last_s = mono_s();  // (not a short shared prefix of another conversation)
             held.add(best_arch);
             if (best_arch->pinned && share_prefix_ && !best && best_sub < 0) {
                 // the whole prefix: attach to its shared region (materialized if needed)
@@ -3512,6 +4086,11 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     // rows become the shared region of that kind of agent
     const int pin = hint;
     PrefillState pf;
+    // [q27-snap-demote2] kept by demote_spent: the LIVE resume point (a fork and the conversation's own next turn both
+    // resume there) and the state a repeat of the slot's last prompt (regenerate, retry, best-of: n <= its length)
+    // resumed from, which the next repeat needs again (q27_rel150_review M1); an unpark demotes nothing (review L1)
+    pf.keep_from = mode == LIVE || (mode == SNAP && n <= old_plen) ? from : -1;
+    pf.resume = resume_mode_;
     if (pin > from && pin < n) {
         marks.push_back(pin);
         pf.pin = pin;
@@ -3539,39 +4118,12 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     std::vector<int> dev_ids;
     size_t img_base = 0;
     if (img_rows > 0) {
-        std::vector<std::pair<size_t, size_t>> used;
-        for (auto& o : pfs_)
-            if (o.img_n > 0) used.push_back({(size_t)o.img_base, (size_t)o.img_base + o.img_n});
-        std::sort(used.begin(), used.end());
         size_t keep = 0;  // rows of the table in use by the others
-        for (auto& [a, b] : used) {
-            if (img_base + img_rows <= a) break;
-            img_base = std::max(img_base, b);
-        }
-        for (auto& u : used) keep = std::max(keep, u.second);
-        if (img_base + img_rows > img_cap_) {
-            const size_t cap = std::max<size_t>(img_base + img_rows, 2 * img_cap_);
-            bf16* t = nullptr;
-            CUDA_CHECK(cudaHostAlloc(&t, cap * cfg_.hidden * 2, cudaHostAllocMapped | cudaHostAllocPortable));
-            if (img_table_ && keep) memcpy(t, img_table_, keep * cfg_.hidden * 2);
-            bf16* old = img_table_;
-            img_table_ = t;
-            img_cap_ = cap;
-            pool_->run([&](int r) {
-                CUDA_CHECK(cudaSetDevice(workers_[r]->device));
-                set_image_table(img_table_);
-                set_image_table_spec(img_table_);
-            });
-            // (after the switch, and once nothing queued on the cards can still read the old table: chunks of the other
-            // prefill read the copy; only when the table grows)
-            if (old) {
-                pool_->run([&](int r) {
-                    CUDA_CHECK(cudaSetDevice(workers_[r]->device));
-                    CUDA_CHECK(cudaDeviceSynchronize());
-                });
-                CUDA_CHECK(cudaFreeHost(old));
-            }
-        }
+        img_base = img_range(img_rows, &keep);
+        // (grown at the top of start_begin, before anything moved: a failed pin failed the start there)
+        CHECK(img_base + img_rows <= img_cap_, "image table: %zu rows past its %zu (grown at the top)", img_base + img_rows,
+              img_cap_);
+        (void)keep;
         dev_ids.assign(ids, ids + n);
         for (int i = 0, j = 0; i < n; i++)
             if (ids[i] >= kImgToken) {
@@ -3584,7 +4136,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     pf.n = n;
     pf.i = from;
     pf.kstart = kstart;
-    pf.dfl = kstart > 0 && use_block(slot);
+    pf.dfl = kstart > 0 && use_block(slot) && !resume_mode_;
     if (pf.dfl) dfl_bind(slot, mode == LIVE || mode == SNAP, from);  // (ring selected with the first chunk)
     else if (dfl_on_) dfl_gap(slot, mode == LIVE || mode == SNAP ? from : 0);  // no block steps: its ring rows go stale (review M1)
     pf.affinity = affinity;
@@ -3654,6 +4206,7 @@ bool Engine::prefill_more_slot(int slot, int budget) {
         if (pf.i < n && (mark || pf.i % ckpt_every_ == 0 || (pf.i >= pf.tail_from && pf.i - pf.last_ck >= kChunk))) {
             if (mark) {
                 take_snapshot(pf.ids.data(), pf.i, pf.i == pf.end_snap ? 1 : 0);
+                if (pf.i == pf.end_snap) demote_spent(pf, pf.i);
             } else {  // periodic / tail: rolling, at most ckpt_keep_ per prefill
                 int rep = 0;
                 if ((int)pf.rolling.size() >= ckpt_keep_) {
@@ -3690,6 +4243,7 @@ int Engine::start_finish_slot(int slot) {
     // (read before the snapshot: [q27-snapasync] its device-to-host copy queues on the copy engine ahead of later reads)
     CUDA_CHECK(cudaMemcpy(&tok, workers_[0]->out_tok_ + last_m - 1, 4, cudaMemcpyDeviceToHost));
     if (!pf.end_snap) take_snapshot(pf.ids.data(), n, 1);  // else saved at n - 1 (start_begin)
+    if (!pf.end_snap) demote_spent(pf, n);
     q.last_tok = q.pending = tok;
     if (q.pen) pool_->run([&](int r) { workers_[r]->pen_host(&tok, 1, n); });  // the first token sits at n
     if (pf.slot < (int)dcopy_.size()) dcopy_[pf.slot] = 0.f;
@@ -3880,13 +4434,27 @@ void Engine::release(int slot) {
         detach(slot);
     }
     // a prompt abandoned in flight (its request failed or was cancelled before start_finish): drop it, else the next
-    // request on this slot would be prefilled / answered from it. Its rows past the restored
-    // prefix and its recurrent state are partial: the slot keeps no reusable content.
+    // request on this slot would be prefilled / answered from it. A failed one: its rows past
+    // the restored prefix and its recurrent state are partial, the slot keeps no reusable content. [srv-disconnect] one
+    // whose client left (prefill_cancel): the scheduler releases it between two chunks, so the slot's rows and state are
+    // those of the prompt's first p.i tokens (the restored part + the chunks done): that is its live end now, and a
+    // retry of the prompt resumes there (an edited one from the snapshot at the old live end, taken by start_begin).
+    // Before, a cancel of a turn that extended the conversation in place lost the whole conversation
     for (size_t i = 0; i < pfs_.size();)
         if (pfs_[i].slot == slot) {
+            PrefillState& p = pfs_[i];
+            Seq& q = seqs_[slot];
+            if (!p.keep) {
+                q.seq.clear();
+                q.pos = 0;
+            } else {
+                if (p.i > q.pos && p.i <= p.n) {
+                    q.seq.assign(p.ids.begin(), p.ids.begin() + p.i);
+                    q.pos = p.i;
+                }
+                q.plen = q.pos;  // (no reply rows past it; review2 L3)
+            }
             pfs_.erase(pfs_.begin() + i);
-            seqs_[slot].seq.clear();
-            seqs_[slot].pos = 0;
         } else {
             i++;
         }
@@ -3895,10 +4463,15 @@ void Engine::release(int slot) {
     seqs_[slot].vwait = false;  // (review R4-L3: an idle slot / the next request does not report a VRAM wait)
     seqs_[slot].vtry = 0;
     seqs_[slot].end = 0;
+    seqs_[slot].rlim = 0;
     seqs_[slot].want_drafts = seqs_[slot].no_ahead = false;
     seqs_[slot].drafts.clear();
     if (seqs_[slot].constrained) constrain(slot, false);
     if (seqs_[slot].banned) ban(slot, nullptr, 0);
+}
+
+void Engine::prefill_cancel(int slot) {
+    if (PrefillState* p = pf_of(slot)) p->keep = true;
 }
 
 bool Engine::trim(int slot, int pos) {
@@ -4870,11 +5443,7 @@ void Engine::decode_calibrate() {
                 comm_free_decode_host(comm_);
             }
             comm_.dxfer = dc.x[0];
-            auto nm = [](int x) { return x == kXferHost ? "pinned host memory" : "P2P SM stores"; };
-            fprintf(stderr, "[comm] decode collectives (QE_DECODE_COMM=auto, from the start-up cache, measured %s): single "
-                            "sequence: %s (P2P %.2f, host memory %.2f ms/step); batched: %s (P2P %.2f, host memory %.2f ms/step); "
-                            "QE_DECODE_COMM=remeasure measures again\n",
-                    dc.when.c_str(), nm(dc.x[0]), dc.tp[0], dc.th[0], nm(dc.x[1]), dc.tp[1], dc.th[1]);
+            comm_decode_cache_log(dc);
             return;
         }
     }
@@ -4981,8 +5550,12 @@ void Engine::decode_calibrate() {
         }
         const double mm = ok ? median(vm) : -1.0, mq = ok ? median(vq) : -1.0;
         const bool keep = ok && mw == 2;
-        snprintf(mixed, sizeof mixed, "; mixed pick: %s host memory with P2P attention exchanges %.2f ms/step vs P2P %.2f "
-                 "(won %d/2): %s", b ? "batched" : "single sequence", mm, mq, mw, keep ? "kept" : "back to P2P");
+        if (ok)
+            snprintf(mixed, sizeof mixed, "; mixed pick: %s host memory with P2P attention exchanges %.2f ms/step vs P2P %.2f "
+                     "(won %d/2): %s", b ? "batched" : "single sequence", mm, mq, mw, keep ? "kept" : "back to P2P");
+        else  // (#22: a leg that did not run prints n/a, not -1.00 ms/step)
+            snprintf(mixed, sizeof mixed, "; mixed pick: %s host memory with P2P attention exchanges n/a (a leg failed): back "
+                     "to P2P", b ? "batched" : "single sequence");
         if (!keep) pick[b] = kXferP2P;
         if (!ok) pick[0] = pick[1] = kXferP2P, ok = true, noisy = true;  // (a failed extra leg: P2P, not cached)
     }
@@ -5078,7 +5651,7 @@ void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
     // and the requested slots still fit every card with it, counted as plan_slots counts them (review M5: slots from
     // QE_MAX_SEQS / QE_SLOTS, the region slack, the per-position buffers of a context past the native one); otherwise
     // MTP only, one line with the numbers and the --max-ctx that fits. dflash2 loads it whenever a 16K-token pool stays.
-    int nslots = env_int("QE_MAX_SEQS", 16);
+    int nslots = env_int("QE_MAX_SEQS", default_slots(workers_.size()));
     if (const char* e = env_str("QE_MAX_SEQS")) {
         std::string v(e);
         if (v.find(',') != std::string::npos) nslots = (int)std::count(v.begin(), v.end(), ',') + 1;

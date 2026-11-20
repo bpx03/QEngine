@@ -5,6 +5,7 @@ transformers), so the server does not depend on a transformers version that know
 The engine consumes the encoder output as the prompt embeddings of the image rows; their token
 ids are content-derived (>= IMG_TOKEN) so that the engine's prefix cache tells images apart."""
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -92,6 +93,11 @@ class VisionEncoder:
         self.w = w
         self.pe_w = w["patch_embed.proj.weight"].reshape(self.dim, -1)
         self.cache = {}  # image digest -> (embeddings on CPU, (t, h, w))
+        # the encoder's launches go through gate() (a context manager; the server sets the engine's driver gate,
+        # Engine.driver_gate): with LAZY module loading a new image shape loads kernels, which must not happen while
+        # the engine's collectives spin on this card. The start-up encode below runs
+        # before the engine exists: no gate needed
+        self.gate = contextlib.nullcontext
         self.cache_bytes, self.cache_limit = 0, env_int("QE_VISION_CACHE_MB", 2048) << 20
         # largest image once: PyTorch's pool then already holds the encoder's peak memory, so a
         # KV cache planned afterwards (engine start) leaves room for it
@@ -231,18 +237,22 @@ class VisionEncoder:
             self.cache[dg] = self.cache.pop(dg)  # LRU order
             return (dg,) + hit
         patches, grid = self.preprocess(Image.open(io.BytesIO(data)))
-        e = self.encode(patches, grid)
-        if self.dt == torch.float16 and not torch.isfinite(e).all():  # fp16 overflow: this image again in bf16
+        with self.gate():  # (the launches only: the kernels then run next to the engine's steps)
+            e = self.encode(patches, grid)
+            # (the finiteness check's kernels launch inside the gate too, review q27_perf L4; read after it, no sync here)
+            fin = torch.isfinite(e).all() if self.dt == torch.float16 else None
+        if fin is not None and not bool(fin):  # fp16 overflow: this image again in bf16
             print("vision: non-finite fp16 encoder output, image re-encoded in bf16", flush=True)
             dt, w0, hw0 = self.dt, self.w, self.hw
-            self.dt, self.w = torch.bfloat16, {k: v.to(torch.bfloat16) for k, v in w0.items()}
             wb0 = getattr(self, "wbuf", None)
-            if hw0:
-                self.hw = [{k: v.to(torch.bfloat16).pin_memory() for k, v in d.items()} for d in hw0]
-                self.wbuf = [{k: torch.empty_like(t, dtype=torch.bfloat16) for k, t in b.items()} for b in wb0]
-            self.pe_w = self.w["patch_embed.proj.weight"].reshape(self.dim, -1)
             try:
-                e = self.encode(patches, grid)
+                with self.gate():  # (bf16 kernels never ran before; pin_memory registers host memory)
+                    self.dt, self.w = torch.bfloat16, {k: v.to(torch.bfloat16) for k, v in w0.items()}
+                    if hw0:
+                        self.hw = [{k: v.to(torch.bfloat16).pin_memory() for k, v in d.items()} for d in hw0]
+                        self.wbuf = [{k: torch.empty_like(t, dtype=torch.bfloat16) for k, t in b.items()} for b in wb0]
+                    self.pe_w = self.w["patch_embed.proj.weight"].reshape(self.dim, -1)
+                    e = self.encode(patches, grid)
             finally:
                 self.dt, self.w, self.hw = dt, w0, hw0
                 if hw0:

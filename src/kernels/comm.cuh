@@ -198,6 +198,11 @@ bool allreduce_add_hc(float* R, const float* inj, const float* partial, int m, i
 // own_rows (sequence-parallel HC): R += inj * sum only on the rows this rank owns (rows [m * rank / ngpu,
 // m * (rank + 1) / ngpu)), nothing published; allreduce_hc_ok tells whether this path applies to m rows
 bool allreduce_hc_ok(const Comm& c, int m, int h);
+// GLM row-owner prefill: reduce-scatter only. out rows [m * rank / ngpu, m * (rank + 1) / ngpu) = bf16(sum of the
+// partials) (the values allreduce_add leaves in a zeroed resid, bit-identical); other rows of out untouched. P2P only.
+bool rs_own_ok(const Comm& c, int m, int h);
+void allreduce_rs_own(float* out, const float* partial, int m, int h, const Comm& c, int rank, const CommCounters& ctr,
+                      cudaStream_t st, bool overlapped);
 
 // Copy-engine deferred prefill all-reduce: the rows move by DMA (cudaMemcpyAsync on the peers'
 // copy streams, issued by a copy thread - comm.cu has no host code for it), only local work runs

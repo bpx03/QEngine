@@ -461,6 +461,34 @@ check("an explicit --prefill-chunk 2048 stays", g.args.prefill_chunk, 2048)
 g, adm = gen(FakeMulti(10 ** 7), [], preempt_max=None, long_share=None, prefill_chunk=2048, prefill_chunk_auto=True,
              prefill_chunk_idle=8192)
 check("--prefill-chunk-idle 8192: the chunk while decoding stays at the measured 4096", g.args.prefill_chunk, 4096)
+# [gptoss-pf90-idle] review pfidle M1: an idle chunk without shared batches (gpt-oss 10240) leaves the cut-in gap alone
+g, adm = gen(FakeEngine(10 ** 6), [], prefill_chunk=2048, prefill_chunk_auto=True, prefill_chunk_idle=10240)
+check("no shared batches: join_cap ignores the idle chunk", (adm.multi, adm.join_cap(), g.args.prefill_chunk), (False, 2560, 2048))
+g, adm = gen(FakeMulti(10 ** 7, bound=False), [], prefill_chunk=2048, prefill_chunk_auto=True, prefill_chunk_idle=4096)
+check("shared batches: join_cap keeps the idle batch", adm.join_cap(), 4608)
+check("gpt-oss profile: idle chunk = the engine chunk", app.FAMILIES["gptoss"]["prefill_chunk_idle"] if hasattr(app, "FAMILIES") else
+      __import__("model_profile").FAMILIES["gptoss"]["prefill_chunk_idle"], 10240)
+# [gptoss-lows] review pfidle L2 / L1: the idle chunk of a lone long prompt (Generator.idle_budget)
+lp = job(90000)
+lp.slot = 0
+for gpo, pf_pass, qn, want, what in ((True, 10240, None, 10240, "nothing queued: the idle chunk"),
+                                     (True, 10240, 5000, 10240, "a queued 5K request that cannot cut in keeps the idle chunk"),
+                                     (True, 10240, 500, 2048, "a queued 500-token request that can cut in: --prefill-chunk"),
+                                     (True, 4096, None, 8192, "engine chunk 4,096: the idle chunk is a multiple of it"),
+                                     (True, 0, None, 10240, "engine chunk not reported: the idle chunk"),
+                                     (False, 0, 5000, 2048, "other families: any queued request -> --prefill-chunk (unchanged)")):
+    g, adm = gen(FakeEngine(10 ** 6), [job(qn)] if qn else [], prefill_chunk=2048, prefill_chunk_auto=True,
+                 prefill_chunk_idle=10240)
+    g.gptoss, g.pf_pass = gpo, pf_pass
+    check(f"idle budget: {what}", app.Generator.idle_budget(g, 2048, False, [lp], adm), want)
+check("idle budget: a decoding slot -> --prefill-chunk", app.Generator.idle_budget(g, 2048, True, [lp], adm), 2048)
+# review lows M1: a request that may cut in later (the fairness gap after a cut-in) keeps --prefill-chunk
+lp.cut_at, lp.round_tok = 0, 600
+g, adm = gen(FakeEngine(10 ** 6), [job(500)], prefill_chunk=2048, prefill_chunk_auto=True, prefill_chunk_idle=10240)
+g.gptoss, g.pf_pass = True, 10240
+check("idle budget: in the fairness gap pick_next admits none", adm.pick_next(NOW, [lp]), [])
+check("idle budget: a 500-token request waiting out the fairness gap -> --prefill-chunk", app.Generator.idle_budget(g, 2048, False, [lp], adm), 2048)
+lp.cut_at = None
 FLASH = os.environ.get("QE_MOCK_MODEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "Qwen3.8-Flash-Next-QE-GDN8"))
 if os.path.exists(os.path.join(FLASH, "config.json")):
     a = app.parse_args(["--model", FLASH])
@@ -469,6 +497,103 @@ if os.path.exists(os.path.join(FLASH, "config.json")):
     a = app.parse_args(["--model", FLASH, "--prefill-chunk", "2048", "--preempt-max", "1024"])
     check("parse_args: explicit values equal to the defaults stay explicit", (a.prefill_chunk_auto, a.preempt_max),
           (False, 1024))
+
+print("queue-aware split (QaSplit, Admission.qa)")
+prof27 = types.SimpleNamespace(defaults={}, family="qwen38-27b")
+g, adm = gen(FakeEngine(10 ** 7), [], prefill_share=0.5, prefill_chunk=2048)
+check("off without the 27B profile (share-min defaults to --prefill-share)", adm.qa, False)
+g.profile = prof27
+adm = app.Admission(g)
+check("27B default: on, floor 0.10, short 4096", (adm.qa, adm.share_min, adm.short), (True, 0.10, 4096))
+g.args.prefill_share_min = 0.5
+check("--prefill-share-min = --prefill-share: off (the fixed split)", app.Admission(g).qa, False)
+g.args.prefill_share_min = None
+
+
+class MultiEng(FakeEngine):  # shared prefill batches (Flash-Next)
+    def can_prefill_multi(self):
+        return True
+
+    def prefill_pass_bound(self):
+        return False
+
+
+gq, admq = gen(MultiEng(10 ** 7), [], prefill_share=0.5, prefill_chunk=2048)
+gq.profile = types.SimpleNamespace(defaults={}, family="qwen38-flash-next")
+admq = app.Admission(gq)
+check("Flash-Next default (3 cards): the time split on (floor 0.10), the one-prompt cut-in rule off",
+      (admq.multi, admq.qa, admq.qa_cut, admq.share_min), (True, True, False, 0.10))
+
+
+class BoundEng(MultiEng):
+    def prefill_pass_bound(self):
+        return True
+
+
+gb, admb = gen(BoundEng(10 ** 7), [], prefill_share=0.5, prefill_chunk=2048)
+gb.profile = gq.profile
+check("Flash-Next, passes bound by expert copies (2 cards): the fixed split as before", app.Admission(gb).qa, False)
+
+
+class PpEng(MultiEng):
+    par = {"mode": "pp"}
+
+
+gp, _ = gen(PpEng(10 ** 7), [], prefill_share=0.5, prefill_chunk=2048)
+gp.profile = gq.profile
+check("Flash-Next in mode B (pp): the fixed split as before", app.Admission(gp).qa, False)
+qm = app.QaSplit(0.15, 0.5, 0.15)
+actq = [types.SimpleNamespace(finished=False) for _ in range(4)]
+qm.add(1, 1.0)  # decoders had their share recently
+admq.e = types.SimpleNamespace(prefill_pos=lambda slot: 0)
+jq = job(800)
+jq.slot = 0
+check("shared batches, short prompt next: a fixed window of the floor share after the pass",
+      round(qm.window(0.2, admq, [jq], [], actq), 4), round(0.2 * 0.15 / 0.85, 4))
+qm.add(0, 30.0)  # decoders far below their floor recently: still no catch-up window while short prompts are next
+check("shared batches, short prompt next: no catch-up window beyond it",
+      round(qm.window(0.2, admq, [jq], [], actq), 4), round(0.2 * 0.15 / 0.85, 4))
+
+
+class PosEng(FakeEngine):
+    def __init__(self, pos):
+        super().__init__(10 ** 7)
+        self.pos = pos
+
+    def prefill_pos(self, slot):
+        return self.pos.get(slot, 0)
+
+
+def pj(n, slot):
+    j = job(n)
+    j.slot = slot
+    return j
+
+
+act = [types.SimpleNamespace(finished=False) for _ in range(8)]
+adm.e = PosEng({0: 0})
+qa = app.QaSplit(0.15, 0.5)
+qa.add(1, 0.5)  # decoders had their share recently
+check("short prompt next: no window", qa.window(0.2, adm, [pj(1000, 0)], [], act), 0.0)
+adm.e = PosEng({0: 0})
+w = qa.window(0.2, adm, [pj(20000, 0)], [job(10000)], act)
+check("long prompts only: share A / (A + W) capped at --prefill-share (8 / 10 -> 0.5: window = tc)", round(w, 6), 0.2)
+w = qa.window(0.2, adm, [pj(20000, 0)], [job(10000)] * 60, act)
+check("many waiting: share floor 0.15", round(w, 6), round(0.2 * 0.15 / 0.85, 6))
+w = qa.window(0.2, adm, [pj(20000, 0)], [job(100)], act)
+check("a short one queued: no window", w, 0.0)
+qa2 = app.QaSplit(0.15, 0.5)
+qa2.add(0, 3.0)
+w = qa2.window(0.2, adm, [pj(1000, 0)], [], act)
+check("floor: decoders far below 0.15 of the recent time get a window", w > 0.4, True)
+adm.e = PosEng({0: 5000})
+long_ = pj(20000, 0)
+long_.cut_at = None
+g.queue[:] = [job(3000), job(6000)]
+check("cut-in up to --prefill-short rows into a long prompt", adm.pick_next(1000.0, [long_]), [0])
+long_.cut_at = 5000
+check("no second cut-in before the long prompt had a pass", adm.pick_next(1000.0, [long_]), [])
+g.queue[:] = []
 
 print("FAIL: " + ", ".join(FAILS) if FAILS else "all passed")
 

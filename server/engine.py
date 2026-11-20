@@ -4,6 +4,7 @@ The same wrapper serves libqengine (Qwen3.8-27B, every function below) and engin
 a subset of the C API (Qwen3.8-Flash-Next while it is being ported): REQUIRED must exist, each
 OPTIONAL group is used when all its functions exist and falls back to single-sequence behaviour
 otherwise (contract: server/qe_capi.h)."""
+import contextlib
 import ctypes
 import json
 import os
@@ -41,6 +42,11 @@ SIGS = {
     "qe_can_admit": (c_int, [c_void_p, c_int]),
     "qe_pause_for": (c_int, [c_void_p, c_int, c_int]),
     "qe_set_limit": (None, [c_void_p, c_int, c_int]),
+    "qe_set_ignore_eos": (None, [c_void_p, c_int, c_int]),  # GLM (review r25-M2): steps do not stop at an EOS
+    "qe_park": (c_int, [c_void_p, c_int]),
+    "qe_unpark": (c_int, [c_void_p, c_int, c_int, P_int]),
+    "qe_park_drop": (None, [c_void_p, c_int]),
+    "qe_num_parked": (c_int, [c_void_p]),
     "qe_warmup": (c_double, [c_void_p, c_int]),
     "qe_reset": (None, [c_void_p]),
     "qe_set_exit_hook": (None, [c_void_p]),
@@ -51,6 +57,7 @@ SIGS = {
     "qe_prefill_multi": (c_int, [c_void_p, P_int, c_int, c_int, P_int]),
     "qe_prefill_multi_caps": (c_int, [c_void_p, P_int, c_int, c_int, P_int, P_int]),
     "qe_prefill_pass_bound": (c_int, [c_void_p]),
+    "qe_prefill_chunk": (c_int, [c_void_p]),  # gpt-oss: rows of one engine prefill pass (pfidle L1)
     "qe_start_finish_slot": (c_int, [c_void_p, c_int]),
     "qe_num_prefills": (c_int, [c_void_p]),
     "qe_prefill_pos": (c_int, [c_void_p, c_int]),
@@ -93,7 +100,9 @@ SIGS = {
     "qe_set_no_lookup": (None, [c_void_p, c_int, c_int]),
     "qe_mem_guard": (None, [c_void_p]),
     "qe_fault_count": (c_i64, [c_void_p]),
+    "qe_prefill_cancel": (None, [c_void_p, c_int]),
     "qe_slot_fault": (c_int, [c_void_p, c_int, c_char_p, c_int]),
+    "qe_drv_gate": (c_int, [c_int]),
 }
 
 
@@ -154,11 +163,27 @@ def bind(lib):
     return have
 
 
+LOG_DRAIN = []  # qe_log_drain of the loaded engine libraries (Flash-Next: async engine log streams)
+
+
+def drain_logs():
+    """The engine libraries' buffered log lines to fd 1 / fd 2 now (os._exit skips the atexit drain)."""
+    for f in LOG_DRAIN:
+        try:
+            f()
+        except Exception:
+            pass
+
+
 class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/steering.py)
     def __init__(self, model_dir, devices="0,1,2", max_t=262144, split="", lib_path=None, vocab=None):
         self.lib_path = lib_path or env_str("QE_LIB") or os.path.join(_ROOT, "build", "libqengine.so")
         with env_write():  # its constructor writes the environment (qe_process_env) while a fetch thread may run (FX11-L1)
             self.lib = ctypes.CDLL(self.lib_path)
+        try:  # the engine's buffered log lines (qe_log.h), written before an os._exit
+            LOG_DRAIN.append(self.lib.qe_log_drain)
+        except AttributeError:
+            pass
         self._init(model_dir, devices, max_t, split, vocab)
 
     def _init(self, model_dir, devices, max_t, split, vocab):
@@ -220,6 +245,20 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         """Feature group (GROUPS) or single function name available."""
         return self.caps.get(feature, feature in self.fns)
 
+    @contextlib.contextmanager
+    def driver_gate(self):
+        """The vision encoder's kernel launches between engine jobs (qe_drv_gate; Flash-Next, 27B): with --vision CUDA module
+        loading is LAZY, and a kernel's first launch (a new image shape) can synchronize the card's context while the
+        engine's collectives spin there (cross-card hang). No-op without the call."""
+        if "qe_drv_gate" not in self.fns:
+            yield
+            return
+        self.lib.qe_drv_gate(1)
+        try:
+            yield
+        finally:
+            self.lib.qe_drv_gate(0)
+
     def par_info(self):
         """The parallel mode of the run (JSON of qe_par_info, refreshed: mode B adds its prompt counters)."""
         if "qe_par_info" not in self.fns:
@@ -233,16 +272,16 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
 
     def host_mem(self):
         """The host-RAM plan of the boot (JSON of qe_host_mem_info: MemTotal / MemAvailable, reserve, each consumer's
-        planned size, what was reduced and why); {} when the engine has none."""
+        planned size, what was reduced and why) and, under "pressure", the runtime host-memory pressure state (read on
+        every call); {} when the engine has none."""
         if "qe_host_mem_info" not in self.fns:
             return {}
-        if not hasattr(self, "_host_mem"):
-            buf = ctypes.create_string_buffer(16384)
-            n = self.lib.qe_host_mem_info(self.h, buf, 16384)
-            try:
-                self._host_mem = json.loads(buf.value.decode(errors="replace")) if n >= 0 else {}
-            except ValueError:
-                self._host_mem = {}
+        buf = ctypes.create_string_buffer(16384)
+        n = self.lib.qe_host_mem_info(self.h, buf, 16384)
+        try:
+            self._host_mem = json.loads(buf.value.decode(errors="replace")) if n >= 0 else {}
+        except ValueError:
+            self._host_mem = getattr(self, "_host_mem", {})
         return self._host_mem
 
     def graph_info(self):
@@ -377,6 +416,10 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
     def can_prefill_multi(self):
         return "qe_prefill_multi" in self.fns and self.caps["chunked"]
 
+    def prefill_chunk(self):
+        """Rows of one engine prefill pass (a longer call splits into equal passes); 0: not reported."""
+        return int(self.lib.qe_prefill_chunk(self.h)) if "qe_prefill_chunk" in self.fns else 0
+
     def prefill_pass_bound(self):
         """True: each prefill pass copies the host-backed experts over PCIe (2 cards): larger batches pay off."""
         return "qe_prefill_pass_bound" in self.fns and bool(self.lib.qe_prefill_pass_bound(self.h))
@@ -436,6 +479,45 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         self._pending.pop(slot, None)
         self.lib.qe_release(self.h, slot)
 
+    def prefill_cancel(self, slot):
+        """[glm-rel-pfgate] stop the slot's prompt inside its prefill (optional; the engine keeps what it finished)."""
+        if "qe_prefill_cancel" in self.fns:
+            self.lib.qe_prefill_cancel(self.h, int(slot))
+
+    def can_park(self):
+        return all(f in self.fns for f in ("qe_park", "qe_unpark", "qe_park_drop"))
+
+    def park(self, slot):
+        """[q27-park-c] Park a decoding slot (state to host memory, slot released): a handle, or None when refused."""
+        if not self.can_park():
+            return None
+        h = self.lib.qe_park(self.h, int(slot))
+        if h < 0:
+            return None
+        self._active.discard(slot)
+        return h
+
+    def unpark(self, h, k=3):
+        """Resume a parked sequence: (slot, extra token or None), or None when no slot / room is free now, or False while
+        a resume whose held copy did not serve is prefilled piece by piece (call again with the same handle; the other
+        requests run in between)."""
+        x = ctypes.c_int(-1)
+        slot = self.lib.qe_unpark(self.h, int(h), int(k), ctypes.byref(x))
+        if slot == -4:
+            return False
+        if slot == -2:
+            raise RuntimeError(f"unpark: unknown handle {h}")
+        if slot <= -3:
+            raise RuntimeError("unpark: the resume failed (non-finite values)")
+        if slot < 0:
+            return None
+        self._active.add(slot)
+        return slot, (x.value if x.value >= 0 else None)
+
+    def park_drop(self, h):
+        if "qe_park_drop" in self.fns:
+            self.lib.qe_park_drop(self.h, int(h))
+
     def resume(self, slot):
         """Make an active slot the current single sequence (for step())."""
         if "qe_resume" in self.fns:
@@ -477,6 +559,12 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         verify only the drafts that fit, so the slot ends exactly at the returned reply."""
         if "qe_set_limit" in self.fns:
             self.lib.qe_set_limit(self.h, int(slot), int(tokens))
+
+    def set_ignore_eos(self, slot, on):
+        """ignore_eos replies (benchmarks): the engine's steps accept rows past an EOS (GLM; others: no-op). The
+        engine resets it when the slot is released."""
+        if "qe_set_ignore_eos" in self.fns:
+            self.lib.qe_set_ignore_eos(self.h, int(slot), 1 if on else 0)
 
     def warmup(self, greedy=False, sampling=True):
         """Pre-build the decode CUDA graphs of slot 0 (seconds spent)."""

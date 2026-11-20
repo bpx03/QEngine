@@ -175,6 +175,20 @@ void qe_gemv_w16(const void* wp, int n, int k, const bf16* x, float* y, int m) {
 #include <sstream>
 
 #include "engine.h"
+#include "drv_gate.h"
+
+// [q27-perf] a decode / prefill / park / unpark / release call is one driver-gate Step from entry to return (drv_gate.h;
+// its GpuPool::run Steps nest for free): a job returns once its launches are queued, so the cards' work of a step
+// (~10-20 ms) ran in what the gate took for an idle gap, and a background pinner's 20 ms gap opened inside a decode: its
+// 4 GB slab registration (~125 ms) then held the step after it (s150 step 3 code -13 %, prose -8 %
+// 2026-11-20). A pinner's gap is now measured between the server's calls: the cards may still run work queued by the last
+// call (a step queued ahead, a prefill chunk), and a registration that starts then delays only the next call's launches,
+// never a job's. None of these calls reaches a Reg (HostPool::release: qe_mem_guard / qe_archive_more, not covered).
+// With Engine::archive_wait at start-up this leaves the registrations of a pinner that resumes while serving (after a
+// host-room hold, the slow-registration back-off or the QE_ARCHIVE_WAIT_S cap) and the snapshot buffers past the first
+// kSnapBase (review q27_perf try 3 M1): they wait for a real gap between calls; meanwhile archives use pageable memory
+// and the engine thread pins a snapshot entry itself between its jobs
+#define QE_STEP_CALL qe_drv::Step qe_step_call_
 
 extern "C" {
 
@@ -200,6 +214,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
     try {
         Engine* en = new Engine(model_dir, devs, max_t, w);
         en->decode_calibrate();  // QE_DECODE_COMM=auto: the decode collectives' path by real decode steps
+        en->archive_wait();      // [q27-perf] the archive pool pinned before the first request (engine.h)
         return en;
     } catch (std::runtime_error& ex) {  // a refused steering vector (QE_STEER / QE_STEER_DIR): no engine
         fprintf(stderr, "qengine: %s\n", ex.what());
@@ -209,7 +224,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
 void qe_destroy(void* e) { delete (Engine*)e; }
 void qe_reset(void* e) { ((Engine*)e)->reset(); }
 int qe_prefill(void* e, const int* ids, int n) { return ((Engine*)e)->prefill(ids, n); }
-int qe_decode(void* e, int tok) { return ((Engine*)e)->decode(tok); }
+int qe_decode(void* e, int tok) { QE_STEP_CALL; return ((Engine*)e)->decode(tok); }
 void qe_debug_hidden(void* e, const int* ids, int n, float* out) {
     ((Engine*)e)->debug_hidden(ids, n, out);
 }
@@ -227,15 +242,19 @@ int qe_start_mm(void* e, const int* ids, int n, int k, unsigned long long affini
 }
 int qe_start_begin(void* e, const int* ids, int n, int k, unsigned long long affinity, int hint,
                    const void* img, int img_rows, const int* rope3, int delta) {
+    QE_STEP_CALL;
     return ((Engine*)e)->start_begin(ids, n, k, affinity, hint, (const bf16*)img, img_rows, rope3, delta);
 }
-int qe_prefill_more(void* e, int budget) { return ((Engine*)e)->prefill_more(budget); }
-int qe_start_finish(void* e) { return ((Engine*)e)->start_finish(); }
-int qe_prefill_more_slot(void* e, int slot, int budget) { return ((Engine*)e)->prefill_more_slot(slot, budget); }
-int qe_start_finish_slot(void* e, int slot) { return ((Engine*)e)->start_finish_slot(slot); }
+int qe_prefill_more(void* e, int budget) { QE_STEP_CALL; return ((Engine*)e)->prefill_more(budget); }
+int qe_start_finish(void* e) { QE_STEP_CALL; return ((Engine*)e)->start_finish(); }
+int qe_prefill_more_slot(void* e, int slot, int budget) { QE_STEP_CALL; return ((Engine*)e)->prefill_more_slot(slot, budget); }
+int qe_start_finish_slot(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->start_finish_slot(slot); }
 int qe_num_prefills(void* e) { return ((Engine*)e)->num_prefills(); }
 int qe_prefill_pos(void* e, int slot) { return ((Engine*)e)->prefill_pos(slot); }
-int qe_archive_more(void* e, long long budget) { return ((Engine*)e)->archive_more((size_t)budget); }
+int qe_archive_more(void* e, long long budget) {
+    const bool done = ((Engine*)e)->archive_more((size_t)budget);
+    return done && qe_memp::holding() ? 2 : done;  // (2: not now, host memory pressure; the server asks again later)
+}
 void qe_mem_guard(void* e) { ((Engine*)e)->mem_guard(); }
 void qe_set_lookahead(void* e, int on) { ((Engine*)e)->set_lookahead(on != 0); }
 int qe_last_slot(void* e) { return ((Engine*)e)->last_slot(); }
@@ -246,13 +265,25 @@ long long qe_pool_tokens(void* e) { return (long long)((Engine*)e)->pool_tokens(
 int qe_kv_in_ram(void*) { return 0; }  // the 27B KV pool is always in VRAM
 // the host-RAM plan of this run (host_budget.h) as JSON; the bytes written (without the 0), -1: buffer too small
 int qe_host_mem_info(void* e, char* buf, int n) {
-    const std::string& j = ((Engine*)e)->host_mem_json();
+    const std::string j = ((Engine*)e)->host_mem_json_now();  // (the boot plan + "pressure": host_pressure.h)
     if (!buf || n <= (int)j.size()) return -1;
     memcpy(buf, j.c_str(), j.size() + 1);
     return (int)j.size();
 }
 int qe_can_admit(void* e, int n) { return ((Engine*)e)->can_admit(n); }
 int qe_pause_for(void* e, int n, int prio) { return ((Engine*)e)->pause_for(n, prio) ? 1 : 0; }
+// [q27-park-c] park / unpark a decoding sequence beyond the seats (engine.h)
+int qe_park(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->park(slot); }
+int qe_unpark(void* e, int h, int k, int* extra) { QE_STEP_CALL; return ((Engine*)e)->unpark(h, k, extra); }
+void qe_park_drop(void* e, int h) { ((Engine*)e)->park_drop(h); }
+// [q27-vision-lazy] the server's vision encoder launches between engine jobs (drv_gate.h qe_drv::hold; 1 take, 0 give
+// back): with --vision torch starts CUDA first, module loading is LAZY, and a new image shape's first launch can
+// synchronize the card's context while a job's collectives spin there (the Flash-Next case)
+int qe_drv_gate(int on) {
+    qe_drv::hold(on != 0);
+    return 1;
+}
+int qe_num_parked(void* e) { return ((Engine*)e)->num_parked(); }
 void qe_set_prio(void* e, int slot, int prio) { ((Engine*)e)->set_prio(slot, prio); }
 void qe_set_limit(void* e, int slot, int tokens) { ((Engine*)e)->set_limit(slot, tokens); }
 void qe_watch_stops(void* e, int slot, int on) { ((Engine*)e)->watch_stops(slot, on != 0); }
@@ -264,7 +295,7 @@ int qe_num_pinned(void* e) { return ((Engine*)e)->num_pinned(); }
 void qe_slot_info(void* e, int i, long long* out) { ((Engine*)e)->slot_info(i, out); }
 void qe_archive_info(void* e, double* out) { ((Engine*)e)->archive_info(out); }
 void qe_pool_counters(void* e, long long* out) { ((Engine*)e)->pool_counters(out); }
-int qe_spec_step(void* e, int* out) { return ((Engine*)e)->spec_step(out); }
+int qe_spec_step(void* e, int* out) { QE_STEP_CALL; return ((Engine*)e)->spec_step(out); }
 void qe_draft_stats(void* e, int slot, long long* out) { ((Engine*)e)->draft_stats(slot, out); }
 // DFlash2 block drafter: {block steps, their tokens}; ms per drafter block (development check, -1: no drafter)
 void qe_dfl_stats(void* e, long long* out) { out[0] = ((Engine*)e)->df_steps_, out[1] = ((Engine*)e)->df_tok_; }
@@ -289,10 +320,13 @@ int qe_num_archives(void* e) { return ((Engine*)e)->num_archives(); }
 int qe_num_disk_archives(void* e) { return ((Engine*)e)->num_disk_archives(); }
 void qe_persist(void* e) { ((Engine*)e)->persist(); }
 void qe_set_dump_hidden(void* e, uint16_t* out) { ((Engine*)e)->set_dump_hidden(out); }
-void qe_release(void* e, int slot) { ((Engine*)e)->release(slot); }
-void qe_resume(void* e, int slot) { ((Engine*)e)->resume(slot); }
+void qe_release(void* e, int slot) { QE_STEP_CALL; ((Engine*)e)->release(slot); }
+// [srv-disconnect] the client of the slot's prompt in flight left: the release that follows keeps the rows done
+void qe_prefill_cancel(void* e, int slot) { ((Engine*)e)->prefill_cancel(slot); }
+void qe_resume(void* e, int slot) { QE_STEP_CALL; ((Engine*)e)->resume(slot); }
 void qe_set_concurrent(void* e, int on) { ((Engine*)e)->set_concurrent(on); }
 void qe_step_batch(void* e, const int* slots, int n, int* out, int* cnt) {
+    QE_STEP_CALL;
     ((Engine*)e)->step_batch(slots, n, out, cnt);
 }
 void qe_set_sampling(void* e, float temperature, float top_p, int top_k, float min_p,

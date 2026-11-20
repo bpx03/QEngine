@@ -2,6 +2,7 @@
 // setup, the fatal-error path of CUDA_CHECK / CHECK and fault injection for tests.
 #include "../env.h"
 #include "watchdog.cuh"
+#include "../qe_log.h"
 
 #include <unistd.h>
 
@@ -179,10 +180,12 @@ void set_reason(const char* fmt, ...) {
         fprintf(stderr, "qengine: exiting (code 75) so the server can be restarted\n");
         fflush(stderr);
         fflush(stdout);
+        qe_log::drain();  // (the engine streams' buffered lines: qe_log.h)
         _exit(75);
     }
     fflush(stderr);
     fflush(stdout);  // the server's persistent log (server/logtee.py) gets the last lines before the process ends
+    qe_log::drain();
     if (env_int("QE_FATAL_EXIT", 0)) _exit(70);  // no core dump
     abort();
 }

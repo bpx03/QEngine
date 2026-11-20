@@ -41,6 +41,7 @@ int qe_spec_step(void* e, int* out);
 int qe_last_reused(void* e);  // prompt tokens taken from cache by the last start
 int qe_last_slot(void* e);    // slot of the last start / start_finish
 void qe_release(void* e, int slot);  // generation over; its tokens stay cached for the next turn
+void qe_prefill_cancel(void* e, int slot);  // optional: the client of the slot's prompt in flight left; qe_release follows
 
 // ======================================================= TIER 1: single functions (each optional)
 int qe_vocab(void* e);                       // logits width (248320); else config.json vocab_size
@@ -51,10 +52,20 @@ int qe_host_mem_info(void* e, char* buf, int n);  // the host-RAM plan at boot a
 int qe_can_admit(void* e, int n);            // a new n-token sequence fits now; default: a free slot and n <= max_context
 int qe_pause_for(void* e, int n, int prio);  // pause decoding sequences of lower prio (lowest first, never a prefill) until a
                                              // new n-token sequence fits; 1: it fits now (nothing paused if it cannot)
+// park a decoding sequence (KV rows + recurrent state to a held host archive, slot released): handle >= 0, -1 refused;
+// unpark it into any free slot bit-identically (no prefill): slot >= 0, -1 not now (retry), -2 unknown handle; *extra a
+// token only when the held state could not serve (its row was prefilled); park_drop: a parked request ended (optional)
+int qe_park(void* e, int slot);
+int qe_unpark(void* e, int h, int k, int* extra);
+void qe_park_drop(void* e, int h);
+int qe_num_parked(void* e);
 void qe_set_limit(void* e, int slot, int tokens);  // reply ends after `tokens` more tokens: verify only drafts that fit
 double qe_warmup(void* e, int modes);        // pre-build graphs (bit0 greedy, bit1 sampling); seconds
 void qe_reset(void* e);                      // forget all cached prefixes
 void qe_set_lookahead(void* e, int on);      // 0 while another prompt's chunks interleave (no step queued ahead)
+// the server's vision encoder launches between engine jobs (1 take, 0 give back the driver gate; Flash-Next, 27B): with
+// --vision CUDA module loading is LAZY and a first launch can synchronize the context while collectives spin
+int qe_drv_gate(int on);
 
 // ======================================================= TIER 2 "chunked": prefill in chunks (all or none)
 // start_begin returns the slot (< 0: no room); then prefill_more[_slot] until it returns 1, then
@@ -76,6 +87,7 @@ int qe_prefill_multi(void* e, const int* slots, int n, int budget, int* done);
 int qe_prefill_multi_caps(void* e, const int* slots, int nslots, int budget, int* done, const int* caps);  // caps[i] > 0: at most that many rows of prompt i (whole 512-row chunks)
 int qe_conv_list(void* e, long long* out, int max);  // known conversations, LRU first: id, tokens, slot (-1 archive), idle ms, tick, generating
 int qe_prefill_pass_bound(void* e);  // 1: a prefill pass costs the PCIe copy of the host-backed experts (big batches pay)
+int qe_prefill_chunk(void* e);  // gpt-oss: rows of one engine prefill pass (a longer call runs as equal passes of <= this)
 
 // ======================================================= TIER 3 "batch": concurrent sequences (all or none)
 void qe_set_concurrent(void* e, int on);  // 1: starts do not release the other slots

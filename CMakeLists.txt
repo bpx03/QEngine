@@ -121,7 +121,7 @@ add_dependencies(qflash qe_build_id)
 
 # CPU unit tests of the comm rules and the exchange flag protocol (no GPU): ctest
 enable_testing()
-foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit qfn_pp_plan_unit load_drop_unit)
+foreach(t comm_rule_unit drv_gate_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit qfn_pp_plan_unit load_drop_unit host_pressure_unit)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cpp)  # the Docker build stage has no tests/
     add_executable(${t} tests/${t}.cpp)
     target_include_directories(${t} PRIVATE src)
@@ -129,10 +129,32 @@ foreach(t comm_rule_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_o
     if(t STREQUAL load_drop_unit)
       target_sources(${t} PRIVATE src/safetensors.cpp)
     endif()
-    if(t STREQUAL kv_disk_unit)
+    if(t STREQUAL kv_disk_unit OR t STREQUAL drv_gate_unit OR t STREQUAL host_pressure_unit)
       find_package(Threads REQUIRED)
       target_link_libraries(${t} PRIVATE Threads::Threads)
     endif()
   endif()
 endforeach()
 
+# GLM-5.3-Flash engine; only where src/glm is present
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/glm/glm.cu)
+  find_package(CUDAToolkit REQUIRED COMPONENTS cublas)
+  # [glm-rel-isa] portable CPU lane: no -march anywhere (plain x86-64); the lane kernels (glm_cpu_isa.cpp) are built
+  # twice, AVX-512 (the Zen 4 set) and AVX2 (x86-64-v3), picked at lane start from cpuid (GLM_CPU_ISA=avx2 forces AVX2);
+  # -mtune never changes the ISA
+  foreach(isa avx512 avx2)
+    add_library(glm_cpu_${isa} OBJECT src/glm/glm_cpu_isa.cpp)
+    target_include_directories(glm_cpu_${isa} PRIVATE src)
+    target_link_libraries(glm_cpu_${isa} PRIVATE CUDA::cudart)
+    set_target_properties(glm_cpu_${isa} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(glm_cpu_${isa} PRIVATE -O3 -mtune=znver4)
+  endforeach()
+  target_compile_definitions(glm_cpu_avx512 PRIVATE GLM_ISA_AVX512=1)
+  target_compile_definitions(glm_cpu_avx2 PRIVATE GLM_ISA_AVX512=0)
+  add_library(qglm SHARED src/glm/glm.cu src/glm/glm_kernels.cu src/glm/glm_step.cu src/glm/glm_ar.cu src/glm/glm_moe8.cu src/glm/glm_gemm8.cu src/glm/glm_cpu.cpp $<TARGET_OBJECTS:glm_cpu_avx512> $<TARGET_OBJECTS:glm_cpu_avx2> src/glm/glm_plan.cpp src/glm/glm_capi.cpp src/glm/glm_ckpt.cu src/build_id.cpp $<TARGET_OBJECTS:qkernels>)
+  target_include_directories(qglm PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  add_dependencies(qglm qe_build_id)
+  target_compile_definitions(qglm PRIVATE GLM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+  target_link_libraries(qglm PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::cublas)
+  set_source_files_properties(src/glm/glm_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mtune=znver4")
+endif()

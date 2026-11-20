@@ -1,4 +1,5 @@
-# only what the image needs: CMakeLists.txt, src/, server/, vectors/, tools/flash_kl_ref.py, requirements.txt, LICENSE, VERSION
+# only what the image needs: CMakeLists.txt, src/, server/, vectors/, tools/flash_kl_ref.py, requirements.txt, LICENSE, VERSION, data/dsv4/,
+# tools/glm/draft_vocab_49k.i32, tools/glm/expert_prior_gen.f32
 *
 !CMakeLists.txt
 !src/
@@ -8,5 +9,8 @@
 !requirements.txt
 !LICENSE
 !VERSION
+!data/dsv4/
+!tools/glm/draft_vocab_49k.i32
+!tools/glm/expert_prior_gen.f32
 **/__pycache__
 **/*.pyc

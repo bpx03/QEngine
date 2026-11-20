@@ -18,16 +18,19 @@ import array
 import hashlib
 import asyncio
 import collections
+import ctypes
 import faulthandler
 import functools
 import json
 import re
+import math
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime
 
@@ -40,14 +43,14 @@ from agents import Tracker
 from qe_env import env_float, env_int, env_str, set_env
 import loop_guard
 from content_markers import OUT_MARK, SENT, Markers, escape_out, mark, out_marks, unmark
-from engine import Engine, EngineRefused, SequenceFault, StartRefused
+from engine import Engine, EngineRefused, SequenceFault, StartRefused, drain_logs
 import engine_stats
 from steering import DEFAULT as STEER_DEFAULT, resolve_steering
 from grammar import Constraint, GrammarError, Grammars, TokenLookup, schema_of
 import tool_choice
 from think_budget import (BudgetError, BudgetMap, ThinkControl, ThinkIds, budget_banner, budget_source, empty_reply,
                           probe_rules, request_budget)
-from model_profile import DroppedTurnLog, Profile, drop_empty_turns, merge_leading_system
+from model_profile import DroppedTurnLog, ParamNotes, Profile, drop_empty_turns, engine_caps, ignored_settings, merge_leading_system
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -112,6 +115,55 @@ def version_info(lib=None):
 # feed = detokenize + parser hand-off, check_done, the rest of the loop iteration), one JSON line per
 # request to $QE_STEP_PROF_FILE (default step_prof.jsonl) with the prompt ids, plus a log summary
 STEP_PROF = env_str("QE_STEP_PROF", "0") != "0"
+# [srv-gptoss-gap] QE_LOOP_PROF=1: scheduler iterations that only decode (no prefill), split by named marks (each mark
+# takes the time since the previous one; "call" = the engine step); a summary line each time the server goes idle
+LOOP_PROF = env_str("QE_LOOP_PROF", "0") != "0"
+
+
+class LoopProf:
+    """[srv-gptoss-gap] QE_LOOP_PROF accumulator over decode-only scheduler iterations."""
+
+    def __init__(self):
+        self.acc, self.cur, self.t, self.ok = {}, {}, 0.0, False
+        self.it = self.toks = self.rows = 0
+        self.n = (0, 0)
+
+    def top(self, active):
+        """Start of a loop iteration: the previous one counts when it decoded and prefilled nothing."""
+        now = _pc()
+        if self.ok and "call" in self.cur:
+            self.mark("rest", now)
+            for k, v in self.cur.items():
+                self.acc[k] = self.acc.get(k, 0.0) + v
+            self.it += 1
+            self.toks += self.n[0]
+            self.rows += self.n[1]
+        self.cur, self.t, self.ok, self.n = {}, now, True, (0, 0)
+        if not active and self.it:
+            self.report()
+
+    def mark(self, k, now=None):
+        now = now or _pc()
+        self.cur[k] = self.cur.get(k, 0.0) + now - self.t
+        self.t = now
+
+    def report(self):
+        tot = sum(self.acc.values())
+        parts = " ".join(f"{k} {1e3 * v / self.it:.3f}" for k, v in self.acc.items())
+        print(f"[loopprof] {self.it} decode iterations, {self.rows / self.it:.2f} slots, {self.toks / self.it:.2f} tok "
+              f"each: ms/iter {1e3 * tot / self.it:.3f} = {parts}; host {100 * (tot - self.acc.get('call', 0)) / tot:.1f} %, "
+              f"{self.toks / tot:.1f} tok/s", flush=True)
+        self.acc, self.it, self.toks, self.rows = {}, 0, 0, 0
+
+
+class _NoProf:
+    ok = False
+
+    def top(self, active):
+        pass
+
+    def mark(self, k, now=None):
+        pass
 # forward progress (issue #3): the scheduler loop beats a heartbeat; no beat for QE_HANG_S seconds (an engine call that
 # never returns) -> Python + native stacks, the requests end with an error, exit 75 (docker / systemd restart it).
 # A start refused after admission for lack of room (KV pool full, prompts in flight) is requeued while sequences run,
@@ -121,12 +173,34 @@ STEP_PROF = env_str("QE_STEP_PROF", "0") != "0"
 # A sequence that gets no token for QE_NO_PROGRESS_STEPS steps and QE_NO_PROGRESS_S seconds while not paused fails.
 HANG_S = env_float("QE_HANG_S", 180.0)
 START_RETRY_S = env_float("QE_START_RETRY_S", 60.0)
+# streamed replies: an SSE keep-alive after this many seconds without an event (a reply queued, parked or waiting for its
+# turn: GLM / DSV4 time slicing can hold one for 30-40 s), so proxies and clients with read timeouts keep the stream;
+# OpenAI streams get the comment ": keep-alive", Anthropic streams a ping event (0 = off)
+SSE_KEEPALIVE_S = env_float("QE_SSE_KEEPALIVE", 10.0)
+KEEPALIVE = object()  # stream_bridge item: nothing new for SSE_KEEPALIVE_S seconds
+
+
+def keepalive_due(last):
+    """review M1: a keep-alive is due when nothing was written for SSE_KEEPALIVE_S (items that the parser holds back,
+    a tool call or hidden reasoning, write nothing); last: [monotonic time of the last write], kept by stamped()"""
+    return SSE_KEEPALIVE_S > 0 and time.monotonic() - last[0] >= SSE_KEEPALIVE_S
+
+
+async def stamped(it, last):
+    """the SSE generator's writes, each stamping last[0] (keepalive_due)"""
+    async for x in it:
+        last[0] = time.monotonic()
+        yield x
 NO_ROOM_S = env_float("QE_NO_ROOM_S", 10.0)
 NOPROG_STEPS = env_int("QE_NO_PROGRESS_STEPS", 64)
 NOPROG_S = env_float("QE_NO_PROGRESS_S", 10.0)
 PAUSE_TIMEOUT_S = env_float("QE_PAUSE_TIMEOUT_S", 900.0)  # deadline of a reply waiting for VRAM another process holds (preemption pauses: none)
 # the hang deadline while the slots are persisted to the disk cache (--disk-cache: idle and at shutdown)
 HANG_PERSIST_S = env_float("QE_HANG_PERSIST_S", 3600.0)
+# [dsv4-rel8-hang] an engine call that may (re-)prefill (DSV4: a whole prompt is one call, a switch may re-prefill the
+# conversation) gets QE_HANG_S plus its tokens at this rate (a floor about 10x below the measured 2,645 tok/s at 236K, review
+# rel8 L6: 1M tokens -> 70 min, 262K -> 20 min); decode passes QE_HANG_S
+HANG_PREFILL_TPS = max(1.0, env_float("QE_HANG_PREFILL_TPS", 250.0))
 DISK_FLUSH_S = env_float("QE_DISK_FLUSH_S", 600.0)  # Flash-Next --disk-cache: how long the exit waits for the queued files
 
 
@@ -196,11 +270,17 @@ def native_stacks(timeout=20.0):
         print(out[-200000:], flush=True)
 
 
+def hard_exit(code):
+    """os._exit after the engine's buffered log lines are out (os._exit skips the atexit drain; qe_log.h)."""
+    drain_logs()
+    os._exit(code)
+
+
 def hard_exit_guard(after_s, code=75):
     """The hard bound of the hang path: an in-process timer exits with `code` after `after_s`, and an outside watcher
     process SIGKILLs this one (SIGCONT first: a killed gdb can leave it stopped) after_s + 10 s later if it still
     runs. The watcher ends quietly when this process exits first (its pipe closes)."""
-    t = threading.Timer(after_s, lambda: os._exit(code))
+    t = threading.Timer(after_s, lambda: hard_exit(code))
     t.daemon = True
     t.start()
     try:
@@ -418,9 +498,11 @@ class Parser:
         self.fresh = True
         self.promoted = False  # the reply's last calls, inside an open block, went to tool_text
 
+    HOLD = 12  # longest tag
+
     def _hold(self, s):
         # length of the longest suffix of s that is a prefix of a tag we may still see
-        for n in range(min(len(s), 12), 0, -1):
+        for n in range(min(len(s), self.HOLD), 0, -1):
             if any(t.startswith(s[-n:]) for t in self.TAGS):
                 return n
         return 0
@@ -513,6 +595,33 @@ class Parser:
         return [(k, unmark(t)) for k, t in out if t]
 
 
+class DsmlParser(Parser):
+    """[shared-srv] DSV4 (DeepSeek-V4.1): reasoning ends at the real </think> token, a tool-call block starts with the
+    text "\n\n<｜DSML｜ calls>" (as dsv4_app's Stream / dsv4_chat.parse_completion)."""
+    CALL = "<｜DSML｜ calls>"  # (the blank line before it stays in the content: Parser's lead strip may eat it)
+    TAGS = (Parser.THINK, Parser.END_THINK, CALL)
+    END_CALL = "</｜DSML｜ calls>"
+    CALL_BODY = "\n<｜DSML｜ invoke"
+    HOLD = len(CALL)
+    LEAD = "\n\n"  # the blank line the format puts before a block: held back, dropped when the block follows (review M3)
+
+    def _hold(self, s):
+        n = super()._hold(s)  # a partial tag at the end, and the newlines right before it (or at the very end)
+        if self.mode == "content":
+            head = s[:len(s) - n]
+            n += min(len(head) - len(head.rstrip("\n")), len(self.LEAD))
+        return n
+
+    def feed(self, text, final=False, promote=False):
+        self.buf += text
+        if self.mode == "content" and self.LEAD + self.CALL in self.buf:
+            self.buf = self.buf.replace(self.LEAD + self.CALL, self.CALL, 1)
+        return super().feed("", final, promote)
+
+
+PARSER = Parser  # the reply parser of the model's format (resolve_model_args)
+
+
 GENERIC = re.compile(r"^(you are claude code, anthropic's official cli|you are a claude agent, built on|"
                      r"x-anthropic-billing-header)", re.I)
 ROLE = re.compile(r"^\s*you are (?:an? |the )?\*{0,2}([A-Za-z0-9][\w.\-]*(?: [\w.\-]+){0,3}?)\*{0,2}"
@@ -544,7 +653,9 @@ def agent_label(sys_txt, messages):
     return "chat" if not lines else "agent"
 
 
-DIAG_PATH = os.path.expanduser(env_str("QE_DIAG_LOG", "~/.local/state/qengine/diag.log"))
+# (not env_str: an empty or blank QE_DIAG_LOG turns the file off, it does not mean unset)
+DIAG_PATH = os.path.expanduser(os.environ.get("QE_DIAG_LOG", "~/.local/state/qengine/diag.log").strip())
+DIAG_PATH = os.path.abspath(DIAG_PATH) if DIAG_PATH else ""  # [kb-server] a bare file name: in the working directory (was never written)
 
 
 def diag(kind, msg):
@@ -619,6 +730,43 @@ def canonical_tools(tools):
     return [_canon_json(t, head=True) for t in sorted(tools, key=name)]
 
 
+TOOL_FORMAT = "qwen"  # set from the model profile at startup ("glm": <arg_key> / <arg_value> pairs)
+
+
+def parse_tool_calls_glm(text, tools):
+    """GLM-5.3: <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>"""
+    schemas = {}
+    for t in tools or []:
+        f = t.get("function", t)
+        props = (f.get("parameters") or {}).get("properties")
+        schemas[f.get("name")] = props if isinstance(props, dict) and props else None
+    calls = []
+    if OUT_MARK in text:  # from Parser (master 99bce1ac): only the real <tool_call> / </tool_call> tokens delimit a call
+        blocks = [unmark(b) for b in re.findall(re.escape(mark("<tool_call>")) + "(.*?)(?:" +
+                                                re.escape(mark("</tool_call>")) + "|$)", text, re.S)]
+    else:
+        blocks = re.findall(r"<tool_call>(.*?)(?:</tool_call>|$)", text, re.S)
+    for block in blocks:
+        name = block.split("<arg_key>", 1)[0].strip()
+        # round 17: a name is one identifier (OpenAI's [A-Za-z0-9_-], plus . and :); prose after <tool_call> (the model
+        # answering inside the tag) is no call, so tool_calls_or_text returns it as text
+        if not re.fullmatch(r"[A-Za-z0-9_.:\-]{1,128}", name):
+            continue
+        props = schemas.get(name)
+        args = {}
+        for key, val in re.findall(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)(?:</arg_value>|$)", block, re.S):
+            key = key.strip()
+            ptype = ((props or {}).get(key) or {}).get("type")
+            if ptype != "string":
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    pass
+            args[key] = val
+        calls.append({"name": name, "arguments": args})
+    return calls
+
+
 def tool_calls_or_text(parser, tools, tchoice, no_calls):
     """The calls of a reply's tool text that tool_choice allows, and that tool text as plain content when no call is
     left (nothing parses, tool_choice filters the calls out, or tool_choice is none; raw, marks removed; "" otherwise). A model-emitted <tool_call> whose body is not a
@@ -632,7 +780,35 @@ def tool_calls_or_text(parser, tools, tchoice, no_calls):
     return calls, ("" if calls else unmark(parser.tool_text))
 
 
+def parse_tool_calls_dsml(text, tools):
+    """[shared-srv] DSV4: "\n\n<｜DSML｜ calls>" blocks (dsv4_chat.parse_completion); arguments as a dict"""
+    import dsv4_chat
+    calls = []
+    t = unmark(text)
+    t = t if t.startswith("\n\n") else "\n\n" + t.lstrip()  # (the parser's tool text starts at the block's tag)
+    for c in dsv4_chat.parse_calls(t):  # per parameter: a value that is not JSON stays its raw string (review M4)
+        args = {}
+        for k, v, is_s in c["params"]:
+            if is_s:
+                args[k] = v
+                continue
+            try:
+                args[k] = json.loads(v)
+            except ValueError:
+                diag("TOOL_ARG_RAW", f"{c['name']}.{k}: not JSON, kept as text ({v[:120]!r})")
+                args[k] = v
+        calls.append({"name": c["name"], "arguments": args})
+    return calls
+
+
 def parse_tool_calls(text, tools):
+    if TOOL_FORMAT == "glm":
+        return parse_tool_calls_glm(text, tools)
+    if TOOL_FORMAT == "dsml":
+        return parse_tool_calls_dsml(text, tools)
+    if TOOL_FORMAT == "harmony":  # [srv-gptoss]
+        import harmony
+        return harmony.parse_calls(text, tools)
     schemas = {}  # name -> properties of its parameter schema (None: the schema lists none)
     for t in tools or []:
         f = t.get("function", t)
@@ -720,6 +896,51 @@ class Ids(list):
     agent = None  # agents.Info: main-thread detection of the request (prio, tracker feedback)
 
 
+class QaSplit:
+    """Queue-aware prefill / decode time split (Admission.qa step A). Prefill and decode time over the
+    last ~QA_TAU seconds (exponential decay); window() = the decode time after a prefill pass of tc seconds."""
+
+    def __init__(self, smin, smax, short_s=0.0):
+        self.smin, self.smax, self.short_s = smin, smax, short_s
+        self.acc = [0.0, 0.0]  # decayed seconds of prefill passes / decode steps
+        self.t = time.time()
+
+    def add(self, k, dt):
+        now = time.time()
+        f = math.exp(-(now - self.t) / QA_TAU)
+        self.acc = [self.acc[0] * f, self.acc[1] * f]
+        self.acc[k] += dt
+        self.t = now
+
+    def window(self, tc, adm, inflight, queue, active):
+        """Prompts in flight / queued: the next pass serves the one with the least left (shortest first). Short (at most
+        --prefill-short rows): no decode window beyond the one step the loop runs anyway; else the decoders' share by head
+        count A / (A + W) within [smin, smax]. Either way the decoders' share over the window stays >= smin."""
+        e = adm.e
+        if self.short_s > 0 and any(j.est is None for j in queue):
+            # (shared batches: a request that arrived during the pass has no estimate yet; counted as its whole prompt it
+            # made a short turn look long, and the decoders got a head-count window while it waited: 16 in flight TTFT
+            # p50 0.61 s vs 0.35 s for the fixed split)
+            adm.estimate(time.time())
+        lefts = [len(j.ids) - max(0, e.prefill_pos(j.slot)) for j in inflight]
+        lefts += [j.est if j.est is not None else len(j.ids) for j in queue]
+        A = sum(1 for j in active if not j.finished)
+        W = len(inflight) + len(queue)
+        s = 0.0
+        if lefts and min(lefts) > adm.short and A > 0:
+            s = min(self.smax, max(self.smin, A / (A + W)))
+        elif self.short_s > 0 and A > 0:
+            # shared prefill batches, a short prompt next: a fixed short window after every pass and no catch-up window
+            # (arrivals during it join the next shared batch; the catch-up of the floor came in bursts that held the
+            # queued prompts: 16 in flight TTFT mean 0.78-0.90 s vs 0.43 s with the fixed 0.10 split)
+            return tc * self.short_s / (1 - self.short_s)
+        win = tc * s / (1 - s) if 0 < s < 1 else 0.0
+        pf, dec = self.acc
+        if self.smin > 0 and pf + dec > 0:  # floor: the decoders' share of the recent time
+            win = max(win, (self.smin * (pf + dec) - dec) / (1 - self.smin))
+        return win
+
+
 class Admission:
     """Which queued request the scheduler starts next (engine thread; called under gen.cv)."""
 
@@ -753,6 +974,50 @@ class Admission:
         # (not in mode B, FLASH_PAR=pp: its stage queues take whole prompts and ignore row caps)
         self.fill = bool(getattr(a, "fill_passes", 0)) and (getattr(gen.engine, "par", None) or {}).get("mode", "tp") != "pp"
         self.caps = {}
+        # queue-aware split (--prefill-share-min < --prefill-share; engines that prefill one prompt per pass, time split):
+        # short prompts never wait for a decode window, a long one shares the time by head count, the decoders keep a
+        # floor share over the last QA_TAU seconds; cut-ins up to --prefill-short rows (step A).
+        # Default on for the 27B and Flash-Next in TP mode with passes not bound by expert copies (3 cards; measured
+        # there; Flash-Next: the time split only, a fixed 0.10 window after every pass while short prompts are next, its
+        # shared batches keep their own cut-in rules); an explicit --prefill-share-min applies to any such engine
+        smin = getattr(a, "prefill_share_min", None)
+        fam = getattr(getattr(gen, "profile", None), "family", None)
+        smax = getattr(a, "prefill_share", 0.5)
+        if smin is None:
+            # (Flash-Next with passes bound by host-backed expert copies (2 cards) or in mode B: not measured, the fixed split)
+            smin = (QA_SHARE_MIN if fam == "qwen38-27b" else
+                    QA_SHARE_MIN_MULTI if fam == "qwen38-flash-next" and not self.pass_bound and
+                    (getattr(gen.engine, "par", None) or {}).get("mode", "tp") == "tp" else smax)
+        self.share_min = min(max(0.0, smin), smax)
+        self.short = max(1, int(getattr(a, "prefill_short", 4096)))
+        self.qa = (self.share_min < smax and getattr(a, "prefill_chunk", 0) > 0 and
+                   getattr(a, "prefill_turns", "time") != "slices")
+        # (the cut-in rule between the chunks of a long prompt: engines that prefill one prompt per pass only)
+        self.qa_cut = self.qa and not self.multi
+        if self.qa:
+            short_txt = (f"prompts up to {self.short} rows next: the decoders get {self.share_min:.2f} of the time after every "
+                         f"pass" if self.multi else
+                         f"prompts up to {self.short} rows run back to back with one decode step between passes")
+            print(f"[sched] queue-aware prefill split: {short_txt}; longer ones leave the decoders A / (A + W) of the time within "
+                  f"[{self.share_min:.2f}, {smax:.2f}]; decoders' floor {self.share_min:.2f} over {QA_TAU:.0f} s",
+                  flush=True)
+        # [q27-park-c] park replies beyond the seats: default on for the 27B (measured there), any engine with qe_park when
+        # --park 1 is given
+        pk = getattr(a, "park", None)
+        if pk is None:
+            # ([qfn-ttft-park] Flash-Next: measured on 3 cards in TP mode with shared batches; 2 cards (passes bound by
+            # expert copies) and mode B keep it off)
+            pk = 1 if fam == "qwen38-27b" or (fam == "qwen38-flash-next" and self.multi and not self.pass_bound and
+                                              (getattr(gen.engine, "par", None) or {}).get("mode", "tp") == "tp") else 0
+        self.seats = len(getattr(self.e, "slots", []) or [])
+        rv = getattr(a, "park_reserve", None)
+        if rv is None:  # (Flash-Next: the reserved seats' prompts share prefill batches; 4 measured over 2)
+            rv = PARK_RESERVE_MULTI if self.multi else PARK_RESERVE
+        self.reserve = max(1, int(rv))
+        self.park = bool(pk) and hasattr(self.e, "can_park") and self.e.can_park() and self.seats > self.reserve + 1
+        if self.park:
+            print(f"[sched] replies beyond {self.seats - self.reserve} decoding sequences are parked in host memory after "
+                  f"their first token ({self.reserve} seats kept for prompts) and resume oldest first", flush=True)
         # --preempt-max default: the profile's (Flash-Next 8192) with the shared-batch cut-ins, else the old 1024
         if getattr(a, "preempt_max", None) is None:
             d = getattr(getattr(gen, "profile", None), "defaults", None) or {}
@@ -835,6 +1100,15 @@ class Admission:
             return [i for i in order if elig(i)]
         if self.pre_max <= 0 or (len(prefills) >= 2 and not self.multi):
             return []
+        if self.qa_cut:
+            # queue-aware split: a queued text request with at most --prefill-short rows (and fewer than the prompt in
+            # flight has left) starts between its chunks, whatever it has left; the long prompt gets at least one pass
+            # between two cut-ins (cut_at: its position at the last one): at least a third of the passes with 4K cut-ins (two
+            # passes each), half with cut-ins of one pass
+            left_long = len(long_.ids) - pos
+            if long_.cut_at is not None and pos <= long_.cut_at:
+                return []
+            return [i for i in order if not getattr(q[i].ids, "mm", None) and q[i].est <= self.short and q[i].est < left_long]
         if len(long_.ids) - pos < self.pre_min:
             return []
         cuts = [j for j in prefills if j is not long_]
@@ -855,7 +1129,8 @@ class Admission:
         return [i for i in order if not getattr(q[i].ids, "mm", None) and q[i].est <= self.pre_max]
 
     def join_cap(self):  # prompt rows in flight that still share one prefill batch (the idle batch + a tail chunk)
-        return max(self.g.args.prefill_chunk, self.g.args.prefill_chunk_idle) + 512
+        # (the idle batch only where prompts share batches: gpt-oss's idle chunk is one prompt's call, review pfidle M1)
+        return max(self.g.args.prefill_chunk, self.g.args.prefill_chunk_idle if self.multi else 0) + 512
 
     def batch_order(self, now, prefills, budget=None):
         """Prompts in flight in the order they get rows of a shared prefill batch: least left first, aged (as
@@ -975,9 +1250,19 @@ class Generator:
         self.profile = prof = getattr(args, "profile", None) or Profile(args.model)
         self.tok, tok_json, tok_note = prof.tokenizer(getattr(args, "tokenizer", None))
         print(f"model {prof.family} ({prof.model_type or 'no model_type'}), tokenizer {tok_note}", flush=True)
-        self.tmpl = Template(args.template)
+        # [shared-srv] a family with its own prompt format renders through its renderer (DSV4: dsv4_chat.encode)
+        if prof.defaults.get("renderer") == "dsv4":
+            from dsv4_engine import Dsv4Template
+            self.tmpl = Dsv4Template(prof)
+        else:
+            self.tmpl = Template(args.template)
+        # encode(): the prompt is tokenized segment by segment at this atomic special token
+        self.seg_mark = "<｜User｜>" if prof.defaults.get("renderer") == "dsv4" else prof.defaults.get("seg_mark", "<|im_start|>")
         self.marks = Markers(self.tok, tok_json)  # markers in content stay plain text (issue #7)
         self.marks.plain_tok()  # at start, not on the event loop of the first request that needs it (review M2)
+        if TOOL_FORMAT == "harmony":  # [srv-gptoss] the harmony control tokens come out marked (only real ones count)
+            import harmony
+            self.marks.out.update(harmony.marks(self.tok))
         self.im_start_user = self.tok.encode("<|im_start|>user", add_special_tokens=False).ids
         self.seg_cache = collections.OrderedDict()
         self.seg_tokens = 0
@@ -1021,14 +1306,25 @@ class Generator:
             self.vision_lock = threading.Lock()
             print(f"vision encoder on {dev} in {time.time() - t0:.1f}s "
                   f"(max {args.max_image_pixels / 1e6:.1f} MPix per image)", flush=True)
-        self.engine = Engine(args.model, args.devices, args.max_ctx, getattr(args, "split", "") or "",
-                             lib_path=getattr(args, "engine_lib", None) or None,
-                             vocab=prof.vocab_size)
+        if prof.defaults.get("adapter"):  # [shared-srv] an engine with its own Python adapter (DSV4: server/dsv4_engine.py)
+            import importlib
+            mod, cls = prof.defaults["adapter"].split(":")
+            self.engine = getattr(importlib.import_module(mod), cls)(args, vocab=prof.vocab_size)
+        else:
+            self.engine = Engine(args.model, args.devices, args.max_ctx, getattr(args, "split", "") or "",
+                                 lib_path=getattr(args, "engine_lib", None) or None,
+                                 vocab=prof.vocab_size)
         self.dstats = engine_stats.DraftStats(self.engine)  # per-slot draft counters (qe_draft_stats)
-        print(context_line(args.max_ctx, self.engine), flush=True)
+        asked = args.max_ctx  # review rel8 L5: the DSV4 default served at its static value is no "lowered" request
+        if getattr(args, "ctx_static", 0) and self.engine.max_t == args.ctx_static:
+            asked = args.ctx_static
+        print(context_line(asked, self.engine), flush=True)
         if not self.engine.has("stops"):  # no undo of the steps past a stop sequence
             global STOP_ROLLBACK
             STOP_ROLLBACK = 0
+        if getattr(self.profile, "is_gptoss", False) and "qe_set_penalty" not in getattr(self.engine, "fns", ()):
+            print("[server] gpt-oss: presence / frequency penalties are not applied by this engine (requests are accepted, "
+                  "the penalty is ignored; the loop guard keeps its note and thinking turn)", flush=True)
         missing = self.engine.missing_optional()
         if missing:
             print(f"engine: optional C API not provided (fallbacks in use): {', '.join(missing)}", flush=True)
@@ -1038,11 +1334,18 @@ class Generator:
         if self.vision is not None and not self.engine.has("vision"):  # (PP x TP: no image input)
             print(f"--vision ignored: {self.engine.refused.get('vision', 'the engine has no image input')}", flush=True)
             self.vision = None
+        if self.vision is not None and hasattr(self.engine, "driver_gate"):  # [qfn-stress2-lazy] (no-op without qe_drv_gate)
+            self.vision.gate = self.engine.driver_gate  # the encoder's launches between engine jobs (vision.py embed)
         if self.engine.has("grammar"):
             self.grammars = Grammars(tok_json, self.engine.vocab(), sorted(self.eos))
             self.grammars.prepare()
         # thinking budget (server/think_budget.py): the forced close of <think> goes through the grammar tier
-        self.think_ids = ThinkIds(self.tok)
+        self.think_ids = ThinkIds(self.tok, self.profile.defaults.get("think_close", "\n\n")
+                                  if getattr(self, "profile", None) is not None else "\n\n")
+        if TOOL_FORMAT == "harmony":  # [srv-gptoss-think] the analysis channel; the close opens the final channel
+            from harmony import HarmonyThinkIds
+            from think_budget import WRAP
+            self.think_ids = HarmonyThinkIds(self.tok, env_str("QE_THINK_WRAP", WRAP))
         self.tool_tier_call = self.tok.token_to_id("<tool_call>")
         self.can_force = self.engine.has("grammar") and self.think_ids.ok
         self.think = {"requests_with_budget": 0, "forced_budget": 0, "forced_max_tokens": 0, "forced_failed": 0,
@@ -1052,7 +1355,14 @@ class Generator:
         self.think_mu = threading.Lock()  # (counted from the scheduler thread and the event loop: review server F9)
         self.drop_log = DroppedTurnLog()  # --drop-empty-turns (HF #50): logged once per conversation
         # tool_choice (server/tool_choice.py): masks through the same grammar tier
-        self.tool_tier = tool_choice.Tier(self.tok, self.think_ids, self.eos, self.im_start) \
+        tier = tool_choice.Tier
+        if TOOL_FORMAT == "dsml":  # [shared-srv] DSV4: the call header is a DSML block
+            from dsv4_engine import DsmlTier as tier
+        elif TOOL_FORMAT == "harmony":  # [srv-gptoss] gpt-oss: message headers (server/harmony.py)
+            from harmony import HarmonyTier as tier
+        elif TOOL_FORMAT == "glm":  # [glm-rel-tools] GLM: <tool_call>NAME<arg_key>..
+            from tool_choice import GlmTier as tier
+        self.tool_tier = tier(self.tok, self.think_ids, self.eos, self.im_start) \
             if self.engine.has("grammar") else None
         if self.tool_tier is not None and not self.tool_tier.ok:
             self.tool_tier = None
@@ -1065,6 +1375,18 @@ class Generator:
                   f"{': ' + self.engine.refused['grammar'] if getattr(self.engine, 'refused', {}).get('grammar') else ''}"
                   "): none ends a reply at its first tool call, required / any / a named tool decode as auto",
                   flush=True)
+        # [feature-matrix] what the loaded engine can do: start-up lines for flags / variables that need a capability
+        # it lacks, and the request parameters it does not support (model_profile.FLAGS / ENV / PARAMS)
+        self.caps = engine_caps(self.engine, prof.family, grammar=self.grammars is not None, force=self.can_force,
+                                vision=self.vision is not None, tool_tier=self.tool_tier is not None)
+        for line in ignored_settings(prof.family, getattr(args, "given", None), getattr(args, "env0", None),
+                                     caps=self.caps, args=args):
+            print(line, flush=True)
+        self.param_notes = ParamNotes(prof.family, self.caps)
+        # [gptoss-lows] gpt-oss's idle-chunk rules (pfidle L1 / L2); pf_pass: rows of one engine prefill pass (0: unknown)
+        self.gptoss = prof.family == "gptoss"
+        pc = getattr(self.engine, "prefill_chunk", None) if self.gptoss else None
+        self.pf_pass = int(pc()) if pc is not None else 0
         if not self.can_force:
             print("thinking budget: not enforced (the engine has no grammar C API or the tokenizer no <think> "
                   "tokens): budgets are ignored and max_tokens may end inside <think>", flush=True)
@@ -1125,6 +1447,57 @@ class Generator:
         if HANG_S > 0:
             threading.Thread(target=self._hang_monitor, daemon=True).start()
 
+    def idle_budget(self, budget, busy, prefills, adm):
+        """The rows of the next prefill call: the larger idle chunk when nothing decodes (see the rules below), else
+        `budget` (--prefill-chunk)."""
+        idle = self.args.prefill_chunk_idle
+        # the larger idle batch when nothing decodes: one prompt and nothing waiting, or several sharing it; on
+        # 2 cards (pass_bound: a pass costs ~0.6 s of PCIe expert copies whatever its rows) also while requests
+        # wait (8 x 16K burst 3.0K -> 4.4K tok/s; 3 cards: no gain)
+        # gpt-oss (review pfidle L2): a queued request that can never cut in (larger than any cut-in: it waits for the
+        # whole prompt anyway) does not take the idle chunk away from it (2,048-row calls slowed both). One that may cut
+        # in later (the fairness gap after a cut-in: review lows M1) keeps the small chunk, as before. (pick_next only
+        # reads the queue here; the engine thread is its only remover.)
+        gpo = getattr(self, "gptoss", False)
+        waiting = bool(self.queue)
+        if waiting and gpo and not adm.pick_next(time.time(), prefills):
+            cut = max(adm.pre_max or 0, adm.short if adm.qa_cut else 0)
+            waiting = any(j.est is None or j.est <= cut for j in list(self.queue))
+        if idle > budget and not busy and ((len(prefills) == 1 and not waiting) or
+                                           (adm.multi and (len(prefills) >= 2 or adm.pass_bound))):
+            budget = idle
+            if gpo and self.pf_pass > 0 and budget > self.pf_pass:
+                # a call splits into the fewest equal engine passes: keep it a multiple of the engine's chunk
+                # where that is cut below the idle chunk (no P2P without host lanes, low pinned RAM: pfidle L1)
+                budget = budget // self.pf_pass * self.pf_pass
+        return budget
+
+    def count_refills(self):
+        """[dsv4-rel8-refill] (qetop review L2) re-prefills the engine ran inside its last call (DSV4: a switch to a
+        conversation whose K/V left the archive) are prefill: their tokens and seconds go to the prefill counters of
+        /api/stats (the count and totals: engine.dsv4.refills). Other engines have no take_refills: nothing."""
+        f = getattr(self.engine, "take_refills", None)
+        ev = f() if f is not None else None
+        if not ev:
+            return
+        m = self.metrics  # (server/metrics.py stays as it is: its session counters under its lock)
+        try:
+            with m.lock:
+                for _slot, n, dt, in_pf in ev:  # (review rel8 L3: a redo inside a prompt's prefill: its time is in
+                    m.session["prefill_tokens"] += n  # that prefill's already, only the extra tokens count)
+                    if not in_pf:
+                        m.session["prefill_s"] += dt
+                    m.cur["pre"] += n
+        except Exception as ex:
+            print(f"[stats] re-prefill counters: {ex!r}", flush=True)
+
+    def call_limit(self, kind, slots=()):
+        """[dsv4-rel8-hang] the hang deadline of the next engine call (None: QE_HANG_S). An engine whose calls can prefill
+        a whole prompt or re-prefill a conversation (DSV4) says how many tokens the call may prefill; the others: None."""
+        f = getattr(self.engine, "call_tokens", None)
+        n = f(kind, slots) if f is not None else 0
+        return HANG_S + n / HANG_PREFILL_TPS if n > 0 and HANG_S > 0 else None
+
     def beat(self, what, limit=None):
         """Scheduler heartbeat. limit: the hang deadline until the next beat (a known long operation, e.g. the disk
         persist), else HANG_S."""
@@ -1136,7 +1509,8 @@ class Generator:
         exits next). Twice, a moment apart: a request that was being queued during the first pass."""
         for k in range(2):
             active, prefills = self.jobs_ref
-            for j in list(active) + list(prefills) + list(self.queue) + [r[1] for r in self.retry_q] + \
+            for j in list(active) + list(prefills) + list(getattr(self, "parked_ref", [])) + list(self.queue) + \
+                    [r[1] for r in self.retry_q] + \
                     ([self.starting] if self.starting is not None else []):
                 if not j.finished:
                     j.error, j.finished = ex, True
@@ -1189,7 +1563,7 @@ class Generator:
                 print(f"[hang] diagnostics: {e2!r}", flush=True)
             # 3. the error events reach the clients (at least 3 s after they were set), then exit
             time.sleep(max(0.0, min(3.0 - (time.monotonic() - t_hang), left())))
-            os._exit(75)
+            hard_exit(75)
 
     def prompt(self, messages, tools, kw, meta=None, track=False, guard_on=True, guard_think=True):
         """Returns (ids, affinity): affinity = hash of the system prompt, so the main agent and
@@ -1233,15 +1607,51 @@ class Generator:
                 tools = canonical_tools(tools)
             mk = getattr(self, "marks", None)
             r_msgs, r_tools = (mk.protect_messages(messages), mk.protect(tools)) if mk is not None else (messages, tools)
-            text = self.tmpl.render(r_msgs, r_tools, **kw)
-            if guard and guard_think and getattr(self.args, "loop_guard_think", 0) > 0 and kw.get("enable_thinking") is False \
-                    and self.can_force and text.endswith(EMPTY_THINK):  # (review 2 L6: only with the budget enforced)
-                # a looping agent on a no-think server: this turn reasons first (session 92997599: 10/10 replays broke the
-                # loop, presence / note alone did not). The prompt is rendered without thinking (same system header and
-                # history, so the cached prefix holds) and only the generation prompt's empty think block is opened.
-                text = text[:len(text) - len(EMPTY_THINK)] + "<think>\n"
-                kw["enable_thinking"] = True
-                guard["think"] = self.args.loop_guard_think
+            if self.profile.is_glm:
+                # GLM template: reasoning_effort in (low, high), anything else -> max; no enable_thinking variable: the
+                # generation prompt ends with <think>, so thinking off closes it right away
+                kw_in, kw = kw, dict(kw)
+                eff = kw.get("reasoning_effort")
+                if eff is not None:
+                    kw["reasoning_effort"] = {"minimal": "low", "low": "low", "medium": "high", "high": "max"}.get(str(eff), eff)
+                think = kw.pop("enable_thinking", True)
+                text = self.tmpl.render(r_msgs, r_tools, **kw)
+                if not think and guard and guard_think and getattr(self.args, "loop_guard_think", 0) > 0 \
+                        and self.can_force and text.endswith("<think>"):
+                    # the loop guard's thinking turn on GLM (master e4489b18, PLAN.md GLM merge list): the same prompt with
+                    # the generation prompt's <think> left open, so this turn reasons first
+                    kw["enable_thinking"] = kw_in["enable_thinking"] = True  # review r17 L8: the caller sees it too
+                    guard["think"] = self.args.loop_guard_think
+                else:
+                    kw["enable_thinking"] = think
+                    text += "" if think else "</think>"
+            elif getattr(self.profile, "is_gptoss", False):
+                # gpt-oss always reasons: thinking off = the lowest effort (the template has no off switch)
+                kw = dict(kw)
+                if kw.pop("enable_thinking", True) is False and kw.get("reasoning_effort") is None:
+                    kw["reasoning_effort"] = self.profile.defaults.get("no_effort", "low")
+                text = self.tmpl.render(r_msgs, r_tools, **kw)
+            elif getattr(self.profile, "is_dsv4", False):
+                # DeepSeek-V4.1 (dsv4_chat): enable_thinking ends the prompt with <think> or </think>; the loop guard's
+                # thinking turn renders the same messages with thinking on
+                text = self.tmpl.render(r_msgs, r_tools, **kw)
+                if guard and guard_think and getattr(self.args, "loop_guard_think", 0) > 0 and kw.get("enable_thinking") is False \
+                        and self.can_force and text.endswith("</think>"):
+                    # (the same non-thinking render, so the cached prefix holds: only the generation prompt opens <think>;
+                    # a thinking render would add the effort line to the system turn: review M5)
+                    text = text[:-len("</think>")] + "<think>"
+                    kw["enable_thinking"] = True
+                    guard["think"] = self.args.loop_guard_think
+            else:
+                text = self.tmpl.render(r_msgs, r_tools, **kw)
+                if guard and guard_think and getattr(self.args, "loop_guard_think", 0) > 0 and kw.get("enable_thinking") is False \
+                        and self.can_force and text.endswith(EMPTY_THINK):  # (review 2 L6: only with the budget enforced)
+                    # a looping agent on a no-think server: this turn reasons first (session 92997599: 10/10 replays broke the
+                    # loop, presence / note alone did not). The prompt is rendered without thinking (same system header and
+                    # history, so the cached prefix holds) and only the generation prompt's empty think block is opened.
+                    text = text[:len(text) - len(EMPTY_THINK)] + "<think>\n"
+                    kw["enable_thinking"] = True
+                    guard["think"] = self.args.loop_guard_think
             sys_txt = "".join(str(m.get("content")) for m in messages[:1] if m.get("role") == "system")
             label = "main agent" if info is not None and info.main else agent_label(sys_txt, messages)
             affinity = int.from_bytes(hashlib.blake2b(sys_txt.encode(), digest_size=8).digest(), "little")
@@ -1250,15 +1660,36 @@ class Generator:
                 os.makedirs(d, exist_ok=True)
                 with open(os.path.join(d, f"{time.time():.3f}.txt"), "w") as f:
                     f.write(mk.restore(text) if mk is not None else text)
-            return self.encode(text), label, affinity
+            ids = self.encode(text)
+            if getattr(self.profile, "is_dsv4", False):  # [dsv4-rel6-xprefix] the shared part: the system message with the tools
+                ids.hint = 0 if (self.args.tier_reset or self.args.no_prefix_share) else \
+                    self.tmpl.system_hint(r_msgs, r_tools, kw, ids, self.encode)
+            return ids, label, affinity
 
         try:
             ids, label, affinity = build(messages, tools, kw)
         except jinja2.TemplateError as ex:  # the template's own checks (no messages, an unknown role, ...): HTTP 400
             raise InputError(f"the chat template refused the messages: {ex}") from ex
+        except TypeError as ex:  # [gptoss-rel1-parts] gpt-oss's template joins strings: a message field of another type
+            if not getattr(self.profile, "is_gptoss", False):
+                raise
+            print(f"[server] gpt-oss: render TypeError (HTTP 400): {traceback.format_exc(limit=3)!r}", flush=True)  # (review rel1 L14)
+            raise InputError(f"the chat template could not render the messages (a field of an unexpected type): {ex}") from ex
         raw = []  # the request's images, read once
 
-        def finish(ids, label):  # the labels, the image tokens
+        def finish(ids, label):  # the GLM system-part hint, the labels, the image tokens
+            if getattr(self.profile, "is_gptoss", False) and (self.args.tier_reset or self.args.no_prefix_share):
+                ids.hint = 0  # [srv-gptoss-cache] no shared system-part snapshot
+            if self.profile.is_glm:
+                ids.hint = 0  # (encode()'s Qwen rule would match a literal "<|im_start|>user" inside the text)
+                # GLM: one segment (no <|im_start|>); the end of the system part = the first <|user|> token (round 18: the
+                # engine keeps a prefix snapshot there, shared by conversations with the same system prompt and tools)
+                u = self.tok.token_to_id("<|user|>")
+                if u is not None:
+                    try:
+                        ids.hint = ids.index(u)
+                    except ValueError:
+                        pass
             ids.label, ids.agent, ids.guard = label, info, guard
             if images:
                 from vision import load_image_bytes
@@ -1353,6 +1784,40 @@ class Generator:
         return {"enabled": bool(st.get("vectors")), "default": st.get("default"), "default_active": st.get("default") is not None,
                 "vectors": [v.get("name") for v in st.get("vectors", [])], "dropped": st.get("dropped", [])}
 
+    def pf_progress(self, jobs, others=()):
+        """Live prefill progress for /api/stats (qetop, dashboard), after each prefill chunk / shared batch: the prompt rows
+        computed so far (prefill_tok), the rows to compute (prefill_total), the rate since the prefill began (prefill_tps,
+        as prefill_done counts it, which overwrites them with the final numbers). Before, the prefill row had only its
+        elapsed time until the whole prompt was done. One prefill_pos read per prompt per chunk; never raises. others:
+        the other prompts in flight, whose rate only decays while they wait (no engine read: Flash-Next pf_of ignores
+        the slot without the batch API)."""
+        m, now = self.metrics, time.time()
+        for j in others:
+            if any(j is k for k in jobs):
+                continue
+            try:
+                with m.lock:
+                    x = m.jobs.get(id(j))
+                    if x is not None and x.get("state") == "prefill" and "prefill_total" in x:
+                        x["prefill_tps"] = x["prefill_tok"] / max(now - x["t_p"], 1e-6)
+            except Exception:
+                pass
+        for j in jobs:
+            try:
+                pos = self.engine.prefill_pos(j.slot)
+                if pos <= getattr(j, "pf0", 0):  # done (-1: finish_start counts it), or no rows yet (Flash-Next mode B
+                    continue  # moves them only at its finish): the row keeps its elapsed time
+                p0 = getattr(j, "pf0", 0)
+                with m.lock:
+                    x = m.jobs.get(id(j))
+                    if x is None or x.get("state") != "prefill":
+                        continue
+                    done = max(pos - p0, 0)
+                    x["prefill_tok"], x["prefill_total"] = done, max(len(j.ids) - p0, 0)
+                    x["prefill_tps"] = done / max(now - x["t_p"], 1e-6)
+            except Exception:
+                pass
+
     def guard_stats(self):
         with self.seg_lock:
             return {"turns": getattr(self.args, "loop_guard_turns", 0), "triggers": self.guards["triggers"],
@@ -1362,6 +1827,9 @@ class Generator:
         """Model-specific history fixes before the template (--merge-system, --drop-empty-turns). track: a
         generation request (info: the agent tracker's view of it); the HF #50 drop is logged once per
         conversation and again only when its count grows."""
+        if getattr(self.profile, "is_gptoss", False):  # [srv-gptoss] reasoning -> thinking, tool arguments as objects
+            import harmony
+            messages = harmony.prepare(messages)
         if self.args.merge_system:
             messages = merge_leading_system(messages)
         if self.args.drop_empty_turns:
@@ -1390,8 +1858,9 @@ class Generator:
         ids = Ids()
         mk = getattr(self, "marks", None)
         with self.seg_lock:
-            for i, part in enumerate(text.split("<|im_start|>")):
-                seg = part if i == 0 else "<|im_start|>" + part
+            sm = getattr(self, "seg_mark", "<|im_start|>")
+            for i, part in enumerate(text.split(sm)):
+                seg = part if i == 0 else sm + part
                 if not seg:
                     continue
                 t = self.seg_cache.get(seg)
@@ -1412,7 +1881,8 @@ class Generator:
                         self.seg_tokens -= len(old)
                 else:
                     self.seg_cache.move_to_end(seg)
-                if not ids.hint and seg.startswith("<|im_start|>user"):
+                # (harmony, segments at <|start|>: the system and developer messages end at the first user message)
+                if not ids.hint and (seg.startswith("<|im_start|>user") or (sm == "<|start|>" and seg.startswith("<|start|>user"))):
                     ids.hint = len(ids)
                 ids.extend(t)
         return ids
@@ -1533,6 +2003,33 @@ class Generator:
                     f"Free the {mem} and send it again.")
         return f"no room in the KV pool: this request doesn't fit ({facts}). No sign of another process taking memory."
 
+    def cancel_note(self, j, where):
+        """[srv-disconnect] one line per request whose client left before its end: where it was stopped and how long
+        after the disconnect its slot was free (the latency of the cancel path)"""
+        c = j.cancelled
+        why = getattr(c, "why", "client")
+        if why != "client":
+            return
+        self.sched["cancelled"] = self.sched.get("cancelled", 0) + 1
+        t = getattr(c, "t", None)
+        dt = f"{time.monotonic() - t:.2f} s" if t is not None else "?"
+        print(f"[sched] client gone: request of {len(j.ids)} tokens cancelled while {where}; slot free {dt} after the "
+              f"disconnect", flush=True)
+
+    def drop_cancelled_queued(self):
+        """[srv-disconnect] requests whose client left while they waited (queue, refused-start retries) end now, before
+        any engine work (they were admitted and prefilled in full before)"""
+        with self.cv:
+            gone = [j for j in self.queue if j.cancelled()] + [r[1] for r in self.retry_q if r[1].cancelled()]
+            if not gone:
+                return
+            self.queue[:] = [j for j in self.queue if not j.cancelled()]
+            self.retry_q = [r for r in self.retry_q if not r[1].cancelled()]
+        for j in gone:
+            j.slot = -1
+            j.fail(Cancelled("cancelled while queued"))
+            self.cancel_note(j, "queued")
+
     def stop_requests(self):
         """Shutdown (SIGTERM / SIGINT, before uvicorn waits for the open streams): queued requests fail now, prompts
         being prefilled at the scheduler's next pass, generating ones at their next step; each ends with an error
@@ -1579,6 +2076,15 @@ class Generator:
         hit = False
         for j in jobs:
             msg = None if j.finished else self.engine.slot_fault(j.slot)
+            if msg and getattr(self.profile, "is_gptoss", False) and msg.startswith("KV pool full"):
+                # [gptoss-rel1-full] no room for the reply to grow (or its context is full): the reply ends as at
+                # max_tokens (finish_reason length), not with an error; the engine keeps the conversation's rows
+                print(f"engine: slot {j.slot} ({len(j.ids)} prompt tokens, {getattr(j, 'n', 0)} generated): {msg}; the "
+                      f"reply ends with finish_reason length", flush=True)
+                j.max_new = getattr(j, "n", 0)  # (review rel1 L6: through feed, which flushes the held-back tail text)
+                j.feed([])
+                j.finish, j.finished = "length", True
+                continue
             if msg:
                 print(f"engine fault: request on slot {j.slot} ({len(j.ids)} prompt tokens, {getattr(j, 'n', 0)} "
                       f"generated) failed: {msg}", flush=True)
@@ -1600,6 +2106,7 @@ class Generator:
             self.cur_slot = -1
         tr("step", ts, 1, len(toks))
         self.metrics.step([j], [len(toks)], time.time() - ts)
+        self.count_refills()
         self.faults(active)  # (all of them: a settle in pp can file another slot's fault)
         if j.finished:
             return 0
@@ -1664,22 +2171,39 @@ class Generator:
         # completion between its chunks (see pick_next)
         prefills = []
         decode_until = 0.0  # while another prompt is prefilled, decode steps run until this time
+        # --prefill-turns slices (DSV4's profile default, dsv4_app's policy): after a prompt chunk every decoding request
+        # gets one slice of --slice-passes passes before the next chunk, instead of the --prefill-share time split
+        turns = getattr(self.args, "prefill_turns", "time") == "slices"
+        dec_left = 0
         bg_done = True  # idle archiving has nothing left (reset only when a request ends without a decode step; else the idle persist)
         burst_wait = max(0.0, getattr(self.args, "burst_wait", 5.0)) / 1000.0
 
         adm = Admission(self)
+        # (shared prefill batches: short prompts next leave the decoders the floor share after every pass too, not only over
+        # the window: arrivals during that short decode window join the next shared batch; back to back passes at 16 in
+        # flight: TTFT p50 0.55 s vs 0.35 s)
+        qa = QaSplit(adm.share_min, self.args.prefill_share, adm.share_min if adm.multi else 0.0)
+        parked = []  # [q27-park-c] replies parked after their first token (engine handle in j.park_h), oldest first
 
         trace = open(env_str("QE_SCHED_TRACE"), "w", buffering=1) if env_str("QE_SCHED_TRACE") else None
         prof_last = 0.0  # QE_STEP_PROF: return time of the last single step (0: none to chain from)
 
-        def tr(kind, t0, n=0, toks=0):  # scheduler trace (QE_SCHED_TRACE=file): one JSON line per event
-            if trace:
-                trace.write(json.dumps([kind, round(t0, 6), round(time.time() - t0, 6), n, toks]) + "\n")
+        def tr(kind, t0, n=0, toks=0, j=None):  # scheduler trace (QE_SCHED_TRACE=file): one JSON line per event
+            if trace:  # (j: the job, as its id; finish_start also its enqueue time, its slot, the cached rows)
+                x = [kind, round(t0, 6), round(time.time() - t0, 6), n, toks]
+                if j is not None:
+                    x.append(id(j))
+                    if kind == "finish_start":
+                        x += [round(j.t_enq, 6), j.slot, getattr(j, "reused", 0)]
+                trace.write(json.dumps(x) + "\n")
         last_mg = 0.0
         stuck_since = None  # since when requests have been queued with nothing running and nothing admitted
+        lp = LoopProf() if LOOP_PROF else _NoProf()  # [srv-gptoss-gap]
         while True:
+            lp.top(active)
             self.beat("scheduler loop")
             self.jobs_ref = (active, prefills)
+            self.parked_ref = parked  # (fail_open: parked replies are open requests too)
             if active or prefills:
                 stuck_since = None
             if self.retry_q:  # refused starts back to the queue (in order): a sequence or prefill ended since the
@@ -1696,6 +2220,9 @@ class Generator:
                         else:
                             keep.append(r)
                     self.retry_q = keep
+            if self.queue or self.retry_q:  # [srv-disconnect] a client gone while its request waits: out of the queue now
+                self.drop_cancelled_queued()
+            lp.mark("retry")
             if time.time() - last_mg > 1.0:  # host memory pressure: the archive gives memory back (engine)
                 last_mg = time.time()
                 try:
@@ -1708,9 +2235,10 @@ class Generator:
                 except Exception:
                     pass
                 last_snap = time.time()
+            lp.mark("memsnap")
             ctrl = []
             with self.cv:
-                while not self.queue and not active and not self.ctrl and not prefills:
+                while not self.queue and not active and not self.ctrl and not prefills and not parked:
                     self.beat("idle")
                     if self.retry_q:  # (released at the top of the loop when idle)
                         break
@@ -1752,6 +2280,9 @@ class Generator:
                         self.cv.release()
                         try:
                             e.mem_guard()
+                            tick = getattr(e, "idle_tick", None)  # [dsv4-rel8-giveback] (DSV4) only here: never while queued
+                            if tick is not None and not self.queue and not self.ctrl:
+                                tick()
                         except Exception:
                             pass
                         finally:
@@ -1762,6 +2293,7 @@ class Generator:
                     idle_since = None
                 if not active and not prefills:
                     ctrl, self.ctrl = self.ctrl, []
+            lp.mark("idlewait")
             for fn, ev in ctrl:
                 try:
                     t0 = time.time()
@@ -1775,6 +2307,64 @@ class Generator:
                 finally:
                     if ev:
                         ev.set()
+            lp.mark("ctrl")
+            resume_due = False  # parked replies wait for room a seat has: new prompts do not take it first (review M3)
+            if parked:  # [q27-park-c] resume parked replies (oldest first) while a decode seat is free
+                if self.stopping:
+                    for j in parked:
+                        e.park_drop(j.park_h)
+                        j.slot = -1
+                        j.fail(SequenceFault("server is shutting down"))
+                    parked = []
+                else:
+                    for j in [j for j in parked if j.cancelled()]:  # client gone: no resume just to release (review L4)
+                        e.park_drop(j.park_h)
+                        parked.remove(j)
+                        j.slot = -1
+                        j.fail(Cancelled("cancelled while parked"))
+                        self.cancel_note(j, "parked")
+                    dec = sum(1 for x in active if not x.finished)
+                    ps = e.pause_state() if hasattr(e, "pause_state") else None
+                    paused_now = bool(ps and ps[1] > 0)  # a paused reply resumes first (as admit_next; review M4)
+                    # (shared prefill batches keep up to --park-reserve prompts in flight: no 2-prompt gate there, the
+                    # engine checks its own limit; nothing waiting for a seat: any free seat, qfn_park_review M4 / H1)
+                    # (a resume prefilled in pieces holds its slot and region: its next piece comes first, whatever the
+                    # seat conditions, else it and a paused reply could wait on each other; review kb M3)
+                    while parked and (getattr(parked[0], "resuming", False) or (
+                            (adm.multi or len(prefills) < 2) and not paused_now and
+                            (dec < adm.seats - adm.reserve or not active or (not self.queue and dec + len(prefills) < adm.seats)))):
+                        j = parked[0]
+                        tu = time.time()
+                        try:
+                            r = e.unpark(j.park_h, self.args.mtp_k)
+                        except Exception as ex:  # (review L3: one reply fails, the scheduler goes on)
+                            parked.pop(0)
+                            self.cur_slot = -1
+                            e.park_drop(j.park_h)
+                            j.slot = -1
+                            j.fail(ex)
+                            continue
+                        if r is False:  # a resume prefilled in pieces: the next piece after the others' turn
+                            j.resuming = True
+                            self.cur_slot = -1  # (the engine bound the resuming slot)
+                            resume_due = True
+                            break
+                        if r is None:
+                            resume_due = bool(active or prefills)
+                            if not active and not prefills:
+                                time.sleep(0.02)  # (nothing runs that could free room: no hot spin)
+                            break
+                        parked.pop(0)
+                        j.resuming = False
+                        j.slot, extra = r
+                        j.park_h, j.ds0 = None, self.dstats.read(j.slot)  # (draft counters are per slot: from here on)
+                        j.empty_n, j.t_tok = 0, time.time()  # (the no-progress guard restarts: review L4)
+                        self.cur_slot = -1
+                        tr("unpark", tu, 1, 0, j)
+                        active.append(j)
+                        dec += 1
+                        if extra is not None:  # (the held state did not serve: the engine prefilled the pending token)
+                            j.feed([extra])
             while True:  # several prompts in one batch: every request that can join is admitted before the next batch
                 with self.cv:
                     if not self.queue and not active and not prefills:
@@ -1792,7 +2382,7 @@ class Generator:
                     # admit the next request (shortest remaining prefill first, aged) while a
                     # sequence slot is free and the pool has room for it
                     admit = None
-                    i = adm.admit_next(time.time(), prefills)
+                    i = None if resume_due else adm.admit_next(time.time(), prefills)
                     if i is not None:
                         admit = self.queue.pop(i)
                         long_ = max(prefills, key=lambda j: len(j.ids) - max(0, e.prefill_pos(j.slot))) if prefills else None
@@ -1819,7 +2409,7 @@ class Generator:
                     # sequence first (without this, a step in a --prefill-share window decoded the slot of the prompt
                     # just admitted, and the running request streamed another conversation's tokens)
                     self.cur_slot = -1
-                    tr("begin_start", tb, len(admit.ids))
+                    tr("begin_start", tb, len(admit.ids), 0, admit)
                     prefills.append(admit)
                 except Exception as ex:
                     # a prompt refused after the engine's checks of its input may have switched the engine's current
@@ -1857,15 +2447,33 @@ class Generator:
                         admit.fail(ex)
                 if not adm.multi:
                     break
+            lp.mark("admit")
             if self.stopping and prefills:  # shutdown: prompts being prefilled end now (stop_requests)
                 for j in prefills:
                     j.fail(SequenceFault("server is shutting down"))
                 prefills = []
+            if prefills:
+                # [srv-disconnect] a client that left while its prompt is prefilled: the prompt stops here, between two
+                # engine calls (27B / Flash-Next / gpt-oss: one chunk; DSV4: a chunk too, its engine reads the cancel
+                # flag inside a call; GLM [glm-rel-pfgate]: its prefill returns inside a prompt, qe_prefill_cancel stops
+                # the window job, the engine keeps the whole windows done). The release drops the prompt in flight
+                # (every engine's qe_release handles a prompt abandoned before start_finish)
+                for j in [j for j in prefills if j.cancelled()]:
+                    pos = e.prefill_pos(j.slot)
+                    pc = getattr(e, "prefill_cancel", None)
+                    if pc is not None:
+                        pc(j.slot)
+                    self.cur_slot = -1  # (the engine may be bound to this slot: the next single step resumes its own)
+                    j.fail(Cancelled("cancelled while its prompt was prefilled"))
+                    prefills.remove(j)
+                    self.retry_gen += 1  # (a slot freed: refused starts try again)
+                    self.cancel_note(j, f"its prompt was prefilled ({max(0, pos)}/{len(j.ids)} rows done)")
             if not self.queue and not active and not prefills:
                 continue
             # no step queued ahead of a prefill chunk, nor next to a logprobs reply's own steps (it would be undone each time)
             e.set_lookahead(not prefills and not any(j.lp is not None for j in active))
             if prefills:
+                lp.ok = False
                 # prompt chunks interleaved with decode steps of the running sequences: small
                 # chunks while others decode (they keep generating), whole ones otherwise
                 cur = prefills[-1]
@@ -1876,22 +2484,16 @@ class Generator:
                 budget = self.args.prefill_chunk if self.args.prefill_chunk > 0 else 1 << 30
                 # adaptive chunk: no other slot decoding or waiting -> the larger idle chunk (Flash-Next: its
                 # 4096-row batch); decided per chunk, so a request that arrives meanwhile gets 2048 again
-                idle = self.args.prefill_chunk_idle
-                # the larger idle batch when nothing decodes: one prompt and nothing waiting, or several sharing it; on
-                # 2 cards (pass_bound: a pass costs ~0.6 s of PCIe expert copies whatever its rows) also while requests
-                # wait (8 x 16K burst 3.0K -> 4.4K tok/s; 3 cards: no gain)
-                if idle > budget and not busy and ((len(prefills) == 1 and not self.queue) or
-                                                   (adm.multi and (len(prefills) >= 2 or adm.pass_bound))):
-                    budget = idle
+                budget = self.idle_budget(budget, busy, prefills, adm)
                 share = self.args.prefill_share if busy and self.args.prefill_chunk > 0 else 0.0
                 try:
                     finished = []
-                    if busy and time.time() < decode_until:  # the decoders' share of the GPU time
-                        pass
+                    if busy and (dec_left > 0 if turns else time.time() < decode_until):  # the decoders' share
+                        dec_left -= 1  # (slices: one engine decode call per loop below)
                     else:
                         tc = time.time()
                         ready = None
-                        self.beat("prefill")
+                        self.beat("prefill", self.call_limit("prefill"))  # (DSV4: a whole prompt is one call)
                         if adm.multi and len(prefills) >= 2:  # one batch over the prompts in flight
                             order = adm.batch_order(tc, prefills, budget)
                             slots = [j.slot for j in order]
@@ -1906,21 +2508,51 @@ class Generator:
                             else:
                                 cur = order[0]  # no shared batch (layout, image rows ...): the first one alone
                         if ready is None:
+                            p0 = max(0, e.prefill_pos(cur.slot)) if trace else 0
                             done = e.prefill_more(budget, cur.slot)
-                            tr("prefill", tc, len(cur.ids))
+                            self.count_refills()  # (DSV4: a banned first token's redo whose trim failed)
+                            tr("prefill", tc, len(cur.ids),
+                               ((len(cur.ids) if done else max(0, e.prefill_pos(cur.slot))) - p0) if trace else 0, cur)
                             self.cur_slot = cur.slot
                             if done:
                                 finished = [cur]
                         adm.account(prefills, budget)  # (a no-op unless batch_order set a long prompt's share)
+                        self.pf_progress(order if ready is not None else [cur], prefills)  # /api/stats: rows done so far
                         tc = time.time() - tc
-                        decode_until = time.time() + (tc * share / (1 - share) if 0 < share < 1 else 0)
+                        if adm.qa and share > 0:  # queue-aware split (busy, chunked)
+                            qa.add(0, tc)
+                            decode_until = time.time() + qa.window(tc, adm, [j for j in prefills if j not in finished],
+                                                                   self.queue, active)
+                        else:
+                            decode_until = time.time() + (tc * share / (1 - share) if 0 < share < 1 else 0)
+                        if turns and share > 0:  # (busy, chunked)
+                            dec_left = max(1, int(getattr(self.args, "slice_passes", 16))) * sum(1 for j in active if not j.finished)
                     if finished:
                         self.retry_gen += 1  # a prefill ended (in-flight limit, donor done)
                     for cur in finished:
                         tf = time.time()
                         try:
                             cur.finish_start()
-                            tr("finish_start", tf)
+                            tr("finish_start", tf, len(cur.ids), 0, cur)
+                            # [q27-park-c] beyond the decode seats while others wait for a prompt seat: park after the
+                            # first token (the waiting moves behind it, as the reply would wait for the seat anyway)
+                            # ([qfn-ttft-park] only beyond the seats: while every open request fits one, nobody waits
+                            # for a seat and a park only takes decode time from the others: Flash-Next 16 agents on 16
+                            # seats with reserve 4, out -14 %)
+                            ndec = sum(1 for x in active if not x.finished)
+                            if adm.park and cur.parkable() and ndec >= adm.seats - adm.reserve and \
+                                    (self.queue or parked or any(x is not cur for x in prefills)) and \
+                                    ndec + len(prefills) + len(self.queue) + len(parked) > adm.seats:
+                                tpk = time.time()
+                                h = e.park(cur.slot)
+                                if h is not None:
+                                    cur.park_h, cur.t_park = h, time.time()
+                                    self.cur_slot = -1
+                                    tr("park", tpk, 1, 0, cur)
+                                    parked.append(cur)
+                                    prefills.remove(cur)
+                                    self.retry_gen += 1  # (a slot freed: refused starts try again)
+                                    continue
                             active.append(cur)
                         except Exception as ex:
                             # the engine may be bound to this slot now (start_finish binds it before it fails or
@@ -1956,6 +2588,14 @@ class Generator:
                             j.fail(SequenceFault(msg))
                         self.cv.wait(0.05)
                 continue
+            lp.mark("lookahead")
+            if any(j.cancelled() and not j.finished for j in active):
+                # [srv-disconnect] a reply whose client left ends before the next step (review M3: on DSV4 that step
+                # could be a turn switch or a whole re-prefill for nobody)
+                active = [j for j in active if not (j.cancelled() and j.check_done())]
+                self.retry_gen += 1
+                bg_done = False
+            t_dec = time.time()
             try:
                 for j in active:
                     if j.finished:
@@ -1964,6 +2604,7 @@ class Generator:
                     near = j.tc is not None and j.tc.near()  # a forced close may come: nothing decoded ahead of it
                     if (j.stops and STOP_ROLLBACK) or j.tc is not None:
                         e.set_no_ahead(j.slot, stop or near)
+                lp.mark("noahead")
                 others = active
                 if any(j.lp is not None for j in active):  # logprobs replies step alone, the others as usual
                     others = [j for j in active if j.lp is None]
@@ -1982,22 +2623,28 @@ class Generator:
                         e.resume(j.slot)
                         self.cur_slot = j.slot
                     ts = time.time()
-                    self.beat("step")
+                    self.beat("step", self.call_limit("step", (j.slot,)))  # (DSV4: a switch may re-prefill)
                     if STEP_PROF:
                         p0 = _pc()
+                    lp.mark("pre")
                     toks = e.step()
+                    lp.mark("call")
+                    lp.n = (len(toks), 1)
                     if not toks:  # no token (paused, refused by the engine's slot check ...): resume explicitly next time
                         self.cur_slot = -1
                     if STEP_PROF:
                         p1 = _pc()
                     tr("step", ts, 1, len(toks))
                     self.metrics.step(others, [len(toks)], time.time() - ts)
+                    self.count_refills()
                     if STEP_PROF:
                         p2 = _pc()
+                    lp.mark("metrics")
                     if self.faults(others) or j.finished:
                         continue
                     j.feed(toks)
                     self.no_progress(j, len(toks))
+                    lp.mark("feed")
                     if not toks and not prefills:  # paused / waiting for room: no hot spin (N-L7; never while a prompt prefills, R4-L2)
                         time.sleep(0.02)
                     if STEP_PROF:
@@ -2009,16 +2656,22 @@ class Generator:
                 else:
                     self.cur_slot = -1  # batch steps undo the queued-ahead single step
                     ts = time.time()
-                    self.beat("batch step")
+                    self.beat("batch step", self.call_limit("step", [j.slot for j in others]))
+                    lp.mark("pre")
                     res = e.step_batch([j.slot for j in others])
+                    lp.mark("call")
+                    lp.n = (sum(len(r) for r in res), len(others))
                     tr("batch", ts, len(others), sum(len(r) for r in res))
                     self.metrics.step(others, [len(r) for r in res], time.time() - ts)
+                    self.count_refills()
+                    lp.mark("metrics")
                     tf = time.time()
                     self.faults(others)
                     for j, toks in zip(others, res):
                         if not j.finished:
                             j.feed(toks)
                             self.no_progress(j, len(toks))
+                    lp.mark("feed")
                     tr("feed", tf, len(others))
                     if not any(res) and not prefills:  # every slot paused / waiting: no hot spin (N-L7; not while a prompt prefills, R4-L2)
                         time.sleep(0.02)
@@ -2026,8 +2679,11 @@ class Generator:
                 for j in active:
                     j.fail(ex)
                 active = []
+            if adm.qa:
+                qa.add(1, time.time() - t_dec)
             n_active = len(active)
             active = [j for j in active if not j.check_done()]
+            lp.mark("done")
             if len(active) < n_active:
                 self.retry_gen += 1  # room may have freed: refused starts try again
 
@@ -2047,6 +2703,11 @@ def repetition_period(ids, max_period=200, min_span=600, min_reps=5):
 
 
 STOP_ROLLBACK = env_int("QE_STOP_ROLLBACK", 2)
+QA_SHARE_MIN = 0.10  # --prefill-share-min default for the 27B (the decoders' floor share; 0.15 measured slower at 16 in flight)
+QA_SHARE_MIN_MULTI = 0.10  # Flash-Next (shared prefill batches): fixed 0.10 / 0.15 equal at 4 / 16 in flight (0.10 mean 0.43 vs 0.50 s), 0.25 slower
+PARK_RESERVE = 2  # --park-reserve default: seats kept for prompts while replies wait parked ([q27-park-c])
+PARK_RESERVE_MULTI = 4  # the same with shared prefill batches (Flash-Next, [qfn-ttft-park]: c32 / c64 p95 0.87 / 0.80 -> 0.64 / 0.65 s)
+QA_TAU = 2.0  # s: the window of the decoders' floor share (queue-aware split, --prefill-share-min)
 MULTI_MAX = 8  # prompts in flight that share prefill batches (the engine's FLASH_MAX_PREFILLS default)
 PAUSE_WAIT = 3.0  # --pause-wait default (s): how long a request that does not fit waits before it pauses others
 LONG_SHARE = 0.5  # --long-share default where passes are copy-bound (the knee for short appends)
@@ -2110,6 +2771,14 @@ class Job:
         e.set_steering(*p.get("steering_sel", STEER_DEFAULT))  # this request's steering (keys the cached prefixes)
         self.slot = e.start_begin(self.ids, g.args.mtp_k, self.affinity, g.system_end(self.ids),
                                   getattr(self.ids, "mm", None))
+        flag = getattr(self.cancelled, "flag", None)
+        if flag is not None and hasattr(e, "set_abort_flag"):  # [srv-disconnect] DSV4: the cancel stops a prefill inside its call
+            e.set_abort_flag(self.slot, flag)
+        if p.get("cache_prompt") is False and hasattr(e, "set_no_cache"):  # [shared-srv] DSV4: no reuse for this request
+            e.set_no_cache(self.slot)
+        if hasattr(e, "set_trim"):  # DSV4 [dsv4-srv-stop]: no stop trim in thinking mode without tools (the next turn drops
+            e.set_trim(self.slot, not (p.get("thinking") and not p.get("has_tools")))  # the reasoning: the snapshot serves it)
+        self.pf0 = max(e.prefill_pos(self.slot), 0)  # rows cached at the start (live prefill progress: Generator.pf_progress)
         # after start_begin: the engine applies sampling parameters to its current slot, which
         # is this request's only now (before, they landed on whichever sequence was current)
         # presence / frequency penalty: the request's, else the server default for sampled requests (greedy ones
@@ -2124,8 +2793,11 @@ class Job:
             pres = max(pres, guard["presence"])
             seed = loop_guard.last_reply_tokens(self.ids, g.im_start, g.asst_ids, g.im_end, g.special_min, g.ws_ids)
         top_p, top_k, min_p = p.get("top_p") or d["top_p"], p.get("top_k") or d["top_k"], p.get("min_p") or d["min_p"]
-        if temp <= 0 and (pres or freq) and (explicit or guard is not None):
-            temp, top_p, top_k, min_p = 1.0, 1.0, 1, 0.0  # greedy with a penalty: the penalised argmax
+        can_pen = not getattr(g.profile, "is_gptoss", False) or "qe_set_penalty" in getattr(e, "fns", ())
+        if temp <= 0 and (pres or freq) and (explicit or guard is not None) and can_pen:
+            # greedy with a penalty: the penalised argmax ([gptoss-rel1] not on an engine without penalties: the
+            # top_k = 1 path would only make the reply slower, filtered sampling takes the full head)
+            temp, top_p, top_k, min_p = 1.0, 1.0, 1, 0.0
         e.set_sampling(temp, top_p, top_k, min_p, p.get("seed") or int(time.time() * 1e6))
         self.penalty = (pres, freq) if temp > 0 and (pres or freq) else None
         if self.penalty and not e.set_penalty(pres, freq, seed):
@@ -2155,6 +2827,8 @@ class Job:
             tg = time.perf_counter()
             self.grammar.fill(e.mask_buffer(self.slot)[0])
             e.constrain(self.slot, True)
+            if self.lp is None and hasattr(e, "set_check"):   # [dsv4-rel8-optgram] DSV4: constrained DSpark passes
+                e.set_check(self.slot, self.grammar.legal_prefix)
             self.grammar_s += time.perf_counter() - tg
         if self.lp is not None:  # the raw logits per token: a constrained slot with every token allowed (engine.capture_logits)
             if self.grammar is None:
@@ -2170,6 +2844,14 @@ class Job:
         real <tool_call> and all that follows."""
         g = self.gen
         ti = g.think_ids
+        if getattr(ti, "harmony", False):  # [srv-gptoss-think] entries for the final channel's body tokens only
+            if getattr(self, "lp_hs", None) is None:
+                self.lp_hs = ti.tracker(self.ids)
+            self.lp_hs.feed([t])
+            if not self.lp_hs.last_final:
+                return None
+            x = g.engine.logits_row(self.slot, self.lp_row)
+            return logprob_entry(g.tok, x, t, self.lp) if x is not None else None
         if self.lp_mode == "tool":
             return None
         if self.lp_mode == "reasoning":
@@ -2226,6 +2908,8 @@ class Job:
             top = self.max_new + self.p["think_budget"] + g.think_ids.wrap_max
             self.max_new = min(top, room) if room > 0 else self.max_new
         e.set_limit(self.slot, self.max_new - 1)
+        if self.p.get("ignore_eos") and hasattr(e, "set_ignore_eos"):  # review r25-M2 (GLM: no EOS cut in the steps)
+            e.set_ignore_eos(self.slot, True)
         # stop sequences: the reply is cut where its stop starts; the engine undoes the accepted
         # tokens past it (trim) when no step ran since, so the next turn resumes from the cut reply's
         # end. A step is queued ahead only while no stop can start before the step in flight's
@@ -2263,11 +2947,17 @@ class Job:
                                    self.p.get("think_budget_src"))
         if guard and guard.get("think") and self.tc is not None:  # (also without a client max_tokens)
             self.answer_at = None
+        elif getattr(getattr(g, "profile", None), "is_gptoss", False):  # harmony: client stops match the final channel only (stop_from)
+            self.answer_at = None
+        elif self.tc is not None and getattr(getattr(g, "profile", None), "is_dsv4", False):
+            # DSV4 (dsv4_app's [dsv4-srv-stop] rule): client stops match the answer only, never the reasoning
+            self.answer_at = None
         self.cut_think = (False, g.think_ids.ok)  # tool_choice none without the grammar tier and without ThinkControl
         # tool_choice required / named (review L2): a client stop ("\n\n", "\n") must not cut the thinking or the forced
         # call header (the reply would end with no call); stops match from the end of the header on (stop_from)
+        # (DSV4: never; its calls are text, dsml_spans keeps stops out of the block, review rel8 L8)
         self.tool_hold = bool(self.stops) and isinstance(getattr(self.grammar, "m", None), tool_choice.ToolMatcher) \
-            and (self.p.get("tool_choice") or {}).get("mode") == tool_choice.REQUIRED
+            and (self.p.get("tool_choice") or {}).get("mode") == tool_choice.REQUIRED and TOOL_FORMAT != "dsml"
         self.feed([first])
 
     def feed(self, pending):
@@ -2291,6 +2981,11 @@ class Job:
                 ok.append(t)
                 if c.done():  # complete: end the turn without another step
                     gdone = True
+                    break
+                if getattr(c, "released", None) is not None and c.released():
+                    # (optgram review L3) the forced header is complete: the step's later tokens are free text, never
+                    # run through the matcher (a mixed trie node would refuse them)
+                    ok.extend(pending[len(ok):])
                     break
             pending = ok
             self.gsteps += 1
@@ -2351,9 +3046,14 @@ class Job:
                 break
         self.n += len(pending)
         entry = self.lp_token(pending[0]) if self.lp is not None and pending else None
+        if self.lp is not None and len(pending) > 1 and getattr(self, "lp_hs", None) is not None:
+            self.lp_hs.feed(pending[1:])  # (harmony: the channel tracker sees every token of the step, review srv L10)
         if self.tc is not None:
             self.tc.track(pending)
-            if self.answer_max is not None and not self.tc.open:  # thinking done: max_tokens for the answer from here
+            # (harmony: the reply's first header comes before its analysis opens: not "done" yet; review M5)
+            hs = getattr(self.tc, "hs", None)
+            first_hdr = hs is not None and hs.state == "hdr" and hs.fresh
+            if self.answer_max is not None and not self.tc.open and not first_hdr:  # thinking done: max_tokens for the answer from here
                 self.max_new = min(self.max_new, self.tc.n + 1 + self.answer_max)
                 self.answer_max = None
                 # the engine's limit follows (review 2 L5): a reply that ends by length leaves no verified drafts past
@@ -2444,6 +3144,31 @@ class Job:
             self.tc.n -= min(self.tc.n, len(self.det.ids) - k)
         return True
 
+    def answer_call(self):
+        """The reply's answer (marked text: after the real </think>, before the first real tool call) and whether the reply
+        made a tool call. Qwen / GLM: a real <tool_call> token, not the text (review L3). DSV4 ([dsv4-rel8-dsml]): the
+        calls are plain text, so the reply's own parser decides (a DSML block in the answer, not one quoted in the
+        reasoning), as the HTTP side does."""
+        ans = self.text_mk
+        if mark("</think>") in ans:
+            ans = ans.split(mark("</think>"), 1)[1]
+        if TOOL_FORMAT == "dsml":
+            g = self.gen
+            p = DsmlParser(bool(g.think_ids.ok and g.think_ids.open_at_end(self.ids, g.im_start)))
+            p.feed(self.text_mk)
+            p.feed("", final=True)
+            call = False
+            if p.mode == "tool" and p.tool_text:  # review rel8 L9: a call only if the block parses (as the HTTP side)
+                import dsv4_chat
+                t = unmark(p.tool_text)
+                try:  # (the calls the reply returns: under its tool_choice, rel re-review L3)
+                    call = bool(tool_choice.filter_calls(self.p.get("tool_choice"),
+                                                         dsv4_chat.parse_calls(t if t.startswith("\n\n") else "\n\n" + t.lstrip())))
+                except Exception:
+                    call = False
+            return (ans.split(DsmlParser.CALL, 1)[0] if call else ans), call
+        return ans.split(mark("<tool_call>"), 1)[0], mark("<tool_call>") in self.text_mk
+
     def stop_from(self):
         """Where client stop sequences may match in text_all, None: not yet. On a guard-opened thinking turn they start at
         the answer's first character: the client asked for no reasoning, and its stops (ReAct "Observation:", "\\n\\n") must
@@ -2458,6 +3183,12 @@ class Job:
                 return None
             self.tool_hold = False
             self.answer_at = j + len("</tool_call>")
+        if self.answer_at is None and getattr(getattr(self.gen, "profile", None), "is_gptoss", False):
+            i = self.text_mk.rfind(mark("<|channel|>") + "final")  # [srv-gptoss] the answer = the final message's body
+            j = self.text_mk.find(mark("<|message|>"), i) if i >= 0 else -1
+            if j >= 0:
+                self.answer_at = j + len("<|message|>")
+            return self.answer_at
         if self.answer_at is None and not self.tc.open:
             tag = mark("</think>")
             i = self.text_mk.rfind(tag)
@@ -2478,14 +3209,18 @@ class Job:
         if a is None:  # nothing to scan yet: all of it goes out (the parser holds its own tags)
             self.stop_sent = len(t)
             return self.text_mk[sent:], -1
+        spans, hold, tail = [(a, len(t))], len(t), True
+        if TOOL_FORMAT == "dsml":
+            spans, hold, tail = self.dsml_spans(t, a, ending)
         a = max(sent, a)  # (the text in front of the answer goes out with what follows)
-        found = [p for p in (t.find(x, a) for x in self.stops) if p >= 0]
+        found = [p for u, v in spans for p in (t.find(x, max(u, a), v) for x in self.stops) if p >= 0]
         pos = min(found) if found else -1
-        hold = len(t)  # start of the longest end of the text that begins a stop
-        for x in self.stops:
-            for n in range(min(len(x) - 1, len(t) - a), 0, -1):
-                if x.startswith(t[-n:]):
-                    hold = min(hold, len(t) - n)
+        # hold: start of the longest end of the text that begins a stop (inside a DSML block nothing can begin one)
+        h0 = hold
+        for x in self.stops if tail else ():
+            for n in range(min(len(x) - 1, h0 - max(a, spans[-1][0])), 0, -1):
+                if x.startswith(t[h0 - n:h0]):
+                    hold = min(hold, h0 - n)
                     break
         if pos >= 0 and (ending or hold >= pos):
             self.stop_sent = pos
@@ -2493,6 +3228,32 @@ class Job:
         end = len(t) if ending else hold
         self.stop_sent = end
         return self.text_mk[sent:end], -1
+
+    def dsml_spans(self, t, a, ending=False):
+        """[dsv4-rel8-think] DSV4 (shared_server_review L7): client stops never match inside a DSML call block (the
+        blank line before it counts as its start; dsv4_app scanned the content only), as tool_hold waits for the forced
+        call's end. Returns the (start, end) spans of t from a on where a stop may match, the end of the text a stop
+        may still begin in (an end of the text that can still become a block start waits), and whether that end is
+        free text (False: inside an open block)."""
+        lead, call, end = DsmlParser.LEAD, DsmlParser.CALL, DsmlParser.END_CALL
+        spans, u = [], a
+        while True:
+            k = t.find(call, u)
+            if k < 0:
+                break
+            b = k
+            while b > u and k - b < len(lead) and t[b - 1] == "\n":
+                b -= 1
+            spans.append((u, b))
+            e = t.find(end, k)
+            if e < 0:
+                return spans, len(t), False
+            u = e + len(end)
+        head = lead + call
+        n = 0 if ending else next((n for n in range(min(len(head) - 1, len(t) - u), 0, -1)
+                                   if head.startswith(t[-n:]) or call.startswith(t[-n:])), 0)
+        spans.append((u, len(t) - n))
+        return spans, len(t) - n, True
 
     def kept_tokens(self, text):
         """Reply tokens wholly inside the text before the stop (trailing whitespace dropped: the
@@ -2522,39 +3283,48 @@ class Job:
                         return True
         return False
 
+    def parkable(self):
+        """[q27-park-c] A reply the engine can park and resume bit-identically: no grammar / logprobs / token ban / images,
+        not finished (the engine refuses steering, LSA and the rest itself)."""
+        return (not self.finished and self.grammar is None and self.lp is None and not self.tool_banned and
+                not getattr(self.ids, "mm", None))
+
     def check_done(self):
         """Release the slot and wake the caller once finished (or cancelled)."""
         if not self.finished and (self.cancelled() or self.gen.stopping):
             self.shut = self.gen.stopping and not self.cancelled()  # shutdown: run() raises (error event)
             self.finished = True
+            if self.cancelled() and getattr(self.cancelled, "why", "client") == "client":
+                self.client_gone = True
         if not self.finished:
             return False
         if not self.done.is_set():
             promoted = self.call_in_block()
-            call = mark("<tool_call>") in self.text_mk  # a real tool-call token, not the text (review L3)
+            ans, call = self.answer_call()
             if self.prio == 1 and self.finish == "stop" and not call:
                 self.gen.engine.set_prio(self.slot, 0)  # a subagent that is done (no tool to run)
             if getattr(self, "det", None) is not None:  # its final reply is recognised in a parent's history
-                ans = self.text_mk  # the answer: after the real </think>, before a real <tool_call>
-                if mark("</think>") in ans:
-                    ans = ans.split(mark("</think>"), 1)[1]
-                self.gen.agents.finished(getattr(self.ids, "agent", None), unmark(ans.split(mark("<tool_call>"), 1)[0]),
-                                         call, split=False)
+                self.gen.agents.finished(getattr(self.ids, "agent", None), unmark(ans), call, split=False)
             ds = engine_stats.delta(getattr(self, "ds0", None), self.gen.dstats.read(self.slot))
             trimmed = None
             if getattr(self, "keep", None) is not None:
                 trimmed = self.gen.engine.trim(self.slot, len(self.ids) + self.keep)
+                if trimmed:  # (hotfix_1331 review F4: Flash-Next's qe_trim binds this slot: the next single step resumes its own)
+                    self.gen.cur_slot = -1
             t2 = time.time()
             self.stats = {"prompt_tokens": len(self.ids), "cached_tokens": self.reused,
                           "cache_src": self.src,
                           "completion_tokens": self.n_out(), "finish": self.finish, "slot": self.slot,
-                          "prefill_s": self.t1 - self.t0, "decode_s": t2 - self.t1}
+                          "prefill_s": self.t1 - self.t0, "decode_s": t2 - self.t1,
+                          "queue_s": max(0.0, self.t0 - self.t_enq)}
             if self.lp is not None:
                 self.stats["logprobs"] = self.lp_out  # (entries no text carried: the HTTP side's last chunk)
             if ds is not None:
                 self.stats["drafts"] = ds  # [steps, MTP drafted, accepted, lookup drafted, accepted]
             if trimmed is not None:
                 self.stats["stop_trim"] = trimmed
+            if getattr(self, "client_gone", False):
+                self.stats["cancelled"] = True  # (complete(): no empty-reply retry for a client that left)
             if promoted:
                 self.stats["promote_call"] = True
             if self.penalty:
@@ -2605,6 +3375,8 @@ class Job:
                 self.gen.remember_turn(self.ids, keep_out)
             self.done.set()
             self.gen.engine.release(self.slot)
+            if getattr(self, "client_gone", False):
+                self.gen.cancel_note(self, f"it generated ({getattr(self, 'n', 0)} tokens out)")
             if keep_out is not None:
                 self.gen.engine.add_corpus(keep_out)
         return True
@@ -2617,7 +3389,7 @@ class Job:
                 pass
         self.error = ex
         self.finished = True
-        self.gen.metrics.finished(self, ex)
+        self.gen.metrics.finished(self, None if isinstance(ex, Cancelled) else ex)  # (a client that left: no error)
         self.done.set()
 
 
@@ -2647,16 +3419,73 @@ def prof_write(job):
           flush=True)
 
 
-def stream_bridge(gen, ids, params, affinity=0):
-    """Run generation in a thread; yields text chunks then the stats dict (async)."""
+class Cancelled(SequenceFault):
+    """[srv-disconnect] the request ended because its client left (queued, prefilling, parked): no engine error (not
+    counted as one; the reply, written to nobody, is a 499)"""
+
+
+class Cancel:
+    """[srv-disconnect] A request's cancel. The HTTP side sets it (the client disconnected, or the reply's stream was
+    closed); the scheduler reads it (calling it: Job.cancelled) at its safe points: queued, between prefill chunks /
+    windows, between decode steps, parked. flag: the same as a C int, for an engine that reads it inside one call (DSV4
+    prefills a prompt alone in one dsv4_start: it stops at the next chunk). t: monotonic time of the disconnect (the
+    scheduler logs the time until the slot was free); why: 'client' (a disconnect seen) or '' (the reply's end)."""
+    __slots__ = ("ev", "flag", "t", "why", "gen")
+
+    def __init__(self, gen=None):
+        self.ev = threading.Event()
+        self.flag = ctypes.c_int(0)
+        self.t, self.why, self.gen = None, "", gen
+
+    def __call__(self):
+        return self.ev.is_set()
+
+    is_set = __call__
+
+    def set(self, why=""):
+        if self.ev.is_set():
+            return
+        self.t, self.why = time.monotonic(), why
+        self.ev.set()
+        self.flag.value = 1
+        g = self.gen
+        if g is not None and why and g.cv.acquire(blocking=False):  # wake an idle / waiting scheduler (never blocks the
+            try:                                                      # event loop: a busy one sees it at its next pass)
+                g.cv.notify()
+            finally:
+                g.cv.release()
+
+
+async def watch_disconnect(req, cancel):
+    """[srv-disconnect] Waits for the client's http.disconnect on the request's receive channel (the body was read
+    before): a client that leaves while its request is queued or its prompt is prefilled (nothing is written then, so
+    a write never fails) cancels it at the scheduler's next safe point. Non-streamed replies write nothing until the
+    end: without this they ran to completion for nobody."""
+    try:
+        while not cancel():
+            msg = await req.receive()
+            if msg.get("type") == "http.disconnect":
+                cancel.set("client")
+                return
+            await asyncio.sleep(0.05)  # (another message: a server that repeats empty bodies must not spin)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # (no receive channel / a closed one: no watch, the write path still notices)
+        return
+
+
+def stream_bridge(gen, ids, params, affinity=0, req=None, keepalive=0.0):
+    """Run generation in a thread; yields text chunks then the stats dict (async). req: the HTTP request, watched for
+    a client disconnect while the generation runs (watch_disconnect). keepalive > 0 (streams only): KEEPALIVE after that
+    many seconds without an item."""
     loop = asyncio.get_running_loop()
     q = asyncio.Queue()
-    cancel = threading.Event()
+    cancel = Cancel(gen)
 
     def work():
         try:
             st = gen.run(ids, params, lambda s: loop.call_soon_threadsafe(q.put_nowait, s),
-                         cancel.is_set, affinity)
+                         cancel, affinity)
             loop.call_soon_threadsafe(q.put_nowait, st)
         except Exception as ex:  # surface errors to the client
             loop.call_soon_threadsafe(q.put_nowait, ex)
@@ -2664,15 +3493,36 @@ def stream_bridge(gen, ids, params, affinity=0):
     threading.Thread(target=work, daemon=True).start()
 
     async def agen():
+        watch = asyncio.ensure_future(watch_disconnect(req, cancel)) if req is not None else None
+        ended = False
         try:
             while True:
-                item = await q.get()
+                if keepalive > 0:
+                    try:
+                        item = await asyncio.wait_for(q.get(), keepalive)
+                    except asyncio.TimeoutError:  # (a cancelled Queue.get loses no item)
+                        yield KEEPALIVE
+                        continue
+                else:
+                    item = await q.get()
+                if isinstance(item, (Exception, dict)):
+                    ended = True
+                    if watch is not None:  # (review L1: a completed response reads as http.disconnect, never a cancel)
+                        watch.cancel()
                 if isinstance(item, Exception):
                     raise item
                 yield item
                 if isinstance(item, dict):
                     return
+        except (asyncio.CancelledError, GeneratorExit):
+            # the stream was closed before its end (a write to a gone client failed, or the server cancelled the
+            # response on a disconnect)
+            if not ended:
+                cancel.set("client")
+            raise
         finally:
+            if watch is not None:
+                watch.cancel()
             cancel.set()
 
     return agen()
@@ -2693,7 +3543,7 @@ async def fault_events(it):
         yield ex
 
 
-async def complete(gen, ids, params, aff, thinking, tools, tchoice=None):
+async def complete(gen, ids, params, aff, thinking, tools, tchoice=None, req=None):
     """A non-streamed reply: (parser, parts, stats, tool calls), or the SequenceFault of an engine error. A sampled
     reply that ends by itself (finish stop) with no text and no tool call -- reasoning only (EOS inside or right after
     <think>, HF Qwen3.8-Flash-Next #50) or a tool call that does not parse -- is sampled again, up to --empty-retry
@@ -2712,11 +3562,11 @@ async def complete(gen, ids, params, aff, thinking, tools, tchoice=None):
         tries = 0
     spent, spent_s, first = 0, 0.0, None
     for attempt in range(tries + 1):
-        parser = Parser(thinking)
+        parser = PARSER(thinking)
         parts = {"reasoning": "", "content": "", "logprobs": []}
         st = None
         p = dict(params, empty_retry=(attempt, tries)) if tries else params  # the empty-reply WARNING says retry k/N
-        async for item in fault_events(stream_bridge(gen, ids, p, aff)):
+        async for item in fault_events(stream_bridge(gen, ids, p, aff, req)):
             if isinstance(item, SequenceFault):
                 return item
             if isinstance(item, dict):
@@ -2734,6 +3584,8 @@ async def complete(gen, ids, params, aff, thinking, tools, tchoice=None):
         no_calls = tchoice is not None and tchoice["mode"] == tool_choice.NONE
         calls, raw_tool = tool_calls_or_text(parser, tools, tchoice, no_calls)
         empty = not calls and not parts["content"].strip() and st["finish"] == "stop"
+        if st.get("cancelled"):  # [srv-disconnect] the client left: no retry
+            break
         if not empty:
             if attempt:
                 gen.think_add("empty_retry_recovered")
@@ -2774,6 +3626,21 @@ def think_note(st):
     b = f"/{th['budget']} ({th.get('budget_from') or 'request'})" if th["budget"] is not None else ""
     f = f", forced close ({th['forced']}, {th['forced_tokens']} tokens)" if th["forced"] else ""
     return f" | think {th['tokens']}{b}{f}{' FAILED' if th.get('failed') else ''}"
+
+
+def timings(st):
+    """[dsv4-rel8-timings] llama.cpp's `timings` object of a response (DSV4 only, as dsv4_app returned one; review L9):
+    prompt_n = the tokens prefilled (the cached ones in cache_n), prompt_ms its wall time (prompt chunks beside other
+    requests' decode included), predicted_* the reply; ttft_s (queue wait + prefill) and tok_s as dsv4_app had them."""
+    pn = max(0, st["prompt_tokens"] - st["cached_tokens"])
+    pms, dms, dn = 1000.0 * st["prefill_s"], 1000.0 * st["decode_s"], st["completion_tokens"]
+    return {"cache_n": st["cached_tokens"], "prompt_n": pn, "prompt_ms": round(pms, 3),
+            "prompt_per_token_ms": round(pms / pn, 3) if pn else 0.0,
+            "prompt_per_second": round(1000.0 * pn / pms, 2) if pms > 0 else 0.0,
+            "predicted_n": dn, "predicted_ms": round(dms, 3), "predicted_per_token_ms": round(dms / dn, 3) if dn else 0.0,
+            "predicted_per_second": round(1000.0 * dn / dms, 2) if dms > 0 else 0.0,
+            "ttft_s": round(st.get("queue_s", 0.0) + st["prefill_s"], 3),
+            "tok_s": round(1000.0 * dn / dms, 2) if dms > 0 else 0.0}
 
 
 def log_stats(kind, st):
@@ -2825,7 +3692,8 @@ def template_kwargs(body, default_think, default_effort=None, anthropic=False):
     top-level reasoning_effort (OpenAI field, also read on the Anthropic path), else reasoning.effort (OpenAI
     Responses / OpenRouter object, both paths), else (anthropic: /v1/messages) output_config.effort, else
     --reasoning-effort (default_effort; None = the template's own default, xhigh).
-    A null value counts as not sent.
+    A null value counts as not sent. enable_thinking: chat_template_kwargs.enable_thinking, else a top-level
+    enable_thinking (a real bool only; issue #31), else --think.
 
     Effort `none` (any case, surrounding blanks ignored): thinking off, i.e. the variables of enable_thinking=false
     (reasoning_effort is dropped, so the prompt is byte for byte that of enable_thinking=false). A `none` the request
@@ -2839,6 +3707,10 @@ def template_kwargs(body, default_think, default_effort=None, anthropic=False):
     over the server default (--think 0, --reasoning-effort none) unless the request turns it off itself, at the effort
     the request names, else the server's, else the template's own default."""
     kw = dict(body.get("chat_template_kwargs") or {})
+    if kw.get("enable_thinking") is None:  # [kb-server] a null counts as not sent (server-small N2: it kept the default off)
+        kw.pop("enable_thinking", None)
+        if isinstance(body.get("enable_thinking"), bool):  # issue #31: the top-level form (only a real bool), was ignored
+            kw["enable_thinking"] = body["enable_thinking"]
     th = body.get("thinking")
     th_type = th.get("type") if isinstance(th, dict) else None
     rs = body.get("reasoning")  # OpenAI Responses / OpenRouter: reasoning: {"effort": ..., "enabled": ...}
@@ -2900,7 +3772,11 @@ def structured(gen, body, kw):
         why = getattr(gen.engine, "refused", {}).get("grammar")
         raise GrammarError(why or "structured output is not supported by this engine (no grammar C API)")
     kw["enable_thinking"] = False
-    return gen.grammars.matcher(schema)
+    c = gen.grammars.matcher(schema)
+    if TOOL_FORMAT == "harmony":  # [srv-gptoss] gpt-oss: its analysis first (free), then the final header, then the
+        import harmony               # schema's body (forcing the final header at once broke the JSON on the GPU: city " Warsaw\xa0?...")
+        c.m = harmony.ReasonFirst(gen.tok, c.m)
+    return c
 
 
 def tool_choice_of(gen, body, tools, grammar):
@@ -2921,10 +3797,7 @@ def tool_choice_of(gen, body, tools, grammar):
         return spec
     if spec["mode"] == tool_choice.NONE:
         return dict(spec, cut=True)
-    if not gen.tool_choice_noted:
-        gen.tool_choice_noted = True
-        print(f"tool_choice {spec['mode']}: not enforced (the engine has no grammar C API); the model decides as with "
-              f"auto (logged once)", flush=True)
+    gen.tool_choice_noted = True  # (logged once by the feature table: ParamNotes)
     return None
 
 
@@ -3229,7 +4102,8 @@ def build_app(gen: Generator, args):
         lim = limits()
         return {"model_alias": model_name, "total_slots": lim["max_num_seqs"],
                 "default_generation_settings": {"n_ctx": lim["max_model_len"]},
-                "modalities": {"vision": gen.vision is not None}, **lim}
+                "modalities": {"vision": gen.vision is not None},
+                "metrics_port": args.metrics_port, **lim}   # live monitoring port (/api/stats), 0 = off
 
     # ---------------- OpenAI chat completions ----------------
     @app.post("/v1/chat/completions")
@@ -3239,6 +4113,7 @@ def build_app(gen: Generator, args):
         if bad:
             return JSONResponse({"error": {"message": bad[1], "type": "invalid_request_error", "param": bad[0]}},
                                 status_code=400)
+        gen.param_notes.check(body)  # [feature-matrix] unsupported parameters: one log line each per process
         bad = bad_param(body, "stop", ("max_completion_tokens", "max_tokens", "temperature", "top_p", "top_k", "min_p", "seed",
                                        "presence_penalty", "frequency_penalty"))
         if bad:
@@ -3297,17 +4172,20 @@ def build_app(gen: Generator, args):
                   "grammar": grammar, "tool_choice": tchoice, "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
-                  "thinking": reply_thinking(gen, ids, kw)}
+                  "thinking": reply_thinking(gen, ids, kw),
+                  "cache_prompt": body.get("cache_prompt", True) is not False, "has_tools": bool(tools)}
         if logprobs is not None:
             params["logprobs"] = logprobs
         rid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
-        parser = Parser(reply_thinking(gen, ids, kw))
+        parser = PARSER(reply_thinking(gen, ids, kw))
         hide_rs = reasoning_excluded(body)  # reasoning.exclude: generated, not returned
 
         def tool_calls_out(calls):
             return [{"index": i, "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                      "function": {"name": c["name"], "arguments": json.dumps(c["arguments"], ensure_ascii=False)}}
                     for i, c in enumerate(calls)]
+
+        dsv4 = getattr(getattr(gen, "profile", None), "is_dsv4", False)  # [dsv4-rel8-timings]
 
         def usage(st):
             u = {"prompt_tokens": st["prompt_tokens"], "completion_tokens": st["completion_tokens"],
@@ -3334,7 +4212,14 @@ def build_app(gen: Generator, args):
                     return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
                 started = False
                 sse_s = [0.0, 0]  # QE_STEP_PROF: event-loop time of parser + chunk JSON, chunks
-                async for item in fault_events(stream_bridge(gen, ids, params, aff)):
+                async for item in fault_events(stream_bridge(gen, ids, params, aff, req, SSE_KEEPALIVE_S)):
+                    if item is KEEPALIVE or (type(item) in (str, LpText) and keepalive_due(last_w)):
+                        # (an SSE comment: clients skip it; the role chunk still comes with the first token; also while
+                        # the parser holds every item back: a tool call, hidden reasoning)
+                        if keepalive_due(last_w):
+                            yield ": keep-alive\n\n"
+                        if item is KEEPALIVE:
+                            continue
                     if isinstance(item, SequenceFault):  # the engine failed this request: an error event, then the end
                         if bad_input(item):
                             yield "data: " + json.dumps({"error": {"message": str(item), "type": "invalid_request_error",
@@ -3362,8 +4247,11 @@ def build_app(gen: Generator, args):
                         lp_buf.extend(st.get("logprobs", ()))
                         yield chunk({}, finish)
                         # usage in its own chunk with empty choices (OpenAI stream_options.include_usage)
-                        yield "data: " + json.dumps({"id": rid, "object": "chat.completion.chunk", "created": created,
-                                                     "model": model_name, "choices": [], "usage": usage(st)}) + "\n\n"
+                        last = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                                "model": model_name, "choices": [], "usage": usage(st)}
+                        if dsv4:
+                            last["timings"] = timings(st)
+                        yield "data: " + json.dumps(last) + "\n\n"
                         yield "data: [DONE]\n\n"
                         log_stats("chat", st)
                         if STEP_PROF and sse_s[1]:
@@ -3384,28 +4272,35 @@ def build_app(gen: Generator, args):
                         yield c
                         if STEP_PROF:
                             a0 = _pc()
-            return StreamingResponse(sse(), media_type="text/event-stream")
+            last_w = [time.monotonic()]
+            return StreamingResponse(stamped(sse(), last_w), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice, req)
+        if isinstance(r, Cancelled):  # [srv-disconnect] the client left (nobody reads it; the access log says 499)
+            return JSONResponse({"error": {"message": str(r), "type": "client_closed_request"}}, status_code=499)
         if isinstance(r, SequenceFault):
             if bad_input(r):
                 return JSONResponse({"error": {"message": str(r), "type": "invalid_request_error"}}, status_code=400)
             return JSONResponse({"error": {"message": f"engine error: {r}", "type": "server_error"}},
                                 status_code=500)
         parser, parts, st, calls = r
-        msg = {"role": "assistant", "content": parts["content"].strip() or (None if calls else "")}
+        raw = PARSER is DsmlParser  # DSV4 renders the history verbatim: the reply as generated (review M3)
+        msg = {"role": "assistant", "content": (parts["content"] if raw else parts["content"].strip()) or (None if calls else "")}
         if logprobs is not None and msg["content"]:  # as streamed: the entries join to exactly this text
             msg["content"] = parts["content"]
         if parts["reasoning"] and not hide_rs:
-            msg["reasoning_content"] = parts["reasoning"].strip()
+            msg["reasoning_content"] = parts["reasoning"] if raw else parts["reasoning"].strip()
         if calls:
             msg["tool_calls"] = [{k: v for k, v in c.items() if k != "index"} for c in tool_calls_out(calls)]
         log_stats("chat", st)
         choice = {"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else st["finish"]}
         if logprobs is not None:
             choice["logprobs"] = {"content": parts["logprobs"]}
-        return {"id": rid, "object": "chat.completion", "created": created, "model": model_name,
-                "choices": [choice], "usage": usage(st)}
+        out = {"id": rid, "object": "chat.completion", "created": created, "model": model_name,
+               "choices": [choice], "usage": usage(st)}
+        if dsv4:
+            out["timings"] = timings(st)
+        return out
 
     # ---------------- Anthropic messages ----------------
     @app.post("/v1/messages/count_tokens")
@@ -3432,6 +4327,7 @@ def build_app(gen: Generator, args):
         if bad:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": bad[1]}},
                                 status_code=400)
+        gen.param_notes.check(body)  # [feature-matrix]
         bad = bad_param(body, "stop_sequences", ("max_tokens", "temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"))
         if bad:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": bad[1]}}, status_code=400)
@@ -3483,9 +4379,11 @@ def build_app(gen: Generator, args):
                   "steering_sel": steer, "think_budget": budget,
                   "think_budget_src": budget_src,
                   "presence_penalty": body.get("presence_penalty"), "frequency_penalty": body.get("frequency_penalty"),
-                  "thinking": reply_thinking(gen, ids, kw)}
+                  "thinking": reply_thinking(gen, ids, kw),
+                  # [kb-server] as /v1/chat/completions (shared_server review L9; has_tools: DSV4's stop trim with tools)
+                  "cache_prompt": body.get("cache_prompt", True) is not False, "has_tools": bool(body.get("tools"))}
         mid = "msg_" + uuid.uuid4().hex[:24]
-        parser = Parser(reply_thinking(gen, ids, kw))
+        parser = PARSER(reply_thinking(gen, ids, kw))
         stop_map = {"stop": "end_turn", "length": "max_tokens"}
 
         def usage(st):
@@ -3525,7 +4423,12 @@ def build_app(gen: Generator, args):
                                                           "delta": delta}))
                     return out
 
-                async for item in fault_events(stream_bridge(gen, ids, params, aff)):
+                async for item in fault_events(stream_bridge(gen, ids, params, aff, req, SSE_KEEPALIVE_S)):
+                    if item is KEEPALIVE or (type(item) in (str, LpText) and keepalive_due(last_w)):
+                        if keepalive_due(last_w):  # (Anthropic's own keep-alive event; also while text is held back)
+                            yield ev("ping", {"type": "ping"})
+                        if item is KEEPALIVE:
+                            continue
                     if isinstance(item, SequenceFault):  # the engine failed this request: an error event, then the end
                         yield ev("error", {"type": "error", "error": {
                             "type": "invalid_request_error" if bad_input(item) else "api_error",
@@ -3554,18 +4457,24 @@ def build_app(gen: Generator, args):
                                                                        "partial_json": json.dumps(c["arguments"], ensure_ascii=False)}})
                             yield ev("content_block_stop", {"type": "content_block_stop", "index": state["idx"]})
                         reason = "tool_use" if calls else stop_map.get(st["finish"], "end_turn")
-                        yield ev("message_delta", {"type": "message_delta",
-                                                   "delta": {"stop_reason": reason, "stop_sequence": None},
-                                                   "usage": usage(st)})
+                        md = {"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None},
+                              "usage": usage(st)}
+                        if getattr(getattr(gen, "profile", None), "is_dsv4", False):  # [dsv4-rel8-timings] (review L10)
+                            md["timings"] = timings(st)
+                        yield ev("message_delta", md)
                         yield ev("message_stop", {"type": "message_stop"})
                         log_stats("messages", st)
                         return
                     for kind, t in parser.feed(item):
                         for x in emit(kind, t):
                             yield x
-            return StreamingResponse(sse(), media_type="text/event-stream")
+            last_w = [time.monotonic()]
+            return StreamingResponse(stamped(sse(), last_w), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice, req)
+        if isinstance(r, Cancelled):  # [srv-disconnect] the client left
+            return JSONResponse({"type": "error", "error": {"type": "client_closed_request", "message": str(r)}},
+                                status_code=499)
         if isinstance(r, SequenceFault):
             if bad_input(r):
                 return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(r)}},
@@ -3583,17 +4492,41 @@ def build_app(gen: Generator, args):
         for c, tid in zip(calls, ids_out):
             content.append({"type": "tool_use", "id": tid, "name": c["name"], "input": c["arguments"]})
         log_stats("messages", st)
-        return {"id": mid, "type": "message", "role": "assistant", "model": model_name, "content": content,
-                "stop_reason": "tool_use" if calls else stop_map.get(st["finish"], "end_turn"),
-                "stop_sequence": None, "usage": usage(st)}
+        out = {"id": mid, "type": "message", "role": "assistant", "model": model_name, "content": content,
+               "stop_reason": "tool_use" if calls else stop_map.get(st["finish"], "end_turn"),
+               "stop_sequence": None, "usage": usage(st)}
+        if getattr(getattr(gen, "profile", None), "is_dsv4", False):  # [dsv4-rel8-timings] (review L10)
+            out["timings"] = timings(st)
+        return out
 
     return app
 
 
 def resolve_model_args(args):
     """Fill the per-model defaults (None on the command line) from the model profile."""
+    if args.model in ("glm", "glm53-flash"):  # the GLM engine's default checkpoint (model_profile.py default_dir)
+        from model_profile import FAMILIES
+        args.model = os.environ.get("QE_GLM_MODEL") or FAMILIES["glm53-flash"]["default_dir"]
+        if not os.path.isdir(args.model):  # [glm-rel-host] a clear message instead of a load error
+            sys.exit(f"GLM-5.3-Flash checkpoint not found at {args.model}. Download the QEngine quant "
+                     f"({FAMILIES['glm53-flash']['hf_repo']}, e.g. `hf download {FAMILIES['glm53-flash']['hf_repo']} "
+                     f"--local-dir <dir>`) and start with --model <dir> (or set QE_GLM_MODEL=<dir>).")
     prof = args.profile = Profile(args.model)
     d = prof.defaults
+    if prof.family == "dsv4":  # [shared-srv] the DSV4 server's own defaults (dsv4_app): context, chunk, library, stats
+        if not getattr(args, "max_ctx_given", True):
+            if d["max_ctx"] == "auto":  # [dsv4-rel8-ctxdef] 262144 with the lazy and the static reservation (user 11-19): the engine knows at load
+                args.max_ctx, args.ctx_static = d["max_ctx_lazy"], d["max_ctx_static"]
+            else:
+                args.max_ctx = d["max_ctx"]
+        if args.prefill_chunk is None:
+            args.prefill_chunk = d["prefill_chunk"]
+        if not args.engine_lib:
+            args.engine_lib = os.environ.get("QE_DSV4_LIB") or os.path.join(ROOT, d["lib"])
+        if args.stats_file == STATS_DEFAULT:
+            args.stats_file = d["stats_file"]
+    if getattr(args, "prefill_turns", "auto") == "auto":
+        args.prefill_turns = d.get("prefill_turns", "time")
     if args.served_name is None:
         args.served_name = d["served_name"]
     if args.mtp_k is None:
@@ -3615,15 +4548,84 @@ def resolve_model_args(args):
         setattr(args, k, bool(d[k]) if v is None else bool(v))
     if not args.engine_lib and not env_str("QE_LIB"):
         lib = os.path.join(ROOT, d["lib"])
+        if not os.path.exists(lib) and prof.family == "gptoss":
+            # [gptoss-rel1-lib] the 27B library cannot run this model: stop with the reason instead of a later failure
+            sys.exit(f"gpt-oss engine library not built: {lib} is missing (run src/gptoss/build.sh)")
         args.engine_lib = lib if os.path.exists(lib) else os.path.join(ROOT, "build", "libqengine.so")
-    if args.vision and not d["vision"]:
-        print(f"vision is not available for {prof.family} yet: --vision ignored", flush=True)
+    if d.get("own_template"):  # GLM: the model's own template unless one was given explicitly
+        own = os.path.join(args.model, "chat_template.jinja")
+        if os.path.exists(own) and (args.template is None or os.path.basename(args.template) == "qwen38_syssafe.jinja"):
+            args.template = own
+    global TOOL_FORMAT, PARSER
+    TOOL_FORMAT = d.get("tool_format", "qwen")
+    if TOOL_FORMAT == "harmony":
+        from harmony import HarmonyParser
+        PARSER = HarmonyParser
+    else:
+        PARSER = DsmlParser if TOOL_FORMAT == "dsml" else Parser
+    if args.vision and not d["vision"]:  # (logged by the feature table: ignored_settings)
         args.vision = 0
     return args
 
 
+STATS_DEFAULT = "~/.cache/qengine/stats.json"
+
+
+def dsv4_flags(ap):
+    """[shared-srv] the DSV4 engine's flags (dsv4_app's, same names and defaults); other models ignore them"""
+    g = ap.add_argument_group("DSV4 (DeepSeek-V4.1-Flash GGUF)")
+    g.add_argument("--engine-args", default="", help="DSV4: extra engine flags (--dspark-dir, --profile, --cpu-threads ...)")
+    g.add_argument("--cache-dir", default=None, help="DSV4: the engine's cache directory")
+    g.add_argument("--no-dspark", action="store_true", help="DSV4 off-switch: plain decode without the DSpark drafter")
+    g.add_argument("--archive-gib", type=float, default=32.0,
+                   help="DSV4: host RAM for idle conversations (their KV state, LRU; it shrinks when MemAvailable runs low); "
+                        "0 = off: a different conversation drops the held one")
+    g.add_argument("--kv-pool-mib", type=int, default=0,
+                   help="DSV4: VRAM per card for the compressed K/V of idle conversations beyond one --max-ctx sequence "
+                        "(default 0: idle ones use what the active conversation does not)")
+    g.add_argument("--tier-reset", action="store_true",
+                   help="DSV4: greedy text independent of earlier unrelated requests: the expert tier back to its post-load "
+                        "state after each request (in the background; -2..-10 %% tok/s); requests then one at a time")
+    g.add_argument("--route-margin", type=float, default=None,
+                   help="DSV4 opt-in, default off. APPROXIMATES the routing: a cold expert choice whose router score is within "
+                        "this margin of a VRAM-resident expert is replaced by that expert (measured 11-17: NLL 1.623 -> 1.641 "
+                        "at 0.05, +6..+11 %% speed at 256 tokens); <= 0 = off (also over DSV4_ROUTE_MARGIN)")
+    g.add_argument("--drop-w", type=float, default=None,
+                   help="DSV4: adaptive top-k at decode (lossy); default 0 = exact routing; also DSV4_DROP_W")
+    g.add_argument("--slice-passes", type=int, default=16,
+                   help="DSV4: decode passes of one request before the next one in service takes its turn")
+    g.add_argument("--no-prefix-share", action="store_true",
+                   help="DSV4 off-switch: no shared prompt-prefix entries (by default the system message of a second "
+                        "prompt that shares it is kept once and reused by later prompts)")
+    g.add_argument("--serial", action="store_true",
+                   help="DSV4 off-switch: one request at a time to its end (also with --tier-reset or --archive-gib 0)")
+    g.add_argument("--prefill-turns", choices=("auto", "time", "slices"), default="auto",
+                   help="prompt chunks beside decoding requests: slices = every decoder gets one --slice-passes slice "
+                        "between two chunks (DSV4's default, as its old server); time = --prefill-share of the time; auto = "
+                        "the model profile's (other models: time)")
+    g.add_argument("--max-active", type=int, default=8,
+                   help="DSV4: requests in service at once (time-sliced; more wait in the queue)")
+
+
+def given_flags(ap, argv=None):
+    """{dest: value} of the flags given on the command line (argparse's own parse with every default suppressed, so
+    abbreviations and --x=v count as argparse reads them)."""
+    saved = [(a, a.default) for a in ap._actions]
+    try:
+        for a, _ in saved:
+            a.default = argparse.SUPPRESS
+        ns, _ = ap.parse_known_args(argv)
+    except SystemExit:
+        return {}
+    finally:
+        for a, d in saved:
+            a.default = d
+    return {k: v for k, v in vars(ns).items() if k != "help"}
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser()
+    dsv4_flags(ap)
     ap.add_argument("--model", default=os.path.join(ROOT, "models/Qwen3.8-27B-INT4"))
     default_tmpl = os.path.join(ROOT, "server/templates/qwen38_syssafe.jinja")
     ap.add_argument("--template", default=default_tmpl if os.path.exists(default_tmpl) else None,
@@ -3708,12 +4710,29 @@ def parse_args(argv=None):
                          "by host-backed expert copies: --prefill-chunk-idle, its big batch)")
     ap.add_argument("--prefill-chunk-idle", type=int, default=None,
                     help="prompt chunk (tokens) while no other sequence decodes or waits (default per "
-                         "model: Flash-Next 4096 = its big prefill batch, 27B 0 = --prefill-chunk)")
+                         "model: Flash-Next 4096 = its big prefill batch, gpt-oss 10240 = its engine chunk, 27B 0 = --prefill-chunk)")
     ap.add_argument("--prefill-share", type=float, default=0.5,
                     help="share of the GPU time the running sequences keep while another prompt "
                          "is prefilled (0.5: they decode at ~half their speed, the prefill takes "
                          "~2x longer; with the INT8 prefill, 8 agents + a 30K prompt: TTFT 11.5 s "
                          "as with 0.3 before it, at 69 instead of 41 tok/s per agent)")
+    ap.add_argument("--prefill-share-min", type=float, default=None,
+                    help="queue-aware split (engines without shared prefill batches: 27B, gpt-oss, GLM): while the "
+                         "prompt to prefill next has at most --prefill-short rows, passes run back to back with one decode "
+                         "step between them; a longer one leaves the decoders A / (A + W) of the time (A decoding, W waiting), "
+                         "within [this, --prefill-share]; over the last ~2 s the decoders never get less than this share "
+                         "(default 0.10 for the 27B, = --prefill-share elsewhere; = --prefill-share: the fixed split of earlier releases)")
+    ap.add_argument("--park", type=int, default=None,
+                    help="requests beyond the decode seats (27B, Flash-Next on 3+ cards in TP): prefill on one of --park-reserve seats kept for prompts, "
+                         "send the first token, park the reply in host memory (its KV rows and state, bit-identical resume) "
+                         "and resume it, oldest first, when a decode seat frees (default 1 for those; 0: such requests "
+                         "wait for a seat before their prefill, as before)")
+    ap.add_argument("--park-reserve", type=int, default=None,
+                    help=f"seats kept for prompts while replies are parked (--park; default {PARK_RESERVE}, Flash-Next "
+                         f"{PARK_RESERVE_MULTI})")
+    ap.add_argument("--prefill-short", type=int, default=4096,
+                    help="rows to prefill that count as short for --prefill-share-min (also the cut-in limit of the "
+                         "queue-aware split)")
     ap.add_argument("--bg-archive", type=int, default=64,
                     help="MB per GPU per step of archiving idle conversations to host memory while "
                          "the server is idle (0 = off: a conversation is archived only when its slot "
@@ -3788,7 +4807,7 @@ def parse_args(argv=None):
     ap.add_argument("--disk-cache", default="",
                     help="directory of a persistent prompt cache surviving restarts (default off: "
                          "conversations live in GPU slots and host memory only)")
-    ap.add_argument("--stats-file", default="~/.cache/qengine/stats.json",
+    ap.add_argument("--stats-file", default=STATS_DEFAULT,
                     help="all-time monitoring totals (dashboard)")
     ap.add_argument("--disk-cache-gb", type=float, default=200)
     ap.add_argument("--persist-idle", type=float, default=120,
@@ -3799,7 +4818,12 @@ def parse_args(argv=None):
                          "~/.cache/qengine/logs/<served-name>.log; '' or 0: off); env QE_LOG_FILE (0: off, empty: unset)")
     ap.add_argument("--log-mb", type=float, default=env_float("QE_LOG_MB", 64.0),
                     help="size of the persistent log before it is rotated (3 old files are kept); env QE_LOG_MB")
+    env0 = dict(os.environ)  # [feature-matrix] the environment as started (before the server sets its own variables)
     args = ap.parse_args(argv)
+    args.given = given_flags(ap, argv)
+    # (argparse also takes an unambiguous abbreviation: --max-c, --max-ct; review shared_server L9)
+    args.max_ctx_given = any((lambda k: k.startswith("--max-c") and "--max-ctx".startswith(k))(x.split("=", 1)[0])
+                             for x in (argv or sys.argv[1:]))
     if args.loop_guard_turns > 0 and not 2 <= args.loop_guard_turns <= loop_guard.WINDOW:
         # 1 flags every reply with a call (a reply that repeats nothing is a stretch of one), above the window nothing
         # ever fires (review 2 L7). The flag is refused; the env value warns and keeps the default (as qe_env does)
@@ -3811,6 +4835,9 @@ def parse_args(argv=None):
     if args.main_bonus is not None:  # (review M2: old command lines keep starting)
         print("[sched] --main-bonus is ignored: no main-thread priority since 2026-11-12 (every conversation alike)", flush=True)
     resolve_model_args(args)
+    # [feature-matrix] flags / variables that have no effect for this model: logged by main() after the log starts
+    args.ignored_start = ignored_settings(args.profile.family, args.given, env0, args=args)
+    args.env0 = env0
     if not args.template:
         args.template = os.path.join(args.model, "chat_template.jinja")
     args.think = bool(args.think)
@@ -3844,7 +4871,6 @@ def parse_args(argv=None):
                 sys.exit(f"--lsa: no such file {spec}")
             if not from_env and not lsa_map.is_safetensors(spec):
                 sys.exit(f"--lsa: {spec} is not a safetensors file")
-            print("[server] LSA: --lsa is for the 27B only; Flash-Next has its own sparse indexer (ignored)", flush=True)
             os.environ["QE_LSA"] = os.path.abspath(spec)
         elif from_env and not lsa_map.is_pt(spec):
             pass  # $QE_LSA=<path> as before: the engine checks it (a bad map: `LSA off: map ...`, full attention)
@@ -3900,10 +4926,41 @@ def start_log(args):
 
 
 def main():
+    # DSV4 (DeepSeek-V4.1-Flash from a GGUF split set, e.g. Maya-S): its own server module (one sequence, DeepSeek
+    # prompt format); the 27B / Flash-Next path below is unchanged
+    # [shared-srv] since 2026-11-18 DSV4 runs in this server (model profile "dsv4", server/dsv4_engine.py);
+    # QE_DSV4_LEGACY=1 = the off-switch: the old module as before
+    if "--model" in sys.argv[1:-1] and env_str("QE_DSV4_LEGACY", "0") not in ("", "0"):
+        md = sys.argv[sys.argv.index("--model") + 1]
+        try:   # (the DSV4 modules are not in the public export: without them this path is skipped)
+            import dsv4_gguf
+        except ImportError:
+            dsv4_gguf = None
+        if dsv4_gguf is not None and dsv4_gguf.is_dsv4_dir(md):
+            import dsv4_app
+            return dsv4_app.main(sys.argv[1:], version_info)   # (version + build for qetop's header: [dsv4-qetop])
     args = parse_args()
     start_log(args)
     print("QEngine %s (build %s)" % version_info(args.engine_lib or env_str("QE_LIB")), flush=True)
-    if not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
+    if not env_str("FLASH_PAR_FALLBACK"):  # (the pp restart: the first start logged them)
+        for line in args.ignored_start:
+            print(line, flush=True)
+    if args.profile.is_glm:  # GLM (round 18 fix of the master merge): only the assets step it had on its branch; the
+        import assets          # 27B checkpoint-format check refused GLM's sharded checkpoint, DFlash2 / LSA are 27B-only
+        assets.ensure(args.model)
+    elif getattr(args.profile, "is_dsv4", False):  # DSV4: GGUF weights, no assets
+        pass
+    elif args.profile.is_gptoss:  # [srv-gptoss] gpt-oss: its own MXFP4 checkpoint (the engine checks it), no assets
+        # [gptoss-rel1] features the gpt-oss engine does not offer in the server (1.5): said at the start, never a stop
+        if env_str("GPTOSS_DFLASH"):  # (blocker 18) the server never drafts with it: loading it would only cost pool rows
+            print(f"[server] gpt-oss: GPTOSS_DFLASH={env_str('GPTOSS_DFLASH')} ignored: the server does not use the DFlash "
+                  "drafter yet (engine tool only); lookup drafts stay on", flush=True)
+            os.environ.pop("GPTOSS_DFLASH", None)
+        if getattr(args, "disk_cache", ""):
+            print(f"[server] gpt-oss: --disk-cache {args.disk_cache} ignored: the gpt-oss engine keeps its prompt cache in "
+                  "VRAM and host RAM only (lost at a restart)", flush=True)
+            args.disk_cache = ""
+    elif not args.profile.is_flash:  # 27B: tuned MTP head + draft vocabulary from the latest release if missing
         import assets
         why = assets.check_27b_format(args.model)
         if why:
@@ -3916,8 +4973,6 @@ def main():
             path = lsa_map.resolve("auto", args.model)
             if path:
                 set_env("QE_LSA", path)  # (a fetch thread may still run: ENV_LOCK, review FX11-L1)
-    elif getattr(args, "lsa", None) == "auto":
-        print("[server] LSA: --lsa is for the 27B only; Flash-Next has its own sparse indexer (ignored)", flush=True)
     try:  # kill -USR1 <pid>: Python stacks of every thread (the native ones: gdb -p <pid>)
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     except Exception:
@@ -3926,7 +4981,7 @@ def main():
         gen = Generator(args)
     except EngineRefused as ex:  # (exit 3 = a refused start, as the engine's own load-time stops; review Flash-Next M7)
         print(f"qengine: {ex}", file=sys.stderr, flush=True)
-        os._exit(3)
+        hard_exit(3)
     class Server(uvicorn.Server):  # SIGTERM / SIGINT: end the requests first, then uvicorn's wait for the streams
         def handle_exit(self, sig, frame):
             if not gen.stopping:
@@ -3941,7 +4996,7 @@ def main():
         signal.signal(sig, lambda *a: None)
     Server(uvicorn.Config(build_app(gen, args), host=args.host, port=args.port, log_level="warning")).run()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda n, f: os._exit(128 + n))
+        signal.signal(sig, lambda n, f: hard_exit(128 + n))
     gen.metrics.save()
     # uvicorn returns after SIGTERM / SIGINT: save the live conversations before exiting
     if args.disk_cache:
@@ -3960,7 +5015,7 @@ def main():
     # end here, as the re-raised signal did before: no interpreter / CUDA teardown while engine threads still run
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(0)
+    hard_exit(0)
 
 
 if __name__ == "__main__":

@@ -167,12 +167,17 @@ class PpEngine {
         int next = -1, draft = -1;
         double t_submit = 0, t_done = 0;
         std::atomic<bool> done{false}, cancel{false};
+        long long g0 = 0;                  // [srv-disconnect] queue index of its first micro-batch (srv_submit)
+        std::atomic<long long> cut_g{-1};  // [srv-disconnect] srv_cancel: micro-batches from this queue index on are skipped
         std::atomic<bool> nf{false};   // the prompt's last row had non-finite values (Worker::nf_check on the last stage)
     };
     // queue the job's micro-batches (in submission order after the jobs already queued); the job object must live until done
     void srv_submit(SrvJob* j);
     // wait until job j is done or ms passed (true: done)
     bool srv_wait(SrvJob* j, double ms);
+    // [srv-disconnect] cancel job j consistently: the micro-batches stage 0 has taken run through every stage, the rest are
+    // skipped by every stage; returns the row the slot's state ends at once j is done (rows [i0, row) computed)
+    int srv_cancel(SrvJob* j);
     int srv_inflight() const;  // micro-batches queued and not finished on the last stage
     // micro-batch rows for a job: the planner's (pp_microbatch) capped by the batch buffers of every stage at the job's
     // context end, and by the receive buffers on peer-to-peer boundaries

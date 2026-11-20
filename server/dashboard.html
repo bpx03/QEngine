@@ -251,8 +251,9 @@ function render(s) {
   $("k-tps").textContent = fmt(r.tok_s_10);
   $("k-tps1").textContent = fmt(r.tok_s_1);
   const jobs = s.jobs, act = jobs.filter(j => j.state !== "queued"), q = jobs.filter(j => j.state === "queued");
+  const livePre = act.filter(j => j.state === "prefill").reduce((a, j) => a + (j.prefill_tps || 0), 0);  // (as qetop: summed)
   const lastPre = act.find(j => j.prefill_tps) || s.recent.find(j => j.prefill_tps);
-  $("k-pre").textContent = lastPre ? fmt(lastPre.prefill_tps) : "–";
+  $("k-pre").textContent = livePre ? fmt(livePre) : lastPre ? fmt(lastPre.prefill_tps) : "–";
   $("k-act").textContent = act.length; $("k-q").textContent = q.length;
   $("k-tpstep").textContent = fmt(r.tokens_per_step, 2);
   $("k-step").textContent = fmt(r.step_ms, 1);

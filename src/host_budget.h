@@ -117,11 +117,11 @@ inline Out plan(const In& in) {
     Out o;
     const double total = eff_total(in), avail = eff_avail(in);
     o.reserve = in.reserve >= 0 ? in.reserve : default_reserve(total);
-    o.room = total - o.reserve - in.base - in.fixed;
     // what the host has free now, kept above the runtime guard's margin (host_mem.h: the archive's own guard)
     // (MemAvailable already lacks what the process holds: the server base and the engine's buffers are not taken again)
     double mnow = in.margin_now >= 0 ? in.margin_now : std::max(8 * GB, 0.05 * in.total);
     if (in.cg_limit > 0) mnow = std::min(mnow, std::max(8 * GB, 0.05 * total));
+    o.room = total - o.reserve - in.base - in.fixed;
     o.room_now = avail - mnow;
     // the machine's size decides; what is free right now only warns (review M1: a process alive at boot must not fix the
     // budgets low until a restart, the runtime guard holds the archive back while memory is short)
@@ -221,7 +221,10 @@ inline Out plan(const In& in) {
         o.ngram_cache = floor01(std::min(12 * GB, std::max(0.0, left) / 2));
         left -= o.ngram_cache;
     }
-    left = std::max(0.0, left);
+    // the archive and the prefixes (filled while serving) keep the runtime margin free as well (issue #25: a 128 GB host
+    // planned to the reserve alone reached ~110 GB RSS with the pinned n-gram table, the archive and the prefixes, and
+    // swapped; all ranks stalled 51.6 s in a launch)
+    left = std::max(0.0, left - mnow);
     // 3. archive + pinned prefixes
     const bool au = in.arch_user >= 0, pu = in.pref_user >= 0;
     double a = au ? in.arch_user : in.arch_def, p = pu ? in.pref_user : in.pref_def;

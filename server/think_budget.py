@@ -96,17 +96,22 @@ class EffortRules:
     variable is not passed, a value of `levels` as is, an `alias` to its level, anything else `fallback`. The
     comparison is exact (no lower-casing), as in the templates. `client`: effort names of other APIs that the server
     rewrites before rendering (Anthropic / vLLM `max`, `minimal`), so the template and the budget see the level the
-    client meant instead of the template's fallback."""
+    client meant instead of the template's fallback. `other`: the level the server sends instead of any other string
+    (for a template that renders every value literally, e.g. gpt-oss's "Reasoning: <effort>")."""
 
-    def __init__(self, name, levels, unset, fallback, alias=None, client=None):
+    def __init__(self, name, levels, unset, fallback, alias=None, client=None, other=None):
         self.name, self.levels, self.unset, self.fallback = name, tuple(levels), unset, fallback
-        self.alias, self.client = dict(alias or {}), dict(client or {})
+        self.alias, self.client, self.other = dict(alias or {}), dict(client or {}), other
 
     def client_effort(self, kw):
         """Rewrites kw["reasoning_effort"] by the client aliases (before the prompt is rendered)."""
         e = kw.get("reasoning_effort")
+        if self.other is not None and isinstance(e, str):   # (review rel1 L16: "High" is high, not medium)
+            e = kw["reasoning_effort"] = e.strip().lower()
         if isinstance(e, str) and e in self.client:
             kw["reasoning_effort"] = self.client[e]
+        elif self.other is not None and e is not None and e not in self.levels:
+            kw["reasoning_effort"] = self.other
         return kw
 
     def level(self, effort):
@@ -120,7 +125,8 @@ class EffortRules:
 
     def describe(self):
         al = "".join(f", {k} = {v}" for k, v in {**self.client, **self.alias}.items())
-        return f"{self.name}: {' / '.join(self.levels)}{al}, unset = {self.unset}, others = {self.fallback or 'as sent'}"
+        oth = self.other or self.fallback or "as sent"
+        return f"{self.name}: {' / '.join(self.levels)}{al}, unset = {self.unset}, others = {oth}"
 
 
 # qwen38_syssafe.jinja (the server default for Qwen3.8-27B and -Flash-Next; the models' own chat_template.jinja is
@@ -130,6 +136,11 @@ QWEN_RULES = EffortRules("qwen3.8", ("low", "medium", "xhigh"), "xhigh", "medium
                          {"max": "xhigh", "minimal": "low"})
 # GLM-5.3-Flash chat_template.jinja: `reasoning_effort in ['low', 'high'] else 'max'` ("Reasoning Effort: Max")
 GLM_RULES = EffortRules("glm-5.3", ("low", "high", "max"), "max", "max", client={"minimal": "low"})
+# [gptoss-rel1-effort] gpt-oss chat_template.jinja: "Reasoning: " + reasoning_effort (unset = medium), every value written
+# literally; the server maps the other APIs' names (max / xhigh -> high, minimal / none -> low) and any other string to
+# medium before rendering, so the prompt only ever carries the three levels the model was trained on
+HARMONY_RULES = EffortRules("harmony (gpt-oss)", ("low", "medium", "high"), "medium", None,
+                            client={"max": "high", "xhigh": "high", "minimal": "low", "none": "low"}, other="medium")
 # a template whose rendering fits neither: the effort as sent; a request with no effort uses the xhigh entry (the
 # Qwen3.8 default), so a map with an xhigh entry still bounds clients that send none
 RAW_RULES = EffortRules("not recognised (efforts as sent)", EFFORT_NAMES, "xhigh", None)
@@ -158,9 +169,11 @@ def probe_rules(render, log=None):
 
 
 def _fit(out):
-    for rules in (QWEN_RULES, GLM_RULES):
+    for rules in (QWEN_RULES, GLM_RULES, HARMONY_RULES):
         seen, ok = {}, True
         for e, text in out.items():
+            if rules is HARMONY_RULES and e is not None and e not in rules.levels:
+                continue  # (the template writes these literally; the server rewrites them before rendering)
             lv = rules.level(e)
             if seen.setdefault(lv, text) != text:
                 ok = False
@@ -306,7 +319,9 @@ def request_budget(body, kw, default=0, rules=None):
 class ThinkIds:
     """Token ids of the delimiters and the pre-tokenized forced closes (built once per server)."""
 
-    def __init__(self, tok):
+    def __init__(self, tok, after="\n\n"):
+        """after: what the forced close writes after </think> (the template's rendered form of a reasoning turn, so the
+        next turn reuses the reply: Qwen "</think>\n\n"; DSV4 renders "</think>" + content, after "" [dsv4-rel8-think])"""
         self.start = tok.token_to_id(THINK_START)
         self.end = tok.token_to_id(THINK_END)
         self.tok, self.spaces = tok, {}
@@ -314,12 +329,13 @@ class ThinkIds:
         body = env_str("QE_THINK_WRAP", WRAP).strip()
         enc = lambda s: tok.encode(s, add_special_tokens=False).ids  # noqa: E731
         # keyed by the newlines put before the wrap-up: none after a paragraph break, one after a newline, else two
-        self.wrap = {p: enc(p + body + "\n" + THINK_END + "\n\n") for p in ("", "\n", "\n\n")}
-        self.bare = {p: enc(p + THINK_END + "\n\n") for p in ("", "\n", "\n\n")}
+        self.wrap = {p: enc(p + body + "\n" + THINK_END + after) for p in ("", "\n", "\n\n")}
+        self.bare = {p: enc(p + THINK_END + after) for p in ("", "\n", "\n\n")}
+        k = 2 if after else 1  # the delimiter's place from the end
         self.wrap_max = max(len(v) for v in self.wrap.values())
         for d in (self.wrap, self.bare):
             for p, ids in d.items():  # the close must be the delimiter token itself, exactly once at the end
-                if not self.ok or ids.count(self.end) != 1 or len(ids) < 2 or ids[-2] != self.end:
+                if not self.ok or ids.count(self.end) != 1 or len(ids) < k or ids[-k] != self.end:
                     self.ok = False
 
     def is_space(self, t):
@@ -350,6 +366,10 @@ class ThinkControl:
         self.src = src or ("request" if budget is not None else "none")  # where the budget came from (budget_source)
         self.open = ti.open_at_end(job.ids, job.gen.im_start)
         self.fresh = True       # no answer text yet: as app.Parser, only here a real <think> opens a block
+        # [srv-gptoss-think] a format whose reasoning is not one tag pair (harmony: the analysis channel) tracks it itself
+        self.hs = ti.tracker(job.ids) if hasattr(ti, "tracker") else None
+        if self.hs is not None:
+            self.open = self.hs.open
         self.n = 0              # thinking tokens so far (the forced wrap-up included)
         self.forced = None      # why the thinking was closed by the server: "budget" / "max_tokens"
         self.fz, self.fi = None, 0  # forced tokens in flight, how many emitted
@@ -365,6 +385,10 @@ class ThinkControl:
 
     def track(self, toks):
         """Thinking state over the reply's emitted tokens (in order)."""
+        if self.hs is not None:
+            self.n += self.hs.feed(toks)
+            self.open, self.fresh = self.hs.open, self.hs.fresh
+            return
         for t in toks:
             if self.open:
                 if t == self.ti.end:
@@ -399,7 +423,10 @@ class ThinkControl:
                 self.fz = None
                 if getattr(j, "grammar", None) is not None:
                     # a tool_choice constraint (server/tool_choice.py) under the close: it stays, and its masks /
-                    # drafts for the next step are the ones Job.feed planned just before this call
+                    # drafts for the next step are the ones Job.feed planned just before this call; DSV4: its
+                    # constrained DSpark passes again (the close's constrain() dropped the check; optgram review L5)
+                    if j.lp is None and hasattr(e, "set_check"):
+                        e.set_check(j.slot, j.grammar.legal_prefix)
                     return
                 if j.lp is None:
                     e.constrain(j.slot, False)
@@ -512,7 +539,10 @@ def empty_reply(job, tail_tokens=8):
     if call in text:
         return None
     tc = job.tc
-    if end_tag in text:
+    hs = getattr(tc, "hs", None)
+    if hs is not None:  # [srv-gptoss-think] harmony: an answer = any body token outside the analysis channel
+        answer = "x" if hs.answer_toks else ""
+    elif end_tag in text:
         answer = text.rsplit(end_tag, 1)[1]
     else:
         answer = "" if tc is not None else text  # the reply opened inside <think> and never closed it

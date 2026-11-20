@@ -688,6 +688,7 @@ void PpEngine::srv_submit(SrvJob* j) {
         for (int s = 0; s < N; s++) if (W_[s]->layer_here(PLE_LAYER)) sple_ = s;
     }
     j->t_submit = pp_now_ms();
+    j->g0 = fq0_ + (long long)fq_.size();  // [srv-disconnect] its micro-batches are [g0, g0 + cuts.size())
     int i = j->i0;
     for (size_t c = 0; c < j->cuts.size(); c++) {
         const int e = j->cuts[c];
@@ -719,7 +720,14 @@ void PpEngine::srv_run(int s, long long g) {
     SrvJob& jb = *e.job;
     const bool last = s == N - 1;
     const double tw0 = pp_now_ms();
-    if (!jb.cancel.load()) {
+    bool cn;
+    long long cg;
+    {  // [srv-disconnect] both under the lock srv_cancel sets them under (review2 M1: a cut seen half by one stage)
+        std::lock_guard<std::mutex> lk(fmu_);
+        cn = jb.cancel.load();
+        cg = jb.cut_g.load();
+    }
+    if (!cn || (cg >= 0 && g < cg)) {  // [srv-disconnect] (a cut cancel: the taken micro-batches complete)
         std::vector<bf16> rows;
         if (s == sple_) {
             rows.resize((size_t)e.m * H);
@@ -785,6 +793,15 @@ void PpEngine::srv_run(int s, long long g) {
 void PpEngine::srv_kick() {
     std::lock_guard<std::mutex> lk(fmu_);
     for (int s = 0; s < nstage(); s++) srv_try_post(s);
+}
+int PpEngine::srv_cancel(SrvJob* j) {
+    std::lock_guard<std::mutex> lk(fmu_);
+    const long long cg = fposted_.empty() ? fq0_ : fposted_[0];  // stage 0 has taken every micro-batch below it
+    const long long k = std::max(0LL, std::min(cg, j->g0 + (long long)j->cuts.size()) - j->g0);  // this job's taken ones
+    const int row = k > 0 ? j->cuts[(size_t)k - 1] : j->i0;
+    j->cut_g.store(cg, std::memory_order_release);
+    j->cancel.store(true, std::memory_order_release);
+    return row;
 }
 bool PpEngine::srv_wait(SrvJob* j, double ms) {
     const double t_end = pp_now_ms() + std::max(0.0, ms);

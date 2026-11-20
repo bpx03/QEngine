@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
-# QEngine: Qwen3.8-27B INT4 inference server for 3x RTX 3090 (sm_86, tensor parallel 3).
-# GPU code (SASS) for sm_86 (RTX 3000 series, tuned on the 3090), sm_89 (RTX 4000) and sm_120 (RTX 5000): see CUDA_ARCHS below.
-# The model is NOT baked in: mount it at /app/models/Qwen3.8-27B-INT4 (see docker-compose.yml).
-# Qwen3.8-Flash-Next: mount it too and set QE_MODEL=/app/models/Qwen3.8-Flash-Next-QE-INT4.
+# QEngine: one inference server image for Qwen3.8-27B, Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash and
+# gpt-oss-120B (tuned on 3x RTX 3090). The 27B, Flash-Next and GLM engines carry GPU code (SASS) for sm_86 (RTX 3000
+# series, tuned on the 3090), sm_89 (RTX 4000) and sm_120 (RTX 5000): see CUDA_ARCHS below; the DSV4 and gpt-oss engines sm_86.
+# The model is NOT baked in: mount it and point QE_MODEL at it (default /app/models/Qwen3.8-27B-INT4; see
+# docker-compose.yml and the README); the engine is picked from the model's config.json (DSV4: from the GGUF files).
 #
 #   docker build -t qengine .                       # with vision (torch, ~+4 GB)
 #   docker build -t qengine --build-arg VISION=0 .  # text only, no torch
@@ -28,6 +29,34 @@ COPY src ./src
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
       "-DQE_GIT_HASH=${REVISION}" \
     && cmake --build build
+# DeepSeek-V4.1-Flash engine (libqdsv4.so; src/dsv4/build.sh, distro GCC 13, sm_86 code): built when the source tree
+# has it; the library lands in /src/dsv4out (empty otherwise) so the runtime stage can copy the directory either way
+RUN mkdir -p /src/dsv4out \
+    && if [ -f src/dsv4/build.sh ]; then \
+         CXX=g++ OUT=/src/build_dsv4 bash src/dsv4/build.sh \
+         && cp /src/build_dsv4/libqdsv4.so /src/dsv4out/; \
+       fi
+# gpt-oss-120B engine (libqgptoss.so; src/gptoss/build.sh with the distro GCC 13, sm_86 code only): built when the
+# source tree has it; the library lands in /src/gptossout (empty otherwise)
+RUN mkdir -p /src/gptossout \
+    && if [ -f src/gptoss/build.sh ]; then \
+         CXX=g++ OUT=/src/build_gptoss bash src/gptoss/build.sh \
+         && cp /src/build_gptoss/libqgptoss.so /src/gptossout/; \
+       fi
+# GLM-5.3-Flash engine (libqglm.so): the CMake build above makes it when the source tree has src/glm (portable CPU
+# lane, no -march: AVX-512 and AVX2 kernels picked at start); the library lands in /src/glmout (empty otherwise), with
+# the two data files it reads from <lib root>/tools/glm (/app/build/libqglm.so -> /app/tools/glm) next to it
+RUN --mount=type=bind,source=.,target=/ctx mkdir -p /src/glmout/build /src/glmout/tools/glm \
+    && if [ -f /src/build/libqglm.so ]; then \
+         cp /src/build/libqglm.so /src/glmout/build/ \
+         && for f in draft_vocab_49k.i32 expert_prior_gen.f32; do \
+              if [ -f /ctx/tools/glm/$f ]; then cp /ctx/tools/glm/$f /src/glmout/tools/glm/; \
+              else echo "warning: tools/glm/$f missing (the GLM engine runs without it)" >&2; fi; \
+            done; \
+       fi
+# its fixed expert ranking (data/dsv4/expert_profile_maya_s.txt, read by server/dsv4_engine.py) when the tree has it
+RUN --mount=type=bind,source=.,target=/ctx mkdir -p /src/dsv4data \
+    && if [ -d /ctx/data/dsv4 ]; then cp -r /ctx/data/dsv4 /src/dsv4data/; fi
 
 # ---------------------------------------------------------------- runtime
 # base = CUDA runtime (libcudart) only; libcuda comes from the host driver (nvidia-container-toolkit)
@@ -59,6 +88,19 @@ COPY LICENSE ./
 # the release version and the engine's build hash, shown in /api/stats (qetop, web dashboard) and the start-up log
 COPY VERSION ./
 COPY --from=build /src/build/qe_build.txt ./build/qe_build.txt
+# DeepSeek-V4.1-Flash engine (server default path build_dsv4/libqdsv4.so); it links cuBLAS / cuBLASLt, which the
+# base image lacks: the matching libcublas package is installed only when one of the libraries below was built
+COPY --from=build /src/dsv4out/ ./build_dsv4/
+COPY --from=build /src/dsv4data/ ./data/
+# gpt-oss-120B engine (server default path build_gptoss/libqgptoss.so); it links cuBLAS too
+COPY --from=build /src/gptossout/ ./build_gptoss/
+# GLM-5.3-Flash engine (server default path build/libqglm.so) and its data files (tools/glm/); it links cuBLAS too
+COPY --from=build /src/glmout/ ./
+RUN if [ -f build_dsv4/libqdsv4.so ] || [ -f build_gptoss/libqgptoss.so ] || [ -f build/libqglm.so ]; then \
+      apt-get update && apt-get install -y --no-install-recommends \
+        "libcublas-$(echo "$CUDA_VERSION" | cut -d. -f1-2 | tr . -)" \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 # included activation-steering vectors (refusal_projection, Flash-Next only); loaded only with QE_STEERING != 0 (vectors/README.md)
 COPY vectors ./vectors
 
@@ -71,7 +113,17 @@ set -euo pipefail
 cd /app
 export QE_DEVICES="${QE_DEVICES:-${QE_GPUS:-0,1,2}}"  # a user-set QE_DEVICES wins (it was overwritten before)
 MODEL="${QE_MODEL:-/app/models/Qwen3.8-27B-INT4}"
-if [ ! -f "$MODEL/config.json" ]; then
+# a model directory has a config.json, or is a DeepSeek-V4.1-Flash GGUF split set (Maya-S: no config.json), detected
+# as server/model_profile.py does it (server/dsv4_gguf.py: the first GGUF file's architecture is deepseek41)
+is_dsv4() {
+  python3 -c 'import sys; sys.path.insert(0, "server")
+try:
+    import dsv4_gguf
+except ImportError:
+    sys.exit(1)
+sys.exit(0 if dsv4_gguf.is_dsv4_dir(sys.argv[1]) else 1)' "$1" 2>/dev/null
+}
+if [ ! -f "$MODEL/config.json" ] && ! is_dsv4 "$MODEL"; then
   echo "model not found at $MODEL: mount it (-v /path/to/models:/app/models:ro)" >&2
   exit 1
 fi
@@ -95,7 +147,7 @@ if [ -n "${QE_STEERING:-}" ] && [ "${QE_STEERING}" != 0 ]; then
 import json, os, sys
 model, want = sys.argv[1], sys.argv[2]
 def log(m): print("QE_STEERING=%s: %s" % (want, m), file=sys.stderr)
-cfg = json.load(open(os.path.join(model, "config.json")))
+cfg = json.load(open(os.path.join(model, "config.json"))) if os.path.isfile(os.path.join(model, "config.json")) else {}  # (DSV4 GGUF dir: none)
 t = cfg.get("text_config") or cfg
 flash = (cfg.get("model_type") or t.get("model_type") or "").startswith("qwen4_exp")
 def scan(d):  # name -> (gguf, sidecar); the name as the engine reads it: sidecar "name", else the file stem
@@ -168,7 +220,7 @@ ENTRYPOINT ["/usr/local/bin/qengine-entrypoint"]
 ARG REVISION=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
-      org.opencontainers.image.description="QEngine: Qwen3.8-27B and Qwen3.8-Flash-Next inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in, not tuned), OpenAI/Anthropic-compatible API; model not included" \
+      org.opencontainers.image.description="QEngine: Qwen3.8-27B, Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash and gpt-oss-120B inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in for the Qwen and GLM engines, not tuned), OpenAI/Anthropic-compatible API; models not included" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"

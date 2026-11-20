@@ -409,7 +409,7 @@ def fallback(so):
         assert "tool_calls" not in ch["message"] and "<function=Bash>" in (ch["message"].get("reasoning_content") or ""), r
     log_out = out.getvalue()
     assert log_out.count("tool_choice none: the reply ends at the tool call") == 2, log_out
-    assert log_out.count("tool_choice required: not enforced") == 1, log_out
+    assert log_out.count("request parameter 'tool_choice' is not supported") == 1, log_out  # [feature-matrix] ParamNotes
     r = c.post("/v1/chat/completions", json={"model": name, "messages": MSGS, "tools": [BASH],
                                              "tool_choice": {"type": "function", "function": {"name": "Nope"}}})
     assert r.status_code == 400 and r.json()["error"]["param"] == "tool_choice", r.text
