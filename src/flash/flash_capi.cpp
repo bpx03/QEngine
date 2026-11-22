@@ -1788,6 +1788,8 @@ struct FE {
                 cost = pb - pin_used;
                 return true;
             });
+            // (#40) blobs of a dropped pin that a restored conversation shares now count in aused(): back under the budget
+            if (pins.size() != n0) make_room(0, nullptr);
             if (!got) return shrank("the archive's guard") ? PR::GAVE : droppable_pins() ? PR::WAIT : PR::EMPTY;
             snprintf(b, sizeof b, "%zu pinned prefixes dropped (%.2f -> %.2f GB), %.1f GB returned to the host", n0 - pins.size(), p0 / 1e9,
                      pin_used / 1e9, got / 1e9);
@@ -1994,8 +1996,11 @@ struct FE {
                     need / 1e9, pin_budget / 1e9);
             return;
         }
-        while (pin_used + need > pin_budget)
-            if (!drop_pin("pin budget")) return;
+        const long long nd = n_pin_drop;
+        while (pin_used + need > pin_budget && drop_pin("pin budget")) {}
+        // (#40) a dropped pin's blobs that a conversation restored from it still holds now count in aused(): back under the budget
+        if (n_pin_drop != nd) make_room(0, c);
+        if (pin_used + need > pin_budget) return;
         mem_guard();
         if (qe_hostmem::headroom() < need) return;  // the host is short of memory
         auto kv = std::make_shared<Seg>();
@@ -2997,7 +3002,7 @@ static void ppb_finish(FE* e, FE::Pf& pf) {
         st->pos = pos;
         st->pend = false;
         st->prev_m = 0;
-        st->kind = pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : pos % e->ckpt_every ? 5 : 3;
+        st->kind = pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : e->ckpt_every > 0 && pos % e->ckpt_every == 0 ? 3 : 5;  // (#41: FLASH_CKPT=0)
         e->add_ck(e->sl[pf.slot].conv, st);
         if (st->kind == 1) e->pin_prefix(pf.slot, pos, st);
     }
@@ -3980,7 +3985,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
         }
         const double gb = e->arch_gb();  // (host-RAM plan; default 48, FLASH_KV_ARCHIVE_GB wins)
         e->budget = gb > 0 ? (size_t)(gb * 1e9) : 0;
-        e->ckpt_every = env_int("FLASH_CKPT", e->ckpt_every);
+        e->ckpt_every = std::max(0, env_int("FLASH_CKPT", e->ckpt_every));  // 0 (or below): no periodic checkpoints
         e->ckpt_min = env_int("FLASH_CKPT_MIN", e->ckpt_min);
         e->end_cut = env_int("FLASH_END_CUT", e->end_cut);
         e->reserve = env_int("FLASH_SLOT_RESERVE", e->reserve);
@@ -4559,7 +4564,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
 
 static void take_ck(FE* e, const FE::Pf& pf, int pos) {
     // 7: the prompt end ([qfn-ttft-pe]), 1: system end, 2: prompt end - 1, 5: divergence point, 3: periodic
-    const int kind = pos == pf.n ? 7 : pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : pos % e->ckpt_every ? 5 : 3;
+    const int kind = pos == pf.n ? 7 : pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : e->ckpt_every > 0 && pos % e->ckpt_every == 0 ? 3 : 5;
     // a conversation keeps one prompt-end state, its latest: the older one goes before the new one is written (with a
     // full archive the write would otherwise evict another conversation for a state that is dropped right after)
     if (kind == 7 && e->sl[pf.slot].conv) kve::drop_kind(*e->sl[pf.slot].conv, 7);
