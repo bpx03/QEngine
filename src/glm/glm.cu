@@ -2472,19 +2472,22 @@ void Engine::load(const std::string& d, int ctx_tokens) {
     const char* cvd = getenv("GLM_NGPU");
     int nd = 0;
     CUDA_CHECK(cudaGetDeviceCount(&nd));
-    if (!cvd && !want_devs.empty()) {  // [glm-rel-host] the server's --devices (the first 3 of more)
+    // [glm-ngpu4] up to kGlmMaxCards ranks: the per-rank structures (P2pAr, HxLayout, GAg, owner arrays, GCeCmd's
+    // 3 peers, Comm) hold 4; 5+ would need them widened
+    constexpr int kGlmMaxCards = 4;
+    if (!cvd && !want_devs.empty()) {  // [glm-rel-host] the server's --devices (the first 4 of more)
         devs = want_devs;
-        if (devs.size() > 3) {
-            fprintf(stderr, "[glm] %zu cards given: GLM uses the first 3\n", devs.size());
-            devs.resize(3);
+        if ((int)devs.size() > kGlmMaxCards) {
+            fprintf(stderr, "[glm] %zu cards given: GLM uses the first %d\n", devs.size(), kGlmMaxCards);
+            devs.resize(kGlmMaxCards);
         }
         ngpu = (int)devs.size();
     } else {
-        ngpu = cvd ? atoi(cvd) : std::min(nd, 3);
+        ngpu = cvd ? atoi(cvd) : std::min(nd, kGlmMaxCards);
         for (int i = 0; i < ngpu; i++) devs.push_back(i);
     }
     if (cvd && !want_devs.empty()) fprintf(stderr, "[glm] GLM_NGPU=%s: the server's --devices are not used\n", cvd);
-    CHECK(ngpu >= 1 && ngpu <= 3, "GLM runs on 1-3 cards, %d asked (--devices / GLM_NGPU)", ngpu);
+    CHECK(ngpu >= 1 && ngpu <= kGlmMaxCards, "GLM runs on 1-%d cards, %d asked (--devices / GLM_NGPU)", kGlmMaxCards, ngpu);
     for (int i = 0; i < ngpu; i++)  // review rel L16
         for (int j = 0; j < i; j++) CHECK(devs[i] != devs[j], "card %d listed twice (--devices)", devs[i]);
     for (int d : devs) CHECK(d >= 0 && d < nd, "card %d asked, %d visible", d, nd);
