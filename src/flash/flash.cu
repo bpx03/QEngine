@@ -4643,7 +4643,11 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     if (qnan) {
                         if (!qnan_rec_) { CUDA_CHECK(cudaHostAlloc((void**)&qnan_rec_, 4096 * 16, cudaHostAllocMapped)); memset(qnan_rec_, 0, 4096 * 16); }
                         if (qnan_n_ < 4096) {
-                            qnan_meta_.push_back({li, cposh_[2 * (int)(posd_ - cposd_) / 2]});
+                            // posd_ points into cposd_ only during chunked prefill; elsewhere (MTP prefill, decode)
+                        // there is no staged position for it, so record -1 instead of reading past cposh_
+                        const int mch = pfbn_ / PFM + PFSEG_MAX;
+                        const bool chunked = posd_ >= cposd_ && posd_ < cposd_ + 2 * mch;
+                        qnan_meta_.push_back({li, chunked ? cposh_[posd_ - cposd_] : -1});
                             k_qnan<<<64, 256, 0, st_>>>(qb, xqpr_[p_.rank], xqseq_, p_.ngpu, p_.rank, mr, qper(p_), q16, attn_x_, qnan_rec_ + 4 * qnan_n_);
                             qnan_n_++;
                         }
