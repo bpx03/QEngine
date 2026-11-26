@@ -365,7 +365,7 @@ FLAGS = {
     "mtp_file": Knob({Q27}, note="the engine loads its own MTP head (Flash-Next: mtp*.safetensors in the model directory)"),
     "split": Knob(QWEN | {GLM}, note="the engine places its weights itself"),  # (GLM: routed expert columns per card)
     # (server/run.sh always passes --devices 0..n-1 of the visible cards: only another order or subset counts; GLM takes
-    # the first 3 of more, unless GLM_NGPU is set)
+    # the first 4 of more, unless GLM_NGPU is set)
     # (feature_matrix_review L2: DSV4, the only engine without the flag, always runs on the first 3 visible cards, so a
     # leading subset or a longer list is ignored too)
     "devices": Knob(ALL - {DSV4}, note="the engine uses the first 3 visible cards; choose them with CUDA_VISIBLE_DEVICES",

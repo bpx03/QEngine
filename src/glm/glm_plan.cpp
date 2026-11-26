@@ -14,25 +14,40 @@
 namespace glm {
 
 std::vector<Plan> make_plan(int ngpu, const int* ecols) {
-    CHECK(ngpu == 3 || ngpu == 2 || ngpu == 1, "ngpu %d", ngpu);
+    CHECK(ngpu >= 1 && ngpu <= 4, "ngpu %d", ngpu);
     std::vector<Plan> v(ngpu);
-    // heads: 22/21/21 ; expert columns in 128-groups: 6/5/5 ; dense 32 groups each ; vocab ~equal
-    const int hs[3][3] = {{64, 0, 0}, {32, 32, 0}, {22, 21, 21}};
+    // heads: 22/21/21 (TP4: 16 each) ; expert columns in 128-groups: 6/5/5 ; dense 32 groups each ; vocab ~equal
+    // [glm-ngpu4] rows 0-2 are the 1-3 card plans unchanged; row 3 is the balanced TP4 plan
+    const int hs[4][4] = {{64, 0, 0, 0}, {32, 32, 0, 0}, {22, 21, 21, 0}, {16, 16, 16, 16}};
     // shared expert column groups per card (the 6th on the card with the fewest routed columns)
-    int es[3][3] = {{16, 0, 0}, {8, 8, 0}, {5, 6, 5}};
-    if (const char* s = getenv("GLM_EGROUPS")) {  // e.g. "6,5,5"
-        int a = 0, b = 0, c = 0;
-        if (sscanf(s, "%d,%d,%d", &a, &b, &c) == 3 && a + b + c == 16) { es[2][0] = a; es[2][1] = b; es[2][2] = c; }
+    int es[4][4] = {{16, 0, 0, 0}, {8, 8, 0, 0}, {5, 6, 5, 0}, {4, 4, 4, 4}};
+    // "a,b[,c[,d]]" with exactly ngpu values (the override applies to this card count's row only)
+    auto parse_n = [ngpu](const char* s, int* out) {
+        int x[5] = {};
+        const int n = sscanf(s, "%d,%d,%d,%d,%d", &x[0], &x[1], &x[2], &x[3], &x[4]);
+        if (n != ngpu) return false;
+        for (int r = 0; r < ngpu; r++) out[r] = x[r];
+        return true;
+    };
+    if (const char* s = getenv("GLM_EGROUPS")) {  // e.g. "6,5,5" (3 cards) or "4,4,4,4" (4 cards)
+        int g[4] = {};
+        int sum = 0;
+        bool ok = ngpu > 1 && parse_n(s, g);
+        for (int r = 0; ok && r < ngpu; r++) { ok &= g[r] > 0; sum += g[r]; }
+        if (ok && sum == 16) for (int r = 0; r < ngpu; r++) es[ngpu - 1][r] = g[r];
+        else fprintf(stderr, "[glm] GLM_EGROUPS=%s ignored: %d positive values summing to 16 expected\n", s, ngpu);
     }
     // routed expert columns per card in 64-steps (default: by the free VRAM of this box: card 1 drives the desktop)
-    int ec[3][3] = {{2048, 0, 0}, {1024, 1024, 0}, {704, 640, 704}};
-    if (const char* s = getenv("GLM_ECOLS")) {  // e.g. "704,640,704"
-        int a = 0, b = 0, c = 0;
-        if (sscanf(s, "%d,%d,%d", &a, &b, &c) == 3 && a + b + c == INTER && a % 64 == 0 && b % 64 == 0 && c % 64 == 0) {
-            ec[2][0] = a; ec[2][1] = b; ec[2][2] = c;
-        }
+    int ec[4][4] = {{2048, 0, 0, 0}, {1024, 1024, 0, 0}, {704, 640, 704, 0}, {512, 512, 512, 512}};
+    if (const char* s = getenv("GLM_ECOLS")) {  // e.g. "704,640,704" (3 cards) or "512,512,512,512" (4 cards)
+        int c[4] = {};
+        int sum = 0;
+        bool ok = ngpu > 1 && parse_n(s, c);
+        for (int r = 0; ok && r < ngpu; r++) { ok &= c[r] > 0 && c[r] % 64 == 0; sum += c[r]; }
+        if (ok && sum == INTER) for (int r = 0; r < ngpu; r++) ec[ngpu - 1][r] = c[r];
+        else fprintf(stderr, "[glm] GLM_ECOLS=%s ignored: %d multiples of 64 summing to %d expected\n", s, ngpu, INTER);
     } else if (getenv("GLM_EGROUPS")) {
-        for (int r = 0; r < 3; r++) ec[2][r] = es[2][r] * 128;
+        for (int r = 0; r < ngpu; r++) ec[ngpu - 1][r] = es[ngpu - 1][r] * 128;
     } else if (ecols && ngpu > 1) {
         int sum = 0;
         for (int r = 0; r < ngpu; r++) sum += ecols[r];
