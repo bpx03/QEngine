@@ -238,7 +238,13 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     const int i = pick_slot(*h, ids, n, &reuse, &snap);
     if (i < 0) return -1;
     Slot& s = h->s[i];
+    // [gptoss-archprot] the entry this prompt restores from stays while its own archive / evictions make room
+    struct Prot {
+        Handle& h;
+        ~Prot() { srv_protect_end(h); }
+    } prot{*h};
     try {
+        srv_protect_begin(*h, ids, n, i);   // (review L4: inside the try)
         // [srv-gptoss-cache] the slot's old conversation goes to the store first when this prompt gives most of it up
         const auto t0 = std::chrono::steady_clock::now();
         auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };

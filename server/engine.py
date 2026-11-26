@@ -41,6 +41,7 @@ SIGS = {
     "qe_graph_info": (c_int, [c_void_p, c_char_p, c_int]),
     "qe_can_admit": (c_int, [c_void_p, c_int]),
     "qe_pause_for": (c_int, [c_void_p, c_int, c_int]),
+    "qe_protect_ids": (None, [c_void_p, P_int, c_int]),
     "qe_set_limit": (None, [c_void_p, c_int, c_int]),
     "qe_set_ignore_eos": (None, [c_void_p, c_int, c_int]),  # GLM (review r25-M2): steps do not stop at an EOS
     "qe_park": (c_int, [c_void_p, c_int]),
@@ -99,6 +100,7 @@ SIGS = {
     "qe_set_penalty": (None, [c_void_p, c_float, c_float, P_int, c_int]),
     "qe_set_no_lookup": (None, [c_void_p, c_int, c_int]),
     "qe_mem_guard": (None, [c_void_p]),
+    "qe_mem_pressure": (None, [c_void_p]),
     "qe_fault_count": (c_i64, [c_void_p]),
     "qe_prefill_cancel": (None, [c_void_p, c_int]),
     "qe_slot_fault": (c_int, [c_void_p, c_int, c_char_p, c_int]),
@@ -490,6 +492,7 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
     def park(self, slot):
         """[q27-park-c] Park a decoding slot (state to host memory, slot released): a handle, or None when refused."""
         if not self.can_park():
+            self.protect_clear()   # ([ink-archprot] review3 nit: no stale prompt for a later park)
             return None
         h = self.lib.qe_park(self.h, int(slot))
         if h < 0:
@@ -544,6 +547,23 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         c = (ctypes.c_longlong * 6)()
         self.lib.qe_pool_counters(self.h, c)
         return int(c[3]), int(c[5])
+
+    def protect_ids(self, ids, owner=None):
+        """[ink-archprot] the prompt the next pause_for / park makes room for: its host-store source is kept (engines
+        with qe_protect_ids; else nothing). owner: the request; its ctypes copy of ids is kept on it (archprot_review2 L1
+        / review3 L2: one array per waiting prompt, not one per admission pass)."""
+        if "qe_protect_ids" in self.fns and ids:
+            c = getattr(owner, "_prot_arr", None)
+            if c is None or c[0] is not ids or c[1] != len(ids):
+                c = (ids, len(ids), (ctypes.c_int * len(ids))(*ids))
+                if owner is not None:
+                    owner._prot_arr = c
+            self.lib.qe_protect_ids(self.h, c[2], c[1])
+
+    def protect_clear(self):
+        """[ink-archprot] a pending protect_ids that no pause / park consumed is dropped (review3 nit)."""
+        if "qe_protect_ids" in self.fns:
+            self.lib.qe_protect_ids(self.h, None, 0)
 
     def pause_for(self, n, prio):
         """Pause decoding sequences (never a prefill), the most recently admitted first (src/pool_order.h; prio is
@@ -620,6 +640,12 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         """Host memory pressure check of the archive (gives memory back below MemAvailable - margin)."""
         if "qe_mem_guard" in self.fns:
             self.lib.qe_mem_guard(self.h)
+
+    def mem_pressure(self):
+        """Only the host-memory part of mem_guard (the idle persist wait; [disk-eager] review M2): no VRAM tick, no idle
+        reclaim (Flash-Next). An engine without it: nothing."""
+        if "qe_mem_pressure" in self.fns:
+            self.lib.qe_mem_pressure(self.h)
 
     def archive_more(self, budget=64 << 20):
         """Archive idle conversations to host memory, about `budget` bytes per GPU per call

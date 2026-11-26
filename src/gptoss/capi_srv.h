@@ -68,6 +68,11 @@ struct Slot {
     // prompt-end snapshot (the slot's rings after its last start's prefill; GPTOSS_SNAP=0: off)
     std::vector<int> snap_toks;
     std::vector<unsigned char> snap;
+    // [gptoss-rearm] H1 / review2 L1: an idle archive of this slot the store refused: not tried again while its rows stay
+    // the same (arch_fail_n), MemAvailable has not grown by 1 GiB and less than 60 s passed (no copy loop under host-memory
+    // pressure); arch_fail_t < 0: none
+    size_t arch_fail_n = 0, arch_fail_avail = 0;
+    double arch_fail_t = -1;
     // a prompt in flight (start_begin .. start_finish): pf_done = rows of pf held, -1 = none
     std::vector<int> pf;
     int pf_done = -1, pf_reused = 0, pf_first = -1;
@@ -147,6 +152,11 @@ struct Handle {
     long hint_saves = 0, archived = 0, restored = 0, slot_copies = 0, dropped = 0;
     int arch_slot = -1;          // idle archiving in progress: that slot's entry so far (rows in parts)
     Entry arch;
+    size_t ring_est = 0;         // [gptoss-rearm] review2 L2: the largest ring blob saved so far (the size estimate)
+    // [gptoss-archprot] while a start makes room (its own slot's archive, evictions), the store entry it will restore from
+    // is never dropped for those archives (protect_on: that entry's tokens / hint flag)
+    bool protect_on = false, protect_hint = false;
+    std::vector<int> protect_toks;
 };
 
 // the slot's sequence on the engine (its ring set, its rows, its position)
@@ -193,12 +203,18 @@ void srv_apply(Handle& h, int me, const Source& src, const int* ids);
 // the slot's sequence into the store (once per change: Slot::archived), at most `max_rows` more rows per call (0: all);
 // 1 done, 0 more to do (call again), -1 the store has no room
 int srv_archive_slot(Handle& h, int j, long max_rows = 0);
-// the archive of slot j now is a bounded copy (its partial idle archive, or at most GPTOSS_ARCHIVE_SYNC_ROWS rows past the
-// rows the store holds; default 16384): eviction and a start on the slot archive only then, else the conversation goes
+// the archive of slot j now is a bounded copy (at most GPTOSS_ARCHIVE_SYNC_ROWS rows past the rows the store holds or its
+// partial idle archive holds; default: no limit): eviction and a start on the slot archive only then, else the conversation goes
 bool srv_archive_cheap(const Handle& h, int j);
 // after a prefill chunk of slot i that ended at its hint: the system-part snapshot into the store
 void srv_hint_save(Handle& h, int i);
-// drop entries until the store fits its budget with `extra` more bytes; false: it never can
+// drop entries until the store fits its budget with `extra` more bytes (to be allocated); the host bytes of the partial
+// idle archive (h.arch) that no entry holds count on both sides (they are allocated already: [gptoss-rearm] H1);
+// false: it never can
 bool srv_store_fit(Handle& h, size_t extra);
+// [gptoss-archprot] a start of ids[0, n): protect the store entry it would restore from now (srv_source) until
+// srv_protect_end; an archive that cannot fit without it is not stored (its conversation goes, as without room)
+void srv_protect_begin(Handle& h, const int* ids, int n, int own);   // own: the start's slot (-1 none)
+void srv_protect_end(Handle& h);
 
 }  // namespace gptoss

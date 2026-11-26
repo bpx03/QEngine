@@ -194,6 +194,24 @@ int main() {
         w.push(std::move(b), 2);
         EXPECT(w.wait(60));
         EXPECT(!exists(dir + "/c0.qfk.part") && exists(dir + "/c1.qfk"));
+        // [disk-eager] cancel_running = false: the running write of the conversation finishes, a newer queued one
+        // replaces only the queued one (one in flight, one queued per conversation)
+        w.take_done();
+        Job e0 = make_job(dir + "/e0.qfk", big, 11);
+        Job e1 = make_job(dir + "/e1.qfk", d, 11);
+        Job e2 = make_job(dir + "/e2.qfk", d, 11);
+        w.push(std::move(e0), 1, false);
+        for (int i = 0; i < 100000 && w.running_key() != 11; i++) usleep(10);
+        EXPECT(w.running_key() == 11);
+        EXPECT(w.running_path(11) == dir + "/e0.qfk" && w.running_path(12).empty());
+        w.push(std::move(e1), 2, false);
+        w.push(std::move(e2), 3, false);
+        EXPECT(w.wait(60));
+        dn = w.take_done();
+        ok = canc = 0;
+        for (auto& x : dn) { ok += x.ok; canc += x.cancelled; }
+        EXPECT(dn.size() == 3 && ok == 2 && canc == 1);
+        EXPECT(exists(dir + "/e0.qfk") && !exists(dir + "/e1.qfk") && exists(dir + "/e2.qfk"));
         // a failed job reports its error
         w.take_done();
         w.push(make_job(dir + "/no/such/x.qfk", d, 10), 1);

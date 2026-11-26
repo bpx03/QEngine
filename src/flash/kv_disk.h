@@ -279,8 +279,10 @@ class Writer {
 public:
     Writer() : th_([this] { loop(); }) {}
     ~Writer() { stop(); }
-    // A job of the same conversation still queued is replaced, one being written is cancelled (it stops within a chunk)
-    void push(Job&& j, uint64_t reserved) {
+    // A job of the same conversation still queued is replaced, one being written is cancelled (it stops within a chunk).
+    // cancel_running = false ([disk-eager], a write after every reply): the one being written finishes (at most one in flight
+    // and one queued per conversation; a newer job replaces only the queued one)
+    void push(Job&& j, uint64_t reserved, bool cancel_running = true) {
         std::lock_guard<std::mutex> l(mu_);
         for (auto it = q_.begin(); it != q_.end();) {
             if (it->j.key == j.key) {
@@ -290,11 +292,17 @@ public:
                 ++it;
             }
         }
-        if (busy_ && cur_key_ == j.key) cancel_ = true;
+        if (cancel_running && busy_ && cur_key_ == j.key) cancel_ = true;
         q_.push_back(Item{std::move(j), reserved});
         cv_.notify_all();
     }
     size_t queued() const { std::lock_guard<std::mutex> l(mu_); return q_.size() + (busy_ ? 1 : 0); }
+    long long running_key() const { std::lock_guard<std::mutex> l(mu_); return busy_ ? cur_key_ : 0; }  // (0: idle; tests)
+    // the path being written for conversation `key` (empty: none running for it)
+    std::string running_path(long long key) const {
+        std::lock_guard<std::mutex> l(mu_);
+        return busy_ && cur_key_ == key ? cur_path_ : std::string();
+    }
     // blobs held by queued and running jobs: an eviction of their conversation frees nothing until they are written
     void held(std::vector<const void*>& out) const {
         std::lock_guard<std::mutex> l(mu_);
@@ -347,6 +355,7 @@ private:
             busy_ = true;
             cancel_ = false;
             cur_key_ = it.j.key;
+            cur_path_ = it.j.path;
             cur_hold_.clear();
             for (auto& h : it.j.hold) cur_hold_.push_back(h.get());
             l.unlock();
@@ -369,6 +378,7 @@ private:
     std::vector<Done> done_;
     std::vector<const void*> cur_hold_;
     long long cur_key_ = 0;
+    std::string cur_path_;
     bool busy_ = false, stop_ = false;
     std::atomic<bool> cancel_{false};
     std::thread th_;

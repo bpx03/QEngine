@@ -338,6 +338,11 @@ public:
     // this card owns) packed into pinned chunks of `chunk` bytes (a piece never straddles two).
     int archive_chunks(int lo, int hi, size_t chunk) const;
     size_t archive_bytes(int lo, int hi) const;  // single contiguous buffer
+    // [gh47] the layout of keys [0, hi) (archive_bytes(0, hi)) assembled from a host copy of keys [0, split) (a pinned
+    // prefix: archive_bytes(0, split)) and one of keys [split, hi) (an archive attached to it: archive_bytes(split, hi)):
+    // its pieces in order, each a range of one of the two; the delta-net state (first) from the own copy
+    struct FlatPiece { bool pre; size_t off, len; };
+    void archive_flat(int split, int hi, std::vector<FlatPiece>& out) const;
     // save: slot -> host (copy_hi = hi); load: host -> slot, keys [lo, copy_hi) and, if with_dn,
     // the delta-net state. The slot must be the selected one (select_slot); lo = its split.
     // Pieces (the delta-net state, then one array per layer / kv head / k|v) from `piece` on,

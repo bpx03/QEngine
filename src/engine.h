@@ -602,8 +602,27 @@ private:
         // evictions archiving other slots) must not drop it before its rows / state are copied
         mutable int hold = 0;
         long long sk = -1;                  // steering key of its KV / states (set_steering); steered ones stay in RAM
+        // [gh47] a split archive's file is written flat (split 0: rows [0, split) from the pinned copy, its state at the
+        // split one more checkpoint): the file's layout while the entry is split (empty: the file's layout is the entry's
+        // own). The entry takes it when its memory copy goes (arch_drop_ram)
+        std::vector<size_t> fsizes;
+        std::vector<int> fsubs;
+        size_t ftotal = 0;
         size_t bytes() const { return total; }
+        size_t file_bytes() const { return fsizes.empty() ? total : ftotal; }
+        bool disk_skip = false;             // [disk-eager] its write was skipped at the eager queue cap: persist() writes it
     };
+    // [gh47] what the file of an archive holds (file_plan)
+    struct FilePlan {
+        const KvArchive* pre = nullptr;     // split > 0: the pinned prefix its rows [0, split) and the state there come from
+        std::vector<int> subs;              // checkpoints in the file
+        int keep = 0;                       // of the archive's own checkpoints (the first ones)
+        std::vector<size_t> sizes;          // per GPU
+        size_t total = 0;
+    };
+    bool file_plan(const KvArchive& a, FilePlan& p) const;  // false: no file (steered, no pinned copy, over the budget)
+    void arch_drop_ram(KvArchive& a);        // the memory copy goes, the file stays (a split one: the file's layout)
+    void prefix_gone(const KvArchive& p);    // a pinned prefix goes: split archives with files keep only the files
     std::vector<int> devs_;  // CUDA devices of the workers (P2P buffers are per device)
     std::list<KvArchive> archives_;
     static constexpr size_t kArchiveChunk = ~(size_t)0 >> 1;  // one contiguous buffer per GPU
@@ -651,7 +670,7 @@ public:
         }
         return j;
     }
-    void mem_guard();  // host memory below MemAvailable - margin: the archive gives memory back
+    void mem_guard(bool vram = true);  // host memory below MemAvailable - margin: the archive gives memory back (vram: the pool tick too)
 private:
     // runtime host-memory pressure (host_pressure.h), stages 1-3 here (hold growth, free slabs, shrink the archive): stepped
     // by mem_guard; the archive's cap while it holds (SIZE_MAX: none)
@@ -687,6 +706,10 @@ private:
         size_t hash_off = 0;               // header offset of the checksums (the writer fills them)
         int ns = 0;                        // delta-net states per section
         std::vector<size_t> snb;           // their bytes per GPU
+        // [gh47] a split archive written flat: the pinned prefix's buffers and, per GPU, the file's section as pieces of
+        // ram / pre (empty: the section is ram's buffer as it is)
+        std::shared_ptr<Bufs> pre;
+        std::vector<std::vector<Worker::FlatPiece>> flat;
     };
     std::deque<DiskJob> disk_q_;
     std::vector<std::pair<std::string, size_t>> covered_files_;  // of the archives drop_covered just dropped (bytes)
@@ -695,6 +718,13 @@ private:
     std::mutex disk_mu_;
     std::condition_variable disk_cv_;
     bool disk_stop_ = false;
+    // [disk-eager] QE_DISK_EAGER=1 (server --disk-eager): a running write of a conversation finishes when a newer archive covers
+    // it (the newer one waits behind it and deletes its file once written), at most eager_cap_ writes queued (more: skipped,
+    // written by persist); disk_cur_path_: the file being written (under disk_mu_)
+    bool disk_eager_ = false, persisting_ = false;
+    size_t eager_cap_ = 8;  // QE_DISK_EAGER_Q (tests force it low)
+    std::string disk_cur_path_;
+    bool eager_full();      // the eager queue is at its cap (and not persisting): a new archive gets no file now
     int disk_busy_ = 0;
     std::thread disk_thread_;
     std::thread alloc_thread_;               // pre-pins snapshot buffers in the background

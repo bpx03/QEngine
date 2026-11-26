@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
-# QEngine: one inference server image for Qwen3.8-27B, Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash and
-# gpt-oss-120B (tuned on 3x RTX 3090). The 27B, Flash-Next and GLM engines carry GPU code (SASS) for sm_86 (RTX 3000
-# series, tuned on the 3090), sm_89 (RTX 4000) and sm_120 (RTX 5000): see CUDA_ARCHS below; the DSV4 and gpt-oss engines sm_86.
+# QEngine: one inference server image for Qwen3.8-27B, Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash,
+# gpt-oss-120B and Inkling-2-Mini (tuned on 3x RTX 3090). The 27B, Flash-Next and GLM engines carry GPU code (SASS) for
+# sm_86 (RTX 3000 series, tuned on the 3090), sm_89 (RTX 4000) and sm_120 (RTX 5000): see CUDA_ARCHS below; the DSV4,
+# gpt-oss and Inkling engines sm_86.
 # The model is NOT baked in: mount it and point QE_MODEL at it (default /app/models/Qwen3.8-27B-INT4; see
 # docker-compose.yml and the README); the engine is picked from the model's config.json (DSV4: from the GGUF files).
 #
@@ -42,6 +43,13 @@ RUN mkdir -p /src/gptossout \
     && if [ -f src/gptoss/build.sh ]; then \
          CXX=g++ OUT=/src/build_gptoss bash src/gptoss/build.sh \
          && cp /src/build_gptoss/libqgptoss.so /src/gptossout/; \
+       fi
+# Inkling-2-Mini engine (libqinkling.so; src/inkling/build.sh with the distro GCC 13, sm_86 code only): built when the
+# source tree has it; the library lands in /src/inklingout (empty otherwise)
+RUN mkdir -p /src/inklingout \
+    && if [ -f src/inkling/build.sh ]; then \
+         CXX=g++ OUT=/src/build_inkling bash src/inkling/build.sh \
+         && cp /src/build_inkling/libqinkling.so /src/inklingout/; \
        fi
 # GLM-5.3-Flash engine (libqglm.so): the CMake build above makes it when the source tree has src/glm (portable CPU
 # lane, no -march: AVX-512 and AVX2 kernels picked at start); the library lands in /src/glmout (empty otherwise), with
@@ -96,7 +104,13 @@ COPY --from=build /src/dsv4data/ ./data/
 COPY --from=build /src/gptossout/ ./build_gptoss/
 # GLM-5.3-Flash engine (server default path build/libqglm.so) and its data files (tools/glm/); it links cuBLAS too
 COPY --from=build /src/glmout/ ./
-RUN if [ -f build_dsv4/libqdsv4.so ] || [ -f build_gptoss/libqgptoss.so ] || [ -f build/libqglm.so ]; then \
+# Inkling-2-Mini engine (server default path build_srv/libqinkling.so); it links cuBLAS too
+COPY --from=build /src/inklingout/ ./build_srv/
+# the build hash next to every engine library (server/app.py reads qe_build.txt beside the loaded library; without it
+# the DSV4 / gpt-oss / Inkling start-up line and /api/stats said 'build unknown')
+RUN for d in build_dsv4 build_gptoss build_srv; do [ -d "$d" ] && cp build/qe_build.txt "$d/"; done; true
+RUN if [ -f build_dsv4/libqdsv4.so ] || [ -f build_gptoss/libqgptoss.so ] || [ -f build/libqglm.so ] \
+       || [ -f build_srv/libqinkling.so ]; then \
       apt-get update && apt-get install -y --no-install-recommends \
         "libcublas-$(echo "$CUDA_VERSION" | cut -d. -f1-2 | tr . -)" \
       && rm -rf /var/lib/apt/lists/*; \
@@ -105,14 +119,27 @@ RUN if [ -f build_dsv4/libqdsv4.so ] || [ -f build_gptoss/libqgptoss.so ] || [ -
 COPY vectors ./vectors
 
 # Entry point: server/run.sh with the container defaults (listen on 0.0.0.0).
-# GPU ids as seen in the container (with --gpus all: the host ids): QE_DEVICES if set, else QE_GPUS, else 0,1,2;
+# GPU ids as seen in the container (with --gpus all: the host ids): QE_DEVICES if set, else QE_GPUS, else 0,1,2
+# (Inkling-2-Mini: else 0, one card; tensor parallelism needs GPU P2P, so it runs on several cards only when asked);
 # run.sh sets CUDA_VISIBLE_DEVICES from it and passes --devices 0..n-1 (n != 3: warning, less tested).
 COPY <<'EOF' /usr/local/bin/qengine-entrypoint
 #!/usr/bin/env bash
 set -euo pipefail
 cd /app
-export QE_DEVICES="${QE_DEVICES:-${QE_GPUS:-0,1,2}}"  # a user-set QE_DEVICES wins (it was overwritten before)
 MODEL="${QE_MODEL:-/app/models/Qwen3.8-27B-INT4}"
+# Inkling-2-Mini (config.json model_type inkling2*, as server/model_profile.py detects it): one card unless the user
+# names the cards (QE_DEVICES / QE_GPUS), as on a host start
+is_inkling() {
+  python3 -c 'import json, sys
+c = json.load(open(sys.argv[1] + "/config.json"))
+t = c.get("text_config") or c
+sys.exit(0 if (c.get("model_type") or t.get("model_type") or "").startswith("inkling2") else 1)' "$1" 2>/dev/null
+}
+if [ -z "${QE_DEVICES:-}${QE_GPUS:-}" ] && is_inkling "$MODEL"; then
+  export QE_DEVICES=0
+else
+  export QE_DEVICES="${QE_DEVICES:-${QE_GPUS:-0,1,2}}"  # a user-set QE_DEVICES wins (it was overwritten before)
+fi
 # a model directory has a config.json, or is a DeepSeek-V4.1-Flash GGUF split set (Maya-S: no config.json), detected
 # as server/model_profile.py does it (server/dsv4_gguf.py: the first GGUF file's architecture is deepseek41)
 is_dsv4() {
@@ -220,7 +247,7 @@ ENTRYPOINT ["/usr/local/bin/qengine-entrypoint"]
 ARG REVISION=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/bpx03/QEngine" \
-      org.opencontainers.image.description="QEngine: Qwen3.8-27B, Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash and gpt-oss-120B inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in for the Qwen and GLM engines, not tuned), OpenAI/Anthropic-compatible API; models not included" \
+      org.opencontainers.image.description="QEngine: Qwen3.8-27B, Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash, gpt-oss-120B and Inkling-2-Mini inference server for RTX 3090 (sm_86; sm_89 and sm_120 built in for the Qwen and GLM engines, not tuned), OpenAI/Anthropic-compatible API; models not included" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"

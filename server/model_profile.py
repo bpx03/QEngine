@@ -88,6 +88,26 @@ FAMILIES = {
         seg_mark="<|start|>",     # encode() splits the prompt at this atomic token
         no_effort="low",          # gpt-oss always reasons: effort none = the lowest level (open decision, design 9.2 (5))
     ),
+    # [ink-srv-capi] Inkling 2 Mini on one card (src/inkling, build_srv/libqinkling.so: the engine implements
+    # server/qe_capi.h itself); the model's own chat template renders (reasoning_effort, tools), server/inkling.py parses
+    # the reply (content_thinking / content_text / content_invoke_tool_json messages)
+    "inkling": dict(
+        served_name="inkling-2-mini-qengine",
+        mtp_k=7,                  # (the C API takes k and ignores it: the DSpark drafter plans its rows per slot, INK_BPOL)
+        split="", lib="build_srv/libqinkling.so", vision=False,
+        # [ink-srv-gap] a prompt alone on the server: 10,240-row calls (the engine chunks them itself, one cut tail per
+        # call) instead of --prefill-chunk 2048 (each 2,048-row call paid its own 1,024-row exact tail: 120K 4,625 tok/s
+        # vs the engine's 5,551 in one call); busy or a request waiting: 2048 as before
+        prefill_chunk_idle=10240,
+        drop_empty_turns=False, merge_system=False,
+        tool_format="inkling",
+        own_template=True,        # chat_template.jinja (reasoning_effort none .. max or a number, tool_declare)
+        seg_mark="<|message_user|>",   # encode() splits the prompt at this atomic token
+        # [ink-ctx-cap] without --max-ctx: the model's own limit (config model_max_length, 1,048,576; no RoPE, nothing to
+        # scale); the engine serves what its KV pool holds (one start-up 'context:' line), one conversation may use the
+        # whole pool (idle slots go to the RAM store, busy ones keep their reply room)
+        max_ctx="model",
+    ),
     "qwen38-flash-next": dict(
         served_name="qwen3.8-flash-next-qengine",
         mtp_k=3,                  # best k 2..4 at c=1 (measured)
@@ -125,9 +145,11 @@ class Profile:
         self.model_type = cfg.get("model_type") or text.get("model_type") or ""
         self.family = ("qwen38-flash-next" if self.model_type.startswith("qwen4_exp") else
                        "glm53-flash" if self.model_type.startswith("glm5_next") else
-                       "gptoss" if self.model_type == "gpt_oss" else "qwen38-27b")
+                       "gptoss" if self.model_type == "gpt_oss" else
+                       "inkling" if self.model_type.startswith("inkling2") else "qwen38-27b")
         self.vocab_size = text.get("vocab_size")
-        self.max_position = text.get("max_position_embeddings")
+        # (Inkling: model_max_length, 1,048,576; the server default context of that family, [ink-ctx-cap])
+        self.max_position = text.get("max_position_embeddings") or text.get("model_max_length")
         self.mtp_layers = text.get("mtp_num_hidden_layers") or 0
         self.gen = _load(os.path.join(model_dir, "generation_config.json"))
         eos = self.gen.get("eos_token_id", text.get("eos_token_id"))
@@ -143,6 +165,10 @@ class Profile:
         return self.family == "gptoss"
 
     @property
+    def is_inkling(self):
+        return self.family == "inkling"
+
+    @property
     def is_dsv4(self):
         return self.family == "dsv4"
 
@@ -154,6 +180,12 @@ class Profile:
         """Server defaults of one mode for requests without them: command line > the model card's for this mode."""
         c = CARD_SAMPLING[bool(thinking)]
         if self.family == "gptoss":   # OpenAI's recommendation for gpt-oss (generation_config.json has no values)
+            t0, p0 = self.gen.get("temperature"), self.gen.get("top_p")
+            return {"temperature": float(temperature if temperature is not None else (t0 if t0 is not None else 1.0)),
+                    "top_p": float(top_p or (p0 if p0 is not None else 1.0)),
+                    "top_k": int(top_k or 0), "min_p": float(min_p or 0.0),
+                    "presence_penalty": float(presence_penalty or 0.0)}
+        if self.family == "inkling":   # generation_config.json (temperature 1.0; no top_p / top_k: the engine's own sampler)
             t0, p0 = self.gen.get("temperature"), self.gen.get("top_p")
             return {"temperature": float(temperature if temperature is not None else (t0 if t0 is not None else 1.0)),
                     "top_p": float(top_p or (p0 if p0 is not None else 1.0)),
@@ -292,9 +324,9 @@ def merge_leading_system(messages):
 #   when: f(value, args) -> True when the value matters at all (default: always)
 # The README feature matrix (public README "Feature matrix") and list the same facts.
 
-Q27, QFN, DSV4, GLM, GPTOSS = "qwen38-27b", "qwen38-flash-next", "dsv4", "glm53-flash", "gptoss"
+Q27, QFN, DSV4, GLM, GPTOSS, INK = "qwen38-27b", "qwen38-flash-next", "dsv4", "glm53-flash", "gptoss", "inkling"
 MODEL_NAMES = {Q27: "Qwen3.8-27B", QFN: "Qwen3.8-Flash-Next", DSV4: "DeepSeek-V4.1-Flash", GLM: "GLM-5.3-Flash",
-               GPTOSS: "gpt-oss-120B"}
+               GPTOSS: "gpt-oss-120B", INK: "Inkling-2-Mini"}
 ALL = frozenset(MODEL_NAMES)
 QWEN = frozenset({Q27, QFN})
 
@@ -328,7 +360,7 @@ FLAGS = {
                    when=lambda v, a: bool(v)),
     "vision_device": Knob(QWEN, note="no image input"),
     "max_image_pixels": Knob(QWEN, note="no image input"),
-    "mtp_k": Knob(ALL - {DSV4, GPTOSS}, note="the engine ignores the draft count: DSV4's DSpark plans its own, gpt-oss drafts by prompt lookup (GPTOSS_LOOKUP)"),
+    "mtp_k": Knob(ALL - {DSV4, GPTOSS, INK}, note="the engine ignores the draft count: DSV4's and Inkling's DSpark drafters plan their own, gpt-oss drafts by prompt lookup (GPTOSS_LOOKUP)"),
     "mtp_file": Knob({Q27}, note="the engine loads its own MTP head (Flash-Next: mtp*.safetensors in the model directory)"),
     "split": Knob(QWEN | {GLM}, note="the engine places its weights itself"),  # (GLM: routed expert columns per card)
     # (server/run.sh always passes --devices 0..n-1 of the visible cards: only another order or subset counts; GLM takes
@@ -337,9 +369,10 @@ FLAGS = {
     # leading subset or a longer list is ignored too)
     "devices": Knob(ALL - {DSV4}, note="the engine uses the first 3 visible cards; choose them with CUDA_VISIBLE_DEVICES",
                     when=lambda v, a: _card_ids(v) != ["0", "1", "2"]),
-    "max_ctx": Knob(QWEN | {DSV4}, when=lambda v, a: v is not None and v > 262144,
+    "max_ctx": Knob(QWEN | {DSV4, INK}, when=lambda v, a: v is not None and v > 262144,
                     note="the engine serves its own maximum: GLM-5.3-Flash 262,144 (GLM_MAX_CTX sets it), gpt-oss-120B "
                          "131,072 (start-up 'context:' line)"),
+    "dense_weights": Knob({INK}, note="the dense weight form (g15 / int8) is an Inkling-2-Mini option"),
     "template": Knob(ALL - {DSV4}, note="DeepSeek-V4.1-Flash renders its own prompt format"),
     "park": Knob(cap="park", when=lambda v, a: bool(v), note="the engine cannot park a reply in host memory; requests beyond the seats wait"),
     "park_reserve": Knob(cap="park", note="no parking on this engine"),
@@ -351,6 +384,7 @@ FLAGS = {
                        when=lambda v, a: bool(v)),
     "disk_cache_gb": Knob(QWEN, note="no disk cache"),
     "persist_idle": Knob(QWEN, note="no disk cache"),
+    "disk_eager": Knob(QWEN, note="no disk cache", when=lambda v, a: bool(v)),
     "presence_penalty": Knob(cap="penalty", note="the sampler has no presence / frequency penalty",
                              when=lambda v, a: bool(v)),
     "frequency_penalty": Knob(cap="penalty", note="the sampler has no presence / frequency penalty",
@@ -370,13 +404,14 @@ FLAGS = {
 }
 
 # environment variables of an engine's own namespace: set for another model, they have no effect
-ENV_OWNERS = (("QE_DSV4_", DSV4), ("FLASH_", QFN), ("GLM_", GLM), ("GPTOSS_", GPTOSS), ("DSV4_", DSV4))
+ENV_OWNERS = (("QE_DSV4_", DSV4), ("FLASH_", QFN), ("GLM_", GLM), ("GPTOSS_", GPTOSS), ("DSV4_", DSV4), ("INK_", INK))
 # read by the server itself or by more than one engine (never warned by the prefix rule)
 ENV_SERVER = frozenset({"FLASH_PAR_FALLBACK", "FLASH_DISK_CACHE", "FLASH_DISK_CACHE_GB", "QE_DSV4_LEGACY"})
 
-_SEATS = "seats: Qwen3.8-27B QE_MAX_SEQS, Flash-Next FLASH_MAX_SEQS, gpt-oss GPTOSS_SLOTS, GLM GLM_CONVS, DSV4 --max-active"
-_KVF = "K/V format: Qwen3.8-27B QE_KV_BITS / QE_KV_FP8, Flash-Next FLASH_KV_BITS, gpt-oss GPTOSS_KV"
-_ARCH = ("host-RAM archive: Qwen3.8-27B / gpt-oss QE_KV_ARCHIVE_GB, Flash-Next FLASH_KV_ARCHIVE_GB, GLM GLM_ARC_GB "
+_SEATS = ("seats: Qwen3.8-27B QE_MAX_SEQS, Flash-Next FLASH_MAX_SEQS, gpt-oss GPTOSS_SLOTS, GLM GLM_CONVS, DSV4 --max-active, "
+          "Inkling INK_SLOTS")
+_KVF = "K/V format: Qwen3.8-27B QE_KV_BITS / QE_KV_FP8, Flash-Next FLASH_KV_BITS, gpt-oss GPTOSS_KV (Inkling: BF16, fixed)"
+_ARCH = ("host-RAM archive: Qwen3.8-27B / gpt-oss / Inkling QE_KV_ARCHIVE_GB, Flash-Next FLASH_KV_ARCHIVE_GB, GLM GLM_ARC_GB "
          "(else QE_KV_ARCHIVE_GB), DSV4 --archive-gib")
 ENV = {
     # rows with a note of their own (the prefix rule covers the rest of each namespace)
@@ -387,7 +422,7 @@ ENV = {
     "FLASH_KV_ARCHIVE_GB": Knob({QFN}, note=_ARCH),
     "FLASH_COMM": Knob({QFN}, note="Qwen3.8-27B: QE_COMM"),
     "FLASH_PIN_WAIT_S": Knob(QWEN),  # (the 27B's fallback for QE_GPU_LOCK_WAIT_S)
-    "GPTOSS_DFLASH": Knob(frozenset(), note="the server ignores it in 1.5 and does not load the drafter (engine tool only)"),
+    "GPTOSS_DFLASH": Knob(frozenset(), note="the server ignores it and does not load the drafter (engine tool only)"),
     # the 27B engine's variables (Flash-Next reads its own FLASH_* names)
     "QE_MAX_SEQS": Knob({Q27}, note=_SEATS),
     "QE_KV_BITS": Knob({Q27}, note=_KVF), "QE_KV_FP8": Knob({Q27}, note=_KVF), "QE_KV_SCALES": Knob({Q27}),
@@ -402,7 +437,7 @@ ENV = {
     "QE_SNAPSHOTS": Knob({Q27}), "QE_PREFIX_GB": Knob({Q27}), "QE_ADMIT_HEADROOM": Knob({Q27}),
     "QE_ADMIT_BY_LIMIT": Knob({Q27}), "QE_RESERVE_GB": Knob({Q27}), "QE_VRAM_ADAPT": Knob({Q27}),
     # (GLM: only when GLM_ARC_GB is unset and GLM_ARC is on; a `when` cannot see the other variables)
-    "QE_KV_ARCHIVE_GB": Knob({Q27, GPTOSS, GLM}, note=_ARCH),
+    "QE_KV_ARCHIVE_GB": Knob({Q27, GPTOSS, GLM, INK}, note=_ARCH),
     "QE_COMM": Knob({Q27}, note="Flash-Next: FLASH_COMM"),
     "QE_P2P": Knob({Q27, QFN, GLM}),
     "QE_STEER": Knob(QWEN, note="activation steering is for the Qwen3.8 models"),

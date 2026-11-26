@@ -256,6 +256,8 @@ int qe_archive_more(void* e, long long budget) {
     return done && qe_memp::holding() ? 2 : done;  // (2: not now, host memory pressure; the server asks again later)
 }
 void qe_mem_guard(void* e) { ((Engine*)e)->mem_guard(); }
+// [disk-eager review M2] the host-memory part of qe_mem_guard alone (no VRAM tick): the server's idle persist wait
+void qe_mem_pressure(void* e) { ((Engine*)e)->mem_guard(false); }
 void qe_set_lookahead(void* e, int on) { ((Engine*)e)->set_lookahead(on != 0); }
 int qe_last_slot(void* e) { return ((Engine*)e)->last_slot(); }
 int qe_num_slots(void* e) { return ((Engine*)e)->num_slots(); }

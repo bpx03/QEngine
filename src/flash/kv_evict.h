@@ -235,13 +235,38 @@ void drop_kind(C& c, int kind) {
 // client sends another text for the reply) replaces the conversation's earlier one: a state per turn would push out the
 // system end, periodic and divergence states (keep) and grow every archived conversation (64 agent sessions on the 48 GB
 // archive: ~1 GB each, live sessions dropped, 287 old rows recomputed per turn).
+// [ckpt-tail] the lowest-position states of one kind beyond `keep` go (review L1: before a new one is written, so a full
+// archive does not evict another conversation for a state dropped right after)
+template <class C>
+void drop_oldest_kind(C& c, int kind, int keep) {
+    for (;;) {
+        int n = 0, lo = -1;
+        for (int i = 0; i < (int)c.ck.size(); i++)
+            if (c.ck[i]->kind == kind && (n++, lo < 0 || c.ck[i]->pos < c.ck[lo]->pos)) lo = i;
+        if (n <= std::max(0, keep) || lo < 0) return;
+        c.ck.erase(c.ck.begin() + lo);
+    }
+}
+// [ckpt-tail] message-start states (kind 8) have their own quota keep8 (the newest by position stay) and do not count in
+// keep; keep8 = 0 (the default): no kind 8 is ever made, the rule above is unchanged.
 template <class C, class P>
-void add_ck(C& c, P s, int keep) {
+void add_ck(C& c, P s, int keep, int keep8 = 0) {
     auto& v = c.ck;
     v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& x) { return x->pos == s->pos || (s->kind == 7 && x->kind == 7); }),
             v.end());
     v.push_back(s);
-    while ((int)v.size() > keep) {
+    if (s->kind == 8) {
+        for (;;) {
+            int n8 = 0, lo = -1;
+            for (int i = 0; i < (int)v.size(); i++)
+                if (v[i]->kind == 8 && (n8++, lo < 0 || v[i]->pos < v[lo]->pos)) lo = i;
+            if (n8 <= std::max(0, keep8)) break;
+            v.erase(v.begin() + lo);
+        }
+        return;
+    }
+    auto others = [&] { int m = 0; for (const auto& x : v) m += x->kind != 8; return m; };
+    while (others() > keep) {
         const void* k = last_turn_end(c);
         int drop = -1;
         for (int want : {3, 5, 4, 2, 1}) {
@@ -250,8 +275,10 @@ void add_ck(C& c, P s, int keep) {
             if (drop >= 0) break;
         }
         for (int i = 0; drop < 0 && i < (int)v.size() - 1; i++)
-            if (v[i].get() != k) drop = i;
-        if (drop < 0) drop = 0;
+            if (v[i].get() != k && v[i]->kind != 8) drop = i;
+        if (drop < 0)
+            for (int i = 0; drop < 0 && i < (int)v.size(); i++)
+                if (v[i]->kind != 8) drop = i;
         v.erase(v.begin() + drop);
     }
 }

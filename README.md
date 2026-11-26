@@ -8,7 +8,7 @@
   <sub>Built and tested on one home machine. If QEngine helps you, a coffee keeps it going.</sub>
 </p>
 
-QEngine is an open-source (MIT) inference engine for five models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
+QEngine is an open-source (MIT) inference engine for six models on NVIDIA RTX 3000, 4000 and 5000 series cards, with
 nothing extra to install or set for any of them (tuned on the RTX 3090):
 
 - **Qwen3.8-Flash-Next**, run from my checkpoint [bpx03/Qwen3.8-Flash-Next-QEngine](https://huggingface.co/bpx03/Qwen3.8-Flash-Next-QEngine)
@@ -30,6 +30,12 @@ nothing extra to install or set for any of them (tuned on the RTX 3090):
   [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) (MXFP4 experts): a sparse
   mixture-of-experts model (128 experts per layer, 4 active) on three 24 GB cards, all in VRAM, 128K context, up to 8
   conversations decoded together. RTX 3090-class cards (compute capability 8.6) only.
+- **Inkling-2-Mini** (preview), run from Thinking Machines' official checkpoint
+  [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (NVFP4 / MXFP8 experts as
+  shipped) plus two small files of mine ([bpx03/Inkling-2-Mini-QEngine](https://huggingface.co/bpx03/Inkling-2-Mini-QEngine):
+  INT8 dense attention weights and a trained DSpark drafter): a looped sparse mixture-of-experts model (26.4B
+  parameters, 3.4B active) on one 24 GB card (about 126K tokens of context) or two with GPU P2P (about 565K), with
+  exact DSpark drafts and up to 8 conversations decoded together. RTX 3090-class cards (compute capability 8.6) only.
 
 One server serves any of them through an **OpenAI-compatible** and an **Anthropic-compatible** API (it works with
 agent clients such as Claude Code). The C++/CUDA engines are built as shared libraries; the Python server loads them
@@ -38,12 +44,12 @@ and handles the API, tool calls, structured output, scheduling and caching.
 **Measured on my machine** (3× RTX 3090, 24 GB, PCIe 4.0 x16, GPU P2P on), QEngine 1.5.0 with its default settings
 and the club-3090 benchmark tools (November 19, 2026):
 
-| output tok/s unless noted | Qwen3.8-27B | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash | gpt-oss-120B |
-|---|---:|---:|---:|---:|---:|
-| single-stream decode, narrative / code | 275 / 524 | 310 / 452 | 88 / 120 | 110 / 92 | 301 / 301 |
-| prefill, 10K-token prompt: tok/s, time to first token | 6,188, 1.60 s | 8,254, 1.23 s | 4,217, 2.35 s | 2,920, 3.42 s | 13,280, 0.74 s |
-| prefill, 90K-token prompt: tok/s, time to first token | 4,994, 18.0 s | 8,390, 10.5 s | 4,895, 17.8 s | 3,572, 25.4 s | 5,055, 17.6 s |
-| total output, 1 / 4 / 8 / 16 streams at once | 312 / 575 / 848 / 999 | 300 / 642 / 880 / 1,061 | 70 / 73 / 78 / 78 | 72 / 55 / 50 / 44 | 306 / 594 / 731 / 835 |
+| output tok/s unless noted | Qwen3.8-27B | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash | gpt-oss-120B | Inkling-2-Mini, 2 cards | Inkling-2-Mini, 1 card |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| single-stream decode, narrative / code | 275 / 524 | 310 / 452 | 88 / 120 | 110 / 92 | 301 / 301 | 230 / 330 | 162 / 223 |
+| prefill, 10K-token prompt: tok/s, time to first token | 6,188, 1.60 s | 8,254, 1.23 s | 4,217, 2.35 s | 2,920, 3.42 s | 13,280, 0.74 s | 9,430, 1.07 s | 6,186, 1.57 s |
+| prefill, 90K-token prompt: tok/s, time to first token | 4,994, 18.0 s | 8,390, 10.5 s | 4,895, 17.8 s | 3,572, 25.4 s | 5,055, 17.6 s | 8,860, 10.2 s | 4,945, 17.6 s |
+| total output, 1 / 4 / 8 / 16 streams at once | 312 / 575 / 848 / 999 | 300 / 642 / 880 / 1,061 | 70 / 73 / 78 / 78 | 72 / 55 / 50 / 44 | 306 / 594 / 731 / 835 | 213 / 362 / 431 / – | 147 / – / – / – |
 
 | model | weights | quality against a reference |
 |---|---|---|
@@ -52,6 +58,7 @@ and the club-3090 benchmark tools (November 19, 2026):
 | DeepSeek-V4.1-Flash | the Maya-S GGUF files as they are: experts IQ2_XXS / IQ2_S / IQ3_XXS / IQ3_S, dense Q8_0, Engram Q6_K | negative log-likelihood 1.635 on my test texts (no full-precision reference fits on this machine) |
 | GLM-5.3-Flash | my INT4 quant: routed experts and KDA layers INT4 ([details](#glm-53-flash-preview)) | next-token KL 0.59 against the official FP8 model (three prompts: 0.45-0.77) |
 | gpt-oss-120B | OpenAI's checkpoint as it is: MXFP4 experts, bf16 dense weights | next-token KL 0.118 against an fp32 reference of the model, top-1 agreement 86.9 % |
+| Inkling-2-Mini | the official checkpoint's NVFP4 / MXFP8 experts as they are; dense attention weights GPTQ INT8, one scale per 128 inputs (`--dense-weights g15`: the original bf16 weights, lossless) | next-token KL 0.00539 against an fp32 reference of the model, top-1 agreement 97.6 % (the official bf16 forward: 0.00592) |
 
 (Single-stream decode: club-3090 `bench.sh` with each model's own sampling; streams: its `concurrency-probe.sh`,
 greedy, 256-token prompts and replies, total output of all streams; each number is the mean of 2 to 6 runs. The two
@@ -59,7 +66,10 @@ Qwen servers ran with thinking on at effort low and vision on. For 16 streams th
 by default were started with 16: `GLM_CONVS=16`, DeepSeek-V4.1-Flash `--max-active 16`, `GPTOSS_SLOTS=16`.
 DeepSeek-V4.1-Flash and GLM-5.3-Flash decode one conversation at a time and give the streams turns, so their total
 output stays at about one stream's. gpt-oss-120B at 90K: prompts of 86,786 and 89,998 tokens. Quality: the same
-builds; the [8-pack](#quality) results are below.)
+builds; the [8-pack](#quality) results are below. Inkling-2-Mini: the 1.6.0 release build, November 26, 2026, its
+server defaults (8 slots on 2 cards, GPUs 0 and 2 with P2P; 2 slots on one card, GPU 0), so the stream counts above its
+slots are not measured ("–"); greedy with the mix of nine prompt types it decodes about 320 tok/s single-stream on 2
+cards and 214 on one card ([Inkling-2-Mini](#inkling-2-mini-preview)).)
 
 **Flash-Next quality**, in more detail: next-token KL divergence against the official BF16 model on the public set
 [jyohukuchan/qwen38-flash-next-bf16-logits](https://huggingface.co/datasets/jyohukuchan/qwen38-flash-next-bf16-logits),
@@ -67,88 +77,37 @@ scored with its own `compare.py`: mean KL **0.114**, top-1 agreement **89.6 %**,
 the context went through batched prefill). 1.5.0 build, November 19, 2026, the same as 1.3.6 to every digit; details
 and the command under [Quality](#quality).
 
-**What is new in 1.5.1** (stable, `latest`; it also holds everything from 1.5.0 below): two Flash-Next fixes.
-`FLASH_CKPT=0` no longer crashes the server (SIGFPE) when a checkpoint is planned at the point where two prompts
-diverge ([#41](https://github.com/bpx03/QEngine/issues/41)), and after a pinned prefix is dropped (pin budget or
-host-memory pressure) the archive goes back under its budget at once ([#40](https://github.com/bpx03/QEngine/issues/40)).
-The other models are unchanged. Checked with the same greedy output and speed as 1.5.0; the release checks and the
-numbers on this page are from 1.5.0 ([release notes](https://github.com/bpx03/QEngine/releases/tag/v1.5.1)).
+**What is new in 1.6.0** (stable, `latest`):
 
-**What is new in 1.5.0**:
+- **A sixth model, as a preview: [Inkling-2-Mini](#inkling-2-mini-preview)**, Thinking Machines' looped mixture-of-experts
+  model (26.4B parameters, 3.4B active), run from the official checkpoint plus two small files of mine (INT8 dense
+  attention weights and a fine-tuned DSpark drafter), on one 24 GB card or on two with GPU P2P: about 320 tok/s
+  single-stream on 2 cards and 214 on one card (greedy, mix of nine prompt types), 565,216 tokens of context per
+  conversation on 2 cards and 125,920 on one card, up to 8 conversations decoded together, exact drafts also for
+  sampled replies (`top_p` / `top_k` / `min_p`), prompt cache, idle conversations in host RAM, parked replies, Docker.
+  8-pack 122 / 124 of 150 (thinking off / on).
+- **Restore points at the last message starts** ([#48](https://github.com/bpx03/QEngine/issues/48)): Flash-Next keeps the
+  state at the start of a prompt's last two messages, so an agent client that drops a short reminder message or the
+  reasoning of its last reply resumes there instead of recomputing from the system prompt (125K-token conversation:
+  15.5-16.3 s -> 0.4-0.6 s per turn); `FLASH_CKPT_TAIL=0` turns it off.
+- **27B disk cache** ([#47](https://github.com/bpx03/QEngine/issues/47)): a conversation attached to a shared system prompt
+  is now saved with that system prompt in its own file, so it comes back after a restart.
+- **Opt-in `--disk-eager`** (27B and Flash-Next, [#33](https://github.com/bpx03/QEngine/issues/33)): with `--disk-cache`,
+  each conversation is also written right after every finished reply, so a crash or power loss loses far less.
+- **GLM-5.3-Flash on 3 cards without GPU P2P** (stock driver) no longer stops at load with a cuBLAS error
+  ([#44](https://github.com/bpx03/QEngine/issues/44)): the prefill indexer runs on every card when the cards have no
+  peer access; a collective stall prints the watchdog report and honours `QE_COLL_TIMEOUT_MS`.
+- **gpt-oss-120B**: after every finished reply the idle conversation is copied to host RAM in the background
+  (`GPTOSS_BG_REARM=0` = off), so the next long prompt does not wait for that copy; a request never drops the stored
+  conversation it is about to restore.
+- The 27B, Flash-Next and DeepSeek-V4.1-Flash engines are unchanged apart from the items above (27B greedy output and
+  Flash-Next deterministic output identical to 1.5.x, decode within 1 %); the speed table above is from 1.5.0 for
+  those models.
 
-- **Three new models, as previews**, in the same server, API and Docker image as the two Qwen models (what each one
-  supports: [Feature matrix](#feature-matrix)):
-  - [DeepSeek-V4.1-Flash](#deepseek-v41-flash-preview), run from the Maya-S GGUF files as they are, on three 24 GB
-    cards plus about 170 GB of host RAM: 262K context, DSpark drafts, thinking, tool calls and structured output, a
-    host-RAM archive and shared system prompts for agent teams. 88 / 120 tok/s single-stream (narrative / code), a
-    90K-token prompt in 17.8 s, 8-pack 122 / 133 of 150 (thinking off / on).
-  - [GLM-5.3-Flash](#glm-53-flash-preview), run from my INT4 quant, on three 24 GB cards plus about 192 GB of host
-    RAM, with the experts in host RAM and a CPU expert lane next to the cards: 262K context, MTP drafts, logprobs, up
-    to 8 conversations at once by exact time slicing. 110 / 92 tok/s single-stream, a 90K-token prompt in 25.4 s,
-    8-pack 121 / 133 of 150.
-  - [gpt-oss-120B](#gpt-oss-120b-preview), run from OpenAI's checkpoint as it is, all in VRAM on three 24 GB cards,
-    with or without GPU P2P: 128K context, up to 8 conversations decoded together, lookup drafts, presence /
-    frequency penalties. 301 tok/s single-stream, 835 tok/s total with 16 streams, a 10K-token prompt in 0.74 s and a
-    90K-token prompt in 17.6 s, 8-pack 110 / 116 of 150 (reasoning effort low / medium).
-
-- **27B: the first token comes much sooner with many agents at once.** The 27B used to keep half of the GPU time for
-  running replies however many requests waited for their prompt. Now the time split follows the queue: short prompts
-  are prefilled back to back with one decode step between passes, long ones share the time by head count, and running
-  replies keep at least 10 % of it (`--prefill-share-min`, `--prefill-short`; `--prefill-share-min 0.5` gives the old
-  split). It counts a running reply at admission by its `max_tokens`, and no longer copies a whole conversation to the
-  host archive when the next turn only replaces the last reply. On my 2 cards, in an agent replay with short tool
-  results, the median time to the first token at 16 agents in flight went from 4.5 s to 0.86 s, with 7 % more total
-  output; single-stream speed is unchanged ([numbers](#qwen38-27b-2)). Beyond its 16 decode seats a request is
-  prefilled on one of two seats kept for prompts, gets its first token, and its reply waits parked in host memory (KV
-  and state, resumed exactly where it stopped) until a decode seat frees (`--park`, `--park-reserve`; `--park 0`
-  waits for a seat first, as before). Archived conversations keep two recurrent-state checkpoints instead of four
-  (`QE_ARCH_SUBS`), so the host archive holds about 1.5 times as many agents. At 32 and 64 agents in flight with the
-  defaults on 2 cards (release build): median first token 1.0 / 0.48 / 1.0 s at 16 / 32 / 64 agents in flight, with
-  243 / 359 / 285 tok/s total output and no agent's prompt computed again. `QE_MAX_SEQS=32` (opt-in) seats 32 conversations on 2 and 3 cards: at 32 agents in flight
-  on 2 cards the median first token went from 25 s to 0.48 s with 106 % more total output, at the cost of a smaller
-  KV pool (2 cards: 417,792 tokens instead of 623,616, so two very long conversations no longer fit at once).
-
-- **Flash-Next: the first token comes much sooner with several agents at once.** Every prompt now keeps the state at
-  its own end, so an agent's next turn resumes there even when the client sends back another text for the reply or
-  drops its reasoning; before, a turn shorter than 4,096 tokens was recomputed on the next turn (about a third of
-  all prefill work in an agent replay). A conversation keeps three recurrent states instead of six (its system end,
-  its latest prompt end and the newest other one; `FLASH_CKPT_KEEP=6` as before), so the host archive holds 64
-  agents. On 3 cards the time split follows the queue as on the 27B: while short prompts are next, running replies
-  get 10 % of the time after every prefill pass instead of half (`--prefill-share-min`; 2 cards and mode B keep the
-  fixed split). In an agent replay with short tool results the median time to the first token went from 0.16 / 0.44
-  / 1.91 / 3.93 s to 0.13 / 0.25 / 0.37 / 2.83 s at 1 / 4 / 16 / 32 agents in flight, with 15 / 14 / 16 / 10 % more
-  total output ([numbers](#qwen38-flash-next-2)). Beyond the 16 decode seats Flash-Next now parks as the 27B does
-  (`--park`, on 3 cards in `tp` mode): a reply gets its first token from one of 4 seats kept for prompts, waits in
-  host memory and resumes exactly where it stopped when a seat frees. At 32 / 64 agents the median time to the
-  first token went from 2.83 / 8.0 s to 0.26 / 0.75 s, with 5 / 9 % more total output.
-
-- **Flash-Next: no more stops at a slot hand-off when the host is short of memory**
-  ([#32](https://github.com/bpx03/QEngine/issues/32), [#25](https://github.com/bpx03/QEngine/issues/25)). The
-  engine's log lines go through a writer thread, so a slow log reader can no longer hold up a GPU step
-  (`QE_LOG_ASYNC`); the archive's memory is pinned in the background only while the engine is idle, 1 GB at a time,
-  and pinning pauses (and backs off) when a registration is slow, which is a sign of host memory pressure. Thanks to
-  cristianflorett, dgaglioni and gbinka for the reports and measurements behind the Flash-Next hand-off fix (#32, #25).
-
-- **Both Qwen models give memory back when other programs squeeze the host while they serve.** A background thread
-  watches the kernel's memory-pressure and swap-in counters next to `MemAvailable`; under pressure the engine stops
-  growing, frees archive memory, shrinks the archive, drops pinned prompts and, last (Flash-Next), moves the n-gram
-  table to the page cache, one logged stage at a time, and it returns slowly once the host stays calm (`QE_MEMP=0`
-  turns it off; [details](docs/advanced.md#host-ram-safety)). With 179 GB taken by another program on my machine,
-  Flash-Next went down to the last stage and served every request, with the same greedy text.
-
-- **For every model:** streamed replies send a keep-alive after 10 s without an event (an OpenAI `: keep-alive`
-  comment, an Anthropic `ping` event; `QE_SSE_KEEPALIVE`), so proxies and clients with a read timeout keep a stream
-  whose request waits for its turn. At start the server logs one `[settings]` line for every flag or environment
-  variable that is set but does nothing for the loaded model. A top-level `enable_thinking` in a request is read too
-  ([#31](https://github.com/bpx03/QEngine/issues/31)).
-
-- 27B and Flash-Next single-stream decode and prefill speed and their quality are the same as in 1.3.6 within the
-  run-to-run spread (same benchmark, 1.3.6: 27B 281 / 507 tok/s, prefill 6,133 / 4,997 tok/s; Flash-Next 306 / 449
-  tok/s, prefill 8,207 / 8,394 tok/s).
-
-1.5.0 went through the release checks on my machine and passed all of them (the 262K-token stress runs with images
-on 3 and on 2 cards, VRAM and host-RAM hogs taken mid-run, soaks, Docker smoke, per model). The 8-pack quality suite ran once per
-model ([Quality](#quality)), next to the KL / NLL measurement and the speed runs of all five models.
+1.6.0 went through the release checks on my machine: the CPU suites, identity and speed points of every model,
+Inkling-2-Mini's 8-pack (once) and its stress runs up to the full context on 2 cards and on one card with the other
+slots busy, VRAM and host-RAM hogs taken before the start and mid-run (Inkling-2-Mini, gpt-oss-120B), and a Docker
+start of all six models from the release image.
 
 Older releases and what changed in each: [releases page](https://github.com/bpx03/QEngine/releases).
 
@@ -210,7 +169,7 @@ docker run -d --name qengine --restart unless-stopped --gpus all --ipc=host --ul
   `-p 8080:8080` (all interfaces) and put a firewall or an authenticating proxy in front: the server has no API keys.
 - `--restart unless-stopped` matters: after a stalled GPU the server exits with code 75 and relies on a restart (see
   [Failure handling](#serving-behaviour)).
-- Images: `latest` / `1.5.1` (text only) and `vision` / `1.5.1-vision` (with the image encoder). Earlier: `1.5.0`, `1.5.0-vision`, `1.3.6`, `1.3.6-vision`, `1.3.5.9`, `1.3.5.9-vision`, `1.3.5.8`, `1.3.5.8-vision`, `1.3.5.7`, `1.3.5.7-vision`, `1.3.5.6`, `1.3.5.6-vision`, `1.3.5` and `1.3.5-vision`; experimental `1.3.5.5`, `1.3.5.5-vision`, `1.3.5.4`, `1.3.5.4-vision`, `1.3.5.3`, `1.3.5.3-vision`, `1.3.5.2`, `1.3.5.2-vision`, `1.3.5.1`, `1.3.5.1-vision`.
+- Images: `latest` / `1.6.0` (text only) and `vision` / `1.6.0-vision` (with the image encoder). Earlier: `1.5.1`, `1.5.1-vision`, `1.5.0`, `1.5.0-vision`, `1.3.6`, `1.3.6-vision`, `1.3.5.9`, `1.3.5.9-vision`, `1.3.5.8`, `1.3.5.8-vision`, `1.3.5.7`, `1.3.5.7-vision`, `1.3.5.6`, `1.3.5.6-vision`, `1.3.5` and `1.3.5-vision`; experimental `1.3.5.5`, `1.3.5.5-vision`, `1.3.5.4`, `1.3.5.4-vision`, `1.3.5.3`, `1.3.5.3-vision`, `1.3.5.2`, `1.3.5.2-vision`, `1.3.5.1`, `1.3.5.1-vision`.
   Earlier releases stay available under their version tags.
 - `QE_GPUS=0,2` picks the GPUs (host ids with `--gpus all`; default `0,1,2`; `QE_DEVICES`, if set, wins over `QE_GPUS`). Settings are environment variables
   (`-e FLASH_PAR=pp`); anything after the image name, or `QE_EXTRA_ARGS`, goes to the server (`--think 0`,
@@ -231,7 +190,7 @@ docker run -d --name qengine --restart unless-stopped --gpus all --ipc=host --ul
   Symbolic links inside the mount must resolve inside the container (mount their targets at the same paths). The
   image carries the DSV4 engine for sm_86 / sm_89 only. Engine settings go in with `-e`
   (`-e DSV4_EGMIRROR=...`), server flags in `QE_EXTRA_ARGS` (`--route-margin 0.05`).
-  One image serves all models; the DSV4, GLM and gpt-oss engines add cuBLAS to it.
+  One image serves all models; the DSV4, GLM, gpt-oss and Inkling engines add cuBLAS to it.
 - GLM-5.3-Flash (preview): mount the `bpx03/GLM-5.3-Flash-INT4-QEngine` directory, e.g.
   `-v /path/to/GLM-5.3-Flash-INT4-QEngine:/app/models/glm:ro -e QE_MODEL=/app/models/glm`. The experts are pinned in
   host RAM (about 157 GB), so `--ipc=host --ulimit memlock=-1` matter here. Engine settings go in with `-e`
@@ -239,6 +198,10 @@ docker run -d --name qengine --restart unless-stopped --gpus all --ipc=host --ul
 - gpt-oss-120B (preview): mount the `openai/gpt-oss-120b` directory, e.g.
   `-v /path/to/gpt-oss-120b:/app/models/gpt-oss-120b:ro -e QE_MODEL=/app/models/gpt-oss-120b`. Engine settings go in
   with `-e` (`-e GPTOSS_SLOTS=4`). The image carries the gpt-oss engine for sm_86 only.
+- Inkling-2-Mini (preview): mount the model directory with `dense8.safetensors` and `mtp_qe.safetensors` in it, e.g.
+  `-v /path/to/Inkling-2-Mini:/app/models/inkling:ro -e QE_MODEL=/app/models/inkling`. It runs on one card (the first
+  of `--gpus`) unless `QE_GPUS` / `QE_DEVICES` name the cards (`-e QE_GPUS=0,1`: two cards, needs GPU P2P). The image
+  carries the Inkling engine for sm_86 only.
 - Build it yourself: `docker build -t qengine .` (with vision), `--build-arg VISION=0` (text only),
   `--build-arg CUDA_ARCHS=86` (RTX 3090 code only, faster build), `--build-arg REVISION=$(git rev-parse HEAD)` (the
   build hash the monitoring headers show; without it they say `build unknown`).
@@ -291,7 +254,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 }'
 ```
 
-The served names are `qwen3.8-flash-next-qengine` and `qwen3.8-27b-qengine` (`--served-name` changes it).
+The served names are `qwen3.8-flash-next-qengine` and `qwen3.8-27b-qengine` (Inkling-2-Mini: `inkling-2-mini-qengine`; `--served-name` changes it).
 For **Claude Code**, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and `CLAUDE_CODE_ATTRIBUTION_HEADER=0`.
 
 ### 5. Behind llama-swap (or another model switcher)
@@ -946,19 +909,34 @@ request of that server, short ones too, so run a separate server for long docume
 - Conversations that leave VRAM go to a **host-RAM archive** (`FLASH_KV_ARCHIVE_GB` 48, `QE_KV_ARCHIVE_GB` 32; smaller
   on machines with less RAM, see [Host memory](#host-memory-flash-next)): returning to a 50K-token conversation is a
   copy, not a recompute.
+- **Restore points at message starts** (Flash-Next): the model carries a recurrent
+  state that cannot be cut back to an arbitrary token, so a conversation resumes only where a state was saved. Each
+  prompt now also keeps the state at the start of its last two messages. An agent client that appends a short
+  message to every request and drops it on the next one (a runtime-context or reminder message), or that drops the
+  reasoning of its last reply, resumes at that message instead of the end of the system prompt: on a 125K-token
+  Flash-Next conversation 15.5-16.3 s -> 0.4-0.6 s per turn (from the second such turn; the first pays the one-time
+  archive copy). Inkling-2-Mini gets the same in a later release. No state is planned when the last
+  message starts within 512 tokens of the point the prompt resumed from, so an append-only agent loop is unchanged;
+  each state takes about 0.12 GB of host RAM. A changed tool list still recomputes the whole prompt (the chat template
+  puts the tools at its start). Flash-Next on 2 cards (more than 10 GB of host-backed
+  experts per card, so every prefill batch copies them again) keeps these states off unless `FLASH_CKPT_TAIL_SNAP=1`
+  (a tail turn of a 67K conversation 10.3 s -> 0.95 s, a cold multi-message prompt about 0.6 s slower). `FLASH_CKPT_TAIL=0`: off.
 - **Pinned system prompts**: the KV and state at the end of each agent kind's system prompt and tools are kept apart
   from the archive (`FLASH_PREFIX_GB` / `QE_PREFIX_GB`, 8 GB), so a new agent of that kind starts after its system
   prompt even when the archive is full.
 - There is no disk cache by default. With `--disk-cache DIR` (both models, 200 GB at most, `--disk-cache-gb`) conversations
   are also written to files and survive a restart: a conversation that returns is read back instead of recomputed. Flash-Next
   has it since 1.3.5.3, experimental; details in
-  [docs/advanced.md](docs/advanced.md#disk-cache). A failing disk costs only the cache; the server keeps serving.
+  [docs/advanced.md](docs/advanced.md#disk-cache). A failing disk costs only the cache; the server keeps serving. Files are
+  written at `--persist-idle` (120 s idle) and at shutdown, so this covers a graceful restart; the opt-in `--disk-eager` also
+  writes after every reply (survives a `kill -9`, at the cost of rewriting the file every turn). On the 27B a conversation
+  that shares a pinned system prompt is saved together with it, so each file restores on its own.
 
 ### DeepSeek-V4.1-Flash (preview)
 
 DeepSeek-V4.1-Flash-1017: 40 layers, 384 routed experts per layer plus a shared expert, Engram n-gram memory tables and
 compressed sparse attention. QEngine runs it on three 24 GB cards plus host RAM, with the DSpark draft model for
-speculative decoding. It is a preview in 1.5: it runs in the same server and API as the other models, with the
+speculative decoding. It is a preview in 1.6: it runs in the same server and API as the other models, with the
 limits listed below.
 
 **Model files.** I do not ship weights for this model. QEngine runs from the **Maya-S GGUF files** on Hugging Face
@@ -983,7 +961,7 @@ is ready about 41 s after start with the files in the page cache.
 
 - **Exactly three NVIDIA cards with 24 GB each**, compute capability 8.6 or 8.9 (RTX 3090 / 3090 Ti, RTX 4090; tuned
   on the 3090). The DSV4 engine is built for sm_86 only, which runs on RTX 4000 (sm_89) cards as is; RTX 5000 cards
-  (sm_120) are not supported in 1.5. The engine uses the first three visible cards (`QE_DEVICES`); a fourth is
+  (sm_120) are not supported in 1.6. The engine uses the first three visible cards (`QE_DEVICES`); a fourth is
   ignored, two are not enough. The expert pool on each card is sized from its free VRAM, so a card that drives a
   desktop works, with fewer experts in VRAM.
 - **GPU P2P between every pair of cards is recommended, not required.** With it, the context reservation is lazy:
@@ -1071,7 +1049,7 @@ is ready about 41 s after start with the files in the page cache.
 Z.ai's GLM-5.3-Flash: 45 layers, 288 routed experts per layer (8 active per token) plus a shared expert, attention
 layers with a sparse indexer for long prompts next to KDA linear-attention layers, and one MTP layer. QEngine runs it
 on three 24 GB cards plus host RAM, with its own engine (`src/glm`): the experts used most often sit in VRAM, the full
-set in pinned host RAM, and the rest of a step's experts run on the CPU next to the cards. It is a preview in 1.5: it
+set in pinned host RAM, and the rest of a step's experts run on the CPU next to the cards. It is a preview in 1.6: it
 runs in the same server and API as the other models, with the limits listed below.
 
 **Model files.** My INT4 quant of GLM-5.3-Flash,
@@ -1094,8 +1072,10 @@ own `chat_template.jinja`. Loading takes about 60 s with the files in the page c
 
 - **Three NVIDIA cards with 24 GB each** (tuned and tested on RTX 3090s). Two cards also work, with fewer expert slots
   per card (slower decode). With four or more cards the engine uses the first three.
-- **GPU P2P is optional.** Without it (the stock GeForce driver) the all-reduces go through host memory. A start-up
-  line says which path runs; `GLM_P2P=0` forces the host path.
+- **GPU P2P is optional.** Without it (the stock GeForce driver) the all-reduces go through host memory and the
+  prefill indexer runs on every card instead of split across them (a 32K prompt prefills about 10 % slower than with
+  P2P; 2K-8K prompts and decode are about level). A start-up line says which path runs; `GLM_P2P=0` forces the host
+  path.
 - **About 192 GB of host RAM**: the experts (about 157 GB) stay pinned in host RAM, plus the conversation archive
   (below, up to 32 GB by default). Less RAM means a smaller archive; the experts themselves have to fit.
 - **An x86-64 CPU with AVX2.** The CPU expert lane is built twice and picks its kernels at start: AVX-512 when the
@@ -1151,7 +1131,7 @@ own `chat_template.jinja`. Loading takes about 60 s with the files in the page c
 
 OpenAI's gpt-oss-120B: 36 layers, 128 experts per layer (4 active per token), MXFP4 expert weights, grouped attention
 with every second layer on a 128-token window, and the harmony chat format. QEngine runs it on three 24 GB cards, all of
-it in VRAM, with its own engine (`src/gptoss`). It is a preview in 1.5: it runs in the same server and API as the other
+it in VRAM, with its own engine (`src/gptoss`). It is a preview in 1.6: it runs in the same server and API as the other
 models, with the limits listed below.
 
 **Model files.** The official checkpoint as OpenAI publishes it, read as it is: the MXFP4 experts and the bf16 dense
@@ -1172,7 +1152,7 @@ about 11 s after start with the files in the page cache.
 - **Three NVIDIA cards with 24 GB each, compute capability 8.6** (RTX 3090 / 3090 Ti). The engine is built for sm_86
   only. RTX 4000 cards (8.9) run the same code untested, with the output head computed in full: its fast two-stage form
   has a rounding margin I measured on 3090s only, so a start-up line says the full head is used (slower decode: about 6 % for one conversation on my 3090s).
-  Other cards (A100 8.0, RTX 5000 12.0, ...) are refused at start in 1.5. Two or four cards are accepted but not tested (two
+  Other cards (A100 8.0, RTX 5000 12.0, ...) are refused at start in 1.6. Two or four cards are accepted but not tested (two
   24 GB cards cannot hold the 65 GB of weights: the start stops with what each card would need); one card is refused.
 - **GPU P2P between the cards is not needed.** With it the cards write into each other's memory. Without it (the
   stock GeForce driver) they exchange through pinned host memory, with the same output bit for bit: on my cards the
@@ -1227,7 +1207,7 @@ about 11 s after start with the files in the page cache.
   steering, no disk cache (`--disk-cache` is ignored with a start-up line).
 - One tool call per reply (the model's format); the built-in `browser` and `python` tools are not run by the server.
 - Constrained replies (structured output, `tool_choice` `required` / named / `none`) decode one row per step.
-- The DFlash drafter is not used by the server in 1.5 (`GPTOSS_DFLASH` is ignored with a start-up line).
+- The DFlash drafter is not used by the server in 1.6 (`GPTOSS_DFLASH` is ignored with a start-up line).
 - A greedy or seeded reply in a reused conversation can differ from the same prompt sent fresh where two tokens are
   nearly tied: rows computed by decode and by prefill differ in rounding. The same holds for a conversation that
   shares its beginning with another one the server still holds (the same system prompt, or just the harmony header):
@@ -1236,35 +1216,137 @@ about 11 s after start with the files in the page cache.
   reply.
 - Context per conversation: 131,072 tokens (the model's own limit, `--max-ctx`); the pool is shared by all slots.
 
+### Inkling-2-Mini (preview)
+
+Thinking Machines' Inkling 2 Mini: 24 layers of which layers 6-17 run three times per token (48 layer applications), a
+sparse mixture of experts (26.4B parameters, 3.4B active per token) with NVFP4 experts in layers 0-19 and MXFP8 in
+20-23, sliding-window attention (1,024 tokens) on 40 of the 48 applications and full attention on 8, and its own chat
+format. QEngine runs the text part with its own engine (`src/inkling`): on one 24 GB card, or split over two cards
+with tensor parallelism. It is a preview in 1.6: same server and API as the other models, with the limits below.
+
+**Model files.** The official checkpoint, read as it is (I tested revision `b85c3cfa`, about 19 GB), plus two files of
+mine next to it in the same directory (about 1.3 GB):
+
+    hf download thinkingmachines/Inkling-2-Mini --revision b85c3cfa --local-dir models/Inkling-2-Mini
+    hf download bpx03/Inkling-2-Mini-QEngine dense8.safetensors mtp_qe.safetensors --local-dir models/Inkling-2-Mini
+    server/run.sh 8080 --model models/Inkling-2-Mini                    # one card (GPU 0)
+    QE_DEVICES=0,1 server/run.sh 8080 --model models/Inkling-2-Mini     # two cards, needs GPU P2P
+
+- `dense8.safetensors` (0.65 GB): the dense attention weights in INT8 with one scale per 128 inputs, rounded with GPTQ
+  (error feedback against activations of public text), so decode reads fewer bytes. Without it the engine uses the
+  original bf16 weights (`g15`, see the table below) and says so at start.
+- `mtp_qe.safetensors` (0.64 GB): the model's DSpark drafter, fine-tuned by me on the model's own outputs (same shapes,
+  less over-confident, with its own stop policy). Without it the engine uses the official `mtp.safetensors` of the
+  checkpoint (`INK_DRAFTER_FILE=mtp.safetensors` picks the official one when both are there). Drafts never change the
+  text: every drafted token is checked against the model's own choice.
+
+The server recognises the model from `config.json` (`model_type` `inkling2_loop`) and loads the Inkling engine
+(`build_srv/libqinkling.so`, built by `OUT=build_srv src/inkling/build.sh`; the Docker image has it). Without that
+library the start stops and says how to build it. The chat template is the model's own `chat_template.jinja`. The
+server is ready about 12 s after start with the files in the page cache.
+
+**What it needs**
+
+- **One or two NVIDIA cards with 24 GB, compute capability 8.6** (RTX 3090 / 3090 Ti; the engine is built for sm_86
+  only). One card by default; `QE_DEVICES=a,b` (or `--devices`) splits it over two cards, which needs GPU P2P between
+  them: without peer access the start stops with that reason. Three cards work (an uneven head split) but are not part
+  of the 1.6 checks.
+- **Host RAM** only for the conversation archive (below); the model itself stays in VRAM.
+- Linux and an NVIDIA driver with CUDA 13.1 support, as for the other models.
+
+**What works**
+
+- The same server and API as the other models: OpenAI `POST /v1/chat/completions` (streaming or not), Anthropic
+  `POST /v1/messages` and `count_tokens`, `GET /v1/models`, `GET /health`.
+- **Thinking**: the template's `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a
+  number from 0 to 0.99); thinking off (`enable_thinking: false`) is effort 0; without one the model's default 0.9.
+  The reasoning comes back in `reasoning_content` (OpenAI) or thinking blocks (Anthropic).
+- **Tool calls** in the OpenAI and Anthropic formats (the model's `content_invoke_tool_json` messages).
+- **DSpark drafts** for greedy and plain-temperature replies: the drafter proposes up to 7 tokens, one multi-row step
+  checks them, and the text is exactly the text without drafts.
+- **Several conversations at once**: 8 slots on 2 cards, 2 on one card (`INK_SLOTS`, 1-16; when they don't fit the
+  server serves fewer and says so). They share one K/V pool, and one conversation may use all of it: per conversation
+  about 565K tokens on 2 cards and 126K on one card with the default weights. Replies decode together in one step,
+  and a reply's tokens are the same as when it runs alone.
+- **Prompt cache**: a follow-up turn reuses its conversation's K/V; idle conversations move to host RAM
+  (`QE_KV_ARCHIVE_GB`, default 128 GiB, never closer than `QE_KV_ARCHIVE_MARGIN_GB` = 8 GiB to `MemAvailable`) and
+  come back with a copy, also in the background after every finished reply (`INK_BG_REARM`); replies beyond the seats
+  are parked in host memory (`--park`).
+- **Sampling**: `temperature` (default 1.0, from the model's `generation_config.json`), `top_p`, `top_k`, `min_p`,
+  `seed`, presence / frequency penalties. Temperature with `top_k` up to 64, `top_p` and `min_p` is sampled on the
+  GPU with drafts on, at about the greedy speed: the engine finds the exact top logits, keeps the same set as the
+  usual rule (top_k, then min_p, then the smallest top_p prefix) and draws from it with seeded noise, so drafts never
+  change the text and a seed gives the same reply alone or in a batch. Without `top_k` the kept set has to end
+  inside the 64 most likely tokens; a token where it doesn't (`top_p` near 1 on very flat text) is picked on the CPU
+  with the same rule and seed, and a conversation where that happens often runs without drafts. `top_k` above 64
+  and presence / frequency penalties are picked on the CPU without drafts. `INK_SAMP_DEV=0` puts all filters on the
+  CPU.
+
+**Known limits (preview)**
+
+- Text only: an image part is answered with `[image omitted: this server runs without vision]` in its place.
+- No structured output and no logprobs (HTTP 400); `tool_choice` `required` / named are not supported (`none` works:
+  the reply ends at its first call); the thinking budget is ignored.
+- Without GPU P2P only one card.
+
 ## Feature matrix
 
-The five engines don't all do the same things. This table is what each one supports today (✅ yes, 🟡 partly, ❌ no).
+The six engines don't all do the same things. This table is what each one supports today (✅ yes, 🟡 partly, ❌ no).
 
-| feature | Qwen3.8-27B | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash | gpt-oss-120B |
-|---|---|---|---|---|---|
-| Tool calls, streaming, OpenAI + Anthropic APIs | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Structured output (`response_format`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `tool_choice` required / named / none | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `logprobs` | ✅ | ✅ | ❌ HTTP 400 | ✅ | ❌ HTTP 400 |
-| Presence / frequency penalty | ✅ | ✅ | ❌ ignored | ❌ ignored | ✅ |
-| Thinking budget | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Thinking off | ✅ | ✅ | ✅ | ✅ | 🟡 always reasons (effort low) |
-| Images (`--vision 1`) | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Activation steering | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Prefix cache, shared system prompt | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Idle conversations in host RAM | ✅ | ✅ | ✅ | ✅ (8 at once, one decodes at a time) | ✅ |
-| Disk cache (`--disk-cache`) | ✅ | ✅ | ❌ | ❌ | ❌ |
-| KV cache in host RAM (`FLASH_KV=ram`) | ❌ | ✅ | ❌ | ❌ | ❌ |
-| Smaller K/V formats (opt-in) | ✅ 4-bit | ✅ 4-bit | ❌ | ❌ | ✅ FP8, 12-bit K |
-| Max context (default) | 256K, 1M with YaRN | 256K, 1M with YaRN + KV in RAM | 256K | 256K | 128K |
-| Parked replies beyond the seats (`--park`) | ✅ | ✅ (3+ cards) | ❌ | ❌ | ❌ |
-| Drafts | MTP, DFlash2, lookup | MTP, n-gram, lookup | DSpark | MTP | prompt lookup |
-| Sparse attention for long prompts | ✅ LSA (opt-in) | built in | built in | built in | ❌ |
-| Cards | 1-4 | 2-4 TP, more in PP | 3 | 3 (2 with fewer expert slots) | 3 (2-4 accepted, untested) |
-| Without GPU P2P | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Docker image | ✅ | ✅ | ✅ | ✅ | ✅ |
+| feature | Qwen3.8-27B | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash | gpt-oss-120B | Inkling-2-Mini |
+|---|---|---|---|---|---|---|
+| Tool calls, streaming, OpenAI + Anthropic APIs | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Structured output (`response_format`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ HTTP 400 |
+| `tool_choice` required / named / none | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 none only (the reply ends at its first call) |
+| `logprobs` | ✅ | ✅ | ❌ HTTP 400 | ✅ | ❌ HTTP 400 | ❌ HTTP 400 |
+| Presence / frequency penalty | ✅ | ✅ | ❌ ignored | ❌ ignored | ✅ | ✅ |
+| Thinking budget | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ ignored |
+| Thinking off | ✅ | ✅ | ✅ | ✅ | 🟡 always reasons (effort low) | 🟡 effort `none`: a short thought remains |
+| Images (`--vision 1`) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Activation steering | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Prefix cache, shared system prompt | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Idle conversations in host RAM | ✅ | ✅ | ✅ | ✅ (8 at once, one decodes at a time) | ✅ | ✅ |
+| Disk cache (`--disk-cache`) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Write after every reply (`--disk-eager`, opt-in) | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| KV cache in host RAM (`FLASH_KV=ram`) | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Smaller K/V formats (opt-in) | ✅ 4-bit | ✅ 4-bit | ❌ | ❌ | ✅ FP8, 12-bit K | ❌ |
+| Dense weight form choice (`--dense-weights`) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ `int8` (GPTQ) / `g15` (original weights, lossless) |
+| Max context (default) | 256K, 1M with YaRN | 256K, 1M with YaRN + KV in RAM | 256K | 256K | 128K | 1M, served up to the KV pool (~565K on 2 cards with INT8 dense weights, ~544K lossless; ~126K on one card, ~117K lossless) |
+| Parked replies beyond the seats (`--park`) | ✅ | ✅ (3+ cards) | ❌ | ❌ | ❌ | ✅ |
+| Drafts | MTP, DFlash2, lookup | MTP, n-gram, lookup | DSpark | MTP | prompt lookup | DSpark |
+| Sparse attention for long prompts | ✅ LSA (opt-in) | built in | built in | built in | ❌ | ❌ (sliding window on most layers) |
+| Cards | 1-4 | 2-4 TP, more in PP | 3 | 3 (2 with fewer expert slots) | 3 (2-4 accepted, untested) | 1 by default, 2-3 TP with `QE_DEVICES` (needs P2P) |
+| Without GPU P2P | ✅ | ✅ | ✅ | ✅ | ✅ | 🟡 one card only |
+| Docker image | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 `n > 1`, `logit_bias` and `parallel_tool_calls: false` are ignored on every model.
+
+Inkling-2-Mini with thinking off runs at reasoning effort `none`, and the model still writes a short thought (one or two
+sentences) before most replies; the server returns it as reasoning (`reasoning_content` / a thinking block), never
+mixed into the answer.
+
+Inkling-2-Mini lets you pick the form of its dense attention weights (`--dense-weights`, or `INK_DENSE8=1` / `0`;
+the flag wins) on any card count:
+
+| form | what it is | decode step, 2 cards / one card | quality (set-2 KL vs the FP32 reference, decode form; BF16 bar 0.00592) | context per conversation, 2 cards / one card |
+|---|---|---|---|---|
+| `int8` (default) | GPTQ INT8, one scale per 128 inputs, from `dense8.safetensors` next to the checkpoint: faster, small quality loss | ~4.9 / ~7.1 ms | 0.00539 (one card 0.00538) | ~565K / ~126K |
+| `g15` | original weights (lossless, bit-exact to the checkpoint, stored in a 12-bit form) | ~5.5 / ~8.0 ms | 0.00495 | ~544K / ~117K |
+
+`int8` is the default on any card count. Prefill runs at about the same speed in both forms (`int8` within 1 %).
+Without `dense8.safetensors` the default is `g15`, and the server logs one line about it. If you ask for `int8` and `dense8.safetensors` is missing, it falls back to RTN INT8 at load (lower quality,
+KL 0.00589), and the server says so at start. A start-up line names the active form, the served context and the
+switch, e.g. `inkling: dense attention weights int8 (...) on 2 cards, context per conversation 565216 tokens; switch:
+--dense-weights g15 (INK_DENSE8=0) = original weights, lossless`.
+
+Inkling-2-Mini serves 8 conversation slots on 2+ cards and 2 on one card. On one card each slot's fixed state
+(~0.36 GB) comes out of the K/V pool, so 2 slots leave ~126K tokens per conversation (8 slots: ~62K; with the
+lossless `g15` weights ~117K, 8 slots ~53K, 1 slot ~137K). `INK_SLOTS=N` (1-16) sets the count. When the requested slots don't fit, the server serves fewer
+and says so in a start-up line (`requested 16 slots, serving 8`).
+
+After every finished reply Inkling-2-Mini copies the idle conversation to host RAM in the background (`INK_BG_REARM=0`
+= off-switch). A 109K-token conversation then comes back in about 0.3 s instead of a 12.7 s prefill, and a new long
+prompt that needs its room does not wait for the copy.
 
 At start the server logs one `[settings]` line for every flag or environment variable that is set but does nothing for
 the loaded model, e.g. `FLASH_KV=ram is set but has no effect for gpt-oss-120B (KV stays in VRAM ...)`. A request
@@ -1633,6 +1715,7 @@ Environment variables are read at start; an empty value counts as unset. A value
 | `QE_COMM` | `auto` | prefill transfer path: `auto`, `p2p`, `ce`, `host` |
 | `QE_FETCH_ASSETS` | `1` | `0`: no downloads at start: not the tuned MTP head and draft ranking, not the DFlash2 drafter (MTP drafts only), not the `--lsa` index map (full attention) |
 | `--disk-cache DIR` | off | persistent prompt cache that survives restarts (Flash-Next: experimental, since 1.3.5.3) |
+| `--disk-eager` | off | with `--disk-cache`: also write each conversation after every reply (NVMe wear: the whole file per turn) |
 
 ### DeepSeek-V4.1-Flash (preview)
 
@@ -1696,7 +1779,29 @@ The common settings above apply (`--max-ctx`, `--reasoning-effort`, `--thinking-
 | `GPTOSS_CHUNK` | `10240` | prefill chunk in tokens |
 | `GPTOSS_ARCHIVE_SYNC_ROWS` | all | an evicted conversation goes to host RAM whatever its size; a number bounds the copy |
 | `QE_KV_ARCHIVE_GB` / `QE_KV_ARCHIVE_MARGIN_GB` | `128` / `8` | host RAM for idle conversations / what it leaves free below `MemAvailable` |
+| `GPTOSS_BG_REARM` | `1` | after every finished reply an idle conversation is copied to host RAM in the background, so the next long prompt does not wait for that copy; `0` = off-switch |
 | `GPTOSS_BROKEN_EXIT` | `1` | after a device fault the process exits with code 75 (for a restart); `0` = off-switch (keeps the failed process for debugging) |
+
+### Inkling-2-Mini (preview)
+
+The common settings above apply (`--max-ctx`, `--reasoning-effort`, `--temperature`, `--top-p`, `--served-name`,
+`--host`, `--port`, `--metrics-port`, `--presence-penalty`, `--frequency-penalty`, `--park`); `--vision`,
+`--disk-cache`, `--thinking-budget` and steering do not. The engine's other switches are in
+[docs/advanced.md](docs/advanced.md#inkling-2-mini-preview).
+
+| setting | default | what it does |
+|---|---|---|
+| `--model <dir>` (Docker `QE_MODEL`) | – | the `thinkingmachines/Inkling-2-Mini` directory (with `dense8.safetensors` and `mtp_qe.safetensors` next to it) |
+| `QE_DEVICES` / `--devices` | `0` (one card) | the cards; two (`0,1`) split the model with tensor parallelism (needs GPU P2P). Docker: `QE_GPUS` / `QE_DEVICES`, else one card |
+| `--max-ctx` | the model's 1,048,576 | context per conversation, served up to what the K/V pool holds (one start-up `context` line) |
+| `--dense-weights` / `INK_DENSE8` | `int8` when `dense8.safetensors` is there, else `g15` | `g15` (`INK_DENSE8=0`) = the original weights, lossless; `int8` (`INK_DENSE8=1`) without the file = RTN INT8 at load (lower quality, logged); the flag wins |
+| `INK_SLOTS` | `8` on 2+ cards, `2` on one card | conversations decoded at once (1-16) |
+| `INK_DRAFTER` | `1` | `0`: no drafter (plain decoding, about 1 GB more K/V room) |
+| `INK_DRAFTER_FILE` | `mtp_qe.safetensors` when present, else `mtp.safetensors` | drafter weights: a file name in the model directory or a path |
+| `QE_KV_ARCHIVE_GB` / `QE_KV_ARCHIVE_MARGIN_GB` | `128` / `8` | host RAM for idle conversations / what it leaves free below `MemAvailable` |
+| `INK_BG_REARM` | `1` | after every finished reply the idle conversation is copied to host RAM in the background; `0` = off-switch |
+| `INK_ADMIT_REPLY_ROWS` | `2048` | rows a new prompt leaves free for the running replies to grow |
+| `INK_ARCHIVE_SYNC_ROWS` | all | an evicted conversation goes to host RAM whatever its size; a number bounds the copy |
 
 ## Benchmarks
 
@@ -1880,6 +1985,28 @@ Quality (1.5.0 build): every layer's output agrees with an fp32 reference of the
 row error 3.96e-4 through the decode path, 5.24e-4 through the prefill path); next-token KL against fp32 0.118 and
 top-1 agreement 86.9 % on 11 items through the prefill path (0.112 through the decode path); needles at 90K: 3 of 3.
 
+### Inkling-2-Mini (preview)
+
+**1.6.0 development build** (November 25, 2026; GPU 0, and GPUs 0 + 2 with P2P; defaults: INT8 dense weights, trained
+drafter; engine tool, greedy):
+
+| Inkling-2-Mini, RTX 3090 | 2 cards | 1 card |
+|---|---:|---:|
+| plain decode step at 512 tokens of context, no drafts (ms; tok/s) | 4.99; 200 | 7.10; 141 |
+| single-stream decode with drafts, mix of 9 prompt types (prose, code, JSON, tables, edits, math; 128 tokens each, harmonic mean, tok/s) | 320 | 214 |
+| prefill, 2K / 8K / 120K-token prompt, engine tool (tok/s) | 10,804 / 12,369 / 9,202 | – |
+| context per conversation, default slots (tokens) | 565,216 (8 slots) | 125,920 (2 slots) |
+| ready after start, server, files in the page cache (s) | 15 | 9 |
+
+Club-3090 tools (1.6.0 release build, November 26, 2026, server defaults; the club sampler `top_p` 0.95 / `top_k`
+20 runs on the device with drafts): single-stream decode narrative / code 230 / 330 tok/s on 2 cards, 162 / 223 on one
+card; prefill 10K / 90K 9,430 / 8,860 tok/s (first token 1.07 / 10.2 s) on 2 cards, 6,186 / 4,945 (1.57 / 17.6 s) on
+one card; 213 / 362 / 431 tok/s total at 1 / 4 / 8 streams on 2 cards (8 slots), 147 at 1 stream on one card (2 slots).
+
+Quality: next-token KL against an fp32 reference of the model on a 25K-token text set: 0.00539 with the
+INT8 dense weights through the decode path (0.00544 through the prefill path; one card 0.00538 / 0.00558), 0.00495
+with `--dense-weights g15`; the official bf16 forward measures 0.00592 on the same set. Top-1 agreement 97.6 %.
+
 ### Quality
 
 **Closeness to BF16.** Next-token KL divergence against the official BF16 model on a public reference set (21 cases,
@@ -1918,19 +2045,21 @@ club-3090 8-pack (benchlocal, 150 scenarios, 4,096-token answer budget per scena
 and the club's launch settings, reasoning effort low). Scenarios passed, thinking off / on (gpt-oss-120B always
 reasons: reasoning effort low / medium):
 
-| pack | N | Qwen3.8-27B | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash | gpt-oss-120B |
-|---|---:|---:|---:|---:|---:|---:|
-| toolcall | 15 | 12 / 13 | 13 / 14 | 12 / 13 | 13 / 13 | 11 / 13 |
-| instructfollow | 15 | 11 / 15 | 13 / 14 | 12 / 15 | 9 / 15 | 14 / 14 |
-| structoutput | 15 | 12 / 12 | 14 / 14 | 12 / 14 | 12 / 14 | 13 / 14 |
-| dataextract | 15 | 10 / 13 | 10 / 12 | 12 / 13 | 13 / 14 | 11 / 9 |
-| reasonmath | 15 | 13 / 15 | 13 / 14 | 12 / 14 | 14 / 15 | 12 / 13 |
-| bugfind | 15 | 14 / 15 | 15 / 14 | 15 / 15 | 15 / 15 | 11 / 12 |
-| hermesagent | 20 | 15 / 14 | 12 / 12 | 15 / 14 | 15 / 15 | 12 / 13 |
-| cli | 40 | 27 / 31 | 30 / 31 | 32 / 35 | 30 / 32 | 26 / 28 |
-| **total** | 150 | **114 / 128** | **120 / 125** | **122 / 133** | **121 / 133** | **110 / 116** |
+| pack | N | Qwen3.8-27B | Qwen3.8-Flash-Next | DeepSeek-V4.1-Flash | GLM-5.3-Flash | gpt-oss-120B | Inkling-2-Mini |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| toolcall | 15 | 12 / 13 | 13 / 14 | 12 / 13 | 13 / 13 | 11 / 13 | 13 / 14 |
+| instructfollow | 15 | 11 / 15 | 13 / 14 | 12 / 15 | 9 / 15 | 14 / 14 | 15 / 15 |
+| structoutput | 15 | 12 / 12 | 14 / 14 | 12 / 14 | 12 / 14 | 13 / 14 | 15 / 14 |
+| dataextract | 15 | 10 / 13 | 10 / 12 | 12 / 13 | 13 / 14 | 11 / 9 | 13 / 14 |
+| reasonmath | 15 | 13 / 15 | 13 / 14 | 12 / 14 | 14 / 15 | 12 / 13 | 13 / 15 |
+| bugfind | 15 | 14 / 15 | 15 / 14 | 15 / 15 | 15 / 15 | 11 / 12 | 15 / 15 |
+| hermesagent | 20 | 15 / 14 | 12 / 12 | 15 / 14 | 15 / 15 | 12 / 13 | 15 / 13 |
+| cli | 40 | 27 / 31 | 30 / 31 | 32 / 35 | 30 / 32 | 26 / 28 | 23 / 24 |
+| **total** | 150 | **114 / 128** | **120 / 125** | **122 / 133** | **121 / 133** | **110 / 116** | **122 / 124** |
 
-No engine errors and no graph fallbacks in any of the runs. Earlier releases published the mean of three runs; from
+Inkling-2-Mini: QEngine 1.6.0 development build (November 25, 2026), 2 cards (GPUs 0 and 2), server defaults; with thinking
+off it runs at reasoning effort `none` and still writes a short thought, so the club tools mark that leg as not
+thinking-free. No engine errors and no graph fallbacks in any of the runs. Earlier releases published the mean of three runs; from
 1.5 on it is a single run, because running it for all models takes a long time.
 
 The earlier result, Flash-Next on QEngine 1.3.6 (November 15, 2026), three full runs, each on a fresh server.

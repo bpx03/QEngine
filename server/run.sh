@@ -19,18 +19,24 @@ fi
 IFS=, read -ra _vis <<< "$CUDA_VISIBLE_DEVICES"
 
 # --devices on the command line wins; otherwise every visible GPU is used
-_devices=""
+_devices=""; _model=""
 for ((i = 1; i <= $#; i++)); do
   a="${!i}"
   case "$a" in
     --devices=*) _devices="${a#--devices=}" ;;
     --devices) j=$((i + 1)); _devices="${!j:-}" ;;
+    --model=*) _model="${a#--model=}" ;;
+    --model) j=$((i + 1)); _model="${!j:-}" ;;
   esac
 done
 _extra=()
+# QE_RUNSH_DEVICES tells the server where --devices came from (Inkling keeps one card unless QE_DEVICES / --devices ask
+# for more): given (on the command line), qe (QE_DEVICES mapped), all (every visible GPU)
+export QE_RUNSH_DEVICES=given
 if [ -z "$_devices" ]; then
   _devices=$(seq -s, 0 $((${#_vis[@]} - 1)))
   _extra=(--devices "$_devices")
+  if [ -n "${QE_DEVICES:-}" ]; then QE_RUNSH_DEVICES=qe; else QE_RUNSH_DEVICES=all; fi
 fi
 IFS=, read -ra _req <<< "$_devices"
 
@@ -47,7 +53,10 @@ if [ "$_uniq" -gt "$_avail" ] || [ "${_max:-0}" -ge "$_avail" ]; then
   echo "QEngine: ${_uniq} devices requested (--devices $_devices) but only $_avail GPU(s) visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)" >&2
   exit 1
 fi
-if [ "${#_req[@]}" -lt 2 ] || [ "${#_req[@]}" -gt 3 ]; then
+# (Inkling-2-Mini runs on one card by default: no warning for it at 1 card; config.json model_type inkling2*)
+_ink1=0
+[ "${#_req[@]}" = 1 ] && [ -n "${_model:-}" ] && grep -qs '"model_type": *"inkling2' "$_model/config.json" && _ink1=1
+if [ "$_ink1" = 0 ] && { [ "${#_req[@]}" -lt 2 ] || [ "${#_req[@]}" -gt 3 ]; }; then
   echo "QEngine: warning: ${#_req[@]} GPU(s) requested; the engines are tested on 2 and 3 GPUs (Flash-Next: 2 or 3 cards: tp; 4 cards: tp with peer access between all of them, else pp; 5+ cards: pp, pipeline stages; see the README)" >&2
 fi
 # no core dumps unless QE_CORE_DUMP=1 (issue #3): a crashed engine holds 50+ GB of pinned host memory and the GPU

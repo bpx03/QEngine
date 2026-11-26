@@ -31,9 +31,17 @@ static inline double glm_us_since(std::chrono::steady_clock::time_point t) {
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// issue #44: a cuBLAS failure after a trapped kernel (watchdog timeout) is the context's sticky CUDA error: report it as
+// one (qe_fatal_cuda prints the watchdog record and exits 75) instead of a bare cuBLAS status. cudaStreamQuery does not
+// block; a healthy context returns success / not ready and the cuBLAS check fails as before.
 #define CUBLAS_CHECK(x)                                                              \
     do {                                                                             \
         cublasStatus_t s__ = (x);                                                    \
+        if (s__ != CUBLAS_STATUS_SUCCESS) {                                          \
+            const cudaError_t e__ = cudaStreamQuery(0);                              \
+            if (e__ != cudaSuccess && e__ != cudaErrorNotReady) { /* review L1: keep the cuBLAS status (a capture error is no trap) */ \
+                fprintf(stderr, "cublas %d at %s:%d\n", (int)s__, __FILE__, __LINE__); qe_fatal_cuda(e__, __FILE__, __LINE__); } \
+        }                                                                            \
         CHECK(s__ == CUBLAS_STATUS_SUCCESS, "cublas %d at %s:%d", (int)s__, __FILE__, __LINE__); \
     } while (0)
 
@@ -205,6 +213,9 @@ void Worker::init(Engine* e, const Plan& pl, int device) {
     p = pl;
     dev = device;
     CUDA_CHECK(cudaSetDevice(dev));
+    // issue #44: the collective watchdog's host record, rank and QE_COLL_TIMEOUT_MS budget on this card (before, GLM's
+    // waits ran on the compiled-in 20 s with no record: a hang ended as an unrelated cuBLAS / CUDA error, no report)
+    qe_wd_init(p.rank, dev);
     CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&cst, cudaStreamNonBlocking));
     {
@@ -2757,6 +2768,20 @@ void Engine::load(const std::string& d, int ctx_tokens) {
         }
     }
     if (ar_ce && !(p2p && comm.pstage[0] && comm.cfl[0])) ar_ce = false;  // review r24 M2: no CE buffers (QE_AR_CE=0)
+    // issue #44: without peer access the indexer split's pool-list exchange (cudaMemcpyPeerAsync, driver-staged through
+    // host memory) next to the overlapped host-path all-reduces spinning on cms (allreduce_rs_rows_kernel exchange())
+    // stops making progress on 3 cards: the first prefill of >= 2,048 rows (the GLM_WARM warm-up at load) trapped in the
+    // watchdog. Same failure class as the CE all-reduce above; the replicated indexer (GLM_IDX_SPLIT=0) runs instead.
+    if (idx_split && ngpu > 1 && !p2p) {
+        idx_split = false;
+        const bool by_env = env_int("GLM_P2P", 1) == 0 || (env_set("QE_P2P") && env_int("QE_P2P", 1) == 0);  // review L3
+        fprintf(stderr, "[glm] %s: prefill indexer split off (replicated indexer on every card)\n",
+                by_env ? "P2P off (GLM_P2P=0 / QE_P2P=0)" : "no peer access");
+    }
+    // GLM does not call comm_select_path (the transport probe of the 27B / Flash-Next engines): its prefill all-reduces
+    // pick their own route (GLM_AR_CE copy engine with P2P, the comm.cu SM path otherwise) and comm.xfer stays kXferP2P;
+    // with p2p false every comm.cu collective it uses keys on comm.p2p, not on xfer. The probe's no-P2P branch would
+    // allocate host-staged buffers and change which comm.cu kernels run, i.e. a new no-P2P path to measure, not a fix.
     if (ar_ce)
         run_all([&](Worker& w) {  // round 24: load the kernels of the copy-engine all-reduce now (scratch rows; prs2 / pstage
                                   // are rewritten before any read)

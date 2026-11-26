@@ -694,6 +694,19 @@ struct FE {
     // dropped in that order). 64 agent sessions of ~11K tokens on the 48 GB archive: with 6, 0.6-1 GB per conversation,
     // live sessions dropped (287-561 old rows per turn recomputed); with 3 none. FLASH_CKPT_KEEP=6: as before
     int next_id = 1, ckpt_every = 8192, ckpt_min = 512, ckpt_keep = 3, end_cut = 4096;
+    // [ckpt-tail] issue #48: states at the starts of the last ckpt_tail messages of a prompt (the role marker token
+    // ckpt_mark, <|im_start|>; not within tail_skip rows of the prompt end: the generation prompt), kind 8, the newest
+    // ckpt_tail of them kept per conversation on top of ckpt_keep. A client that changes or drops the prompt's last
+    // message(s) (a trailing runtime-context message, reasoning stripped from the reply) resumes at that message's start
+    // instead of the system end (125K: 15.5 s -> 0.5 s per turn). Default 2 (the append-only agent loop and
+    // 1-64 agents plan none, no measured loss; +0.12 GB host per planned state). FLASH_CKPT_TAIL=0: off
+    int ckpt_tail = 2, ckpt_mark = 248045, tail_skip = 16;
+    bool tail_snap = false;  // FLASH_CKPT_TAIL_SNAP=1: also on cards with > 10 GB of host-backed experts (review M3)
+    int tail_state = -1;     // whether the last start could plan them (logged when it changes)
+    bool tail_cheap() const {  // every card <= 10 GB of host-backed experts: a prefill stop costs no expert restage
+        for (Worker* w : W) if (w->cold_bytes() > 10e9) return false;
+        return true;
+    }
     unsigned long long tick = 0;
     const Conv* hold = nullptr;   // the conversation a start is restoring from (never evicted meanwhile)
     const Pin* hold_pin = nullptr;  // the pinned prefix a start is restoring from (drop_pin skips it meanwhile)
@@ -709,6 +722,7 @@ struct FE {
         bool from_archive = false;  // (qe_last_* after its finish: another start may have run in between)
         double idle_s = -1;         // its conversation's idle time before this start (the restore line)
         std::vector<int> cks;     // checkpoint positions still ahead (ascending)
+        std::vector<int> marks;   // [ckpt-tail] the message-start ones among them (kind 8)
         std::vector<int> drafts;
         // image prompt: device-side ids (image rows -> kImgToken + their row of the image table), the (t, h, w) RoPE
         // positions of every row, its rows [img0, img0 + img_n) of the image table
@@ -2054,6 +2068,7 @@ struct FE {
     std::list<DkEnt> dk_idx;
     uint64_t dk_budget = 0, dk_reserve = 0, dk_used = 0, dk_inflight = 0;  // dk_used: files + what queued writes will take
     int dk_min = 2048, dk_lock = -1;
+    bool dk_eager = false;  // [disk-eager] FLASH_DISK_EAGER=1 (server --disk-eager): a file after every reply, once archived
     double dk_min_ms = 60000, dk_load_ms = 30000, dk_retry_at = 0, dk_backoff = 60000, dk_room_log = -1e18;
     std::atomic<int> dk_n{0};
     std::atomic<long long> dk_b{0};
@@ -2109,12 +2124,15 @@ struct FE {
     // Queue a file of a conversation whose copy in host memory is whole: nothing is copied, the writer holds the blobs. Not a
     // short one. force: the idle save / shutdown; else (it left VRAM) at most one
     // file per conversation per FLASH_DISK_MIN_S, and not behind a slow disk: it stays in memory and the next save has it.
-    void dk_enqueue(Conv& c, bool force) {
+    // eager ([disk-eager], the idle archiver just made the copy whole after a reply): no FLASH_DISK_MIN_S, the same queue
+    // bound (a skipped one is written by the next reply's or the idle save), and the conversation's write in flight finishes
+    // (a newer one waits behind it and replaces only a queued one)
+    void dk_enqueue(Conv& c, bool force, bool eager = false) {
         if (!dk || c.dk_no || (int)c.toks.size() < dk_min) return;
         const double t = now_ms();
         if (t < dk_retry_at) return;
         const uint64_t sig = dk_sig(c);
-        if (sig == c.dk_sig || (!force && (t - c.dk_ms < dk_min_ms || dk->queued() >= 8))) return;
+        if (sig == c.dk_sig || (!force && ((!eager && t - c.dk_ms < dk_min_ms) || dk->queued() >= 8))) return;
         kvd::Job j;
         j.key = c.id;
         j.m.fp = dk_fp;
@@ -2163,11 +2181,17 @@ struct FE {
                                                                 (j.m.steer.empty() ? 0 : kvd::hash_bytes(j.m.steer.data(), j.m.steer.size()))), n);
         j.path = dk_dir + name;
         j.old_path = c.dk_path;
+        // (disk review L1) eager: a write of this conversation still running finishes; this one replaces its file too, so
+        // that file goes when this one is collected even if the conversation is gone by then (its own old_path is c.dk_path)
+        if (eager) {
+            std::string rp = dk->running_path(c.id);
+            if (!rp.empty()) j.old_path = rp;
+        }
         c.dk_sig = sig;
         c.dk_ms = t;
         dk_used += need;
         dk_inflight += need;
-        dk->push(std::move(j), need);
+        dk->push(std::move(j), need, !eager);
     }
     // finished writes into the index, a finished read into the archive
     void dk_reap() {
@@ -2466,6 +2490,8 @@ struct FE {
         dk_reserve = (uint64_t)(std::max(0.0, env_double("FLASH_DISK_RESERVE_GB", 1.0)) * (1ull << 30));
         dk_min = env_int("FLASH_DISK_MIN_TOKENS", dk_min);
         dk_min_ms = env_double("FLASH_DISK_MIN_S", dk_min_ms / 1000.0) * 1000.0;
+        dk_eager = env_int("FLASH_DISK_EAGER", 0) != 0;
+        if (dk_eager) fprintf(stderr, "[qflash] disk cache: eager (--disk-eager): every conversation is written after each reply once archived\n");
         dk_load_ms = env_double("FLASH_DISK_LOAD_S", dk_load_ms / 1000.0) * 1000.0;
         dk_fp = dk_fingerprint(model);
         int other = 0, bad = 0, unfit = 0;
@@ -2560,7 +2586,7 @@ struct FE {
         return b;
     }
     void add_ck(Conv* c, std::shared_ptr<State> s) {
-        if (s && c) kve::add_ck(*c, s, ckpt_keep);
+        if (s && c) kve::add_ck(*c, s, ckpt_keep, ckpt_tail);
     }
     // ---- preemption: active sequences that do not all fit the pool
     bool prefilling(int s) const {
@@ -2760,6 +2786,14 @@ static void pp_hybrid_init(FE* e, const std::string& model, const std::vector<in
 }
 
 static void take_ck(FE* e, const FE::Pf& pf, int pos);
+// 7: the prompt end ([qfn-ttft-pe]), 1: system end, 8: a message start ([ckpt-tail]), 2: prompt end - 1, 3: periodic,
+// 5: divergence point
+static int ck_kind(const FE* e, const FE::Pf& pf, int pos) {
+    if (pos == pf.n) return 7;
+    if (pos == pf.hint) return 1;
+    if (std::find(pf.marks.begin(), pf.marks.end(), pos) != pf.marks.end()) return 8;
+    return pos == pf.n - 1 ? 2 : e->ckpt_every > 0 && pos % e->ckpt_every == 0 ? 3 : 5;  // (#41: FLASH_CKPT=0)
+}
 // the driver: the prompt's rows [t0, t1) through the stages; each stage's KV rows leave for the TP slot batch by batch
 static void pp_start(FE* e, FE::Pf& pf) {
     PpHy& h = *e->pph;
@@ -2907,8 +2941,10 @@ static void ppb_submit(FE* e, FE::Pf& pf) {
     if (snap_env < 0)
         for (Worker* w : e->W) snap |= w->cold_bytes() > 10e9;  // (2 cards: 14-16 GB cold per card; 3 cards 3-6 GB keep
                                                                // exact checkpoints: a retry resumes at n - 1)
+    // [ckpt-tail] review M3: a message start (planned on such cards only with FLASH_CKPT_TAIL_SNAP=1, see qe_start_begin) cuts like
+    // the system end: snapped back to a batch end it would miss the turn it is for and count as another kind
     for (int c : pf.cks)
-        if (c < pf.n && (!snap || c == pf.hint)) stops.push_back(c);
+        if (c < pf.n && (!snap || c == pf.hint || std::find(pf.marks.begin(), pf.marks.end(), c) != pf.marks.end())) stops.push_back(c);
     stops.push_back(pf.n);
     int at = pf.i;
     for (int st : stops) {
@@ -2948,6 +2984,11 @@ static void ppb_submit(FE* e, FE::Pf& pf) {
     }
     pf.ckst.clear();
     pf.ckpos.clear();
+    if (e->budget && e->sl[pf.slot].conv) {  // ([ckpt-tail] review L1: the oldest message starts go before the new ones are allocated)
+        int m = 0;
+        for (int c : pf.cks) m += c < pf.n && ck_kind(e, pf, c) == 8;
+        if (m) kve::drop_oldest_kind(*e->sl[pf.slot].conv, 8, e->ckpt_tail - m);  // (review2 Low 1: room for all m new ones)
+    }
     if (e->budget)
         for (int c : pf.cks)
             if (c < pf.n)
@@ -3002,7 +3043,7 @@ static void ppb_finish(FE* e, FE::Pf& pf) {
         st->pos = pos;
         st->pend = false;
         st->prev_m = 0;
-        st->kind = pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : e->ckpt_every > 0 && pos % e->ckpt_every == 0 ? 3 : 5;  // (#41: FLASH_CKPT=0)
+        st->kind = ck_kind(e, pf, pos);
         e->add_ck(e->sl[pf.slot].conv, st);
         if (st->kind == 1) e->pin_prefix(pf.slot, pos, st);
     }
@@ -4005,6 +4046,20 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             }
         }
         if (env_set("FLASH_CKPT_KEEP")) e->ckpt_keep = std::max(1, env_int("FLASH_CKPT_KEEP", e->ckpt_keep));
+        e->ckpt_tail = std::max(0, std::min(8, env_int("FLASH_CKPT_TAIL", e->ckpt_tail)));
+        e->ckpt_mark = env_int("FLASH_CKPT_MARK", e->ckpt_mark);
+        e->tail_skip = std::max(0, env_int("FLASH_CKPT_TAIL_SKIP", e->tail_skip));
+        e->tail_snap = env_int("FLASH_CKPT_TAIL_SNAP", 0) != 0;
+        if (e->ckpt_tail) {
+            const bool on = e->tail_snap || e->tail_cheap();
+            e->tail_state = on;
+            if (on)
+                fprintf(stderr, "[qflash] checkpoints at the last %d message starts: on (token %d, not within %d rows of the prompt end%s)\n",
+                        e->ckpt_tail, e->ckpt_mark, e->tail_skip, e->tail_snap ? "; FLASH_CKPT_TAIL_SNAP=1" : "");
+            else
+                fprintf(stderr, "[qflash] checkpoints at the last %d message starts: off on this machine (> 10 GB of host-backed experts per card: "
+                        "each prefill stop restages them); FLASH_CKPT_TAIL_SNAP=1 turns them on\n", e->ckpt_tail);
+        }
         e->log = env_int("FLASH_SLOT_LOG", 0);
         e->batch_api = env_int("FLASH_BATCH", 1);
         e->max_pf = e->batch_api ? std::max(1, std::min(Worker::PFSEG_MAX, env_int("FLASH_MAX_PREFILLS", 8))) : 1;
@@ -4528,6 +4583,20 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         // A conversation keeps only its latest such state (kind 7; kve::add_ck). FLASH_CKPT_PE=0: off
         static const bool pe = env_int("FLASH_CKPT_PE", 1) != 0;
         if (pe && n > L) c.push_back(n);
+        // [ckpt-tail] the last ckpt_tail message starts past L + ckpt_min ([qfn-ck-near]: no short split of an append; a
+        // later prompt that changes such a message resumes at most ckpt_min rows earlier, at L)
+        pf.marks.clear();
+        // (review M3: where every prefill batch restages the host-backed experts, > 10 GB of them on a card (2 cards), a stop
+        // costs a batch: 2 cards TP, cold 67K multi-message prompt 10.9 -> 11.6 s (a tail turn 10.3 -> 0.95 s); there the
+        // states are planned only with FLASH_CKPT_TAIL_SNAP=1; 3 cards (3-6 GB) +50-80 ms per stop: on)
+        bool tail_on = e->ckpt_tail > 0 && (e->tail_snap || e->tail_cheap());
+        if (e->ckpt_tail > 0 && (int)tail_on != e->tail_state) {  // (review2 Low 3: the 10 GB rule switched at runtime, e.g. VRAM pressure)
+            fprintf(stderr, "[qflash] message-start checkpoints %s (host-backed experts per card %s 10 GB)\n", tail_on ? "on again" : "off",
+                    tail_on ? "<=" : ">");
+            e->tail_state = tail_on;
+        }
+        for (int i = n - 1 - e->tail_skip; tail_on && i > L + e->ckpt_min && (int)pf.marks.size() < e->ckpt_tail; i--)
+            if (ids[i] == e->ckpt_mark && i != hint) { pf.marks.push_back(i); c.push_back(i); }
         std::sort(c.begin(), c.end());
         c.erase(std::unique(c.begin(), c.end()), c.end());
         pf.cks = c;
@@ -4563,11 +4632,12 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
 }
 
 static void take_ck(FE* e, const FE::Pf& pf, int pos) {
-    // 7: the prompt end ([qfn-ttft-pe]), 1: system end, 2: prompt end - 1, 5: divergence point, 3: periodic
-    const int kind = pos == pf.n ? 7 : pos == pf.hint ? 1 : pos == pf.n - 1 ? 2 : e->ckpt_every > 0 && pos % e->ckpt_every == 0 ? 3 : 5;
+    const int kind = ck_kind(e, pf, pos);
     // a conversation keeps one prompt-end state, its latest: the older one goes before the new one is written (with a
     // full archive the write would otherwise evict another conversation for a state that is dropped right after)
     if (kind == 7 && e->sl[pf.slot].conv) kve::drop_kind(*e->sl[pf.slot].conv, 7);
+    // [ckpt-tail] review L1: likewise the oldest message start beyond ckpt_tail - 1 goes before the new one is written
+    if (kind == 8 && e->sl[pf.slot].conv) kve::drop_oldest_kind(*e->sl[pf.slot].conv, 8, e->ckpt_tail - 1);
     auto st = e->save_state(pf.slot, false, kind);
     e->add_ck(e->sl[pf.slot].conv, st);  // (the prompt's slot: qe_prefill_multi)
     if (kind == 1) e->pin_prefix(pf.slot, pos, st);  // the system end of an agent kind: pinned outside the LRU
@@ -6252,6 +6322,14 @@ void qe_mem_guard(void* p) {  // (also the idle reclaim: the next request decode
     if (!e->ppb) e->reclaim_idle();
     if (e->dk) e->dk_reap();
 }
+// [disk-eager review M2] the host-memory part of qe_mem_guard alone: no idle reclaim (idle conversations stay in VRAM until
+// --persist-idle, as before), no disk index work unless --disk-eager (its finished writes: the superseded file goes)
+void qe_mem_pressure(void* p) {
+    FE* e = (FE*)p;
+    e->mem_guard();
+    e->mem_pressure();
+    if (e->dk && e->dk_eager) e->dk_reap();
+}
 int qe_archive_more(void* p, long long budget) {
     FE* e = (FE*)p;
     if (!e->budget || !e->pfs.empty()) return 1;
@@ -6279,6 +6357,8 @@ int qe_archive_more(void* p, long long budget) {
             if (upto < hn) return 0;
         }
         if (!e->sync(s, 1 << 30, true, FE::ROOM_NONE)) continue;
+        // [disk-eager] its copy is whole now: the file goes to the writer (off this thread; the slot keeps serving)
+        if (e->dk && e->dk_eager && q.synced && !q.fault && q.conv) e->dk_enqueue(*q.conv, false, true);
         return 0;
     }
     return 1;

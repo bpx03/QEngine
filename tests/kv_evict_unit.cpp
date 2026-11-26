@@ -167,6 +167,41 @@ static void fixed_cases() {
         kve::add_ck(f, mk(800, 7), 6);
         EXPECT(has_pos(p, 500) && !has_pos(f, 500) && has_pos(f, 800) && has_pos(f, 50));
     }
+    {  // [ckpt-tail] message-start states (8): own quota (newest by position), never counted in keep nor dropped for others
+        Conv m;
+        kve::add_ck(m, mk(50, 1), 3, 2);
+        for (int t = 0; t < 6; t++) {
+            const int p0 = 10000 + 1000 * t;
+            kve::add_ck(m, mk(p0 - 120, 8), 3, 2);  // the trailing message's start
+            kve::add_ck(m, mk(p0, 7), 3, 2);        // the prompt end
+            kve::add_ck(m, mk(p0 + 40, 4), 3, 2);   // the turn end
+            int n8 = 0, no = 0;
+            for (auto& x : m.ck) (x->kind == 8 ? n8 : no)++;
+            EXPECT(n8 == std::min(t + 1, 2) && no == 3 && has_pos(m, 50) && has_pos(m, p0 - 120) && has_pos(m, p0 + 40));
+            if (t) EXPECT(has_pos(m, p0 - 1120));
+        }
+        // review L1: the oldest message start goes before the new one is written (keep - 1 left), the others untouched
+        {
+            Conv d = m;
+            const size_t before = d.ck.size();
+            kve::drop_oldest_kind(d, 8, 1);
+            int n8 = 0, top = -1;
+            for (auto& x : d.ck) if (x->kind == 8) { n8++; top = std::max(top, x->pos); }
+            EXPECT(n8 == 1 && top == 14880 && d.ck.size() == before - 1);
+            kve::add_ck(d, mk(15880, 8), 3, 2);
+            n8 = 0;
+            for (auto& x : d.ck) n8 += x->kind == 8;
+            EXPECT(n8 == 2 && has_pos(d, 14880) && has_pos(d, 15880) && has_pos(d, 50));
+        }
+        // keep8 = 0: the old rule (no kind 8 kept), the others untouched
+        Conv z;
+        kve::add_ck(z, mk(50, 1), 3, 0);
+        kve::add_ck(z, mk(900, 8), 3, 0);
+        EXPECT(z.ck.size() == 1 && has_pos(z, 50));
+        // cut past the divergence drops the newer ones, the older message start survives for the next restore
+        kve::cut(m, 14900);
+        EXPECT(has_pos(m, 14880) && !has_pos(m, 15000) && has_pos(m, 50));
+    }
     {  // a state of an earlier build's mark (kind 6, read back from a disk-cache file) counts as a turn end
         Conv m;
         kve::add_ck(m, mk(10, 6), 2);

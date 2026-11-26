@@ -533,6 +533,35 @@ size_t Worker::archive_bytes(int lo, int hi) const {
     return end;  // the last piece's offset + its size
 }
 
+void Worker::archive_flat(int split, int hi, std::vector<FlatPiece>& out) const {
+    CHECK(split > 0 && split < hi, "archive_flat [0, %d) at %d", hi, split);
+    struct P { size_t off, len; };
+    auto lay = [&](int lo, int h) {
+        std::vector<P> v;
+        archive_layout(snapshot_bytes(), c_.n_full(), ash_, has_mtp, kv_row(), mtp_row(), lo, h, ~(size_t)0 >> 1,
+                       [&](int f, int, int, int, size_t o, size_t rows) {
+                           v.push_back({o, f < 0 ? snapshot_bytes() : rows * (f < c_.n_full() ? kv_row() : mtp_row())});
+                       });
+        return v;
+    };
+    const std::vector<P> pre = lay(0, split), own = lay(split, hi), all = lay(0, hi);
+    CHECK(pre.size() == all.size() && own.size() == all.size() && !all.empty(), "archive_flat: layouts differ");
+    out.clear();
+    size_t at = 0;
+    for (size_t i = 0; i < all.size(); i++) {
+        CHECK(all[i].off == at, "archive_flat: piece %zu at %zu, expected %zu", i, all[i].off, at);
+        if (i == 0) {  // the delta-net state (at hi): the own copy's
+            out.push_back({false, own[0].off, own[0].len});
+        } else {  // keys [0, split) then [split, hi): the rows of one array in key order (pm_rank is additive)
+            CHECK(pre[i].len + own[i].len == all[i].len, "archive_flat: piece %zu rows", i);
+            if (pre[i].len) out.push_back({true, pre[i].off, pre[i].len});
+            if (own[i].len) out.push_back({false, own[i].off, own[i].len});
+        }
+        at += all[i].len;
+    }
+    CHECK(at == archive_bytes(0, hi), "archive_flat: %zu bytes of %zu", at, archive_bytes(0, hi));
+}
+
 int Worker::archive_xfer(int slot, int lo, int hi, int copy_hi, void* const* chunks, size_t chunk, bool save,
                          bool with_dn, int piece, size_t budget) {
     CHECK(slot == cur_slot_ && copy_hi <= hi, "archive_xfer");

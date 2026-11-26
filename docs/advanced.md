@@ -61,6 +61,8 @@ and uses the default too. In Docker pass them with `-e`.
 | `FLASH_CKPT_MIN` | `512` | A conversation gets a checkpoint where it diverges from a cached one at least this many tokens in (prefix reuse across conversations). A turn that resumes from a cached point gets no periodic checkpoint within this many tokens after it, so a short append is not split into a few-token batch plus the rest (`FLASH_CKPT_NEAR=1`: the old checkpoints). | Rarely. |
 | `FLASH_CKPT_PE` | `1` | Every prompt keeps the state at its own end (no extra prefill batch: it is the state the prefill ends with). An agent client that sends back another text for the reply, or drops its reasoning, resumes its next turn there instead of recomputing the last turn (agent replay: about a third of the prefill work before). One such state per conversation, the latest. Costs about 2 ms per prompt on 3 cards. | `0` turns it off (the old resume points). |
 | `FLASH_CKPT_KEEP` | `3` | Recurrent states a conversation keeps (about 0.12 GB of host RAM each): its system end, its latest prompt end, and the newest other one (a periodic one, a divergence point, a turn end, or the last row of a long prompt for an identical retry). With many agents the host archive then holds more conversations (64 agents of ~11K tokens: none lost in the 48 GB archive; with 6 it lost live ones). | `6` (the old value) keeps more restore points far back in long conversations, at more host RAM per conversation. |
+| `FLASH_CKPT_TAIL` | `2` | Recurrent states at the starts of a prompt's last N messages (the `<|im_start|>` role marker; not the generation prompt; only when the message starts more than `FLASH_CKPT_MIN` tokens after the point the prompt resumed from, so an append-only agent loop plans none). They have their own quota (the newest N per conversation, about 0.12 GB of host RAM each, outside `FLASH_CKPT_KEEP`). A client that changes or drops its last message(s) on the next request (a trailing runtime-context message, reasoning left out of the last reply) resumes there instead of the end of the system prompt (125K conversation: 15.5 s -> 0.5 s per turn). Each planned state costs one extra prefill pass (about 50-80 ms). | `0`: off. |
+| `FLASH_CKPT_TAIL_SNAP` | `0` | Cards with more than 10 GB of host-backed experts (2 cards, TP or the pipelined prefill), where every prefill batch copies those experts again: `1` plans the `FLASH_CKPT_TAIL` states there too, each cutting the prompt like the system end (67K conversation on 2 cards: a tail turn 10.3 s -> 0.95 s; a cold multi-message prompt 10.9 -> 11.6 s). Off by default there; 3 cards plan them always. | `1`: on, for clients that change the prompt tail. |
 | `FLASH_START_SLOW_MS` | `200` | A request start (slot, cached prefix copy or restore) that takes at least this long prints one log line with its phases. | `0` turns the line off. |
 | `FLASH_DETERMINISTIC` | `0` | `1`: fixed-order reductions in prefill, so a run repeats exactly. Slower. | For reproducible runs of one conversation, together with `FLASH_LOOKUP=0`. |
 | `FLASH_ATTN_CHUNK` | `0` | `1`: the same request gives the same text whatever shares a step and whatever state the machine is in. By default the text can differ between runs at near-ties; I measured no sign of lower quality from that, and the KL numbers in the README are taken at the default. It does not improve KL. Cost, measured on one build (3 cards): 8 agents at once -8.6 % (2 runs each), a burst of 8 short prompts about +125 ms to the first token, because they are prefilled one after another, and -2.3 % on 8 short concurrent sequences with no server. | `1` when you compare runs, reproduce a report or run tests. |
@@ -551,6 +553,7 @@ ones below are **off-switches or experiments**: the defaults are the measured be
 | `GLM_DRAFT_VOCAB` | `tools/glm/draft_vocab_49k.i32` | the drafter's vocabulary list (int32 token ids); `0` = the full head |
 | `GLM_PRIOR` | `tools/glm/expert_prior_gen.f32` | expert prior that fills the VRAM expert slots at start |
 | `GLM_ECOLS` | – | the same as `--split` (expert columns per card) |
+| `GLM_IDX_SPLIT` | `1` | prefill indexer and top-k split by query rows over the cards; off by itself when the cards have no P2P (the indexer then runs on every card); `0` = off |
 | `GLM_WARM` | `4096` | rows of the warm-up prefill at load (`0` = off; the first request then pays the first-use module loads) |
 | `GLM_CPU_FIRST` | `1` | first core of the CPU lane when `GLM_CPU_THREADS` is set |
 | `GLM_LANE_SPIN_US` / `GLM_COORD_SPIN_US` / `GLM_POOL_SPIN_US` | `20000` | µs the CPU lane's workers, the step coordinator and the host worker pool spin after their last job before they block (about one decode step, so serving speed is unchanged and an idle server uses no CPU); `-1` = always spin |
@@ -606,7 +609,7 @@ Prefill:
 | `GPTOSS_PF_SKIP=0` | the last layer in full for every prompt row |
 
 `GPTOSS_KV=fp8sim` and `GPTOSS_KV_SIM` are quality emulations for tests. `GPTOSS_DFLASH` (a DFlash drafter directory)
-is for the engine's own tool only in 1.5; the server ignores it with a start-up line. `GPTOSS_TEST_FAULT_STEP`,
+is for the engine's own tool only in 1.6; the server ignores it with a start-up line. `GPTOSS_TEST_FAULT_STEP`,
 `GPTOSS_TEST_CAPTURE_FAIL` and `GPTOSS_TEST_PIN_FAIL` (failed pinned host allocations) inject faults for tests. The engine tool `build_gptoss/gptoss_run` reads its model from
 `--model`, else `GPTOSS_MODEL`, else `models/gpt-oss-120b` next to its build directory (`GPTOSS_DFLASH_MODEL` likewise
 for its drafter).
@@ -653,7 +656,7 @@ for its drafter).
 | `--stats-file` | `~/.cache/qengine/stats.json` | all-time monitoring totals |
 | `--metrics-host` | `127.0.0.1` | address the monitoring port listens on (the Docker image sets `0.0.0.0` inside the container) |
 | `--engine-lib` / `QE_LIB` | `build/libqengine.so` (27B), `build/libqflash.so` (Flash-Next) | the engine shared library to load |
-| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | persistent prompt cache (both models; Flash-Next: see [Disk cache](#disk-cache)), its size, and the idle seconds before live conversations are saved; on the 27B, steered conversations are not saved. The flag also moves the start-up cache there; `QE_DISK_CACHE` alone moves only the start-up cache |
+| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | persistent prompt cache (both models; Flash-Next: see [Disk cache](#disk-cache)), its size, and the idle seconds before live conversations are saved; on the 27B, steered conversations are not saved, and a conversation attached to a shared system prompt (`QE_SHARE_PREFIX=1`, the default) is saved with that system prompt in its own file (each file restores alone; it is larger by the system prompt's rows: 0.41 GB for a 7K-token system prompt on one card, so a 7K-token conversation file is about 0.75 GB). `--disk-eager` writes after every reply (see [Disk cache](#disk-cache)). The flag also moves the start-up cache there; `QE_DISK_CACHE` alone moves only the start-up cache |
 
 Per-request statistics lines, e.g.:
 
@@ -696,7 +699,7 @@ graphs keep the room); a fast-growing `budget_evictions` under steady traffic me
 | `QE_NO_PROGRESS_STEPS` / `QE_NO_PROGRESS_S` | `64` / `10` | a conversation without a token for this many steps and seconds (not paused) fails with an error; either `0` = off |
 | `QE_GPU_LOCK_WAIT_S` | `60` | at start, wait for a previous engine that is still exiting, also one in another container (the old name `FLASH_PIN_WAIT_S` is still read when this one is not set); `0` = fail at once |
 | `QE_ALLOW_SHARED_GPU` | `0` | `1` skips the one-engine-per-GPU lock (`~/.cache/qengine/locks/`) |
-| `QE_COLL_TIMEOUT_MS` | `20000` | both models: every wait of a GPU for another card's data (all-reduces, exchanges) is bounded; past this many ms the process stops with `qengine: collective timeout: GPUx (rank r) waited ... s in ...` and exits with code 75. Raise it (e.g. `120000`) to see whether a stall clears on its own; `0` = off |
+| `QE_COLL_TIMEOUT_MS` | `20000` | 27B and Flash-Next: every wait of a GPU for another card's data (all-reduces, exchanges) is bounded (GLM-5.3-Flash: its prefill all-reduces only; its decode all-reduce waits are not bounded by this setting); past this many ms the process stops with `qengine: collective timeout: GPUx (rank r) waited ... s in ...` and exits with code 75. Raise it (e.g. `120000`) to see whether a stall clears on its own; `0` = off |
 | `QE_LOG_ASYNC` | `1` | Flash-Next: the engine's log lines go to a memory buffer and a writer thread passes them on to stdout / stderr, so a slow log reader (a stalled `tee`, a rate-limited journal) never holds up a GPU step; before this, such a stall could end the process with a collective timeout at a slot hand-off ([#32](https://github.com/bpx03/QEngine/issues/32)). On every exit path, including a crash signal, the buffered lines are written out first (at most 5 s when the reader takes nothing). `0`: plain blocking writes (off-switch) |
 | `QE_LOG_BUF_MB` | `64` | with `QE_LOG_ASYNC=1`: buffered log bytes per stream while the reader is behind; past this, lines are dropped and counted (`[qengine] log: N bytes dropped`) |
 | `QE_UNPARK_CHUNK` (27B) / `FLASH_UNPARK_CHUNK` (Flash-Next) | `4096` | a parked reply whose held copy is gone (rare: the copy could not be written) prefills the rest of its conversation in pieces of this many tokens, and the other requests run between the pieces |
@@ -750,7 +753,9 @@ Flash-Next, what it does:
 
 - **When it writes.** When a conversation leaves VRAM (at most once a minute per conversation), after `--persist-idle` seconds
   with no request, and at shutdown (a second Ctrl-C or `docker stop` ends the wait; give `docker stop` a longer `-t`). The writes
-  run in the background and do not hold up requests. Conversations under 2048 tokens are not written. Steered conversations are, and each file records its steering: the vector's name and contents, mode, layers and scale.
+  run in the background and do not hold up requests. So the guarantee is a graceful restart: a `kill -9` (or a crash or power
+  loss) before the next of these writes loses what the conversation added since its last file. `--disk-eager` closes that
+  window (below). Conversations under 2048 tokens are not written. Steered conversations are, and each file records its steering: the vector's name and contents, mode, layers and scale.
 - **What comes back.** A prompt that matches a file further than anything in memory reads it back into the host archive: all of
   it when the conversation continues, or only the part up to the last checkpoint in the match, e.g. the end of a shared
   system prompt. Other conversations keep generating during the read. After `FLASH_DISK_LOAD_S` the prompt prefills instead.
@@ -759,10 +764,24 @@ Flash-Next, what it does:
   from an earlier version is not used, so an upgrade starts empty. Files from another configuration are kept and go first
   when room is needed. A truncated or damaged file is refused and removed, checked by a checksum on every read, and the prompt
   prefills.
-- **Size.** Each conversation's file holds its KV and its recurrent states. About 2.3 GB for a 95K-token conversation (measured). The cache stays below
+- **Size.** Each conversation's file holds its KV (about 13.5 KB per token with the default FP8 KV) and a few recurrent states
+  (the end state and the kept checkpoints, a fixed amount per state), so short files are dominated by the states: 1.08 GB for
+  a 27K-token conversation (about 42 KB per token at that length), about 2.3 GB at 95K tokens (measured). A read-back copies
+  less than the file: only what the prompt needs, e.g. 0.51 GB of the 27K file (the KV and one state). The cache stays below
   `--disk-cache-gb` and keeps 1 GB free on the disk; the least recently used file goes first.
 - **When the disk fails.** A directory it can't write, a full disk or a write error costs only the cache. A warning goes to
   the log and the server keeps serving. After a failed write, it tries again after a minute, then less often.
+
+**`--disk-eager` (opt-in, Qwen3.8-27B and Flash-Next).** With `--disk-cache`, each conversation is also written right after
+every finished reply: the server copies it to the host archive while it is idle and the file goes to the background writer.
+Requests are not held up (the copy runs between requests in small pieces; the write is off the request path): in a tight
+agent loop at ~106K tokens the time to first token stayed at 0.09 s on Flash-Next (3 cards) and 0.08 s on the 27B at 33K.
+At most one write per conversation runs at a time; a newer one waits and replaces a queued older one, so back-to-back
+turns write about every other turn on Flash-Next (2.2 GB per file at 106K); the 27B with half-second tool gaps wrote a
+file after every turn (1.8 GB at 33K, 0.2 s after the reply). A `kill -9` after that keeps the last turn. At most 8
+writes wait in the queue; past that a conversation keeps its previous file and the newer one is written at the next
+save. The old file of a conversation is deleted only after its newer file is on the drive. The cost is disk wear: the whole conversation file is rewritten after every turn (several GB per turn for
+a long agent session), which is why it is off by default.
 
 Not covered: conversations that didn't fit the host archive are not written, a file is rewritten whole each time, and
 one server per directory (a second one runs without the cache and says so).
@@ -866,6 +885,35 @@ changing them run once with `QE_COMM_CACHE=refresh`.
 
 For the 27B the prefill all-reduce runs on the copy engine already; `QE_COMM=p2p` selects the SM-store
 all-reduce and `QE_COMM=host` turns peer access off.
+
+### Inkling-2-Mini (preview)
+
+The README's settings table has the switches most people need (`--dense-weights`, `INK_SLOTS`, `INK_DRAFTER`, ...).
+The engine's other switches are below. Each one is an **off-switch or an experiment**: the defaults are the measured
+best.
+
+| setting | default | what it does |
+|---|---|---|
+| `INK_DENSE8_FILE` | `<model>/dense8.safetensors` | another INT8 dense weight file; a set path that does not exist stops the start |
+| `INK_DENSE8_RTN` | off | `1`: INT8 dense weights rounded to nearest at load, even when `dense8.safetensors` is there (lower quality: KL 0.00589 against 0.00539) |
+| `INK_PF8WOB` | `1` | `0`: keep a bf16 copy of the attention output weights for prefill (about 10K fewer tokens of context on 2 cards, prefill under 1 % faster) |
+| `INK_MAX_CTX` | `1048576` | caps the context per conversation below the model's limit |
+| `INK_POOL` | every row that fits | K/V rows shared by all slots; a number pins it |
+| `INK_DRAFT_MIN_CTX` | `16384` | the drafter stays loaded only while the K/V pool keeps at least this many rows with it; below that it is dropped at start to keep the context |
+| `INK_TAU`, `INK_DCAL` | the drafter file's own | the drafter's confidence stop and its 20-value calibration table |
+| `INK_SNAP` | `1` | `0`: no prompt-end snapshot (a follow-up turn whose history differs inside the previous reply is prefilled in full) |
+| `INK_SLOT_GROW` | `2048` | rows a conversation's interval grows by when it needs room |
+| `INK_PREEMPT` | `1` | a reply that has no room to grow pauses the most recently admitted decoding reply (possibly itself) until rows free, instead of ending with finish_reason `length`. Its state goes to host memory and it resumes exactly where it stopped. `0`: the reply ends with `length` (the old behaviour) |
+| `INK_RESUME_ROOM` | `reply` | rows a paused reply needs free for every running conversation before it resumes: `reply` = `INK_ADMIT_REPLY_ROWS` (2048, at most pool / 16) each, `growth` = each one's whole remaining reply, `bounded` = that but at most pool / 8. Always capped by the context the conversation has left; a paused reply that is alone always resumes |
+| `INK_BATCH` | `1` | `0`: every slot steps alone (no joint steps of several conversations) |
+| `INK_SAMP_DEV` | `1` | `0`: top_k / top_p / min_p are picked on the CPU from the full logits, without drafts (before 1.6: about half the decode speed of the GPU path) |
+| `INK_CHUNK` | per card count and memory | prefill chunk in tokens (64-8192) |
+| `INK_CACHE_LOG` | off | `1`: one log line per prompt start (archive copy, room, cache source and times) |
+| `INK_BROKEN_EXIT` | `1` | after a device fault the process exits (for a restart); `0` = off-switch |
+| `QE_EXIT_HOOK_S` | `5` | seconds the open requests get to receive their error before the process exits after a device fault |
+
+The other `INK_*` names the engine reads are kernel variants, self-tests and traces (`INK_TB*`, `INK_TCX*`, `INK_Q8*`,
+`INK_PF*`, `INK_*_CHK`, `INK_PROF`, `INK_VIRTUAL_TP` and similar); they are for engine work, not for serving.
 
 ## Build the Flash-Next model directory yourself
 

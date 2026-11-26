@@ -26,6 +26,11 @@ namespace glm {
 #define CUBLAS_CHECK_(x)                                                                          \
     do {                                                                                          \
         cublasStatus_t s__ = (x);                                                                 \
+        if (s__ != CUBLAS_STATUS_SUCCESS) { /* issue #44: a sticky CUDA error (trap) -> qe_fatal_cuda (glm.cu) */ \
+            const cudaError_t e__ = cudaStreamQuery(0);                                           \
+            if (e__ != cudaSuccess && e__ != cudaErrorNotReady) { /* review L1: keep the cuBLAS status (a capture error is no trap) */ \
+                fprintf(stderr, "cublas %d at %s:%d\n", (int)s__, __FILE__, __LINE__); qe_fatal_cuda(e__, __FILE__, __LINE__); } \
+        }                                                                                         \
         CHECK(s__ == CUBLAS_STATUS_SUCCESS, "cublas %d at %s:%d", (int)s__, __FILE__, __LINE__); \
     } while (0)
 

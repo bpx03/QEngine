@@ -578,6 +578,7 @@ void qe_reset(void* p) {
     h->store_bytes = 0;
     h->arch = Entry{};
     h->arch_slot = -1;
+    h->ring_est = 0;   // [gptoss-rearm]
     h->e->reset();
 }
 

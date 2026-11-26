@@ -35,6 +35,7 @@ import uuid
 from datetime import datetime
 
 import jinja2
+import jinja2.ext
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -115,6 +116,7 @@ def version_info(lib=None):
 # feed = detokenize + parser hand-off, check_done, the rest of the loop iteration), one JSON line per
 # request to $QE_STEP_PROF_FILE (default step_prof.jsonl) with the prompt ids, plus a log summary
 STEP_PROF = env_str("QE_STEP_PROF", "0") != "0"
+REQ_PROF = env_str("QE_REQ_PROF", "0") != "0"  # [ink-srv-gap] per streamed request: server-side stamps (chat handler)
 # [srv-gptoss-gap] QE_LOOP_PROF=1: scheduler iterations that only decode (no prefill), split by named marks (each mark
 # takes the time since the previous one; "call" = the engine step); a summary line each time the server goes idle
 LOOP_PROF = env_str("QE_LOOP_PROF", "0") != "0"
@@ -304,10 +306,21 @@ _pc = time.perf_counter
 # ----------------------------------------------------------------------------- template
 
 
+class _GenerationTag(jinja2.ext.Extension):
+    """HF's {% generation %} ... {% endgeneration %} (marks the assistant tokens for training masks): renders its body
+    as is. [ink-srv-capi] Inkling 2's template uses it; the other templates never do."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+        return jinja2.nodes.Scope(body, lineno=lineno)
+
+
 class Template:
     def __init__(self, path):
         env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True,
-                                 extensions=["jinja2.ext.loopcontrols"])
+                                 extensions=["jinja2.ext.loopcontrols", _GenerationTag])
 
         def raise_exception(msg):
             raise jinja2.TemplateError(msg)
@@ -777,7 +790,12 @@ def tool_calls_or_text(parser, tools, tchoice, no_calls):
     parsed = [] if no_calls else parse_tool_calls(parser.tool_text, tools)
     calls = tool_choice.filter_calls(tchoice, parsed) if not no_calls else []
     # review r17 L10: calls that parse but tool_choice filters out also leave the reply empty otherwise
-    return calls, ("" if calls else unmark(parser.tool_text))
+    if calls:
+        return calls, ""
+    if TOOL_FORMAT == "inkling":  # never the control tokens of a call body that did not parse as text (rel160)
+        import inkling
+        return calls, inkling.plain(parser.tool_text)
+    return calls, unmark(parser.tool_text)
 
 
 def parse_tool_calls_dsml(text, tools):
@@ -809,6 +827,9 @@ def parse_tool_calls(text, tools):
     if TOOL_FORMAT == "harmony":  # [srv-gptoss]
         import harmony
         return harmony.parse_calls(text, tools)
+    if TOOL_FORMAT == "inkling":  # [ink-srv-capi] <|content_invoke_tool_json|>{"name", "args"}<|end_message|>
+        import inkling
+        return inkling.parse_calls(text, tools)
     schemas = {}  # name -> properties of its parameter schema (None: the schema lists none)
     for t in tools or []:
         f = t.get("function", t)
@@ -867,8 +888,8 @@ def parse_tool_calls(text, tools):
         else:
             miss = [r for r in params.get("required", []) if r not in args]
             if miss:
-                diag("TOOL_ARGS_MISSING", f"{name} missing {miss}: {block[:300]!r}"
-                     f" (raw: {diag_dump('tool', unmark(text))})")
+                raw = diag_dump('tool', unmark(text))   # "" with the diag file off: no empty "(raw: )"
+                diag("TOOL_ARGS_MISSING", f"{name} missing {miss}: {block[:300]!r}" + (f" (raw: {raw})" if raw else ""))
     return calls
 
 
@@ -1227,6 +1248,8 @@ class Admission:
                 return i
             ps = e.pause_state() if hasattr(e, "pause_state") else None
             if ps is not None and ps[1] == 0 and now - j.t_enq >= self.pause_wait:
+                if hasattr(e, "protect_ids"):  # [ink-archprot] its archived conversation stays while the copies make room
+                    e.protect_ids(j.ids, j)
                 ok = e.pause_for(need, j.prio)  # (any request, by the pool order: the most recently admitted first)
                 ps2 = e.pause_state()  # (also after a False: pause_slot may have failed after pausing some)
                 if ps2 is not None and ps2[0] > ps[0]:  # (counted and logged only when something was paused)
@@ -1263,6 +1286,9 @@ class Generator:
         if TOOL_FORMAT == "harmony":  # [srv-gptoss] the harmony control tokens come out marked (only real ones count)
             import harmony
             self.marks.out.update(harmony.marks(self.tok))
+        if TOOL_FORMAT == "inkling":  # [ink-srv-capi] Inkling's message / content tokens likewise
+            import inkling
+            self.marks.out.update(inkling.marks(self.tok))
         self.im_start_user = self.tok.encode("<|im_start|>user", add_special_tokens=False).ids
         self.seg_cache = collections.OrderedDict()
         self.seg_tokens = 0
@@ -1316,6 +1342,8 @@ class Generator:
                                  vocab=prof.vocab_size)
         self.dstats = engine_stats.DraftStats(self.engine)  # per-slot draft counters (qe_draft_stats)
         asked = args.max_ctx  # review rel8 L5: the DSV4 default served at its static value is no "lowered" request
+        if getattr(args, "max_ctx_model", False):  # [ink-ctx-cap] review L1: the model's limit, not a request
+            asked = min(asked, self.engine.max_t)
         if getattr(args, "ctx_static", 0) and self.engine.max_t == args.ctx_static:
             asked = args.ctx_static
         print(context_line(asked, self.engine), flush=True)
@@ -1347,6 +1375,8 @@ class Generator:
             from think_budget import WRAP
             self.think_ids = HarmonyThinkIds(self.tok, env_str("QE_THINK_WRAP", WRAP))
         self.tool_tier_call = self.tok.token_to_id("<tool_call>")
+        if TOOL_FORMAT == "inkling":  # (tool_choice none without masks: the reply ends at the call's body token)
+            self.tool_tier_call = self.tok.token_to_id("<|content_invoke_tool_json|>")
         self.can_force = self.engine.has("grammar") and self.think_ids.ok
         self.think = {"requests_with_budget": 0, "forced_budget": 0, "forced_max_tokens": 0, "forced_failed": 0,
                       "empty_replies": 0, "empty_stop": 0, "empty_length": 0, "empty_after_forced_close": 0,
@@ -1631,6 +1661,11 @@ class Generator:
                 if kw.pop("enable_thinking", True) is False and kw.get("reasoning_effort") is None:
                     kw["reasoning_effort"] = self.profile.defaults.get("no_effort", "low")
                 text = self.tmpl.render(r_msgs, r_tools, **kw)
+            elif getattr(self.profile, "is_inkling", False):
+                # [ink-srv-capi] Inkling 2: thinking is the template's reasoning_effort (none / minimal / low / medium /
+                # high / xhigh / max or a number in [0, 0.99]); thinking off = none (0); no effort = its default 0.9
+                import inkling
+                text = self.tmpl.render(r_msgs, r_tools, **inkling.effort(kw))
             elif getattr(self.profile, "is_dsv4", False):
                 # DeepSeek-V4.1 (dsv4_chat): enable_thinking ends the prompt with <think> or </think>; the loop guard's
                 # thinking turn renders the same messages with thinking on
@@ -1680,6 +1715,9 @@ class Generator:
         def finish(ids, label):  # the GLM system-part hint, the labels, the image tokens
             if getattr(self.profile, "is_gptoss", False) and (self.args.tier_reset or self.args.no_prefix_share):
                 ids.hint = 0  # [srv-gptoss-cache] no shared system-part snapshot
+            if getattr(self.profile, "is_inkling", False):  # [ink-srv-capi] the system part (tools, system, effort)
+                u = self.tok.token_to_id("<|message_user|>")
+                ids.hint = ids.index(u) if u is not None and u in ids else 0
             if self.profile.is_glm:
                 ids.hint = 0  # (encode()'s Qwen rule would match a literal "<|im_start|>user" inside the text)
                 # GLM: one segment (no <|im_start|>); the end of the system part = the first <|user|> token (round 18: the
@@ -1830,6 +1868,9 @@ class Generator:
         if getattr(self.profile, "is_gptoss", False):  # [srv-gptoss] reasoning -> thinking, tool arguments as objects
             import harmony
             messages = harmony.prepare(messages)
+        if getattr(self.profile, "is_inkling", False):  # [ink-srv-capi] text parts, reasoning_content, arguments as objects
+            import inkling
+            messages = inkling.prepare(messages)
         if self.args.merge_system:
             messages = merge_leading_system(messages)
         if self.args.drop_empty_turns:
@@ -2076,7 +2117,10 @@ class Generator:
         hit = False
         for j in jobs:
             msg = None if j.finished else self.engine.slot_fault(j.slot)
-            if msg and getattr(self.profile, "is_gptoss", False) and msg.startswith("KV pool full"):
+            # (rel160: Inkling too: its C API is the gpt-oss port and logs "the reply ends with finish_reason length", but
+            # the server answered HTTP 500, 1.6.0 stress gate)
+            if msg and (getattr(self.profile, "is_gptoss", False) or getattr(self.profile, "is_inkling", False)) \
+                    and msg.startswith("KV pool full"):
                 # [gptoss-rel1-full] no room for the reply to grow (or its context is full): the reply ends as at
                 # max_tokens (finish_reason length), not with an error; the engine keeps the conversation's rows
                 print(f"engine: slot {j.slot} ({len(j.ids)} prompt tokens, {getattr(j, 'n', 0)} generated): {msg}; the "
@@ -2176,6 +2220,10 @@ class Generator:
         turns = getattr(self.args, "prefill_turns", "time") == "slices"
         dec_left = 0
         bg_done = True  # idle archiving has nothing left (reset only when a request ends without a decode step; else the idle persist)
+        # [ink-ctx-arch] Inkling, [gptoss-rearm] gpt-oss: re-armed after every finished reply too (their archive is host RAM
+        # only; before, a reply that ended after decode steps was archived only on the next prompt's path: Inkling +1.6 s
+        # TTFT per 109K rows on TP2)
+        ink_rearm = bg_rearm_after_reply(self.profile, os.environ, self.args)
         burst_wait = max(0.0, getattr(self.args, "burst_wait", 5.0)) / 1000.0
 
         adm = Admission(self)
@@ -2268,7 +2316,25 @@ class Generator:
                         rest = idle_persist - (time.monotonic() - idle_since)
                         if rest > 0:
                             w = min(rest, HANG_S / 2) if HANG_S > 0 else rest
-                            self.cv.wait(min(w, 1.0) if bg_done == 2 else w)
+                            self.cv.wait(min(w, 1.0))
+                            # the host memory check once a second here too, as in the idle wait below (before, an idle
+                            # server with --disk-cache skipped it until the persist: a hog got no pressure response for
+                            # up to --persist-idle); [disk-eager] the engine also collects its finished writes there
+                            # (Flash-Next dk_reap: a superseded file goes, the index and the disk budget follow)
+                            if time.time() - last_mg > 1.0:
+                                last_mg = time.time()
+                                self.cv.release()
+                                try:
+                                    # (only the host-memory part, review M2: no idle reclaim / VRAM tick before the persist)
+                                    mp = getattr(e, "mem_pressure", None)
+                                    if mp is not None:
+                                        mp()
+                                except Exception:
+                                    pass
+                                finally:
+                                    self.cv.acquire()
+                                if bg_done == 2:  # (review M1) the archiver stopped for host memory retries, as below
+                                    bg_done = False
                             continue
                         idle_since = None
                         if not self.queue and not self.ctrl:
@@ -2544,6 +2610,12 @@ class Generator:
                                     (self.queue or parked or any(x is not cur for x in prefills)) and \
                                     ndec + len(prefills) + len(self.queue) + len(parked) > adm.seats:
                                 tpk = time.time()
+                                if self.queue and hasattr(e, "protect_ids"):  # [ink-archprot] review2 L4: the queue head's source stays
+                                    try:  # (review3 nit: never a failed start of cur)
+                                        q0 = self.queue[0]
+                                        e.protect_ids(q0.ids, q0)
+                                    except Exception:
+                                        pass
                                 h = e.park(cur.slot)
                                 if h is not None:
                                     cur.park_h, cur.t_park = h, time.time()
@@ -2686,6 +2758,8 @@ class Generator:
             lp.mark("done")
             if len(active) < n_active:
                 self.retry_gen += 1  # room may have freed: refused starts try again
+                if ink_rearm:  # [ink-ctx-arch] / [gptoss-rearm] a finished reply goes to host RAM while the server idles (no disk files)
+                    bg_done = False
 
 
 def repetition_period(ids, max_period=200, min_span=600, min_reps=5):
@@ -2949,6 +3023,8 @@ class Job:
             self.answer_at = None
         elif getattr(getattr(g, "profile", None), "is_gptoss", False):  # harmony: client stops match the final channel only (stop_from)
             self.answer_at = None
+        elif getattr(getattr(g, "profile", None), "is_inkling", False):  # Inkling: the content messages only (stop_from)
+            self.answer_at = None
         elif self.tc is not None and getattr(getattr(g, "profile", None), "is_dsv4", False):
             # DSV4 (dsv4_app's [dsv4-srv-stop] rule): client stops match the answer only, never the reasoning
             self.answer_at = None
@@ -3150,6 +3226,9 @@ class Job:
         calls are plain text, so the reply's own parser decides (a DSML block in the answer, not one quoted in the
         reasoning), as the HTTP side does."""
         ans = self.text_mk
+        if TOOL_FORMAT == "inkling":  # [ink-srv-capi] the content messages; a call = a parsed invoke body
+            import inkling
+            return inkling.answer_of(ans)
         if mark("</think>") in ans:
             ans = ans.split(mark("</think>"), 1)[1]
         if TOOL_FORMAT == "dsml":
@@ -3183,6 +3262,10 @@ class Job:
                 return None
             self.tool_hold = False
             self.answer_at = j + len("</tool_call>")
+        if self.answer_at is None and getattr(getattr(self.gen, "profile", None), "is_inkling", False):
+            import inkling
+            self.answer_at = inkling.answer_start(self.text_mk)   # [ink-srv-capi] the body of the latest content message
+            return self.answer_at
         if self.answer_at is None and getattr(getattr(self.gen, "profile", None), "is_gptoss", False):
             i = self.text_mk.rfind(mark("<|channel|>") + "final")  # [srv-gptoss] the answer = the final message's body
             j = self.text_mk.find(mark("<|message|>"), i) if i >= 0 else -1
@@ -3212,6 +3295,10 @@ class Job:
         spans, hold, tail = [(a, len(t))], len(t), True
         if TOOL_FORMAT == "dsml":
             spans, hold, tail = self.dsml_spans(t, a, ending)
+        elif getattr(getattr(self.gen, "profile", None), "is_inkling", False):
+            import inkling  # [ink-srv-review-fix] L5: content bodies only (no later reasoning, no tool-call JSON)
+            spans, tail = inkling.stop_spans(self.text_mk)
+            spans = [(u, v) for u, v in spans if v > a] or [(a, a)]
         a = max(sent, a)  # (the text in front of the answer goes out with what follows)
         found = [p for u, v in spans for p in (t.find(x, max(u, a), v) for x in self.stops) if p >= 0]
         pos = min(found) if found else -1
@@ -4108,7 +4195,9 @@ def build_app(gen: Generator, args):
     # ---------------- OpenAI chat completions ----------------
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
+        t_in = time.time()  # [ink-srv-gap] QE_REQ_PROF=1: one line of server-side stamps per streamed request
         body = await req.json()
+        t_json = time.time()
         bad = request_shape_error(body)
         if bad:
             return JSONResponse({"error": {"message": bad[1], "type": "invalid_request_error", "param": bad[0]}},
@@ -4146,12 +4235,14 @@ def build_app(gen: Generator, args):
         except ValueError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error",
                                            "param": "steering"}}, status_code=400)
+        t_pr0 = time.time()
         try:
             ids, aff = gen.prompt(openai_messages(body["messages"]), tools, kw, body.get("metadata"), track=True,
                                   guard_on=body.get("loop_guard") is not False, guard_think=grammar is None)
         except InputError as ex:
             return JSONResponse({"error": {"message": str(ex), "type": "invalid_request_error", "param": "messages"}},
                                 status_code=400)
+        t_pr1 = time.time()
         if gen.too_long(ids):
             # OpenAI's wording: harnesses detect an overlong prompt by it (verifiers / AutomationBench end the rollout
             # cleanly and score it instead of aborting it, LiteLLM raises ContextWindowExceededError)
@@ -4211,6 +4302,7 @@ def build_app(gen: Generator, args):
                         d.update(extra)
                     return "data: " + json.dumps(d, ensure_ascii=False) + "\n\n"
                 started = False
+                text_seen, t_role = [False], t_in
                 sse_s = [0.0, 0]  # QE_STEP_PROF: event-loop time of parser + chunk JSON, chunks
                 async for item in fault_events(stream_bridge(gen, ids, params, aff, req, SSE_KEEPALIVE_S)):
                     if item is KEEPALIVE or (type(item) in (str, LpText) and keepalive_due(last_w)):
@@ -4231,6 +4323,7 @@ def build_app(gen: Generator, args):
                         return
                     if not started:  # role chunk with the first token: clients measure TTFT on it
                         started = True
+                        t_role = time.time()
                         yield chunk({"role": "assistant", "content": ""})
                     if isinstance(item, dict):
                         st = item
@@ -4269,6 +4362,12 @@ def build_app(gen: Generator, args):
                         if STEP_PROF:
                             sse_s[0] += _pc() - a0
                             sse_s[1] += 1
+                        if REQ_PROF and not text_seen[0]:
+                            text_seen[0] = True
+                            print(f"[reqprof] t_in {t_in:.6f}: json {1e3 * (t_json - t_in):.1f} ms, prompt (template + "
+                                  f"tokenize, {len(ids)} tokens) {1e3 * (t_pr1 - t_pr0):.1f} ms (at +{1e3 * (t_pr0 - t_in):.1f}), "
+                                  f"role chunk +{1e3 * (t_role - t_in):.1f} ms, first text chunk +{1e3 * (time.time() - t_in):.1f} ms",
+                                  flush=True)
                         yield c
                         if STEP_PROF:
                             a0 = _pc()
@@ -4502,6 +4601,100 @@ def build_app(gen: Generator, args):
     return app
 
 
+INK_CTX_MAX = 1 << 20  # the Inkling engine's own cap (qe_create)
+
+
+def model_ctx_limit(v):
+    """[ink-ctx-cap] review L6: a config's context limit as a sane int (None: none / a "no limit" sentinel above the
+    engine's cap counts as the cap, a non-number as none)."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not v == v or v < 1024:
+        return None
+    return int(min(v, INK_CTX_MAX))
+
+
+def bg_rearm_after_reply(profile, env, args=None):
+    """[ink-ctx-arch] idle archiving re-armed after every finished reply: Inkling and ([gptoss-rearm]) gpt-oss (their
+    archive is host RAM only; the 27B / Flash-Next / GLM / DSV4 keep the 1.3.5 rule: re-arm only after a reply without
+    decode steps). Off-switches: INK_BG_REARM=0 (Inkling), GPTOSS_BG_REARM=0 (gpt-oss); 0 / false / off / no
+    (any case) mean off ([gptoss-rearm] review L3).
+    [disk-eager] the 27B and Flash-Next with --disk-cache and the opt-in --disk-eager: re-armed too, so the idle archiver
+    copies the conversation after each reply and its file is written right away (the 27B writes a file whenever an
+    archive is complete; Flash-Next FLASH_DISK_EAGER, set by the server)."""
+    if (args is not None and getattr(args, "disk_eager", False) and getattr(args, "disk_cache", "")
+            and getattr(profile, "family", None) in ("qwen38-27b", "qwen38-flash-next")):  # (model_profile Q27 / QFN)
+        return True
+    if getattr(profile, "is_inkling", False):
+        key = "INK_BG_REARM"
+    elif getattr(profile, "is_gptoss", False):
+        key = "GPTOSS_BG_REARM"
+    else:
+        return False
+    return (env.get(key) or "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _c_atoi(v):
+    """C atoi: the leading integer of v (else 0), as the Inkling engine parses INK_DENSE8"""
+    m = re.match(r"\s*[+-]?\d+", v or "")
+    return int(m.group()) if m else 0
+
+
+def ink_dense8_lines(model, env):
+    """[ink-pf8] review L3 / review2 L2: the start-up line when INT8 dense weights are asked for explicitly (INK_DENSE8 != 0
+    by the engine's atoi, or INK_DENSE8_RTN) but will not come from dense8.safetensors. Engine rules (ink.cu load):
+    INK_DENSE8 set and atoi 0 = g15; INK_DENSE8_RTN (non-empty, not starting with 0) = RTN at load; a set INK_DENSE8_FILE
+    that does not exist stops the start; else the file next to the checkpoint, RTN at load when it is missing."""
+    e8 = env.get("INK_DENSE8")
+    rtn = env.get("INK_DENSE8_RTN") or ""
+    rtn_on = bool(rtn) and not rtn.startswith("0")
+    if (e8 and not _c_atoi(e8)) or not ((e8 and _c_atoi(e8)) or rtn_on) or rtn_on:
+        return []  # g15 / the engine's default (its own line) / RTN asked for by name
+    f = env.get("INK_DENSE8_FILE")
+    if f:
+        return [] if os.path.exists(f) else [f"[settings] INK_DENSE8_FILE={f} does not exist: the Inkling engine will not start "
+                                             "(unset it to use dense8.safetensors next to the checkpoint)"]
+    d8f = os.path.join(model, "dense8.safetensors")
+    if os.path.exists(d8f):
+        return []
+    return [f"[settings] INT8 dense weights asked for but {d8f} is missing: RTN INT8 at load (lower quality than GPTQ: "
+            "set-2 KL 0.00589 vs 0.00539); put dense8.safetensors next to the checkpoint, or --dense-weights g15 for the "
+            "original weights"]
+
+
+def inkling_devices(given, env):
+    """[ink-ctx-dev] Inkling's cards (indices within CUDA_VISIBLE_DEVICES) and start-up lines. given: --devices from the
+    command line (None / "": not given); env: os.environ. One card unless asked: an explicit --devices, QE_DEVICES
+    through server/run.sh (mapped to --devices), or QE_DEVICES on a direct start (the engine's old way, indices).
+    run.sh's own every-visible-GPU list (QE_RUNSH_DEVICES=all) is not a request: tensor parallelism needs P2P and two
+    cards are the measured best, so it is never implicit. Raises ValueError for a malformed or repeated list."""
+    src = (env.get("QE_RUNSH_DEVICES") or "").strip()
+    q = (env.get("QE_DEVICES") or "").strip()
+    given = (given or "").strip() or None
+    lines = []
+    if given is not None and src != "all":
+        dev = given
+        if q and not src:  # a direct start: QE_DEVICES would have been the engine's own list
+            lines.append(f"[settings] QE_DEVICES={q} is set but has no effect for Inkling-2-Mini (--devices {given} wins)")
+    elif q and not src:
+        dev = q
+    else:
+        dev = "0"
+        if src == "all" and given and given != "0":
+            lines.append(f"[ink] one card (index 0 of the visible GPUs); tensor parallel: QE_DEVICES=a,b server/run.sh or --devices 0,1")
+    if not re.fullmatch(r"\d+(,\d+)*", dev.replace(" ", "")):
+        raise ValueError(f"--devices / QE_DEVICES '{dev}': a comma list of GPU indices (0,1)")
+    ids = [int(x) for x in dev.replace(" ", "").split(",")]
+    if len(set(ids)) < len(ids) and (env.get("INK_VIRTUAL_TP") or "").strip() in ("", "0"):
+        raise ValueError(f"--devices '{dev}' repeats a card (several ranks on one card are an engine test: INK_VIRTUAL_TP=1)")
+    vis = [x for x in (env.get("CUDA_VISIBLE_DEVICES") or "").split(",") if x.strip()]
+    if vis and max(ids) >= len(vis):
+        raise ValueError(f"--devices '{dev}': index {max(ids)} but only {len(vis)} visible GPU(s) (CUDA_VISIBLE_DEVICES={','.join(vis)})")
+    return ",".join(map(str, ids)), lines
+
+
 def resolve_model_args(args):
     """Fill the per-model defaults (None on the command line) from the model profile."""
     if args.model in ("glm", "glm53-flash"):  # the GLM engine's default checkpoint (model_profile.py default_dir)
@@ -4525,12 +4718,34 @@ def resolve_model_args(args):
             args.engine_lib = os.environ.get("QE_DSV4_LIB") or os.path.join(ROOT, d["lib"])
         if args.stats_file == STATS_DEFAULT:
             args.stats_file = d["stats_file"]
+    args.ink_lines = []
+    if d.get("max_ctx") == "model":  # [ink-ctx-cap] Inkling: the model's limit (capped at the KV pool)
+        mx = model_ctx_limit(prof.max_position)
+        if not getattr(args, "max_ctx_given", True):
+            args.max_ctx = mx or args.max_ctx
+            args.max_ctx_model = True  # (review L1: the start-up context line says nothing is "lowered")
+        elif mx and args.max_ctx > mx:  # (review L2)
+            args.ink_lines.append(f"[settings] --max-ctx {args.max_ctx} is above what Inkling-2-Mini serves: "
+                                  f"capped at its {mx:,} tokens (and the KV pool)")
+            args.max_ctx = mx
     if getattr(args, "prefill_turns", "auto") == "auto":
         args.prefill_turns = d.get("prefill_turns", "time")
     if args.served_name is None:
         args.served_name = d["served_name"]
     if args.mtp_k is None:
         args.mtp_k = d["mtp_k"]
+    if prof.family == "inkling":  # [ink-ctx-dev] review H1 / M1 / M2 / L4 / L5
+        try:
+            args.devices, lines = inkling_devices(args.devices if "devices" in getattr(args, "given", {}) else None, os.environ)
+        except ValueError as ex:
+            sys.exit(f"Inkling-2-Mini: {ex}")
+        args.ink_lines += lines
+        # [ink-pf8] --dense-weights (any card count): the flag wins over INK_DENSE8
+        dw = getattr(args, "dense_weights", None)
+        if dw:
+            os.environ["INK_DENSE8"] = "1" if dw == "int8" else "0"
+        for ln in ink_dense8_lines(args.model, os.environ):
+            args.ink_lines.append(ln)
     if args.devices is None:
         vis = [x for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
         args.devices = ",".join(str(i) for i in range(len(vis))) if vis else "0,1,2"
@@ -4548,6 +4763,8 @@ def resolve_model_args(args):
         setattr(args, k, bool(d[k]) if v is None else bool(v))
     if not args.engine_lib and not env_str("QE_LIB"):
         lib = os.path.join(ROOT, d["lib"])
+        if not os.path.exists(lib) and prof.family == "inkling":
+            sys.exit(f"Inkling engine library not built: {lib} is missing (run OUT=build_srv src/inkling/build.sh)")
         if not os.path.exists(lib) and prof.family == "gptoss":
             # [gptoss-rel1-lib] the 27B library cannot run this model: stop with the reason instead of a later failure
             sys.exit(f"gpt-oss engine library not built: {lib} is missing (run src/gptoss/build.sh)")
@@ -4561,6 +4778,9 @@ def resolve_model_args(args):
     if TOOL_FORMAT == "harmony":
         from harmony import HarmonyParser
         PARSER = HarmonyParser
+    elif TOOL_FORMAT == "inkling":
+        from inkling import InklingParser
+        PARSER = InklingParser
     else:
         PARSER = DsmlParser if TOOL_FORMAT == "dsml" else Parser
     if args.vision and not d["vision"]:  # (logged by the feature table: ignored_settings)
@@ -4640,10 +4860,18 @@ def parse_args(argv=None):
             raise argparse.ArgumentTypeError("a token count (262144, 512K, 1M)")
         return int(float(m.group(1)) * {"": 1, "k": 1024, "m": 1024 * 1024}[m.group(2).lower()])
     ap.add_argument("--max-ctx", type=ctx_arg, default=262144,
-                    help="context per conversation (default 262144); above 262144 (up to 1M) turns on YaRN RoPE "
+                    help="context per conversation (default 262144; Inkling-2-Mini: the model's 1,048,576); above 262144 (up to 1M) turns on YaRN RoPE "
                          "scaling, factor context / 262144 (27B: QE_YARN, Flash-Next: FLASH_YARN, and needs FLASH_KV=ram). "
                          "Never above the KV pool: a smaller pool lowers it and the server starts anyway (start-up line "
                          "'context: requested ..., KV pool ..., served ...')")
+    ap.add_argument("--dense-weights", choices=("int8", "g15"), default=None,
+                    help="Inkling-2-Mini: form of the dense attention weights, on any card count. "
+                         "g15 = original weights (lossless, bit-exact to the checkpoint; set-2 KL vs the FP32 reference "
+                         "0.00495); int8 = GPTQ INT8 g128 from dense8.safetensors next to the checkpoint: faster decode, "
+                         "small quality loss (set-2 KL 0.00539 decode form, 0.00544 prefill form on 2 cards; one card "
+                         "0.00538 / 0.00558); without that file int8 is RTN INT8 at load (lower quality, KL 0.00589; logged "
+                         "at start). Default: int8 on any card count when dense8.safetensors is present, else g15. "
+                         "Env: INK_DENSE8=1 (int8) / 0 (g15); the flag wins")
     ap.add_argument("--mtp-k", type=int, default=None,
                     help="max MTP drafts per step (adaptive; default per model: 27B 7, Flash-Next 3)")
     ap.add_argument("--temperature", type=float, default=None,
@@ -4812,6 +5040,11 @@ def parse_args(argv=None):
     ap.add_argument("--disk-cache-gb", type=float, default=200)
     ap.add_argument("--persist-idle", type=float, default=120,
                     help="seconds idle before live conversations are saved to the disk cache")
+    ap.add_argument("--disk-eager", action="store_true",
+                    help="with --disk-cache (Qwen3.8-27B / Flash-Next): write each conversation to the disk cache in the "
+                         "background right after every finished reply (a kill -9 then keeps the last turn), instead of "
+                         "only at --persist-idle and at shutdown. Off by default: it writes the whole conversation file "
+                         "after every turn (NVMe wear)")
     ap.add_argument("--log-file", default=env_str("QE_LOG_FILE", "auto"),
                     help="persistent log: the server's whole output (also the engine's) is appended to this file with "
                          "a timestamp per line and survives crashes and restarts (auto: "
@@ -4836,7 +5069,7 @@ def parse_args(argv=None):
         print("[sched] --main-bonus is ignored: no main-thread priority since 2026-11-12 (every conversation alike)", flush=True)
     resolve_model_args(args)
     # [feature-matrix] flags / variables that have no effect for this model: logged by main() after the log starts
-    args.ignored_start = ignored_settings(args.profile.family, args.given, env0, args=args)
+    args.ignored_start = ignored_settings(args.profile.family, args.given, env0, args=args) + getattr(args, "ink_lines", [])
     args.env0 = env0
     if not args.template:
         args.template = os.path.join(args.model, "chat_template.jinja")
@@ -4897,9 +5130,19 @@ def parse_args(argv=None):
     # Flash-Next: its disk tier has its own variables. QE_DISK_CACHE alone only moves the start-up cache there (documented),
     # so setting it never turns the tier on; without the flag it is off
     os.environ.pop("FLASH_DISK_CACHE", None)
+    os.environ.pop("FLASH_DISK_EAGER", None)
+    os.environ.pop("QE_DISK_EAGER", None)
+    if args.disk_cache and args.disk_eager and not args.profile.is_flash:  # (27B: engine.cpp disk_eager_)
+        os.environ["QE_DISK_EAGER"] = "1"
     if args.disk_cache and args.profile.is_flash:
         os.environ["FLASH_DISK_CACHE"] = args.disk_cache
         os.environ["FLASH_DISK_CACHE_GB"] = str(args.disk_cache_gb)
+        if args.disk_eager:
+            os.environ["FLASH_DISK_EAGER"] = "1"
+    if args.disk_eager and not args.disk_cache:
+        print("[settings] --disk-eager has no effect without --disk-cache DIR", flush=True)
+    elif args.disk_eager and not args.bg_archive:  # (review L3: the copy after a reply is the idle archiver's)
+        print("[settings] --disk-eager has no effect with --bg-archive 0 (the idle archiver makes the copy it writes)", flush=True)
     return args
 
 
@@ -4949,6 +5192,8 @@ def main():
         import assets          # 27B checkpoint-format check refused GLM's sharded checkpoint, DFlash2 / LSA are 27B-only
         assets.ensure(args.model)
     elif getattr(args.profile, "is_dsv4", False):  # DSV4: GGUF weights, no assets
+        pass
+    elif getattr(args.profile, "is_inkling", False):  # [ink-srv-capi] Inkling 2: its own checkpoint (+ mtp.safetensors), no assets
         pass
     elif args.profile.is_gptoss:  # [srv-gptoss] gpt-oss: its own MXFP4 checkpoint (the engine checks it), no assets
         # [gptoss-rel1] features the gpt-oss engine does not offer in the server (1.5): said at the start, never a stop

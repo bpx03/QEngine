@@ -52,6 +52,8 @@ int qe_host_mem_info(void* e, char* buf, int n);  // the host-RAM plan at boot a
 int qe_can_admit(void* e, int n);            // a new n-token sequence fits now; default: a free slot and n <= max_context
 int qe_pause_for(void* e, int n, int prio);  // pause decoding sequences of lower prio (lowest first, never a prefill) until a
                                              // new n-token sequence fits; 1: it fits now (nothing paused if it cannot)
+void qe_protect_ids(void* e, const int* ids, int n);  // [ink-archprot] the prompt the next qe_pause_for / qe_park makes room
+                                             // for: its host-store source is kept if the copies fit without it (Inkling); optional
 // park a decoding sequence (KV rows + recurrent state to a held host archive, slot released): handle >= 0, -1 refused;
 // unpark it into any free slot bit-identically (no prefill): slot >= 0, -1 not now (retry), -2 unknown handle; *extra a
 // token only when the held state could not serve (its row was prefilled); park_drop: a parked request ended (optional)
@@ -105,6 +107,7 @@ int qe_last_from_archive(void* e);  // last start restored from the host archive
 // ======================================================= TIER 5 "archive": host / disk archive (all or none)
 int qe_archive_more(void* e, long long budget);  // archive idle slots, ~budget bytes/GPU; 1 = nothing left
 void qe_mem_guard(void* e);  // host memory pressure: the archive gives memory back below MemAvailable - margin (call ~1/s)
+void qe_mem_pressure(void* e);  // only the host-memory part of qe_mem_guard (the server's idle persist wait)
 void qe_persist(void* e);
 int qe_num_archives(void* e);
 int qe_num_disk_archives(void* e);
