@@ -1398,7 +1398,8 @@ __device__ __noinline__ int i8c_publish(int u, int n, unsigned sl, unsigned tg, 
 }
 
 template <int WT, int TB, int G, int HM, int MINB = 1, int NST = STAGES, int OPT = 0>
-__global__ void __launch_bounds__(kThreads, MINB) gemm_i8v_kernel(const uint4* __restrict__ wq,
+// This engine tile spills at the 2-CTA register cap on sm_86; leave arithmetic and dispatch/grid unchanged.
+__global__ void __launch_bounds__(kThreads, (WT == 2 && TB == 64 && G == 64 && HM == 2 && MINB == 2 && NST == 3 && OPT == 12289 ? 1 : MINB)) gemm_i8v_kernel(const uint4* __restrict__ wq,
                                                            const bf16* __restrict__ ws, int N, int K,
                                                            const int8_t* __restrict__ x,
                                                            const float4* __restrict__ xsc, int T,
