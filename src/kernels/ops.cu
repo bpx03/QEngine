@@ -2234,9 +2234,12 @@ void attention_seg(const AttnSegs& g, const AttnShape& s, int ld, const bf16* qn
             a.kc2 = c.kc2;
             a.vc2 = c.vc2;
             a.xrow0 = seg_row0(g, z);
+            a.rdelta = c.rdelta;  // [gh49] this sequence's RoPE shift and no prompt-chunk rows, as seq_view(c)
+            a.rpos3 = nullptr;
             attn_prep_kernel<<<dim3(c.m, s.nq + 2 * s.nkv), 256, 0, st>>>(c.proj, ld, a, qn_w, kn_w, eps,
                                                                        inv_freq, c.pos, c.q, c.kc, c.vc);
-            attention(c.q, c.kc, c.vc, a, c.proj, ld, c.pos, c.m, c.work, c.out, st);
+            // [gh49] c.xh too: the o projection after a batched step reads the XH copy on the H16 path
+            attention(c.q, c.kc, c.vc, a, c.proj, ld, c.pos, c.m, c.work, c.out, st, c.xh);
         }
         return;
     }
