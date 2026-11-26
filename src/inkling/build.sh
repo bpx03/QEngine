@@ -2,6 +2,13 @@
 # Build ink_run (Inkling 2 Mini one-card engine) and libqinkling.so (the server's C API, server/qe_capi.h).
 # No --use_fast_math (IEEE exp / tanh for the reference numerics). LIB=0: ink_run only.
 set -e
+# OUT: the output directory; a relative OUT is taken from the caller's directory (from the repository root,
+# OUT=build_srv is the server's build_srv/libqinkling.so); default: build_inkling/ at the repository root
+case "${OUT:-}" in
+  "") ;;
+  /*) ;;
+  *) OUT="$PWD/$OUT" ;;
+esac
 cd "$(dirname "$0")"
 OUT=${OUT:-../../build_inkling}
 mkdir -p $OUT

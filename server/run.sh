@@ -2,7 +2,8 @@
 # Start the QEngine server (OpenAI + Anthropic API), tensor parallel over the selected GPUs.
 # usage: server/run.sh <port> [extra args for server/app.py]
 #
-# GPU selection (default: GPUs 0,1,2, tensor parallel 3; 2 GPUs are supported too):
+# GPU selection (default: every GPU present (nvidia-smi -L; 0,1,2 without nvidia-smi); Inkling-2-Mini: one card;
+# DeepSeek-V4.1-Flash: 3 cards):
 #   QE_DEVICES=0,2 server/run.sh 8080     # physical GPU ids; sets CUDA_VISIBLE_DEVICES=0,2, --devices 0,1
 #   CUDA_VISIBLE_DEVICES=0,2 server/run.sh 8080   # same, all visible GPUs are used
 #   server/run.sh 8080 --devices 0,1      # explicit --devices (indices within CUDA_VISIBLE_DEVICES) is passed through
@@ -14,7 +15,13 @@ shift || true
 if [ -n "${QE_DEVICES:-}" ]; then
   export CUDA_VISIBLE_DEVICES="$QE_DEVICES"
 else
-  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
+  if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    # neither set: every GPU present (0..n-1), 0,1,2 when nvidia-smi cannot count them
+    _n=0
+    command -v nvidia-smi >/dev/null 2>&1 && _n=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
+    if [ "${_n:-0}" -gt 0 ]; then CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((_n - 1))); else CUDA_VISIBLE_DEVICES=0,1,2; fi
+  fi
+  export CUDA_VISIBLE_DEVICES
 fi
 IFS=, read -ra _vis <<< "$CUDA_VISIBLE_DEVICES"
 
@@ -51,6 +58,16 @@ _uniq=$(printf '%s\n' "${_req[@]}" | sort -u | wc -l)
 _max=$(printf '%s\n' "${_req[@]}" | sort -n | tail -1)
 if [ "$_uniq" -gt "$_avail" ] || [ "${_max:-0}" -ge "$_avail" ]; then
   echo "QEngine: ${_uniq} devices requested (--devices $_devices) but only $_avail GPU(s) visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)" >&2
+  exit 1
+fi
+# DeepSeek-V4.1-Flash (a GGUF split set, general.architecture deepseek41) always runs on the first 3 visible cards:
+# with fewer, stop here instead of failing in the engine's load
+_gg=""
+if [ -n "${_model:-}" ] && [ -d "$_model" ]; then
+  for f in "$_model"/*-00001-of-*.gguf "$_model"/*.gguf; do [ -f "$f" ] && { _gg=$f; break; }; done
+fi
+if [ -n "$_gg" ] && LC_ALL=C grep -qa deepseek41 < <(head -c 65536 "$_gg") && [ "$_avail" -lt 3 ]; then
+  echo "QEngine: DeepSeek-V4.1-Flash needs 3 GPUs (24 GB each), but only $_avail GPU(s) visible (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES). Select three cards with QE_DEVICES, e.g. QE_DEVICES=0,1,2 server/run.sh $PORT --model $_model" >&2
   exit 1
 fi
 # (Inkling-2-Mini runs on one card by default: no warning for it at 1 card; config.json model_type inkling2*)

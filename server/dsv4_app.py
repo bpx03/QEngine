@@ -352,8 +352,10 @@ class Server:
                 pfx = 0
         pfx = pfx if pfx >= 1024 else 0
         t = body.get("temperature", self.def_t)
-        sampling = dict(temperature=0.0 if t is None else float(t),
-                        top_p=float(body.get("top_p", self.def_p) or 1.0), top_k=int(body.get("top_k") or 0),
+        tp = body.get("top_p")
+        tp = float(self.def_p if tp is None else tp)   # an explicit 0 is a value: top_p <= 0 = the top token (greedy)
+        sampling = dict(temperature=0.0 if t is None or tp <= 0 else float(t),
+                        top_p=tp if tp > 0 else 1.0, top_k=int(body.get("top_k") or 0),
                         min_p=float(body.get("min_p") or 0.0), seed=int(body["seed"]) if body.get("seed") is not None else uuid.uuid4().int & 0xFFFFFFFF)   # review rel L2: seed 0 is a seed
         mx = int(body.get("max_completion_tokens") or body.get("max_tokens") or (self.e.max_ctx - len(ids) - 16))
         return ids, thinking, sampling, max(1, mx), parse_stop(body.get("stop")), pfx

@@ -177,29 +177,30 @@ class Profile:
         return self.family == "qwen38-flash-next"
 
     def sampling(self, thinking, temperature=None, top_p=None, top_k=None, min_p=None, presence_penalty=None):
-        """Server defaults of one mode for requests without them: command line > the model card's for this mode."""
+        """Server defaults of one mode for requests without them: command line > the model card's for this mode. An
+        explicit 0 is a value (top_k 0: no top-k cut; top_p 0: greedy, Job.begin_start); only None takes the default."""
         c = CARD_SAMPLING[bool(thinking)]
         if self.family == "gptoss":   # OpenAI's recommendation for gpt-oss (generation_config.json has no values)
             t0, p0 = self.gen.get("temperature"), self.gen.get("top_p")
             return {"temperature": float(temperature if temperature is not None else (t0 if t0 is not None else 1.0)),
-                    "top_p": float(top_p or (p0 if p0 is not None else 1.0)),
-                    "top_k": int(top_k or 0), "min_p": float(min_p or 0.0),
-                    "presence_penalty": float(presence_penalty or 0.0)}
+                    "top_p": float(top_p if top_p is not None else (p0 if p0 is not None else 1.0)),
+                    "top_k": int(top_k if top_k is not None else 0), "min_p": float(min_p if min_p is not None else 0.0),
+                    "presence_penalty": float(presence_penalty if presence_penalty is not None else 0.0)}
         if self.family == "inkling":   # generation_config.json (temperature 1.0; no top_p / top_k: the engine's own sampler)
             t0, p0 = self.gen.get("temperature"), self.gen.get("top_p")
             return {"temperature": float(temperature if temperature is not None else (t0 if t0 is not None else 1.0)),
-                    "top_p": float(top_p or (p0 if p0 is not None else 1.0)),
-                    "top_k": int(top_k or 0), "min_p": float(min_p or 0.0),
-                    "presence_penalty": float(presence_penalty or 0.0)}
+                    "top_p": float(top_p if top_p is not None else (p0 if p0 is not None else 1.0)),
+                    "top_k": int(top_k if top_k is not None else 0), "min_p": float(min_p if min_p is not None else 0.0),
+                    "presence_penalty": float(presence_penalty if presence_penalty is not None else 0.0)}
         if self.family == "dsv4":   # the GGUF's general.sampling.* (dsv4_app's defaults), else 1.0; the engine sampler: top_k 0 = 64
             t0, p0 = self.gen.get("temperature"), self.gen.get("top_p")
             return {"temperature": float(temperature if temperature is not None else (t0 if t0 is not None else 1.0)),
-                    "top_p": float(top_p or (p0 if p0 is not None else 1.0)),
-                    "top_k": int(top_k or 0), "min_p": float(min_p or 0.0),
-                    "presence_penalty": float(presence_penalty or 0.0)}
+                    "top_p": float(top_p if top_p is not None else (p0 if p0 is not None else 1.0)),
+                    "top_k": int(top_k if top_k is not None else 0), "min_p": float(min_p if min_p is not None else 0.0),
+                    "presence_penalty": float(presence_penalty if presence_penalty is not None else 0.0)}
         return {"temperature": float(temperature if temperature is not None else c["temperature"]),
-                "top_p": float(top_p or c["top_p"]),
-                "top_k": int(top_k or c["top_k"]),
+                "top_p": float(top_p if top_p is not None else c["top_p"]),
+                "top_k": int(top_k if top_k is not None else c["top_k"]),
                 "min_p": float(min_p if min_p is not None else c["min_p"]),
                 "presence_penalty": float(presence_penalty if presence_penalty is not None else c["presence_penalty"])}
 

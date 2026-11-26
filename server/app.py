@@ -2838,6 +2838,12 @@ class Job:
         d = g.sampling_defaults[bool(p.get("thinking", True))]
         temp = p.get("temperature")
         temp = d["temperature"] if temp is None else temp
+        # an explicit 0 is a value, only a missing one takes the default; top_k 0 = no top-k cut (the engine's candidate
+        # list: 27B / Flash-Next / DSV4 64, the others the full vocabulary); top_p <= 0 = only the top token: greedy
+        # (every engine reads top_p <= 0 as "no top-p cut", so it becomes temperature 0 here)
+        top_p, top_k, min_p = (d[k] if p.get(k) is None else p[k] for k in ("top_p", "top_k", "min_p"))
+        if float(top_p) <= 0:
+            temp = 0
         self.max_new = p.get("max_tokens") or (e.max_t - len(self.ids) - 16)
         self.stops = [s for s in (p.get("stop") or []) if s]
         self.t0 = time.time()
@@ -2866,13 +2872,18 @@ class Job:
         if guard is not None:
             pres = max(pres, guard["presence"])
             seed = loop_guard.last_reply_tokens(self.ids, g.im_start, g.asst_ids, g.im_end, g.special_min, g.ws_ids)
-        top_p, top_k, min_p = p.get("top_p") or d["top_p"], p.get("top_k") or d["top_k"], p.get("min_p") or d["min_p"]
         can_pen = not getattr(g.profile, "is_gptoss", False) or "qe_set_penalty" in getattr(e, "fns", ())
         if temp <= 0 and (pres or freq) and (explicit or guard is not None) and can_pen:
             # greedy with a penalty: the penalised argmax ([gptoss-rel1] not on an engine without penalties: the
             # top_k = 1 path would only make the reply slower, filtered sampling takes the full head)
             temp, top_p, top_k, min_p = 1.0, 1.0, 1, 0.0
-        e.set_sampling(temp, top_p, top_k, min_p, p.get("seed") or int(time.time() * 1e6))
+        # an explicit seed is kept, 0 included (`or` replaced seed 0 with a time seed); the GLM engine takes 0 for "a
+        # random seed": an explicit 0 goes there as another fixed value, so seed 0 repeats there too
+        seed_v = p.get("seed")
+        seed_v = int(time.time() * 1e6) if seed_v is None else int(seed_v)
+        if seed_v == 0 and getattr(g.profile, "is_glm", False):
+            seed_v = 0x9E3779B97F4A7C15
+        e.set_sampling(temp, top_p, top_k, min_p, seed_v)
         self.penalty = (pres, freq) if temp > 0 and (pres or freq) else None
         if self.penalty and not e.set_penalty(pres, freq, seed):
             self.penalty = None
@@ -4764,7 +4775,8 @@ def resolve_model_args(args):
     if not args.engine_lib and not env_str("QE_LIB"):
         lib = os.path.join(ROOT, d["lib"])
         if not os.path.exists(lib) and prof.family == "inkling":
-            sys.exit(f"Inkling engine library not built: {lib} is missing (run OUT=build_srv src/inkling/build.sh)")
+            sys.exit(f"Inkling engine library not built: {lib} is missing (run OUT={os.path.normpath(os.path.dirname(lib))} "
+                     f"{os.path.normpath(os.path.join(ROOT, 'src', 'inkling', 'build.sh'))})")
         if not os.path.exists(lib) and prof.family == "gptoss":
             # [gptoss-rel1-lib] the 27B library cannot run this model: stop with the reason instead of a later failure
             sys.exit(f"gpt-oss engine library not built: {lib} is missing (run src/gptoss/build.sh)")

@@ -119,9 +119,10 @@ RUN if [ -f build_dsv4/libqdsv4.so ] || [ -f build_gptoss/libqgptoss.so ] || [ -
 COPY vectors ./vectors
 
 # Entry point: server/run.sh with the container defaults (listen on 0.0.0.0).
-# GPU ids as seen in the container (with --gpus all: the host ids): QE_DEVICES if set, else QE_GPUS, else 0,1,2
-# (Inkling-2-Mini: else 0, one card; tensor parallelism needs GPU P2P, so it runs on several cards only when asked);
-# run.sh sets CUDA_VISIBLE_DEVICES from it and passes --devices 0..n-1 (n != 3: warning, less tested).
+# GPU ids as seen in the container (with --gpus all: the host ids): QE_DEVICES if set, else QE_GPUS, else every GPU in
+# the container (run.sh's default; Inkling-2-Mini: else 0, one card; tensor parallelism needs GPU P2P, so it runs on
+# several cards only when asked); run.sh sets CUDA_VISIBLE_DEVICES from it and passes --devices 0..n-1 (n != 3:
+# warning, less tested).
 COPY <<'EOF' /usr/local/bin/qengine-entrypoint
 #!/usr/bin/env bash
 set -euo pipefail
@@ -137,8 +138,10 @@ sys.exit(0 if (c.get("model_type") or t.get("model_type") or "").startswith("ink
 }
 if [ -z "${QE_DEVICES:-}${QE_GPUS:-}" ] && is_inkling "$MODEL"; then
   export QE_DEVICES=0
+elif [ -n "${QE_DEVICES:-}${QE_GPUS:-}" ]; then
+  export QE_DEVICES="${QE_DEVICES:-$QE_GPUS}"  # a user-set QE_DEVICES wins (it was overwritten before)
 else
-  export QE_DEVICES="${QE_DEVICES:-${QE_GPUS:-0,1,2}}"  # a user-set QE_DEVICES wins (it was overwritten before)
+  unset QE_DEVICES  # (compose passes it empty) none set: run.sh uses every GPU in the container
 fi
 # a model directory has a config.json, or is a DeepSeek-V4.1-Flash GGUF split set (Maya-S: no config.json), detected
 # as server/model_profile.py does it (server/dsv4_gguf.py: the first GGUF file's architecture is deepseek41)
@@ -158,7 +161,9 @@ fi
 # scratch space at --work (tools/flash_kl_ref.py; the cards of QE_GPUS); the other arguments go to the tool
 if [ "${1:-}" = kl ]; then
   shift
-  exec python3 tools/flash_kl_ref.py --model "$MODEL" --devices "$QE_DEVICES" "$@"
+  n=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
+  [ "${n:-0}" -gt 0 ] && all=$(seq -s, 0 $((n - 1))) || all=0,1,2
+  exec python3 tools/flash_kl_ref.py --model "$MODEL" --devices "${QE_DEVICES:-$all}" "$@"
 fi
 # Activation steering (off by default). QE_STEERING=0: no vectors, the server runs as without them. QE_STEERING=1:
 # the included refusal_projection (Flash-Next only) is the default of every request; QE_STEERING=<name>: that vector

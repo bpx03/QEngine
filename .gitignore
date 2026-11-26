@@ -6,6 +6,7 @@ build/
 
 # model weights, references and local data (not distributed in git)
 models/
+!docs/models/
 refs/
 bench/data/
 bench/compare/stage/

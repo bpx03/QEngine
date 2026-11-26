@@ -18,7 +18,8 @@ services:
     security_opt:
       - label=disable    # SELinux hosts (Fedora/RHEL): read the bind-mounted model without relabelling it
     environment:
-      QE_GPUS: "${QE_GPUS:-0,1,2}"   # GPU ids to use, e.g. "0,2" for two GPUs (3 GPUs = tested default)
+      QE_GPUS: "${QE_GPUS:-}"         # GPU ids to use, e.g. "0,2" for two GPUs; empty: every GPU (Inkling-2-Mini: one)
+      QE_DEVICES: "${QE_DEVICES:-}"   # the same; wins over QE_GPUS when set
       QE_PORT: "8080"
       QE_EXTRA_ARGS: "${QE_EXTRA_ARGS:-}"
       QE_STEERING: "${QE_STEERING:-0}"   # steering: 0 off, 1 = included refusal_projection (Flash-Next), or a vector name
