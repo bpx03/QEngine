@@ -4590,12 +4590,14 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 static const bool pfsel = env_int("FLASH_ATTN_PFSEL", 1);
                 static const int pfs = env_set("FLASH_ATTN_PFS") ? std::max(1, std::min(8, env_int("FLASH_ATTN_PFS", 2))) : 2;
                 static const int qpf_dbg = env_int("FLASH_QPF_DBG", 0);
-                // copy-engine exchanges (FLASH_COMM=ce): FLASH_QPF_CE=1 runs pfsel there, the q flags waited for by
-                // k_qpf_qwait before the kernel (no spinning pfsel blocks); default 0: k_qsa_dec. Re-tested 2026-10-29
+                // copy-engine exchanges (FLASH_COMM=ce): FLASH_QPF_CE=1 (default) runs pfsel there, the q flags waited for by
+                // k_qpf_qwait before the kernel (no spinning pfsel blocks); 0: k_qsa_dec. Re-tested 2026-10-29
                 // (pfsel_ce_2026-10-29): clean (the old "faults / NaN in batches > 2560 rows" of 3008153 and the eager-batch
                 // deadlock were seen under an unstable GPU clock setting / lazy module loading) and bit-equal to the P2P
-                // default, but no faster: CE prefill is bound by the exchanges (16K -0.6 %, 100K +0.7 %), so it stays off
-                static const bool qpf_ce_on = env_int("FLASH_QPF_CE", 0);
+                // default, and no faster: CE prefill is bound by the exchanges (16K -0.6 %, 100K +0.7 %). On by default so
+                // that the prefill transport does not change the output: with k_qsa_dec a prompt long enough for block
+                // selection got other values over the copy engine than over P2P or host staging (#50)
+                static const bool qpf_ce_on = env_int("FLASH_QPF_CE", 1);
                 const bool ce_x = xstage_ && comm_.xfer == kXferCE;
                 if (pfsel && !pfdec_ && pf_ && sel_on_ && mr > MAXM && std::min(pfs, attn_split_) >= 1 && (!ce_x || qpf_ce_on)) {
                     const int S = std::min(pfs, attn_split_);
